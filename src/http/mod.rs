@@ -2,6 +2,8 @@
 mod async_request;
 mod conf;
 mod module;
+/// Imports commonly needed by HTTP modules.
+pub mod prelude;
 mod request;
 mod status;
 /// HTTP subrequest support.

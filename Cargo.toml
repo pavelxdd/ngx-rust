@@ -44,6 +44,7 @@ targets = []
 
 [dependencies]
 async-task = { version = "4.7.1", optional = true }
+bitflags = { version = "2.13.1", default-features = false }
 lock_api = "0.4.14"
 log = { version = "0.4.33", optional = true }
 nginx-sys = { path = "nginx-sys", version = "0.5.0"}
