@@ -67,7 +67,8 @@
 //!
 //! ## Cargo features
 //!
-//! - `async` - Enables a minimal async runtime built on top of the NGINX event loop.
+//! - `async` - Enables a minimal async runtime built on top of the NGINX event loop. This feature
+//!   also enables `std` so task wakeups can safely arrive from other threads.
 //! - `log` - **Enabled** by default. Connects the `log` facade to the NGINX cycle logger.
 //! - `log-debug` - Allows debug records to reach the NGINX runtime filter.
 //! - `log-trace` - Allows trace records to reach the NGINX runtime filter.
