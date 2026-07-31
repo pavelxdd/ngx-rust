@@ -204,16 +204,16 @@ http_variable_get!(
             Ok((ip, port)) => {
                 // create context,
                 // set context
-                let new_ctx = request.pool().allocate::<NgxHttpOrigDstCtx>(Default::default());
-
-                if new_ctx.is_null() {
+                let Ok(mut new_ctx) =
+                    (unsafe { request.pool().allocate_with_cleanup(NgxHttpOrigDstCtx::default) })
+                else {
                     return Status::NGX_ERROR;
-                }
+                };
 
                 ngx_log_debug_http!(request, "httporigdst: saving ip - {:?}, port - {}", ip, port,);
-                unsafe { (*new_ctx).save(&ip, port, &request.pool()) };
-                unsafe { (*new_ctx).bind_addr(v) };
-                request.set_module_ctx(new_ctx as *mut c_void, Module::module());
+                unsafe { new_ctx.as_mut().save(&ip, port, &request.pool()) };
+                unsafe { new_ctx.as_ref().bind_addr(v) };
+                request.set_module_ctx(new_ctx.as_ptr().cast(), Module::module());
             }
         }
         Status::NGX_OK
@@ -243,16 +243,16 @@ http_variable_get!(
             Ok((ip, port)) => {
                 // create context,
                 // set context
-                let new_ctx = request.pool().allocate::<NgxHttpOrigDstCtx>(Default::default());
-
-                if new_ctx.is_null() {
+                let Ok(mut new_ctx) =
+                    (unsafe { request.pool().allocate_with_cleanup(NgxHttpOrigDstCtx::default) })
+                else {
                     return Status::NGX_ERROR;
-                }
+                };
 
                 ngx_log_debug_http!(request, "httporigdst: saving ip - {:?}, port - {}", ip, port,);
-                unsafe { (*new_ctx).save(&ip, port, &request.pool()) };
-                unsafe { (*new_ctx).bind_port(v) };
-                request.set_module_ctx(new_ctx as *mut c_void, Module::module());
+                unsafe { new_ctx.as_mut().save(&ip, port, &request.pool()) };
+                unsafe { new_ctx.as_ref().bind_port(v) };
+                request.set_module_ctx(new_ctx.as_ptr().cast(), Module::module());
             }
         }
         Status::NGX_OK
