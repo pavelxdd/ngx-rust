@@ -15,6 +15,7 @@ build = "../build.rs"
 [dependencies]
 nginx-sys = { path = "../nginx-sys/" }
 ngx = { path = "../", default-features = false, features = ["std"] }
+log = { version = "0.4.27", optional = true }
 
 [dev-dependencies]
 aws-sign-v4 = "0.3.0"
@@ -69,7 +70,7 @@ default = ["export-modules", "ngx/vendored"]
 # this configuration automatically.
 # See https://github.com/rust-lang/rust/issues/20267
 export-modules = []
-async = ["ngx/async"]
+async = ["dep:log", "ngx/async", "ngx/log"]
 linux = []
 
 [lints]

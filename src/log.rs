@@ -5,6 +5,9 @@ use core::ptr::NonNull;
 
 use crate::ffi::{self, NGX_MAX_ERROR_STR, ngx_err_t, ngx_log_t, ngx_uint_t};
 
+#[cfg(feature = "log")]
+pub mod interop;
+
 /// This constant is set to `true` if NGINX is compiled with debug logging (`--with-debug`).
 pub const DEBUG: bool = cfg!(ngx_feature = "debug");
 
@@ -193,7 +196,7 @@ macro_rules! ngx_log_debug_mask {
 
 /// Debug masks for use with [`ngx_log_debug_mask`], these represent the only accepted values for
 /// the mask.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum DebugMask {
     /// Aligns to the NGX_LOG_DEBUG_CORE mask.
     Core,

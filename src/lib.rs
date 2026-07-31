@@ -70,6 +70,9 @@
 //! - `alloc` - **Enabled** by default. This provides APIs that require allocations
 //!   via the `alloc` crate.
 //! - `async` - Enables a minimal async runtime built on top of the NGINX event loop.
+//! - `log` - **Enabled** by default. Connects the `log` facade to the NGINX cycle logger.
+//! - `log-debug` - Allows debug records to reach the NGINX runtime filter.
+//! - `log-trace` - Allows trace records to reach the NGINX runtime filter.
 //! - `serde` - Enables serialization support for some of the provided and
 //!   re-exported types.
 //! - `std` - **Enabled** by default. This provides APIs that require the standard
@@ -120,6 +123,8 @@
 #![no_std]
 #[cfg(feature = "alloc")]
 extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
 
 pub mod allocator;
 #[cfg(feature = "async")]
