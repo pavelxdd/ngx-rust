@@ -244,6 +244,7 @@ pub unsafe trait HttpModuleLocationConf: HttpModule {
 mod core {
     use crate::allocator::AllocError;
     use crate::{
+        collections::NgxArray,
         ffi::{
             ngx_http_core_loc_conf_t, ngx_http_core_main_conf_t, ngx_http_core_module,
             ngx_http_core_srv_conf_t,
@@ -304,10 +305,13 @@ mod core {
         H: HttpRequestHandler,
     {
         let cmcf = unsafe { NgxHttpCoreModule::main_conf_mut(cf) }.expect("http core main conf");
-        let h: *mut nginx_sys::ngx_http_handler_pt = unsafe {
-            nginx_sys::ngx_array_push(&raw mut cmcf.phases[H::PHASE as usize].handlers).cast()
-        };
-        if h.is_null() {
+        let handlers = unsafe {
+            NgxArray::<nginx_sys::ngx_http_handler_pt>::from_ngx_array_mut(
+                &mut cmcf.phases[H::PHASE as usize].handlers,
+            )
+        }
+        .expect("http phase handler array type");
+        if handlers.push(Some(crate::http::raw_handler::<H>)).is_err() {
             ngx_conf_log_error!(
                 nginx_sys::NGX_LOG_EMERG,
                 cf,
@@ -315,10 +319,6 @@ mod core {
                 H::name(),
             );
             return Err(AllocError);
-        }
-        // set an H::PHASE phase handler
-        unsafe {
-            *h = Some(crate::http::raw_handler::<H>);
         }
         Ok(())
     }
