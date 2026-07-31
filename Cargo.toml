@@ -65,6 +65,7 @@ async = [
     "alloc",
     "dep:async-task",
     "dep:pin-project-lite",
+    "std",
 ]
 # Provides APIs that require allocations via the `alloc` crate.
 alloc = ["allocator-api2/alloc"]

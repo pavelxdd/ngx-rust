@@ -2,145 +2,210 @@ use alloc::collections::vec_deque::VecDeque;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::mem;
-use core::ptr::{self, NonNull};
+use core::ptr;
+use std::sync::{Mutex, OnceLock};
+use std::thread::{self, ThreadId};
 
 pub use async_task::Task;
 use async_task::{Runnable, ScheduleInfo, WithInfo};
-use nginx_sys::{
-    ngx_del_timer, ngx_delete_posted_event, ngx_event_t, ngx_post_event, ngx_posted_next_events,
-};
+use nginx_sys::{ngx_event_actions, ngx_event_t, ngx_post_event, ngx_posted_next_events};
 
 use crate::log::ngx_cycle_log;
-use crate::{ngx_container_of, ngx_log_debug};
+use crate::ngx_log_debug;
 
 static SCHEDULER: Scheduler = Scheduler::new();
 
-struct Scheduler(UnsafeCell<SchedulerInner>);
+struct RunnableQueue(Mutex<VecDeque<Runnable>>);
 
-// SAFETY: Scheduler must only be used from the main thread of a worker process.
-unsafe impl Send for Scheduler {}
+impl RunnableQueue {
+    const fn new() -> Self {
+        Self(Mutex::new(VecDeque::new()))
+    }
+
+    fn push(&self, runnable: Runnable) {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).push_back(runnable);
+    }
+
+    fn take(&self) -> VecDeque<Runnable> {
+        mem::take(&mut *self.0.lock().unwrap_or_else(|error| error.into_inner()))
+    }
+}
+
+struct Scheduler {
+    worker: OnceLock<ThreadId>,
+    queue: RunnableQueue,
+    posted: UnsafeCell<PostedEvent>,
+}
+
+// SAFETY: the queue and worker ID are synchronized. The posted event is accessed only from the
+// registered nginx worker thread.
 unsafe impl Sync for Scheduler {}
 
 impl Scheduler {
     const fn new() -> Self {
-        Self(SchedulerInner::new())
+        Self {
+            worker: OnceLock::new(),
+            queue: RunnableQueue::new(),
+            posted: UnsafeCell::new(PostedEvent::new()),
+        }
     }
 
-    pub fn schedule(&self, runnable: Runnable) {
-        // SAFETY: the cell is not empty, and we have exclusive access due to being a
-        // single-threaded application.
-        let inner = unsafe { &mut *UnsafeCell::raw_get(&raw const self.0) };
-        inner.send(runnable)
-    }
-}
-
-#[repr(C)]
-struct SchedulerInner {
-    _ident: [usize; 4], // `ngx_event_ident` compatibility
-    event: ngx_event_t,
-    queue: VecDeque<Runnable>,
-}
-
-impl SchedulerInner {
-    const fn new() -> UnsafeCell<Self> {
-        let mut event: ngx_event_t = unsafe { mem::zeroed() };
-        event.handler = Some(Self::scheduler_event_handler);
-
-        UnsafeCell::new(Self {
-            _ident: [
-                0, 0, 0, 0x4153594e, // ASYN
-            ],
-            event,
-            queue: VecDeque::new(),
-        })
+    fn register_worker(&self) {
+        let current = thread::current().id();
+        let worker = self.worker.get_or_init(|| current);
+        assert_eq!(*worker, current, "async tasks must be spawned on the nginx worker thread");
     }
 
-    pub fn send(&mut self, runnable: Runnable) {
-        // Cached `ngx_cycle.log` can be invalidated when reloading configuration in a single
-        // process mode. Update `log` every time to avoid using stale log pointer.
-        self.event.log = ngx_cycle_log().as_ptr();
+    fn schedule(&self, runnable: Runnable) {
+        self.queue.push(runnable);
 
-        // While this event is not used as a timer at the moment, we still want to ensure that it is
-        // compatible with `ngx_event_ident`.
-        if self.event.data.is_null() {
-            self.event.data = ptr::from_mut(self).cast();
+        if self.worker.get().is_some_and(|worker| *worker == thread::current().id()) {
+            self.post_event();
+            return;
         }
 
-        // FIXME: VecDeque::push could panic on an allocation failure, switch to a datastructure
-        // which will not and propagate the failure.
-        self.queue.push_back(runnable);
-        unsafe { ngx_post_event(&raw mut self.event, &raw mut ngx_posted_next_events) }
+        // SAFETY: nginx initializes the selected event actions before worker modules can spawn
+        // tasks and does not replace them while the worker is running.
+        let notify = unsafe { ngx_event_actions.notify };
+        if let Some(notify) = notify {
+            // SAFETY: notify is the selected event module's cross-thread entrypoint. The callback
+            // only drains the synchronized queue and polls tasks on the nginx worker thread.
+            let _ = unsafe { notify(Some(Self::notification_handler)) };
+        }
     }
 
-    /// This event handler is called by ngx_event_process_posted at the end of
-    /// ngx_process_events_and_timers.
-    extern "C" fn scheduler_event_handler(ev: *mut ngx_event_t) {
-        let mut runnables = {
-            // SAFETY:
-            // This handler always receives a non-null pointer to an event embedded into a
-            // UnsafeCell<SchedulerInner> instance. We modify the contents of the `UnsafeCell`,
-            // but we ensured that:
-            //  - we access the cell correctly, as documented in https://doc.rust-lang.org/stable/std/cell/struct.UnsafeCell.html#memory-layout
-            //  - the access is unique due to being single-threaded
-            //  - the reference is dropped before we start processing queued runnables.
-            let cell: NonNull<UnsafeCell<Self>> =
-                ngx_container_of!(unsafe { NonNull::new_unchecked(ev) }, Self, event).cast();
-            let this = unsafe { &mut *UnsafeCell::raw_get(cell.as_ptr()) };
+    fn post_event(&self) {
+        let posted = unsafe { &mut *self.posted.get() };
+        posted.event.log = ngx_cycle_log().as_ptr();
+        if posted.event.data.is_null() {
+            posted.event.data = ptr::from_mut(posted).cast();
+        }
+        // SAFETY: this function is called only from the registered worker thread, which owns both
+        // the posted event and nginx's posted-event queue.
+        unsafe { ngx_post_event(&raw mut posted.event, &raw mut ngx_posted_next_events) }
+    }
 
-            ngx_log_debug!(
-                this.event.log,
-                "async: processing {} deferred wakeups",
-                this.queue.len()
-            );
-
-            // Move runnables to a new queue to avoid borrowing from the SchedulerInner and limit
-            // processing to already queued wakeups. This ensures that we correctly handle tasks
-            // that keep scheduling themselves (e.g. using yield_now() in a loop).
-            // We can't use drain() as it borrows from self and breaks aliasing rules.
-            mem::take(&mut this.queue)
-        };
+    fn process(&self) {
+        let mut runnables = self.queue.take();
+        ngx_log_debug!(
+            ngx_cycle_log().as_ptr(),
+            "async: processing {} deferred wakeups",
+            runnables.len()
+        );
 
         for runnable in runnables.drain(..) {
             runnable.run();
         }
     }
+
+    unsafe extern "C" fn notification_handler(_event: *mut ngx_event_t) {
+        SCHEDULER.process();
+    }
+
+    unsafe extern "C" fn posted_handler(_event: *mut ngx_event_t) {
+        SCHEDULER.process();
+    }
 }
 
-impl Drop for SchedulerInner {
-    fn drop(&mut self) {
-        if self.event.posted() != 0 {
-            unsafe { ngx_delete_posted_event(&raw mut self.event) };
-        }
+#[repr(C)]
+struct PostedEvent {
+    _ident: [usize; 4], // `ngx_event_ident` compatibility
+    event: ngx_event_t,
+}
 
-        if self.event.timer_set() != 0 {
-            unsafe { ngx_del_timer(&raw mut self.event) };
+impl PostedEvent {
+    const fn new() -> Self {
+        let mut event: ngx_event_t = unsafe { mem::zeroed() };
+        event.handler = Some(Scheduler::posted_handler);
+
+        Self {
+            _ident: [
+                0, 0, 0, 0x4153594e, // ASYN
+            ],
+            event,
         }
     }
 }
 
 fn schedule(runnable: Runnable, _info: ScheduleInfo) {
-    // Always defer the wake via `ngx_post_event`; never re-poll synchronously.
+    // Always defer the wake through the nginx event loop; never re-poll synchronously.
     //
     // `Waker::wake()` may fire from arbitrary contexts, including a future's
     // `Drop` while a lock is held (e.g. h2's `Streams::drop` wakes its parked
-    // `Connection` task while holding `Arc<Mutex<Inner>>`). A synchronous
-    // re-poll would re-enter the task and deadlock on that lock. Deferring
-    // costs one event-loop tick: `ngx_event_process_posted` drains the queue
-    // at the end of each cycle.
+    // `Connection` task while holding `Arc<Mutex<Inner>>`). A synchronous re-poll would re-enter
+    // the task and deadlock on that lock.
     SCHEDULER.schedule(runnable);
 }
 
 /// Creates a new task running on the NGINX event loop.
+///
+/// This function must be called on the nginx worker thread. The task is always polled on that
+/// thread even when its waker is invoked from another thread. Prompt cross-thread wakeups require
+/// the selected nginx event module to provide its notification hook.
 pub fn spawn<F, T>(future: F) -> Task<T>
 where
     F: Future<Output = T> + 'static,
     T: 'static,
 {
+    SCHEDULER.register_worker();
     ngx_log_debug!(ngx_cycle_log().as_ptr(), "async: spawning new task");
     let scheduler = WithInfo(schedule);
-    // Safety: single threaded embedding takes care of send/sync requirements for future and
-    // scheduler. Future and scheduler are both 'static.
-    let (runnable, task) = unsafe { async_task::spawn_unchecked(future, scheduler) };
+    let (runnable, task) = async_task::spawn_local(future, scheduler);
     runnable.schedule();
     task
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::task::{Context, Poll, Waker};
+    use std::sync::mpsc;
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn runnable_queue_returns_remote_wake_to_owner() {
+        let queue = Arc::new(RunnableQueue::new());
+        let ready = Arc::new(AtomicBool::new(false));
+        let (waker_tx, waker_rx) = mpsc::channel();
+
+        let future_ready = Arc::clone(&ready);
+        let future = core::future::poll_fn(move |context| {
+            if future_ready.load(Ordering::Acquire) {
+                Poll::Ready(7)
+            } else {
+                waker_tx.send(context.waker().clone()).unwrap();
+                Poll::Pending
+            }
+        });
+        let scheduled = Arc::clone(&queue);
+        let (runnable, task) =
+            async_task::spawn_local(future, move |runnable| scheduled.push(runnable));
+
+        runnable.schedule();
+        for runnable in queue.take() {
+            runnable.run();
+        }
+
+        let remote_ready = Arc::clone(&ready);
+        let waker = waker_rx.recv().unwrap();
+        thread::spawn(move || {
+            remote_ready.store(true, Ordering::Release);
+            waker.wake();
+        })
+        .join()
+        .unwrap();
+
+        for runnable in queue.take() {
+            runnable.run();
+        }
+
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(7));
+    }
 }
