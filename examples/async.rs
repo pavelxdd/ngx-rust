@@ -11,9 +11,10 @@ use ngx::ffi::{
     NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MODULE, NGX_LOG_EMERG,
     ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_int_t, ngx_module_t, ngx_str_t, ngx_uint_t,
 };
+use ngx::http::subrequest::{SubRequestBuilder, SubRequestError};
 use ngx::http::{
-    self, AsyncHandlerContext, AsyncHttpRequestHandler, HttpModule, HttpModuleLocationConf,
-    HttpModuleRequestContext, MergeConfigError,
+    self, AsyncHandlerContext, AsyncHttpRequestHandler, HTTPStatus, HttpModule,
+    HttpModuleLocationConf, HttpModuleRequestContext, MergeConfigError,
 };
 use ngx::{async_ as ngx_async, ngx_conf_log_error, ngx_log_debug_http, ngx_string};
 
@@ -95,10 +96,15 @@ unsafe impl HttpModuleRequestContext for Module {
 
 struct AsyncAccessHandler;
 
+struct AsyncOutput {
+    elapsed: u128,
+    subrequest_status: Option<HTTPStatus>,
+}
+
 impl AsyncHttpRequestHandler for AsyncAccessHandler {
     const PHASE: ngx::http::HttpPhase = ngx::http::HttpPhase::Access;
     type Module = Module;
-    type Output = Option<u128>;
+    type Output = Result<Option<AsyncOutput>, SubRequestError>;
     type Result = Status;
 
     fn start(
@@ -107,24 +113,48 @@ impl AsyncHttpRequestHandler for AsyncAccessHandler {
         let co = Module::location_conf(request).expect("module config is none");
         ngx_log_debug_http!(request, "async module enabled: {}", co.enable);
         let enabled = co.enable;
+        let subrequest = enabled.then(|| {
+            let started = Instant::now();
+            SubRequestBuilder::new(request, "/async-target")
+                .and_then(|builder| {
+                    builder.waited().build_async(|subrequest, completion_status| {
+                        let status = subrequest
+                            .status()
+                            .or_else(|| HTTPStatus::try_from(completion_status).ok());
+                        (status, Status::NGX_OK)
+                    })
+                })
+                .map(|(future, _)| (started, future))
+        });
 
         async move {
-            if !enabled {
-                return None;
-            }
+            let Some(subrequest) = subrequest else {
+                return Ok(None);
+            };
+            let (started, subrequest) = subrequest?;
+            let subrequest_status = subrequest.await?;
 
-            let start = Instant::now();
             ngx_async::sleep(Duration::from_millis(10)).await;
-            Some(start.elapsed().as_millis())
+            Ok(Some(AsyncOutput { elapsed: started.elapsed().as_millis(), subrequest_status }))
         }
     }
 
-    fn finish(request: &mut http::Request, elapsed: Self::Output) -> Self::Result {
-        let Some(elapsed) = elapsed else {
-            return Status::NGX_DECLINED;
+    fn finish(request: &mut http::Request, output: Self::Output) -> Self::Result {
+        let output = match output {
+            Ok(Some(output)) => output,
+            Ok(None) => return Status::NGX_DECLINED,
+            Err(_) => return Status::NGX_ERROR,
         };
-        let elapsed = elapsed.to_string();
+        let Some(subrequest_status) = output.subrequest_status else {
+            return Status::NGX_ERROR;
+        };
+
+        let elapsed = output.elapsed.to_string();
         if request.add_header_out("X-Async-Time", &elapsed).is_none() {
+            return Status::NGX_ERROR;
+        }
+        let subrequest_status = subrequest_status.0.to_string();
+        if request.add_header_out("X-Async-Subrequest-Status", &subrequest_status).is_none() {
             return Status::NGX_ERROR;
         }
         Status::NGX_OK

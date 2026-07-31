@@ -21,7 +21,7 @@ use Test::Nginx;
 select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
-my $t = Test::Nginx->new()->has(qw/http/)->plan(2)
+my $t = Test::Nginx->new()->has(qw/http/)->plan(3)
 	->write_file_expand('nginx.conf', <<'EOF');
 
 %%TEST_GLOBALS%%
@@ -45,6 +45,12 @@ http {
         location /disabled {
             async off;
         }
+
+        location = /async-target {
+            internal;
+            async off;
+            return 204;
+        }
     }
 }
 
@@ -55,7 +61,9 @@ $t->run();
 
 ###############################################################################
 
-like(http_get('/index.html'), qr/X-Async-Time:/, 'async handler');
+my $response = http_get('/index.html');
+like($response, qr/X-Async-Time:/, 'async handler');
+like($response, qr/X-Async-Subrequest-Status: 204/, 'async subrequest');
 unlike(http_get('/disabled'), qr/X-Async-Time:/, 'disabled async handler');
 
 ###############################################################################
