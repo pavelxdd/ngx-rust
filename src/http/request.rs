@@ -229,6 +229,11 @@ impl Request {
         core::ptr::eq(self, main)
     }
 
+    /// Whether nginx marked this request as internal.
+    pub fn is_internal(&self) -> bool {
+        self.0.internal() != 0
+    }
+
     /// Main request associated with this request.
     pub fn main(&self) -> &Request {
         if self.is_main() {
@@ -978,6 +983,16 @@ mod tests {
         raw.connection = &raw mut connection;
 
         assert_eq!(request_from(&mut raw).bytes_sent(), 8192);
+    }
+
+    #[test]
+    fn internal_redirect_flag_is_exposed() {
+        let mut raw = zeroed_request();
+
+        assert!(!request_from(&mut raw).is_internal());
+
+        raw.set_internal(1);
+        assert!(request_from(&mut raw).is_internal());
     }
 
     #[test]
