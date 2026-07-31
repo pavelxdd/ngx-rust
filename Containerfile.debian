@@ -16,3 +16,5 @@ RUN set -eux \
         sed \
         make; \
     git config --global --add safe.directory /project
+
+RUN rustup component add clippy
