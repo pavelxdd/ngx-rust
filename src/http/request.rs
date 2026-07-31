@@ -9,6 +9,7 @@ use crate::core::*;
 use crate::ffi::*;
 use crate::http::HttpPhase;
 use crate::http::status::*;
+use crate::http::upstream::UpstreamState;
 
 /// Define a static request handler.
 ///
@@ -219,6 +220,46 @@ impl Request {
             return None;
         }
         Some(self.0.upstream)
+    }
+
+    /// Upstream attempts recorded for this request, in chronological order.
+    ///
+    /// The slice is empty before nginx creates an upstream or when the request is served without
+    /// contacting one. Retries add one state for each attempted peer.
+    pub fn upstream_states(&self) -> &[UpstreamState] {
+        if self.0.upstream_states.is_null() {
+            return &[];
+        }
+
+        let states = unsafe { &*self.0.upstream_states };
+        if states.nelts == 0 {
+            return &[];
+        }
+
+        // SAFETY: nginx creates this array with ngx_http_upstream_state_t elements in the request
+        // pool. UpstreamState is a transparent wrapper and the request borrow bounds the slice.
+        unsafe { slice::from_raw_parts(states.elts.cast(), states.nelts) }
+    }
+
+    /// Seconds since the Unix epoch when nginx created the request.
+    pub fn start_sec(&self) -> time_t {
+        self.0.start_sec
+    }
+
+    /// Millisecond component of the request creation time.
+    pub fn start_msec(&self) -> ngx_msec_t {
+        self.0.start_msec
+    }
+
+    /// Bytes received for the request line, headers, and body parsed so far.
+    pub fn request_length(&self) -> off_t {
+        self.0.request_length
+    }
+
+    /// Current value of the client connection's sent-byte counter.
+    pub fn bytes_sent(&self) -> off_t {
+        // SAFETY: nginx assigns a connection before creating a valid HTTP request.
+        unsafe { (*self.0.connection).sent }
     }
 
     /// Pointer to a [`ngx_connection_t`] client connection object.
@@ -799,4 +840,83 @@ enum MethodInner {
     Patch,
     Trace,
     Connect,
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem::MaybeUninit;
+
+    use super::*;
+
+    fn zeroed_request() -> ngx_http_request_t {
+        unsafe { MaybeUninit::zeroed().assume_init() }
+    }
+
+    fn request_from(raw: &mut ngx_http_request_t) -> &mut Request {
+        unsafe { Request::from_ngx_http_request(raw) }
+    }
+
+    #[test]
+    fn upstream_states_is_empty_without_an_array() {
+        let mut raw = zeroed_request();
+
+        assert!(request_from(&mut raw).upstream_states().is_empty());
+    }
+
+    #[test]
+    fn upstream_states_is_empty_without_elements() {
+        let mut states: ngx_array_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        states.elts = (&raw mut states).cast();
+
+        let mut raw = zeroed_request();
+        raw.upstream_states = &raw mut states;
+
+        assert!(request_from(&mut raw).upstream_states().is_empty());
+    }
+
+    #[test]
+    fn upstream_states_preserves_attempt_order() {
+        let mut values: [ngx_http_upstream_state_t; 2] =
+            unsafe { MaybeUninit::zeroed().assume_init() };
+        values[0].status = 502;
+        values[0].response_time = 3;
+        values[1].status = 200;
+        values[1].response_time = 12;
+
+        let mut states: ngx_array_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        states.elts = values.as_mut_ptr().cast();
+        states.nelts = values.len();
+
+        let mut raw = zeroed_request();
+        raw.upstream_states = &raw mut states;
+
+        let attempts = request_from(&mut raw).upstream_states();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!((attempts[0].status(), attempts[0].response_time()), (502, 3));
+        assert_eq!((attempts[1].status(), attempts[1].response_time()), (200, 12));
+    }
+
+    #[test]
+    fn request_metrics_read_nginx_fields() {
+        let mut raw = zeroed_request();
+        raw.start_sec = 1_700_000_000;
+        raw.start_msec = 250;
+        raw.request_length = 4096;
+
+        let request = request_from(&mut raw);
+        assert_eq!(request.start_sec(), 1_700_000_000);
+        assert_eq!(request.start_msec(), 250);
+        assert_eq!(request.request_length(), 4096);
+    }
+
+    #[test]
+    fn bytes_sent_reads_the_client_connection() {
+        let mut connection: ngx_connection_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        connection.sent = 8192;
+
+        let mut raw = zeroed_request();
+        raw.connection = &raw mut connection;
+
+        assert_eq!(request_from(&mut raw).bytes_sent(), 8192);
+    }
 }
