@@ -114,7 +114,12 @@ where
     }
 
     /// Appends an element to the end of the queue.
-    pub fn push_back(&mut self, entry: &mut T) {
+    ///
+    /// # Safety
+    ///
+    /// `entry` must not be linked into any other queue, and no references obtained through a
+    /// queue may exist while it is inserted.
+    pub unsafe fn push_back(&mut self, entry: &mut T) {
         if self.head.prev.is_null() {
             unsafe { ngx_queue_init(&raw mut self.head) }
         }
@@ -123,7 +128,12 @@ where
     }
 
     /// Appends an element to the beginning of the queue.
-    pub fn push_front(&mut self, entry: &mut T) {
+    ///
+    /// # Safety
+    ///
+    /// `entry` must not be linked into any other queue, and no references obtained through a
+    /// queue may exist while it is inserted.
+    pub unsafe fn push_front(&mut self, entry: &mut T) {
         if self.head.prev.is_null() {
             unsafe { ngx_queue_init(&raw mut self.head) }
         }
@@ -133,12 +143,12 @@ where
 
     /// Returns an iterator over the entries of the queue.
     pub fn iter(&self) -> NgxQueueIter<'_, T> {
-        NgxQueueIter::new(&self.head)
+        unsafe { NgxQueueIter::new(&self.head) }
     }
 
     /// Returns a mutable iterator over the entries of the queue.
     pub fn iter_mut(&mut self) -> NgxQueueIterMut<'_, T> {
-        NgxQueueIterMut::new(&mut self.head)
+        unsafe { NgxQueueIterMut::new(&mut self.head) }
     }
 }
 
@@ -154,7 +164,12 @@ where
     T: NgxQueueEntry,
 {
     /// Creates a new queue iterator.
-    pub fn new(head: &'a ngx_queue_t) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// `head` must anchor a valid queue whose entries satisfy [`NgxQueueEntry`]. The queue must
+    /// remain unchanged for the iterator's lifetime.
+    pub unsafe fn new(head: &'a ngx_queue_t) -> Self {
         let head = NonNull::from(head);
         NgxQueueIter { head, current: head, _lifetime: PhantomData }
     }
@@ -183,7 +198,7 @@ where
 pub struct NgxQueueIterMut<'a, T> {
     head: NonNull<ngx_queue_t>,
     current: NonNull<ngx_queue_t>,
-    _lifetime: PhantomData<&'a T>,
+    _lifetime: PhantomData<&'a mut T>,
 }
 
 impl<'a, T> NgxQueueIterMut<'a, T>
@@ -191,7 +206,12 @@ where
     T: NgxQueueEntry,
 {
     /// Creates a new mutable queue iterator.
-    pub fn new(head: &'a mut ngx_queue_t) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// `head` must anchor a valid queue whose entries satisfy [`NgxQueueEntry`]. The queue and all
+    /// entries must remain exclusively accessible for the iterator's lifetime.
+    pub unsafe fn new(head: &'a mut ngx_queue_t) -> Self {
         let head = NonNull::from(head);
         NgxQueueIterMut { head, current: head, _lifetime: PhantomData }
     }
@@ -288,6 +308,46 @@ impl<T, A: Allocator> Queue<T, A> {
         QueueIterMut::new(&mut self.raw_mut().head)
     }
 
+    /// Returns a reference to the first element.
+    pub fn front(&self) -> Option<&T> {
+        self.iter().next()
+    }
+
+    /// Returns a mutable reference to the first element.
+    pub fn front_mut(&mut self) -> Option<&mut T> {
+        self.iter_mut().next()
+    }
+
+    /// Returns a reference to the last element.
+    pub fn back(&self) -> Option<&T> {
+        if self.is_empty() {
+            return None;
+        }
+        let node = NonNull::new(self.raw().head.prev)?;
+        let entry = QueueEntry::<T>::from_queue(node);
+        Some(unsafe { &entry.as_ref().item })
+    }
+
+    /// Returns a mutable reference to the last element.
+    pub fn back_mut(&mut self) -> Option<&mut T> {
+        if self.is_empty() {
+            return None;
+        }
+        let node = NonNull::new(self.raw_mut().head.prev)?;
+        let mut entry = QueueEntry::<T>::from_queue(node);
+        Some(unsafe { &mut entry.as_mut().item })
+    }
+
+    /// Returns a reference to the element at `index`.
+    pub fn get(&self, index: usize) -> Option<&T> {
+        self.iter().nth(index)
+    }
+
+    /// Returns a mutable reference to the element at `index`.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        self.iter_mut().nth(index)
+    }
+
     /// Removes the last element and returns it or `None` if the list is empty.
     pub fn pop_back(&mut self) -> Option<T> {
         if self.is_empty() {
@@ -308,18 +368,24 @@ impl<T, A: Allocator> Queue<T, A> {
 
     /// Appends an element to the end of the list.
     pub fn push_back(&mut self, item: T) -> Result<&mut T, AllocError> {
+        if self.len == usize::MAX {
+            return Err(AllocError);
+        }
         let mut entry = QueueEntry::new_in(item, self.allocator())?;
         let entry = unsafe { entry.as_mut() };
-        self.raw_mut().push_back(entry);
+        unsafe { self.raw_mut().push_back(entry) };
         self.len += 1;
         Ok(&mut entry.item)
     }
 
     /// Appends an element to the beginning of the list.
     pub fn push_front(&mut self, item: T) -> Result<&mut T, AllocError> {
+        if self.len == usize::MAX {
+            return Err(AllocError);
+        }
         let mut entry = QueueEntry::new_in(item, self.allocator())?;
         let entry = unsafe { entry.as_mut() };
-        self.raw_mut().push_front(entry);
+        unsafe { self.raw_mut().push_front(entry) };
         self.len += 1;
         Ok(&mut entry.item)
     }
@@ -344,9 +410,10 @@ impl<T, A: Allocator> Queue<T, A> {
         self.len -= 1;
 
         let entry = QueueEntry::<T>::from_queue(node);
+        let layout = Layout::new::<QueueEntry<T>>();
         let copy = unsafe { entry.read() };
         // Skip drop as QueueEntry is already copied to `x`.
-        unsafe { self.allocator().deallocate(entry.cast(), Layout::for_value(entry.as_ref())) };
+        unsafe { self.allocator().deallocate(entry.cast(), layout) };
         copy.item
     }
 }
@@ -372,10 +439,8 @@ impl<T> QueueEntry<T> {
         let p: NonNull<Self> = alloc.allocate(Layout::new::<Self>())?.cast();
 
         unsafe {
-            let u = p.cast::<mem::MaybeUninit<Self>>().as_mut();
-            // does not read the uninitialized data
-            ngx_queue_init(&raw mut u.assume_init_mut().queue);
-            ptr::write(&raw mut u.assume_init_mut().item, item);
+            ngx_queue_init(ptr::addr_of_mut!((*p.as_ptr()).queue));
+            ptr::addr_of_mut!((*p.as_ptr()).item).write(item);
         }
 
         Ok(p)
@@ -386,9 +451,8 @@ impl<T> QueueEntry<T> {
 pub struct QueueIter<'a, T>(NgxQueueIter<'a, QueueEntry<T>>);
 
 impl<'a, T> QueueIter<'a, T> {
-    /// Creates a new iterator for the linked list.
-    pub fn new(head: &'a ngx_queue_t) -> Self {
-        Self(NgxQueueIter::new(head))
+    fn new(head: &'a ngx_queue_t) -> Self {
+        Self(unsafe { NgxQueueIter::new(head) })
     }
 }
 
@@ -404,9 +468,8 @@ impl<'a, T> Iterator for QueueIter<'a, T> {
 pub struct QueueIterMut<'a, T>(NgxQueueIterMut<'a, QueueEntry<T>>);
 
 impl<'a, T> QueueIterMut<'a, T> {
-    /// Creates a new mutable iterator for the linked list.
-    pub fn new(head: &'a mut ngx_queue_t) -> Self {
-        Self(NgxQueueIterMut::new(head))
+    fn new(head: &'a mut ngx_queue_t) -> Self {
+        Self(unsafe { NgxQueueIterMut::new(head) })
     }
 }
 
@@ -415,5 +478,39 @@ impl<'a, T> Iterator for QueueIterMut<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         Some(&mut self.0.next()?.item)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::allocator::Global;
+
+    use super::Queue;
+
+    #[test]
+    fn owned_queue_exposes_sequence_access_and_mutation() {
+        let mut queue = Queue::try_new_in(Global).unwrap();
+
+        assert_eq!(queue.front(), None);
+        assert_eq!(queue.back(), None);
+        queue.push_back(20).unwrap();
+        queue.push_front(10).unwrap();
+        queue.push_back(30).unwrap();
+
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.front(), Some(&10));
+        assert_eq!(queue.get(1), Some(&20));
+        assert_eq!(queue.get(3), None);
+        assert_eq!(queue.back(), Some(&30));
+
+        *queue.front_mut().unwrap() = 11;
+        *queue.get_mut(1).unwrap() = 21;
+        *queue.back_mut().unwrap() = 31;
+
+        assert_eq!(queue.iter().copied().collect::<alloc::vec::Vec<_>>(), [11, 21, 31]);
+        assert_eq!(queue.pop_front(), Some(11));
+        assert_eq!(queue.pop_back(), Some(31));
+        assert_eq!(queue.pop_back(), Some(21));
+        assert!(queue.is_empty());
     }
 }
