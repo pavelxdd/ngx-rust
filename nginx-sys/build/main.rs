@@ -249,6 +249,206 @@ fn generate_binding(nginx: &NginxSource) {
         env::var("OUT_DIR").expect("The required environment variable OUT_DIR was not set");
     let out_path = PathBuf::from(out_dir_env);
     bindings.write_to_file(out_path.join("bindings.rs")).expect("Couldn't write bindings!");
+
+    #[cfg(feature = "test-link")]
+    build_test_library(nginx, &includes, &defines);
+}
+
+#[cfg(feature = "test-link")]
+fn build_test_library(
+    nginx: &NginxSource,
+    includes: &[PathBuf],
+    defines: &[(String, Option<String>)],
+) {
+    assert_eq!(
+        env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("linux"),
+        "nginx-sys/test-link currently supports Linux only"
+    );
+
+    let makefile_path = nginx.build_dir.join("Makefile");
+    let makefile = read_to_string(&makefile_path).expect("configured NGINX Makefile");
+    let lines = logical_makefile_lines(&makefile);
+    let objects = nginx_binary_objects(&lines);
+    let mut sources = Vec::with_capacity(objects.len());
+    let mut external_sources = 0;
+
+    for object in objects {
+        let source = object_source(&lines, &object)
+            .unwrap_or_else(|| panic!("source file for NGINX object {object}"));
+        let source = resolve_makefile_path(nginx, &source);
+        let Ok(source) = dunce::canonicalize(source) else {
+            external_sources += 1;
+            continue;
+        };
+        if !source.starts_with(&nginx.source_dir) && !source.starts_with(&nginx.build_dir) {
+            external_sources += 1;
+            continue;
+        }
+        if !source.ends_with("src/core/nginx.c") {
+            println!("cargo:rerun-if-changed={}", source.display());
+            sources.push(source);
+        }
+    }
+    if external_sources > 0 {
+        println!("cargo::warning=skipped {external_sources} configured external source files");
+    }
+
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let wrapper = out_dir.join("nginx_test_main.c");
+    let mut file = File::create(&wrapper).expect("NGINX test main wrapper");
+    writeln!(file, "#define main ngx_test_main\n#include <nginx.c>")
+        .expect("NGINX test main wrapper");
+    sources.push(wrapper);
+
+    let mut build = cc::Build::new();
+    build.include(nginx.source_dir.join("src/core"));
+    for include in includes {
+        let include = resolve_makefile_path(nginx, include.to_str().expect("Unicode include path"));
+        if include.is_dir() {
+            build.include(include);
+        }
+    }
+    for (name, value) in defines {
+        build.define(name, value.as_deref());
+    }
+    if let Some(standard) = c_standard(&lines) {
+        build.flag(&standard);
+    }
+    build.warnings(false);
+    build.files(sources);
+    build.compile("nginx_test");
+
+    emit_nginx_link_libraries(nginx, &lines);
+}
+
+#[cfg(feature = "test-link")]
+fn logical_makefile_lines(makefile: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut logical = String::new();
+
+    for raw in makefile.lines() {
+        let raw = raw.trim_end();
+        if let Some(part) = raw.strip_suffix('\\') {
+            logical.push_str(part);
+            logical.push(' ');
+        } else {
+            logical.push_str(raw);
+            lines.push(core::mem::take(&mut logical));
+        }
+    }
+    if !logical.is_empty() {
+        lines.push(logical);
+    }
+
+    lines
+}
+
+#[cfg(feature = "test-link")]
+fn nginx_binary_objects(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .find_map(|line| {
+            let (target, dependencies) = line.split_once(':')?;
+            let target = Path::new(target.trim());
+            if target.file_name()?.to_str()? != "nginx" {
+                return None;
+            }
+
+            let objects: Vec<_> = shlex::split(dependencies)?
+                .into_iter()
+                .filter(|dependency| dependency.ends_with(".o"))
+                .collect();
+            (!objects.is_empty()).then_some(objects)
+        })
+        .expect("NGINX binary object list")
+}
+
+#[cfg(feature = "test-link")]
+fn object_source(lines: &[String], object: &str) -> Option<String> {
+    lines.iter().find_map(|line| {
+        let (target, dependencies) = line.split_once(':')?;
+        if target.trim() != object {
+            return None;
+        }
+
+        shlex::split(dependencies)?.into_iter().find(|dependency| {
+            matches!(
+                Path::new(dependency).extension().and_then(|extension| extension.to_str()),
+                Some("c" | "cc" | "cpp" | "s" | "S")
+            )
+        })
+    })
+}
+
+#[cfg(feature = "test-link")]
+fn resolve_makefile_path(nginx: &NginxSource, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        return path;
+    }
+
+    let source_path = nginx.source_dir.join(&path);
+    if source_path.exists() {
+        return source_path;
+    }
+
+    let build_path = nginx.build_dir.join(&path);
+    if build_path.exists() {
+        return build_path;
+    }
+
+    panic!("NGINX Makefile path does not exist: {}", path.display());
+}
+
+#[cfg(feature = "test-link")]
+fn c_standard(lines: &[String]) -> Option<String> {
+    lines.iter().find_map(|line| {
+        let flags = line.strip_prefix("CFLAGS")?.strip_prefix(" =")?;
+        shlex::split(flags)?.into_iter().find_map(|flag| match flag.as_str() {
+            "-std=c2y" => Some("-std=c2x".into()),
+            "-std=gnu2y" => Some("-std=gnu2x".into()),
+            _ if flag.starts_with("-std=") => Some(flag),
+            _ => None,
+        })
+    })
+}
+
+#[cfg(feature = "test-link")]
+fn emit_nginx_link_libraries(nginx: &NginxSource, lines: &[String]) {
+    let link = lines
+        .iter()
+        .find(|line| line.trim_start().starts_with("$(LINK) -o "))
+        .expect("NGINX link command");
+    let words = shlex::split(link).expect("NGINX link command arguments");
+    let mut search_paths = Vec::new();
+    let mut libraries = Vec::new();
+    let mut words = words.into_iter();
+
+    while let Some(word) = words.next() {
+        if let Some(path) = word.strip_prefix("-L") {
+            let path =
+                if path.is_empty() { words.next().expect("-L argument") } else { path.into() };
+            let path = resolve_makefile_path(nginx, &path);
+            if path.exists() {
+                search_paths.push(path);
+            }
+        } else if let Some(library) = word.strip_prefix("-l") {
+            let library = if library.is_empty() {
+                words.next().expect("-l argument")
+            } else {
+                library.into()
+            };
+            libraries.push(library);
+        }
+    }
+
+    for path in search_paths {
+        println!("cargo::rustc-link-search=native={}", path.display());
+    }
+    for library in libraries {
+        println!("cargo::rustc-link-lib={library}");
+    }
 }
 
 /// Reads through the makefile generated by autoconf and finds all of the includes

@@ -86,6 +86,8 @@ std = [
     "alloc",
     "allocator-api2/std"
 ]
+# Links tests against the configured NGINX source tree.
+test-link = ["nginx-sys/test-link"]
 # Enables the build scripts to build a copy of nginx source and link against it.
 vendored = ["nginx-sys/vendored"]
 
