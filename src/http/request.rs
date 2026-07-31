@@ -211,10 +211,37 @@ impl Request {
         unsafe { &mut *r.cast::<Request>() }
     }
 
+    /// Create a shared [`Request`] from an [`ngx_http_request_t`] pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must provide a valid non-null request pointer and ensure that no mutable
+    /// reference to the request is live for the returned lifetime.
+    pub unsafe fn from_const_ngx_http_request<'a>(r: *const ngx_http_request_t) -> &'a Request {
+        unsafe { &*r.cast::<Request>() }
+    }
+
     /// Is this the main request (as opposed to a subrequest)?
     pub fn is_main(&self) -> bool {
         let main = self.0.main.cast();
         core::ptr::eq(self, main)
+    }
+
+    /// Main request associated with this request.
+    pub fn main(&self) -> &Request {
+        if self.is_main() {
+            self
+        } else {
+            unsafe { Request::from_const_ngx_http_request(self.0.main) }
+        }
+    }
+
+    /// Mutable main request associated with this request.
+    ///
+    /// Nginx processes a request and its subrequests sequentially, so the active request borrow
+    /// has exclusive access to their shared main-request state.
+    pub fn main_mut(&mut self) -> &mut Request {
+        if self.is_main() { self } else { unsafe { Request::from_ngx_http_request(self.0.main) } }
     }
 
     /// Request pool.
@@ -944,5 +971,38 @@ mod tests {
 
         assert_eq!(success.into_handler_status(request), Status::NGX_AGAIN.0);
         assert_eq!(error.into_handler_status(request), 400);
+    }
+
+    #[test]
+    fn main_returns_the_same_main_request() {
+        let mut raw = zeroed_request();
+        raw.main = &raw mut raw;
+        let request = request_from(&mut raw);
+
+        assert!(core::ptr::eq(request.main(), request));
+    }
+
+    #[test]
+    fn main_returns_the_parent_of_a_subrequest() {
+        let mut raw_main = zeroed_request();
+        raw_main.main = &raw mut raw_main;
+        let mut raw_subrequest = zeroed_request();
+        raw_subrequest.main = &raw mut raw_main;
+
+        let main: *const ngx_http_request_t = request_from(&mut raw_subrequest).main().into();
+
+        assert_eq!(main, &raw const raw_main);
+    }
+
+    #[test]
+    fn main_mut_updates_the_parent_of_a_subrequest() {
+        let mut raw_main = zeroed_request();
+        raw_main.main = &raw mut raw_main;
+        let mut raw_subrequest = zeroed_request();
+        raw_subrequest.main = &raw mut raw_main;
+
+        request_from(&mut raw_subrequest).main_mut().0.request_length = 4096;
+
+        assert_eq!(raw_main.request_length, 4096);
     }
 }
