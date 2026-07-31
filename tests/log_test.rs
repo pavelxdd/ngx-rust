@@ -67,6 +67,9 @@ impl Nginx {
         let config = prefix.path().join("nginx.conf");
 
         fs::create_dir(prefix.path().join("logs"))?;
+        for dir in ["client_body_temp", "proxy_temp", "fastcgi_temp", "uwsgi_temp", "scgi_temp"] {
+            fs::create_dir(prefix.path().join(dir))?;
+        }
 
         Ok(Nginx { prefix, bin_path: binary.as_ref().to_owned(), config_path: config })
     }
