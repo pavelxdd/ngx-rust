@@ -549,6 +549,7 @@ version = "0.5.0"
 dependencies = [
  "allocator-api2",
  "async-task",
+ "bitflags",
  "lock_api",
  "log",
  "nginx-sys",

@@ -1,17 +1,11 @@
 use core::ffi::{c_char, c_void};
 use core::ptr;
 
-use ngx::core::Status;
-use ngx::ffi::{
-    NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MODULE, NGX_LOG_EMERG,
-    ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_int_t, ngx_module_t, ngx_str_t, ngx_uint_t,
-};
-use ngx::http::{self, HttpModule, HttpModuleLocationConf, HttpRequestHandler, MergeConfigError};
-use ngx::{ngx_conf_log_error, ngx_log_debug_http, ngx_string};
+use ngx::http::prelude::*;
 
 struct Module;
 
-impl http::HttpModule for Module {
+impl HttpModule for Module {
     fn module() -> &'static ngx_module_t {
         unsafe { &*::core::ptr::addr_of!(ngx_http_curl_module) }
     }
@@ -19,7 +13,7 @@ impl http::HttpModule for Module {
     unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
         // SAFETY: this function is called with non-NULL cf always
         let cf = unsafe { &mut *cf };
-        http::add_phase_handler::<CurlRequestHandler>(cf)
+        add_phase_handler::<CurlRequestHandler>(cf)
             .map_or(Status::NGX_ERROR, |_| Status::NGX_OK)
             .into()
     }
@@ -37,7 +31,7 @@ unsafe impl HttpModuleLocationConf for Module {
 static mut NGX_HTTP_CURL_COMMANDS: [ngx_command_t; 2] = [
     ngx_command_t {
         name: ngx_string!("curl"),
-        type_: (NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        type_: CommandFlags::HTTP_LOCATION.union(CommandFlags::TAKE_1).bits(),
         set: Some(ngx_http_curl_commands_set_enable),
         conf: NGX_HTTP_LOC_CONF_OFFSET,
         offset: 0,
@@ -60,7 +54,7 @@ static NGX_HTTP_CURL_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
 // Generate the `ngx_modules` table with exported modules.
 // This feature is required to build a 'cdylib' dynamic module outside of the NGINX buildsystem.
 #[cfg(feature = "export-modules")]
-ngx::ngx_modules!(ngx_http_curl_module);
+ngx_modules!(ngx_http_curl_module);
 
 #[used]
 #[allow(non_upper_case_globals)]
@@ -72,7 +66,7 @@ pub static mut ngx_http_curl_module: ngx_module_t = ngx_module_t {
     ..ngx_module_t::default()
 };
 
-impl http::Merge for ModuleConfig {
+impl Merge for ModuleConfig {
     fn merge(&mut self, prev: &ModuleConfig) -> Result<(), MergeConfigError> {
         if prev.enable {
             self.enable = true;
@@ -84,10 +78,10 @@ impl http::Merge for ModuleConfig {
 struct CurlRequestHandler;
 
 impl HttpRequestHandler for CurlRequestHandler {
-    const PHASE: ngx::http::HttpPhase = ngx::http::HttpPhase::Access;
+    const PHASE: HttpPhase = HttpPhase::Access;
     type Output = Status;
 
-    fn handler(request: &mut http::Request) -> Self::Output {
+    fn handler(request: &mut Request) -> Self::Output {
         let co = Module::location_conf(request).expect("module config is none");
 
         ngx_log_debug_http!(request, "curl module enabled: {}", co.enable);
@@ -95,7 +89,7 @@ impl HttpRequestHandler for CurlRequestHandler {
         match co.enable {
             true => {
                 if request.user_agent().is_some_and(|ua| ua.as_bytes().starts_with(b"curl")) {
-                    http::HTTPStatus::FORBIDDEN.into()
+                    HTTPStatus::FORBIDDEN.into()
                 } else {
                     Status::NGX_DECLINED
                 }
@@ -118,7 +112,7 @@ extern "C" fn ngx_http_curl_commands_set_enable(
             Ok(s) => s,
             Err(_) => {
                 ngx_conf_log_error!(NGX_LOG_EMERG, cf, "`curl` argument is not utf-8 encoded");
-                return ngx::core::NGX_CONF_ERROR;
+                return NGX_CONF_ERROR;
             }
         };
 
@@ -132,5 +126,5 @@ extern "C" fn ngx_http_curl_commands_set_enable(
         }
     };
 
-    ngx::core::NGX_CONF_OK
+    NGX_CONF_OK
 }
