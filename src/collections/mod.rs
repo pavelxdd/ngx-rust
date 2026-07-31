@@ -9,8 +9,10 @@ pub use allocator_api2::{
     vec, // reexport both the module and the macro
     vec::Vec,
 };
+pub use array::NgxArray;
 pub use queue::Queue;
 pub use rbtree::RbTreeMap;
 
+pub mod array;
 pub mod queue;
 pub mod rbtree;
