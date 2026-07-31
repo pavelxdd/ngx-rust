@@ -40,6 +40,10 @@ patches applied.
   thus it may be necessary to check for `stream` in
   [`DEP_NGINX_FEATURES`](#dep_nginx_features).
 
+- `test-link`: Builds and links a static library from the configured NGINX source
+  and build directories for Linux unit-test executables. Configured external modules
+  are not included, and NGINX global state is not initialized.
+
 - `vendored`: Enables the build scripts to download and build a copy of nginx
   source and link against it.
   See `nginx-src` crate documentation for additional details.

@@ -40,6 +40,8 @@ http = []
 mail = []
 # Allows generation of bindings for the Stream module.
 stream = []
+# Builds a static NGINX library for unit-test executables.
+test-link = []
 # Enables downloading and building a copy of NGINX in the build script.
 vendored = ["dep:nginx-src"]
 

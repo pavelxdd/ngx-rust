@@ -77,6 +77,9 @@
 //!   re-exported types.
 //! - `std` - **Enabled** by default. This provides APIs that require the standard
 //!   library.
+//! - `test-link` - Builds and links a static library from the configured NGINX source and build
+//!   directories for Linux unit-test executables. Configured external modules are not included,
+//!   and NGINX global state is not initialized.
 //! - `vendored`: Enables the build scripts to build a copy of nginx source and link
 //!   against it. See the [nginx-src] crate documentation for additional details.
 //!
