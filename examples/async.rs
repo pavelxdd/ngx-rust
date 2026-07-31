@@ -12,10 +12,14 @@ use std::time::Instant;
 use ngx::core::Status;
 use ngx::ffi::{
     NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MODULE, NGX_LOG_EMERG,
-    ngx_command_t, ngx_conf_t, ngx_connection_t, ngx_event_t, ngx_http_module_t, ngx_int_t,
-    ngx_module_t, ngx_post_event, ngx_posted_events, ngx_posted_next_events, ngx_str_t, ngx_uint_t,
+    ngx_command_t, ngx_conf_t, ngx_connection_t, ngx_event_t, ngx_http_module_t,
+    ngx_http_request_t, ngx_int_t, ngx_module_t, ngx_post_event, ngx_posted_events,
+    ngx_posted_next_events, ngx_str_t, ngx_uint_t,
 };
-use ngx::http::{self, HttpModule, HttpModuleLocationConf, HttpRequestHandler, MergeConfigError};
+use ngx::http::{
+    self, HttpModule, HttpModuleLocationConf, HttpModuleRequestContext, HttpRequestHandler,
+    MergeConfigError,
+};
 use ngx::{ngx_conf_log_error, ngx_log_debug_http, ngx_string};
 use tokio::runtime::Runtime;
 
@@ -134,6 +138,10 @@ impl Drop for RequestCTX {
     }
 }
 
+unsafe impl HttpModuleRequestContext for Module {
+    type RequestContext = RequestCTX;
+}
+
 struct AsyncAccessHandler;
 
 impl HttpRequestHandler for AsyncAccessHandler {
@@ -149,7 +157,7 @@ impl HttpRequestHandler for AsyncAccessHandler {
             return Status::NGX_DECLINED;
         }
 
-        if let Some(ctx) = request.get_module_ctx::<RequestCTX>(Module::module()) {
+        if let Some(ctx) = request.module_context::<Module>() {
             if !ctx.done.load(Ordering::Relaxed) {
                 return Status::NGX_AGAIN;
             }
@@ -157,20 +165,20 @@ impl HttpRequestHandler for AsyncAccessHandler {
             return Status::NGX_OK;
         }
 
-        let Ok(mut ctx) = (unsafe { request.pool().allocate_with_cleanup(RequestCTX::default) })
+        let connection = request.connection();
+        let request_ptr = (request as *mut http::Request).cast::<ngx_http_request_t>();
+        let Ok(ctx) = request.get_or_insert_module_context_with::<Module>(RequestCTX::default)
         else {
             return Status::NGX_ERROR;
         };
-        request.set_module_ctx(ctx.as_ptr().cast(), Module::module());
 
-        let ctx = unsafe { ctx.as_mut() };
         ctx.event.handler = Some(check_async_work_done);
-        ctx.event.data = request.connection().cast();
-        ctx.event.log = unsafe { (*request.connection()).log };
+        ctx.event.data = connection.cast();
+        ctx.event.log = unsafe { (*connection).log };
         unsafe { ngx_post_event(&raw mut ctx.event, &raw mut ngx_posted_next_events) };
 
-        // Request is no longer needed and can be converted to something movable to the async block
-        let req = AtomicPtr::new(request.into());
+        // Only the raw request pointer is moved into the async block.
+        let req = AtomicPtr::new(request_ptr);
         let done_flag = ctx.done.clone();
 
         let rt = ngx_http_async_runtime();

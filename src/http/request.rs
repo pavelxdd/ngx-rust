@@ -5,11 +5,12 @@ use core::ptr::NonNull;
 use core::slice;
 use core::str::FromStr;
 
+use crate::allocator::AllocError;
 use crate::core::*;
 use crate::ffi::*;
-use crate::http::HttpPhase;
 use crate::http::status::*;
 use crate::http::upstream::UpstreamState;
+use crate::http::{HttpModuleRequestContext, HttpPhase};
 
 /// Define a static request handler.
 ///
@@ -323,18 +324,61 @@ impl Request {
         unsafe { *self.0.ctx.add(module.ctx_index) }
     }
 
-    /// Get Module context
-    pub fn get_module_ctx<T>(&self, module: &ngx_module_t) -> Option<&T> {
-        let ctx = self.get_module_ctx_ptr(module).cast::<T>();
-        // SAFETY: ctx is either NULL or allocated with ngx_p(c)alloc and
-        // explicitly initialized by the module
-        unsafe { ctx.as_ref() }
+    /// Context associated with module `M` for this request.
+    pub fn module_context<M>(&self) -> Option<&M::RequestContext>
+    where
+        M: HttpModuleRequestContext,
+    {
+        let context = self.get_module_ctx_ptr(M::module()).cast::<M::RequestContext>();
+        unsafe { context.as_ref() }
     }
 
-    /// Sets the value as the module's context.
-    ///
-    /// See <https://nginx.org/en/docs/dev/development_guide.html#http_request>
-    pub fn set_module_ctx(&self, value: *mut c_void, module: &ngx_module_t) {
+    /// Mutable context associated with module `M` for this request.
+    pub fn module_context_mut<M>(&mut self) -> Option<&mut M::RequestContext>
+    where
+        M: HttpModuleRequestContext,
+    {
+        let context = self.get_module_ctx_ptr(M::module()).cast::<M::RequestContext>();
+        unsafe { context.as_mut() }
+    }
+
+    /// Returns the module context, inserting a pool-owned value when absent.
+    pub fn get_or_insert_module_context_with<M>(
+        &mut self,
+        constructor: impl FnOnce() -> M::RequestContext,
+    ) -> Result<&mut M::RequestContext, AllocError>
+    where
+        M: HttpModuleRequestContext,
+    {
+        let context = self.get_module_ctx_ptr(M::module()).cast::<M::RequestContext>();
+        if let Some(mut context) = NonNull::new(context) {
+            return Ok(unsafe { context.as_mut() });
+        }
+
+        let mut context = unsafe { self.pool().allocate_with_cleanup(constructor)? };
+        self.set_module_ctx_ptr(context.as_ptr().cast(), M::module());
+        Ok(unsafe { context.as_mut() })
+    }
+
+    /// Drops and removes the module context when present.
+    pub fn remove_module_context<M>(&mut self) -> Option<()>
+    where
+        M: HttpModuleRequestContext,
+    {
+        let context =
+            NonNull::new(self.get_module_ctx_ptr(M::module()).cast::<M::RequestContext>())?;
+        self.set_module_ctx_ptr(core::ptr::null_mut(), M::module());
+
+        let mut pool = self.pool();
+        if unsafe { pool.remove(context.as_ptr()) }.is_some() {
+            Some(())
+        } else {
+            self.set_module_ctx_ptr(context.as_ptr().cast(), M::module());
+            None
+        }
+    }
+
+    fn set_module_ctx_ptr(&mut self, value: *mut c_void, module: &ngx_module_t) {
         unsafe {
             *self.0.ctx.add(module.ctx_index) = value;
         };
@@ -886,9 +930,27 @@ enum MethodInner {
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+
+    use alloc::boxed::Box;
     use core::mem::MaybeUninit;
 
     use super::*;
+    use crate::http::{HttpModule, HttpModuleRequestContext};
+
+    struct TestContextModule;
+
+    impl HttpModule for TestContextModule {
+        fn module() -> &'static ngx_module_t {
+            let mut module = ngx_module_t::default();
+            module.ctx_index = 0;
+            Box::leak(Box::new(module))
+        }
+    }
+
+    unsafe impl HttpModuleRequestContext for TestContextModule {
+        type RequestContext = u32;
+    }
 
     fn zeroed_request() -> ngx_http_request_t {
         unsafe { MaybeUninit::zeroed().assume_init() }
@@ -1004,5 +1066,27 @@ mod tests {
         request_from(&mut raw_subrequest).main_mut().0.request_length = 4096;
 
         assert_eq!(raw_main.request_length, 4096);
+    }
+
+    #[test]
+    fn module_context_reads_the_associated_context_type() {
+        let mut context = 41u32;
+        let mut contexts = [(&raw mut context).cast()];
+        let mut raw = zeroed_request();
+        raw.ctx = contexts.as_mut_ptr();
+
+        assert_eq!(request_from(&mut raw).module_context::<TestContextModule>(), Some(&41));
+    }
+
+    #[test]
+    fn module_context_mut_updates_the_associated_context_type() {
+        let mut context = 41u32;
+        let mut contexts = [(&raw mut context).cast()];
+        let mut raw = zeroed_request();
+        raw.ctx = contexts.as_mut_ptr();
+
+        *request_from(&mut raw).module_context_mut::<TestContextModule>().unwrap() = 42;
+
+        assert_eq!(context, 42);
     }
 }
