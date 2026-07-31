@@ -151,7 +151,7 @@ extern "C" fn ngx_http_shared_dict_add_zone(
     NGX_CONF_OK
 }
 
-fn ngx_http_shared_dict_get_shared(shm_zone: &mut ngx_shm_zone_t) -> Result<&SharedData, Status> {
+fn ngx_http_shared_dict_init_shared(shm_zone: &mut ngx_shm_zone_t) -> Result<(), Status> {
     let mut alloc = unsafe { SlabPool::from_shm_zone(shm_zone) }.ok_or(Status::NGX_ERROR)?;
 
     if alloc.as_mut().data.is_null() {
@@ -166,6 +166,12 @@ fn ngx_http_shared_dict_get_shared(shm_zone: &mut ngx_shm_zone_t) -> Result<&Sha
             .cast();
     }
 
+    Ok(())
+}
+
+fn ngx_http_shared_dict_get_shared(shm_zone: &ngx_shm_zone_t) -> Result<&SharedData, Status> {
+    let alloc = unsafe { SlabPool::from_shm_zone(shm_zone) }.ok_or(Status::NGX_ERROR)?;
+
     unsafe { alloc.as_ref().data.cast::<SharedData>().as_ref().ok_or(Status::NGX_ERROR) }
 }
 
@@ -175,7 +181,7 @@ extern "C" fn ngx_http_shared_dict_zone_init(
 ) -> ngx_int_t {
     let shm_zone = unsafe { &mut *shm_zone };
 
-    match ngx_http_shared_dict_get_shared(shm_zone) {
+    match ngx_http_shared_dict_init_shared(shm_zone) {
         Err(e) => e.into(),
         Ok(_) => Status::NGX_OK.into(),
     }
@@ -247,7 +253,6 @@ extern "C" fn ngx_http_shared_dict_get_variable(
 ) -> ngx_int_t {
     let r = unsafe { &mut *r };
     let v = unsafe { &mut *v };
-    let smcf = HttpSharedDictModule::main_conf_mut(r).expect("shared dict main config");
 
     let mut key = ngx_str_t::empty();
     if unsafe { ngx_http_complex_value(r, data as _, &raw mut key) } != Status::NGX_OK.into() {
@@ -255,8 +260,9 @@ extern "C" fn ngx_http_shared_dict_get_variable(
     }
 
     let key = unsafe { NgxStr::from_ngx_str(key) };
+    let smcf = HttpSharedDictModule::main_conf(r).expect("shared dict main config");
 
-    let Ok(shared) = ngx_http_shared_dict_get_shared(unsafe { &mut *smcf.shm_zone }) else {
+    let Ok(shared) = ngx_http_shared_dict_get_shared(unsafe { &*smcf.shm_zone }) else {
         return Status::NGX_ERROR.into();
     };
 
@@ -294,14 +300,14 @@ extern "C" fn ngx_http_shared_dict_set_variable(
 ) {
     let r = unsafe { &mut *r };
     let v = unsafe { &mut *v };
-    let smcf = HttpSharedDictModule::main_conf_mut(r).expect("shared dict main config");
     let mut key = ngx_str_t::empty();
 
     if unsafe { ngx_http_complex_value(r, data as _, &raw mut key) } != Status::NGX_OK.into() {
         return;
     }
 
-    let Ok(shared) = ngx_http_shared_dict_get_shared(unsafe { &mut *smcf.shm_zone }) else {
+    let smcf = HttpSharedDictModule::main_conf(r).expect("shared dict main config");
+    let Ok(shared) = ngx_http_shared_dict_get_shared(unsafe { &*smcf.shm_zone }) else {
         return;
     };
 
@@ -351,11 +357,11 @@ extern "C" fn ngx_http_shared_dict_get_entries(
     let r = unsafe { &mut *r };
     let v = unsafe { &mut *v };
     let pool = unsafe { Pool::from_ngx_pool(r.pool) };
-    let smcf = HttpSharedDictModule::main_conf_mut(r).expect("shared dict main config");
+    let smcf = HttpSharedDictModule::main_conf(r).expect("shared dict main config");
 
     ngx_log_debug!(unsafe { (*r.connection).log }, "shared dict: get all entries");
 
-    let Ok(shared) = ngx_http_shared_dict_get_shared(unsafe { &mut *smcf.shm_zone }) else {
+    let Ok(shared) = ngx_http_shared_dict_get_shared(unsafe { &*smcf.shm_zone }) else {
         return Status::NGX_ERROR.into();
     };
 
@@ -407,11 +413,11 @@ extern "C" fn ngx_http_shared_dict_set_entries(
     _data: usize,
 ) {
     let r = unsafe { &mut *r };
-    let smcf = HttpSharedDictModule::main_conf_mut(r).expect("shared dict main config");
+    let smcf = HttpSharedDictModule::main_conf(r).expect("shared dict main config");
 
     ngx_log_debug!(unsafe { (*r.connection).log }, "shared dict: clear");
 
-    let Ok(shared) = ngx_http_shared_dict_get_shared(unsafe { &mut *smcf.shm_zone }) else {
+    let Ok(shared) = ngx_http_shared_dict_get_shared(unsafe { &*smcf.shm_zone }) else {
         return;
     };
 

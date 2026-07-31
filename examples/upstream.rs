@@ -124,15 +124,19 @@ http_upstream_init_peer_pt!(
 
         // SAFETY: this function is called with non-NULL uf always
         let us = unsafe { &mut *us };
-        let hccf = match Module::server_conf(us) {
-            Some(x) => x,
+        let original_init_peer = match Module::server_conf(us) {
+            Some(hccf) => hccf.original_init_peer.unwrap(),
             None => return Status::NGX_ERROR,
         };
 
-        let original_init_peer = hccf.original_init_peer.unwrap();
         if unsafe { original_init_peer(request.into(), us) != Status::NGX_OK.into() } {
             return Status::NGX_ERROR;
         }
+
+        let hccf = match Module::server_conf(us) {
+            Some(hccf) => ptr::from_ref(hccf),
+            None => return Status::NGX_ERROR,
+        };
 
         let maybe_upstream = request.upstream();
         if maybe_upstream.is_none() {
@@ -220,24 +224,28 @@ unsafe extern "C" fn ngx_http_upstream_init_custom(
 
     // SAFETY: this function is called with non-NULL uf always
     let us = unsafe { &mut *us };
-    let hccf = Module::server_conf_mut(us);
-    if hccf.is_none() {
-        ngx_conf_log_error!(NGX_LOG_EMERG, cf, "CUSTOM UPSTREAM no upstream srv_conf");
-        return isize::from(Status::NGX_ERROR);
-    }
-    let hccf = hccf.unwrap();
-    // NOTE: ngx_conf_init_uint_value macro is unavailable
-    if hccf.max == u32::MAX {
-        hccf.max = 100;
-    }
-
-    let init_upstream_ptr = hccf.original_init_upstream.unwrap();
+    let init_upstream_ptr = {
+        let Some(hccf) = (unsafe { Module::server_conf_mut(us) }) else {
+            ngx_conf_log_error!(NGX_LOG_EMERG, cf, "CUSTOM UPSTREAM no upstream srv_conf");
+            return isize::from(Status::NGX_ERROR);
+        };
+        // NOTE: ngx_conf_init_uint_value macro is unavailable
+        if hccf.max == u32::MAX {
+            hccf.max = 100;
+        }
+        hccf.original_init_upstream.unwrap()
+    };
     if unsafe { init_upstream_ptr(cf, us) } != Status::NGX_OK.into() {
         ngx_conf_log_error!(NGX_LOG_EMERG, cf, "CUSTOM UPSTREAM failed calling init_upstream");
         return isize::from(Status::NGX_ERROR);
     }
 
-    hccf.original_init_peer = us.peer.init;
+    let original_init_peer = us.peer.init;
+    let Some(hccf) = (unsafe { Module::server_conf_mut(us) }) else {
+        ngx_conf_log_error!(NGX_LOG_EMERG, cf, "CUSTOM UPSTREAM no upstream srv_conf");
+        return isize::from(Status::NGX_ERROR);
+    };
+    hccf.original_init_peer = original_init_peer;
     us.peer.init = Some(http_upstream_init_custom_peer);
 
     ngx_log_debug_mask!(
@@ -278,7 +286,8 @@ unsafe extern "C" fn ngx_http_upstream_commands_set_custom(
         ccf.max = n as u32;
     }
 
-    let uscf = NgxHttpUpstreamModule::server_conf_mut(cf).expect("http upstream srv conf");
+    let uscf =
+        unsafe { NgxHttpUpstreamModule::server_conf_mut(cf) }.expect("http upstream srv conf");
 
     ccf.original_init_upstream = if uscf.peer.init_upstream.is_some() {
         uscf.peer.init_upstream

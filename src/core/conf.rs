@@ -54,19 +54,31 @@ impl CoreModuleConfExt for crate::ffi::ngx_conf_t {
 /// `CoreModuleConfExt` to turn the raw configuration slot lookup into typed references.
 ///
 /// # Safety
-/// Caller must ensure that type `CoreModuleMainConf::MainConf` matches the configuration type
-/// for the specified module.
+/// Implementers must ensure that `Self::MainConf` is the actual main-configuration type for the
+/// module returned by `Self::module()`.
 pub unsafe trait CoreModuleMainConf: CoreModule {
     /// Concrete type of this module's main configuration.
     type MainConf;
 
     /// Get a typed shared reference to this module's main configuration.
-    fn main_conf(o: &impl CoreModuleConfExt) -> Option<&'static Self::MainConf> {
+    fn main_conf(o: &impl CoreModuleConfExt) -> Option<&Self::MainConf> {
         unsafe { Some(o.core_main_conf_unchecked(Self::module())?.as_ref()) }
     }
 
     /// Get a typed mutable reference to this module's main configuration.
-    fn main_conf_mut(o: &impl CoreModuleConfExt) -> Option<&'static mut Self::MainConf> {
+    ///
+    /// ```compile_fail
+    /// # use ngx::core::CoreModuleMainConf;
+    /// # use ngx::ffi::ngx_conf_t;
+    /// # fn access<M: CoreModuleMainConf>(cf: &mut ngx_conf_t) {
+    /// let _ = M::main_conf_mut(cf);
+    /// # }
+    /// ```
+    ///
+    /// # Safety
+    /// The caller must have exclusive access to the configuration slot for the full lifetime of
+    /// the returned reference. No other references to the same configuration may exist.
+    unsafe fn main_conf_mut(o: &mut impl CoreModuleConfExt) -> Option<&mut Self::MainConf> {
         unsafe { Some(o.core_main_conf_unchecked(Self::module())?.as_mut()) }
     }
 }
@@ -171,7 +183,7 @@ mod tests {
 
         assert_eq!(TestCoreModule::main_conf(&conf).copied(), Some(42));
 
-        if let Some(v) = TestCoreModule::main_conf_mut(&conf) {
+        if let Some(v) = unsafe { TestCoreModule::main_conf_mut(&mut conf) } {
             *v = 99;
         }
         assert_eq!(value, 99);
