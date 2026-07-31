@@ -180,10 +180,16 @@ pub unsafe trait StreamModuleServerConf: StreamModule {
 }
 
 mod core_module {
+    use crate::allocator::AllocError;
+    use crate::collections::NgxArray;
     use crate::ffi::{
-        ngx_stream_core_main_conf_t, ngx_stream_core_module, ngx_stream_core_srv_conf_t,
+        NGX_LOG_EMERG, ngx_conf_t, ngx_stream_core_main_conf_t, ngx_stream_core_module,
+        ngx_stream_core_srv_conf_t, ngx_stream_handler_pt,
     };
-    use crate::stream::{StreamModule, StreamModuleMainConf, StreamModuleServerConf};
+    use crate::ngx_conf_log_error;
+    use crate::stream::{
+        StreamModule, StreamModuleMainConf, StreamModuleServerConf, StreamSessionHandler,
+    };
 
     /// Typed access to `ngx_stream_core_module` configuration.
     pub struct NgxStreamCoreModule;
@@ -201,9 +207,33 @@ mod core_module {
     unsafe impl StreamModuleServerConf for NgxStreamCoreModule {
         type ServerConf = ngx_stream_core_srv_conf_t;
     }
+
+    /// Registers a typed handler in its declared Stream phase.
+    ///
+    /// Call this function from the module's postconfiguration callback.
+    pub fn add_phase_handler<H>(cf: &mut ngx_conf_t) -> Result<(), AllocError>
+    where
+        H: StreamSessionHandler,
+    {
+        let main =
+            unsafe { NgxStreamCoreModule::main_conf_mut(cf) }.expect("stream core main conf");
+        let handlers = unsafe {
+            NgxArray::<ngx_stream_handler_pt>::from_ngx_array_mut(
+                &mut main.phases[H::PHASE as usize].handlers,
+            )
+        }
+        .expect("stream phase handler array type");
+
+        if handlers.push(Some(crate::stream::raw_handler::<H>)).is_err() {
+            ngx_conf_log_error!(NGX_LOG_EMERG, cf, "failed to register {} handler", H::name(),);
+            return Err(AllocError);
+        }
+
+        Ok(())
+    }
 }
 
-pub use core_module::NgxStreamCoreModule;
+pub use core_module::{NgxStreamCoreModule, add_phase_handler};
 
 #[cfg(ngx_feature = "stream_ssl")]
 mod ssl {

@@ -28,8 +28,6 @@ pub enum StreamPhase {
     Ssl = crate::ffi::ngx_stream_phases_NGX_STREAM_SSL_PHASE as _,
     /// Protocol preread processing.
     Preread = crate::ffi::ngx_stream_phases_NGX_STREAM_PREREAD_PHASE as _,
-    /// Content processing.
-    Content = crate::ffi::ngx_stream_phases_NGX_STREAM_CONTENT_PHASE as _,
     /// Session logging.
     Log = crate::ffi::ngx_stream_phases_NGX_STREAM_LOG_PHASE as _,
 }
@@ -88,6 +86,19 @@ pub trait StreamSessionHandler {
     fn name() -> &'static str {
         core::any::type_name::<Self>()
     }
+}
+
+/// C-compatible adapter for a typed Stream phase handler.
+///
+/// # Safety
+/// `session` must be a valid non-null pointer to a live session that nginx has made exclusively
+/// available to the current phase handler.
+pub(crate) unsafe extern "C" fn raw_handler<H>(session: *mut ngx_stream_session_t) -> ngx_int_t
+where
+    H: StreamSessionHandler,
+{
+    let session = unsafe { Session::from_ngx_stream_session(session) };
+    H::handler(session).into_handler_status(session)
 }
 
 /// Associates one session-context type with a Stream module.
@@ -322,7 +333,7 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     use super::StreamModuleSessionContext;
-    use super::{IntoHandlerStatus, Session, StreamSessionHandler};
+    use super::{IntoHandlerStatus, Session, StreamSessionHandler, raw_handler};
     use crate::core::Status;
     use crate::ffi::{NGX_ERROR, NGX_STREAM_OK, ngx_module_t, ngx_stream_session_t};
     #[cfg(feature = "test-link")]
@@ -388,6 +399,16 @@ mod tests {
         let session = session_from(&mut raw);
 
         let status = TestHandler::handler(session).into_handler_status(session);
+
+        assert_eq!(status, Status::NGX_DECLINED.0);
+        assert_eq!(raw.status, NGX_STREAM_OK as _);
+    }
+
+    #[test]
+    fn raw_handler_wraps_the_session_and_returns_the_converted_status() {
+        let mut raw = zeroed_session();
+
+        let status = unsafe { raw_handler::<TestHandler>(&raw mut raw) };
 
         assert_eq!(status, Status::NGX_DECLINED.0);
         assert_eq!(raw.status, NGX_STREAM_OK as _);
