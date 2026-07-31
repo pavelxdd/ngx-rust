@@ -10,6 +10,14 @@
 //! This project is in active development. It is stable enough to be used in our
 //! own products, but the APIs are not stabilized and breaking changes are expected.
 //!
+//! ### Minimum supported Rust version
+//!
+//! The workspace `rust-version` field is authoritative. The project follows the oldest Rust
+//! compiler available in its supported official base images instead of a fixed release window.
+//! Raising it requires every supported image to provide the new compiler and the complete CI
+//! matrix to pass with that exact version. Dependency resolution uses MSRV fallback and must keep
+//! building with the declared version.
+//!
 //! ## Build
 //!
 //! NGINX modules can be built against a particular version of NGINX. The following
