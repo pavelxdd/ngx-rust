@@ -7,7 +7,7 @@ use crate::ffi::*;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HTTPStatus(pub ngx_uint_t);
 
-/// A possible error value when converting a `HTTPStatus` from a `u16` or `&str`
+/// A possible error when converting an integer or byte slice into an [`HTTPStatus`].
 ///
 /// This error indicates that the supplied input was not a valid number, was less
 /// than 100, or was greater than 599.
@@ -55,7 +55,7 @@ impl fmt::Debug for HTTPStatus {
 }
 
 impl HTTPStatus {
-    /// Convets a u16 to a status code.
+    /// Converts a `u16` to a status code.
     #[inline]
     pub fn from_u16(src: u16) -> Result<HTTPStatus, InvalidHTTPStatusCode> {
         if !(100..600).contains(&src) {
@@ -65,7 +65,7 @@ impl HTTPStatus {
         Ok(HTTPStatus(src.into()))
     }
 
-    /// Converts a &[u8] to a status code.
+    /// Converts a byte slice to a status code.
     pub fn from_bytes(src: &[u8]) -> Result<HTTPStatus, InvalidHTTPStatusCode> {
         if src.len() != 3 {
             return Err(InvalidHTTPStatusCode::new());
@@ -79,8 +79,45 @@ impl HTTPStatus {
             return Err(InvalidHTTPStatusCode::new());
         }
 
-        let status = (a * 100) + (b * 10) + c;
-        Ok(HTTPStatus(status.into()))
+        Self::from_u16((a * 100) + (b * 10) + c)
+    }
+}
+
+impl TryFrom<u16> for HTTPStatus {
+    type Error = InvalidHTTPStatusCode;
+
+    #[inline]
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::from_u16(value)
+    }
+}
+
+impl TryFrom<usize> for HTTPStatus {
+    type Error = InvalidHTTPStatusCode;
+
+    #[inline]
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        let value = u16::try_from(value).map_err(|_| InvalidHTTPStatusCode::new())?;
+        Self::from_u16(value)
+    }
+}
+
+impl TryFrom<isize> for HTTPStatus {
+    type Error = InvalidHTTPStatusCode;
+
+    #[inline]
+    fn try_from(value: isize) -> Result<Self, Self::Error> {
+        let value = usize::try_from(value).map_err(|_| InvalidHTTPStatusCode::new())?;
+        Self::try_from(value)
+    }
+}
+
+impl TryFrom<&[u8]> for HTTPStatus {
+    type Error = InvalidHTTPStatusCode;
+
+    #[inline]
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Self::from_bytes(value)
     }
 }
 
@@ -205,4 +242,31 @@ http_status_codes! {
     (505, VERSION_NOT_SUPPORTED, "VERSION_NOT_SUPPORTED");
     /// 507 INSUFFICIENT_STORAGE
     (507, INSUFFICIENT_STORAGE, "INSUFFICIENT_STORAGE");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integer_conversions_accept_http_status_range() {
+        assert_eq!(HTTPStatus::try_from(100usize).unwrap(), HTTPStatus(100));
+        assert_eq!(HTTPStatus::try_from(200isize).unwrap(), HTTPStatus(200));
+        assert_eq!(HTTPStatus::try_from(599u16).unwrap(), HTTPStatus(599));
+    }
+
+    #[test]
+    fn integer_conversions_reject_values_outside_http_status_range() {
+        assert!(HTTPStatus::try_from(99usize).is_err());
+        assert!(HTTPStatus::try_from(600usize).is_err());
+        assert!(HTTPStatus::try_from(-1isize).is_err());
+    }
+
+    #[test]
+    fn byte_conversion_uses_http_status_parser() {
+        assert_eq!(HTTPStatus::try_from(&b"204"[..]).unwrap(), HTTPStatus(204));
+        assert!(HTTPStatus::try_from(&b"099"[..]).is_err());
+        assert!(HTTPStatus::try_from(&b"600"[..]).is_err());
+        assert!(HTTPStatus::try_from(&b"20x"[..]).is_err());
+    }
 }
