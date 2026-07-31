@@ -62,6 +62,15 @@ impl NgxStr {
         &self.0
     }
 
+    /// Returns an [`ngx_str_t`] that points to these bytes.
+    ///
+    /// The returned pointer becomes invalid when the backing storage is dropped or reallocated.
+    /// Because `ngx_str_t` has no lifetime, the caller must not retain it beyond that point.
+    #[inline]
+    pub fn as_ngx_str(&self) -> ngx_str_t {
+        ngx_str_t { data: self.0.as_ptr().cast_mut(), len: self.0.len() }
+    }
+
     /// Yields a `&str` slice if the [`NgxStr`] contains valid UTF-8.
     pub fn to_str(&self) -> Result<&str, Utf8Error> {
         str::from_utf8(self.as_bytes())
@@ -325,7 +334,7 @@ mod _alloc {
         }
 
         #[inline]
-        pub(crate) fn as_ngx_str(&self) -> &NgxStr {
+        pub(crate) fn as_ngx_str_ref(&self) -> &NgxStr {
             NgxStr::from_bytes(self.0.as_slice())
         }
 
@@ -363,7 +372,7 @@ mod _alloc {
         A: Allocator + Clone,
     {
         fn as_ref(&self) -> &NgxStr {
-            self.as_ngx_str()
+            self.as_ngx_str_ref()
         }
     }
 
@@ -401,7 +410,7 @@ mod _alloc {
         A: Allocator + Clone,
     {
         fn borrow(&self) -> &NgxStr {
-            self.as_ngx_str()
+            self.as_ngx_str_ref()
         }
     }
 
@@ -434,7 +443,7 @@ mod _alloc {
         type Target = NgxStr;
 
         fn deref(&self) -> &Self::Target {
-            self.as_ngx_str()
+            self.as_ngx_str_ref()
         }
     }
 
@@ -452,7 +461,7 @@ mod _alloc {
         A: Allocator + Clone,
     {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            fmt::Display::fmt(self.as_ngx_str(), f)
+            fmt::Display::fmt(self.as_ngx_str_ref(), f)
         }
     }
 
@@ -629,5 +638,27 @@ mod tests {
         // drop(s); // ☢️
 
         assert_eq!(a.0, b.0);
+    }
+
+    #[test]
+    fn borrowed_string_exposes_the_same_nginx_bytes() {
+        let bytes = b"test";
+        let string = NgxStr::from_bytes(bytes);
+        let raw: ngx_str_t = string.as_ngx_str();
+
+        assert_eq!(raw.len, bytes.len());
+        assert_eq!(raw.data.cast_const(), bytes.as_ptr());
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn owned_string_exposes_the_same_nginx_bytes() {
+        use crate::allocator::Global;
+
+        let string = NgxString::try_from_bytes_in(b"test", Global).unwrap();
+        let raw: ngx_str_t = string.as_ngx_str();
+
+        assert_eq!(raw.len, string.len());
+        assert_eq!(raw.data.cast_const(), string.as_bytes().as_ptr());
     }
 }
