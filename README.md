@@ -41,6 +41,11 @@ specific version of NGINX:
 NGINX_BUILD_DIR=/path/to/nginx-1.28.3/objs cargo build --package=examples --examples
 ```
 
+### Windows
+
+The CI matrix builds NGINX from source for `x86_64-pc-windows-msvc` and links the Rust example
+modules statically through NMAKE. Dynamic Windows modules are not part of the supported matrix.
+
 ### Building with the NGINX build script
 
 You can build your Rust-based module as a part of the NGINX build process by
