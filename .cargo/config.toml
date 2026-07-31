@@ -1,2 +1,5 @@
 [env]
 CACHE_DIR = { value = ".cache", relative = true }
+
+[resolver]
+incompatible-rust-versions = "fallback"
