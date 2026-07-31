@@ -121,7 +121,7 @@ impl Merge for ModuleConfig {
                 String::from(if !prev.access_key.is_empty() { &prev.access_key } else { "" });
         }
         if self.enable && self.access_key.is_empty() {
-            return Err(MergeConfigError::NoValue);
+            return Err("awssigv4_access_key is required when awssigv4 is enabled".into());
         }
 
         if self.secret_key.is_empty() {
@@ -129,7 +129,7 @@ impl Merge for ModuleConfig {
                 String::from(if !prev.secret_key.is_empty() { &prev.secret_key } else { "" });
         }
         if self.enable && self.secret_key.is_empty() {
-            return Err(MergeConfigError::NoValue);
+            return Err("awssigv4_secret_key is required when awssigv4 is enabled".into());
         }
 
         if self.s3_bucket.is_empty() {
@@ -137,7 +137,7 @@ impl Merge for ModuleConfig {
                 String::from(if !prev.s3_bucket.is_empty() { &prev.s3_bucket } else { "" });
         }
         if self.enable && self.s3_bucket.is_empty() {
-            return Err(MergeConfigError::NoValue);
+            return Err("awssigv4_s3_bucket is required when awssigv4 is enabled".into());
         }
 
         if self.s3_endpoint.is_empty() {
