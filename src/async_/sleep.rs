@@ -1,4 +1,5 @@
 use core::future::Future;
+use core::marker::PhantomPinned;
 use core::mem;
 use core::pin::Pin;
 use core::ptr::NonNull;
@@ -23,6 +24,18 @@ pub fn sleep(duration: Duration) -> Sleep {
 
 pin_project! {
 /// Future returned by [sleep].
+///
+/// A sleep stays on the nginx worker thread where it is polled and cannot be moved after polling.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ngx::async_::Sleep>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_unpin<T: Unpin>() {}
+/// assert_unpin::<ngx::async_::Sleep>();
+/// ```
 pub struct Sleep {
     #[pin]
     timer: TimerEvent,
@@ -63,7 +76,7 @@ impl Future for Sleep {
             Poll::Ready(()) if this.duration == &step => Poll::Ready(()),
             Poll::Ready(()) => {
                 *this.duration = this.duration.saturating_sub(step);
-                this.timer.event.set_timedout(0); // rearm
+                this.timer.as_mut().rearm();
                 this.timer.as_mut().poll_sleep(step.as_millis() as _, cx)
             }
             x => x,
@@ -74,11 +87,8 @@ impl Future for Sleep {
 struct TimerEvent {
     event: ngx_event_t,
     waker: Option<task::Waker>,
+    _pin: PhantomPinned,
 }
-
-// SAFETY: Timer will only be used in a single-threaded environment
-unsafe impl Send for TimerEvent {}
-unsafe impl Sync for TimerEvent {}
 
 impl TimerEvent {
     pub fn new(log: NonNull<ngx_log_t>) -> Self {
@@ -93,7 +103,7 @@ impl TimerEvent {
         ev.log = log.as_ptr();
         ev.set_cancelable(1);
 
-        Self { event: ev, waker: None }
+        Self { event: ev, waker: None, _pin: PhantomPinned }
     }
 
     pub fn poll_sleep(
@@ -101,20 +111,29 @@ impl TimerEvent {
         duration: ngx_msec_t,
         context: &mut task::Context<'_>,
     ) -> Poll<()> {
-        if self.event.timedout() != 0 {
+        // SAFETY: no field is moved; the pinned address is the one stored in nginx's timer tree.
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+
+        if this.event.timedout() != 0 {
             Poll::Ready(())
-        } else if self.event.timer_set() != 0 {
-            if let Some(waker) = self.waker.as_mut() {
+        } else if this.event.timer_set() != 0 {
+            if let Some(waker) = this.waker.as_mut() {
                 waker.clone_from(context.waker());
             } else {
-                self.waker = Some(context.waker().clone());
+                this.waker = Some(context.waker().clone());
             }
             Poll::Pending
         } else {
-            unsafe { ngx_add_timer(&raw mut self.event, duration) };
-            self.waker = Some(context.waker().clone());
+            unsafe { ngx_add_timer(&raw mut this.event, duration) };
+            this.waker = Some(context.waker().clone());
             Poll::Pending
         }
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    fn rearm(mut self: Pin<&mut Self>) {
+        // SAFETY: clearing a flag does not move any field of the pinned timer.
+        unsafe { self.as_mut().get_unchecked_mut().event.set_timedout(0) };
     }
 
     unsafe extern "C" fn timer_handler(ev: *mut ngx_event_t) {
