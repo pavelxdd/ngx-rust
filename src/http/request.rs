@@ -6,6 +6,7 @@ use core::slice;
 use core::str::FromStr;
 
 use crate::allocator::AllocError;
+use crate::collections::{NgxList, list::NgxListIter};
 use crate::core::*;
 use crate::ffi::*;
 use crate::http::status::*;
@@ -579,56 +580,25 @@ impl fmt::Debug for Request {
 /// Iterator for [`ngx_list_t`] types.
 ///
 /// Implementes the core::iter::Iterator trait.
-pub struct NgxListIterator<'a> {
-    part: Option<ListPart<'a>>,
-    i: ngx_uint_t,
-}
-struct ListPart<'a> {
-    raw: &'a ngx_list_part_t,
-    arr: &'a [ngx_table_elt_t],
-}
-impl<'a> From<&'a ngx_list_part_t> for ListPart<'a> {
-    fn from(raw: &'a ngx_list_part_t) -> Self {
-        let arr = if raw.nelts != 0 {
-            unsafe { slice::from_raw_parts(raw.elts.cast(), raw.nelts) }
-        } else {
-            &[]
-        };
-        Self { raw, arr }
-    }
-}
+pub struct NgxListIterator<'a>(NgxListIter<'a, ngx_table_elt_t>);
 
 /// Creates new HTTP header iterator
 ///
 /// # Safety
 ///
-/// The caller has provided a valid [`ngx_str_t`] which can be dereferenced validly.
+/// The list parts must be valid and contain initialized [`ngx_table_elt_t`] values whose key and
+/// value strings remain valid for the returned borrow.
 pub unsafe fn list_iterator(list: &ngx_list_t) -> NgxListIterator<'_> {
-    NgxListIterator { part: Some((&list.part).into()), i: 0 }
+    let list = unsafe { NgxList::from_ngx_list(list) }.expect("HTTP header list type");
+    NgxListIterator(list.iter())
 }
 
 // iterator for ngx_list_t
 impl<'a> Iterator for NgxListIterator<'a> {
-    // TODO: try to use struct instead of &str pair
-    // something like pub struct Header(ngx_table_elt_t);
-    // then header would have key and value
-
     type Item = (&'a NgxStr, &'a NgxStr);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let part = self.part.as_mut()?;
-        if self.i >= part.arr.len() {
-            if let Some(next_part_raw) = unsafe { part.raw.next.as_ref() } {
-                // loop back
-                *part = next_part_raw.into();
-                self.i = 0;
-            } else {
-                self.part = None;
-                return None;
-            }
-        }
-        let header = &part.arr[self.i];
-        self.i += 1;
+        let header = self.0.next()?;
         unsafe { Some((NgxStr::from_ngx_str(header.key), NgxStr::from_ngx_str(header.value))) }
     }
 }
@@ -890,7 +860,7 @@ enum MethodInner {
 mod tests {
     extern crate alloc;
 
-    use alloc::boxed::Box;
+    use alloc::{boxed::Box, vec::Vec};
     use core::mem::MaybeUninit;
 
     use super::*;
@@ -916,6 +886,34 @@ mod tests {
 
     fn request_from(raw: &mut ngx_http_request_t) -> &mut Request {
         unsafe { Request::from_ngx_http_request(raw) }
+    }
+
+    #[test]
+    fn header_iterator_returns_keys_and_values() {
+        let mut headers: [ngx_table_elt_t; 2] = unsafe { MaybeUninit::zeroed().assume_init() };
+        headers[0].key = crate::ngx_string!("X-First");
+        headers[0].value = crate::ngx_string!("one");
+        headers[1].key = crate::ngx_string!("X-Second");
+        headers[1].value = crate::ngx_string!("two");
+
+        let mut raw = ngx_list_t {
+            last: core::ptr::null_mut(),
+            part: ngx_list_part_t {
+                elts: headers.as_mut_ptr().cast(),
+                nelts: headers.len(),
+                next: core::ptr::null_mut(),
+            },
+            size: core::mem::size_of::<ngx_table_elt_t>(),
+            nalloc: headers.len(),
+            pool: core::ptr::null_mut(),
+        };
+        raw.last = &raw mut raw.part;
+
+        let values: Vec<_> = unsafe { list_iterator(&raw) }
+            .map(|(key, value)| (key.to_str().unwrap(), value.to_str().unwrap()))
+            .collect();
+
+        assert_eq!(values, [("X-First", "one"), ("X-Second", "two")]);
     }
 
     #[test]
