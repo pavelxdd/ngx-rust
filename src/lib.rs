@@ -89,6 +89,7 @@
 //! - `log-trace` - Allows trace records to reach the NGINX runtime filter.
 //! - `serde` - Enables serialization support for some of the provided and
 //!   re-exported types.
+//! - `stream` - Enables the NGINX Stream module API.
 //! - `std` - **Enabled** by default. This provides APIs that require the standard
 //!   library.
 //! - `test-link` - Builds and links a static library from the configured NGINX source and build
@@ -177,6 +178,12 @@ pub mod http;
 pub mod log;
 
 pub mod sync;
+
+/// The Stream module.
+///
+/// This module provides wrappers and utilities for NGINX Stream configuration and sessions.
+#[cfg(all(feature = "stream", ngx_feature = "stream"))]
+pub mod stream;
 
 /// Define modules exported by this library.
 ///
