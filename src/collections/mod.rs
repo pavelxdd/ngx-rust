@@ -10,9 +10,11 @@ pub use allocator_api2::{
     vec::Vec,
 };
 pub use array::NgxArray;
+pub use list::NgxList;
 pub use queue::Queue;
 pub use rbtree::RbTreeMap;
 
 pub mod array;
+pub mod list;
 pub mod queue;
 pub mod rbtree;
