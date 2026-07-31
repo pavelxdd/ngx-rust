@@ -133,10 +133,12 @@ unsafe fn ngx_get_origdst(request: &mut http::Request) -> Result<(String, in_por
         return Err(Status::NGX_DECLINED);
     }
 
-    if unsafe { ngx_connection_local_sockaddr(c, ptr::null_mut(), 0) } != Status::NGX_OK.into() {
-        ngx_log_debug_http!(request, "httporigdst: no local sockaddr from connection");
-        return Err(Status::NGX_ERROR);
-    }
+    Status(unsafe { ngx_connection_local_sockaddr(c, ptr::null_mut(), 0) }).into_result().map_err(
+        |_| {
+            ngx_log_debug_http!(request, "httporigdst: no local sockaddr from connection");
+            Status::NGX_ERROR
+        },
+    )?;
 
     let level: c_int;
     let optname: c_int;

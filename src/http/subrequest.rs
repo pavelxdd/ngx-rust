@@ -16,7 +16,7 @@ use core::task::{Context, Poll, Waker};
 
 use nginx_sys::{
     NGX_HTTP_SUBREQUEST_BACKGROUND, NGX_HTTP_SUBREQUEST_CLONE, NGX_HTTP_SUBREQUEST_IN_MEMORY,
-    NGX_HTTP_SUBREQUEST_WAITED, NGX_OK, ngx_http_post_subrequest_t, ngx_http_request_body_t,
+    NGX_HTTP_SUBREQUEST_WAITED, ngx_http_post_subrequest_t, ngx_http_request_body_t,
     ngx_http_request_t, ngx_int_t, ngx_list_init, ngx_list_t, ngx_str_t, ngx_table_elt_t,
     ngx_uint_t,
 };
@@ -191,9 +191,7 @@ impl<'r, H> SubRequestBuilder<'r, H> {
                     mem::size_of::<ngx_table_elt_t>(),
                 )
             };
-            if status != NGX_OK as ngx_int_t {
-                return Err(SubRequestError::Alloc);
-            }
+            crate::core::Status(status).into_result().map_err(|_| SubRequestError::Alloc)?;
             Some(headers)
         };
 
@@ -228,9 +226,7 @@ impl<'r, H> SubRequestBuilder<'r, H> {
                 self.flags,
             )
         };
-        if status != NGX_OK as ngx_int_t {
-            return Err(SubRequestError::Create(status));
-        }
+        crate::core::Status(status).into_result().map_err(|_| SubRequestError::Create(status))?;
 
         let subrequest: &'r mut Request = unsafe { Request::from_ngx_http_request(subrequest) };
         if !self.keep_body {
