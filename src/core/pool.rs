@@ -5,7 +5,7 @@ use core::ptr::{self, NonNull};
 
 use nginx_sys::{
     NGX_ALIGNMENT, ngx_buf_t, ngx_create_temp_buf, ngx_palloc, ngx_pcalloc, ngx_pfree,
-    ngx_pmemalign, ngx_pnalloc, ngx_pool_cleanup_add, ngx_pool_t,
+    ngx_pmemalign, ngx_pnalloc, ngx_pool_cleanup_add, ngx_pool_cleanup_t, ngx_pool_t,
 };
 
 use crate::allocator::{AllocError, Allocator, dangling_for_layout};
@@ -18,6 +18,10 @@ use crate::core::buffer::{Buffer, MemoryBuffer, TemporaryBuffer};
 #[derive(Clone, Debug)]
 #[repr(transparent)]
 pub struct Pool(NonNull<ngx_pool_t>);
+
+fn cleanup_type_fits_pool<T>() -> bool {
+    mem::align_of::<T>() <= NGX_ALIGNMENT
+}
 
 unsafe impl Allocator for Pool {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
@@ -200,25 +204,43 @@ impl Pool {
         Some(MemoryBuffer::from_ngx_buf(buf))
     }
 
-    /// Adds a cleanup handler for a value in the memory pool.
+    /// Allocates a value and registers its destructor with the pool.
     ///
-    /// Returns `Ok(())` if the cleanup handler is successfully added, or `Err(())` if the cleanup
-    /// handler cannot be added.
+    /// The constructor is called only after nginx allocates storage for the value. The destructor
+    /// runs when the pool is destroyed or when [`remove`](Self::remove) removes the value.
     ///
     /// # Safety
-    /// This function is marked as unsafe because it involves raw pointer manipulation.
-    unsafe fn add_cleanup_for_value<T>(&self, value: *mut T) -> Result<(), ()> {
-        let cln = unsafe { ngx_pool_cleanup_add(self.0.as_ptr(), 0) };
-        if cln.is_null() {
-            return Err(());
+    ///
+    /// The returned pointer must not outlive the pool and must not be freed manually. The caller
+    /// must not access the value after the pool is destroyed or after passing its pointer to
+    /// [`remove`](Self::remove).
+    pub unsafe fn allocate_with_cleanup<T>(
+        &self,
+        constructor: impl FnOnce() -> T,
+    ) -> Result<NonNull<T>, AllocError> {
+        if !cleanup_type_fits_pool::<T>() {
+            return Err(AllocError);
         }
 
+        let mut cleanup =
+            NonNull::new(unsafe { ngx_pool_cleanup_add(self.0.as_ptr(), mem::size_of::<T>()) })
+                .ok_or(AllocError)?;
+
+        let data: NonNull<T> = if mem::size_of::<T>() == 0 {
+            cleanup.cast()
+        } else {
+            NonNull::new(unsafe { cleanup.as_ref().data.cast() }).ok_or(AllocError)?
+        };
+        debug_assert_eq!(data.as_ptr().align_offset(mem::align_of::<T>()), 0);
+
+        let value = constructor();
         unsafe {
-            (*cln).handler = Some(cleanup_type::<T>);
-            (*cln).data = value as *mut c_void;
+            data.as_ptr().write(value);
+            cleanup.as_mut().data = data.as_ptr().cast();
+            cleanup.as_mut().handler = Some(cleanup_type::<T>);
         }
 
-        Ok(())
+        Ok(data)
     }
 
     /// Allocates memory from the pool of the specified size.
@@ -267,21 +289,48 @@ impl Pool {
         self.alloc_unaligned(mem::size_of::<T>()) as *mut T
     }
 
-    /// Allocates memory for a value of a specified type and adds a cleanup handler to the memory
-    /// pool.
+    /// Runs the cleanup handler for a value and unlinks it from the pool.
     ///
-    /// Returns a typed pointer to the allocated memory if successful, or a null pointer if
-    /// allocation or cleanup handler addition fails.
-    pub fn allocate<T>(&self, value: T) -> *mut T {
-        unsafe {
-            let p = self.alloc(mem::size_of::<T>()) as *mut T;
-            ptr::write(p, value);
-            if self.add_cleanup_for_value(p).is_err() {
-                ptr::drop_in_place(p);
-                return ptr::null_mut();
-            };
-            p
+    /// Returns `None` when the value has no matching cleanup entry.
+    ///
+    /// # Safety
+    ///
+    /// `value` must be a non-null pointer returned by [`allocate_with_cleanup`](Self::allocate_with_cleanup)
+    /// for this pool. No references to the value may be live, the pointer must not be used after
+    /// this call, and no other handle may access the pool's cleanup list during this call.
+    pub unsafe fn remove<T>(&mut self, value: *const T) -> Option<()> {
+        let cleanup = self.remove_cleanup_if(|cleanup| ptr::addr_eq(cleanup.data, value))?;
+        let handler = cleanup.handler?;
+
+        unsafe { handler(cleanup.data) };
+        Some(())
+    }
+
+    fn remove_cleanup_if(
+        &mut self,
+        predicate: impl Fn(&ngx_pool_cleanup_t) -> bool,
+    ) -> Option<&ngx_pool_cleanup_t> {
+        let mut head = ngx_pool_cleanup_t {
+            handler: None,
+            data: ptr::null_mut(),
+            next: self.as_ref().cleanup,
+        };
+        let head_ptr = &raw const head;
+        let mut previous = &mut head;
+
+        while let Some(cleanup) = unsafe { previous.next.as_mut() } {
+            if predicate(cleanup) {
+                if ptr::eq(previous, head_ptr) {
+                    self.as_mut().cleanup = cleanup.next;
+                } else {
+                    previous.next = cleanup.next;
+                }
+                return Some(cleanup);
+            }
+            previous = cleanup;
         }
+
+        None
     }
 
     /// Resizes a memory allocation in place if possible.
@@ -319,19 +368,56 @@ impl Pool {
     }
 }
 
-/// Cleanup handler for a specific type `T`.
-///
-/// This function is called when cleaning up a value of type `T` in an FFI context.
+/// Drops a value registered in a pool cleanup entry.
 ///
 /// # Safety
-/// This function is marked as unsafe due to the raw pointer manipulation and the assumption that
-/// `data` is a valid pointer to `T`.
-///
-/// # Arguments
-///
-/// * `data` - A raw pointer to the value of type `T` to be cleaned up.
+/// `data` must be a valid, writable, and properly aligned pointer to an initialized `T`.
 unsafe extern "C" fn cleanup_type<T>(data: *mut c_void) {
     unsafe {
         ptr::drop_in_place(data as *mut T);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::cell::Cell;
+    use core::mem::{MaybeUninit, zeroed};
+
+    use super::*;
+
+    #[repr(align(4096))]
+    struct OverAligned;
+
+    struct DropCounter<'a>(&'a Cell<usize>);
+
+    impl Drop for DropCounter<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn cleanup_storage_rejects_unsupported_alignment() {
+        assert!(!cleanup_type_fits_pool::<OverAligned>());
+    }
+
+    #[test]
+    fn remove_drops_value_and_unlinks_cleanup() {
+        let drops = Cell::new(0);
+        let mut value = MaybeUninit::new(DropCounter(&drops));
+        let mut cleanup = ngx_pool_cleanup_t {
+            handler: Some(cleanup_type::<DropCounter<'_>>),
+            data: value.as_mut_ptr().cast(),
+            next: ptr::null_mut(),
+        };
+        let mut raw_pool: ngx_pool_t = unsafe { zeroed() };
+        raw_pool.cleanup = &raw mut cleanup;
+        let mut pool = unsafe { Pool::from_ngx_pool(&raw mut raw_pool) };
+
+        let removed = unsafe { pool.remove(value.as_ptr()) };
+
+        assert_eq!(removed, Some(()));
+        assert!(raw_pool.cleanup.is_null());
+        assert_eq!(drops.get(), 1);
     }
 }

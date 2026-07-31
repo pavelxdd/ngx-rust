@@ -1,7 +1,7 @@
 use core::error;
 use core::ffi::{c_char, c_void};
 use core::fmt;
-use core::ptr;
+use core::ptr::{self, NonNull};
 
 use crate::core::NGX_CONF_ERROR;
 use crate::core::*;
@@ -79,7 +79,10 @@ pub trait HttpModule {
     {
         unsafe {
             let pool = Pool::from_ngx_pool((*cf).pool);
-            pool.allocate::<Self::MainConf>(Default::default()) as *mut c_void
+            pool.allocate_with_cleanup(Self::MainConf::default)
+                .map(NonNull::as_ptr)
+                .unwrap_or(ptr::null_mut())
+                .cast()
         }
     }
 
@@ -106,7 +109,10 @@ pub trait HttpModule {
     {
         unsafe {
             let pool = Pool::from_ngx_pool((*cf).pool);
-            pool.allocate::<Self::ServerConf>(Default::default()) as *mut c_void
+            pool.allocate_with_cleanup(Self::ServerConf::default)
+                .map(NonNull::as_ptr)
+                .unwrap_or(ptr::null_mut())
+                .cast()
         }
     }
 
@@ -144,7 +150,10 @@ pub trait HttpModule {
     {
         unsafe {
             let pool = Pool::from_ngx_pool((*cf).pool);
-            pool.allocate::<Self::LocationConf>(Default::default()) as *mut c_void
+            pool.allocate_with_cleanup(Self::LocationConf::default)
+                .map(NonNull::as_ptr)
+                .unwrap_or(ptr::null_mut())
+                .cast()
         }
     }
 
