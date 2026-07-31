@@ -94,6 +94,7 @@ patches applied.
 - `async` - Enables a minimal async runtime built on top of the NGINX event loop.
 - `serde` - Enables serialization support for some of the provided and
   re-exported types.
+- `stream` - Enables the NGINX Stream module API.
 - `std` - **Enabled** by default. This provides APIs that require the standard
   library.
 - `test-link` - Builds and links a static library from the configured NGINX source and build

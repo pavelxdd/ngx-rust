@@ -82,6 +82,8 @@ log = [
 log-debug = ["log"]
 # Allows trace records to reach the nginx runtime filter.
 log-trace = ["log-debug"]
+# Enables the NGINX Stream module API.
+stream = ["nginx-sys/stream"]
 # Provides APIs that require the standard library.
 std = [
     "alloc",
