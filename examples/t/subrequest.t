@@ -68,6 +68,10 @@ http {
             internal;
             return 200;
         }
+
+        location = /not-found {
+            return 404;
+        }
     }
 }
 
