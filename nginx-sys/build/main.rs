@@ -227,6 +227,16 @@ fn generate_binding(nginx: &NginxSource) {
         .expect("rust-version is valid and supported by bindgen");
 
     let bindings = bindgen::Builder::default()
+        .allowlist_function("ngx_.*")
+        // Required by the platform adapters for errors, random values, and yielding.
+        .allowlist_function(
+            "^(GetLastError|SetLastError|SwitchToThread|WSAGetLastError|WSASetLastError|rand|random|sched_yield|usleep)$",
+        )
+        // Recursive allowlisting deliberately retains external types used in the NGINX ABI. They
+        // must come from the headers selected by the configured NGINX build, not from a crate that
+        // may select a different native library.
+        .allowlist_type("ngx_.*")
+        .allowlist_var("^(NGX|NGINX|ngx|nginx)_.*$")
         // Bindings will not compile on Linux without block listing this item
         // It is worth investigating why this is
         .blocklist_item("IPPORT_RESERVED")
