@@ -419,6 +419,13 @@ impl Request {
         }
     }
 
+    /// HTTP response status set by nginx.
+    ///
+    /// Returns `None` while the status is unset or outside the valid HTTP range.
+    pub fn status(&self) -> Option<HTTPStatus> {
+        HTTPStatus::try_from(self.0.headers_out.status).ok()
+    }
+
     /// Set HTTP status of response.
     pub fn set_status(&mut self, status: HTTPStatus) {
         self.0.headers_out.status = status.into();
@@ -1088,5 +1095,23 @@ mod tests {
         *request_from(&mut raw).module_context_mut::<TestContextModule>().unwrap() = 42;
 
         assert_eq!(context, 42);
+    }
+
+    #[test]
+    fn status_is_none_when_unset_or_invalid() {
+        let mut raw = zeroed_request();
+
+        assert_eq!(request_from(&mut raw).status(), None);
+
+        raw.headers_out.status = 600;
+        assert_eq!(request_from(&mut raw).status(), None);
+    }
+
+    #[test]
+    fn status_returns_a_valid_response_status() {
+        let mut raw = zeroed_request();
+        raw.headers_out.status = 204;
+
+        assert_eq!(request_from(&mut raw).status(), Some(HTTPStatus::NO_CONTENT));
     }
 }
