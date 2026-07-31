@@ -107,6 +107,66 @@ unsafe impl HttpModuleRequestContext for Module {
 
 struct AsyncAccessHandler;
 
+#[cfg(not(windows))]
+mod thread_wake {
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, Waker};
+    use core::time::Duration;
+    use std::sync::Mutex;
+    use std::thread;
+
+    pub(super) struct ThreadWake {
+        state: Arc<Mutex<ThreadWakeState>>,
+    }
+
+    #[derive(Default)]
+    struct ThreadWakeState {
+        ready: bool,
+        waker: Option<Waker>,
+    }
+
+    impl ThreadWake {
+        pub(super) fn new() -> Self {
+            let state = Arc::new(Mutex::new(ThreadWakeState::default()));
+            let thread_state = Arc::clone(&state);
+            let _thread = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                let waker = {
+                    let mut state = thread_state.lock().unwrap_or_else(|error| error.into_inner());
+                    state.ready = true;
+                    state.waker.take()
+                };
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            });
+
+            Self { state }
+        }
+    }
+
+    impl Future for ThreadWake {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.ready {
+                return Poll::Ready(());
+            }
+
+            if state.waker.as_ref().is_none_or(|waker| !waker.will_wake(context.waker())) {
+                state.waker = Some(context.waker().clone());
+            }
+            Poll::Pending
+        }
+    }
+}
+
+#[cfg(not(windows))]
+use thread_wake::ThreadWake;
+
 struct AsyncOutput {
     elapsed: u128,
     subrequest_status: Option<HTTPStatus>,
@@ -146,6 +206,9 @@ impl AsyncHttpRequestHandler for AsyncAccessHandler {
             let subrequest_status = subrequest.await?;
 
             ngx_async::sleep(Duration::from_millis(10)).await;
+            // nginx's IOCP event module has no cross-thread notification hook.
+            #[cfg(not(windows))]
+            ThreadWake::new().await;
             Ok(Some(AsyncOutput { elapsed: started.elapsed().as_millis(), subrequest_status }))
         }
     }
@@ -167,6 +230,12 @@ impl AsyncHttpRequestHandler for AsyncAccessHandler {
         let subrequest_status = subrequest_status.0.to_string();
         if request.add_header_out("X-Async-Subrequest-Status", &subrequest_status).is_none() {
             return Status::NGX_ERROR;
+        }
+        #[cfg(not(windows))]
+        {
+            if request.add_header_out("X-Async-Thread-Wake", "1").is_none() {
+                return Status::NGX_ERROR;
+            }
         }
         Status::NGX_OK
     }
