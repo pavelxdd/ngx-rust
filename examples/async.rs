@@ -157,13 +157,13 @@ impl HttpRequestHandler for AsyncAccessHandler {
             return Status::NGX_OK;
         }
 
-        let ctx = request.pool().allocate(RequestCTX::default());
-        if ctx.is_null() {
+        let Ok(mut ctx) = (unsafe { request.pool().allocate_with_cleanup(RequestCTX::default) })
+        else {
             return Status::NGX_ERROR;
-        }
-        request.set_module_ctx(ctx.cast(), Module::module());
+        };
+        request.set_module_ctx(ctx.as_ptr().cast(), Module::module());
 
-        let ctx = unsafe { &mut *ctx };
+        let ctx = unsafe { ctx.as_mut() };
         ctx.event.handler = Some(check_async_work_done);
         ctx.event.data = request.connection().cast();
         ctx.event.log = unsafe { (*request.connection()).log };
