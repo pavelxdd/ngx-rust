@@ -1,27 +1,21 @@
 extern crate alloc;
 
-use alloc::sync::Arc;
+use alloc::string::ToString;
 use core::ffi::{c_char, c_void};
-use core::mem;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use core::time::Duration;
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use ngx::core::Status;
 use ngx::ffi::{
     NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MODULE, NGX_LOG_EMERG,
-    ngx_command_t, ngx_conf_t, ngx_connection_t, ngx_event_t, ngx_http_module_t,
-    ngx_http_request_t, ngx_int_t, ngx_module_t, ngx_post_event, ngx_posted_events,
-    ngx_posted_next_events, ngx_str_t, ngx_uint_t,
+    ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_int_t, ngx_module_t, ngx_str_t, ngx_uint_t,
 };
 use ngx::http::{
-    self, HttpModule, HttpModuleLocationConf, HttpModuleRequestContext, HttpRequestHandler,
-    MergeConfigError,
+    self, AsyncHandlerContext, AsyncHttpRequestHandler, HttpModule, HttpModuleLocationConf,
+    HttpModuleRequestContext, MergeConfigError,
 };
-use ngx::{ngx_conf_log_error, ngx_log_debug_http, ngx_string};
-use tokio::runtime::Runtime;
+use ngx::{async_ as ngx_async, ngx_conf_log_error, ngx_log_debug_http, ngx_string};
 
 struct Module;
 
@@ -33,7 +27,7 @@ impl http::HttpModule for Module {
     unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
         // SAFETY: this function is called with non-NULL cf always
         let cf = unsafe { &mut *cf };
-        http::add_phase_handler::<AsyncAccessHandler>(cf)
+        http::add_async_phase_handler::<AsyncAccessHandler>(cf)
             .map_or(Status::NGX_ERROR, |_| Status::NGX_OK)
             .into()
     }
@@ -95,110 +89,45 @@ impl http::Merge for ModuleConfig {
     }
 }
 
-unsafe extern "C" fn check_async_work_done(event: *mut ngx_event_t) {
-    let ctx = ngx::ngx_container_of!(event, RequestCTX, event);
-    let c: *mut ngx_connection_t = unsafe { (*event).data.cast() };
-
-    if unsafe { (*ctx).done.load(Ordering::Relaxed) } {
-        // Triggering async_access_handler again
-        unsafe { ngx_post_event((*c).write, &raw mut ngx_posted_events) };
-    } else {
-        // this doesn't have have good performance but works as a simple thread-safe example and
-        // doesn't causes segfault. The best method that provides both thread-safety and
-        // performance requires an nginx patch.
-        unsafe { ngx_post_event(event, &raw mut ngx_posted_next_events) };
-    }
-}
-
-struct RequestCTX {
-    done: Arc<AtomicBool>,
-    event: ngx_event_t,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Default for RequestCTX {
-    fn default() -> Self {
-        Self {
-            done: AtomicBool::new(false).into(),
-            event: unsafe { mem::zeroed() },
-            task: Default::default(),
-        }
-    }
-}
-
-impl Drop for RequestCTX {
-    fn drop(&mut self) {
-        if let Some(handle) = self.task.take() {
-            handle.abort();
-        }
-
-        if self.event.posted() != 0 {
-            unsafe { ngx::ffi::ngx_delete_posted_event(&raw mut self.event) };
-        }
-    }
-}
-
 unsafe impl HttpModuleRequestContext for Module {
-    type RequestContext = RequestCTX;
+    type RequestContext = AsyncHandlerContext<AsyncAccessHandler>;
 }
 
 struct AsyncAccessHandler;
 
-impl HttpRequestHandler for AsyncAccessHandler {
+impl AsyncHttpRequestHandler for AsyncAccessHandler {
     const PHASE: ngx::http::HttpPhase = ngx::http::HttpPhase::Access;
-    type Output = Status;
+    type Module = Module;
+    type Output = Option<u128>;
+    type Result = Status;
 
-    fn handler(request: &mut http::Request) -> Self::Output {
+    fn start(
+        request: &mut http::Request,
+    ) -> impl core::future::Future<Output = Self::Output> + 'static {
         let co = Module::location_conf(request).expect("module config is none");
-
         ngx_log_debug_http!(request, "async module enabled: {}", co.enable);
+        let enabled = co.enable;
 
-        if !co.enable {
-            return Status::NGX_DECLINED;
-        }
-
-        if let Some(ctx) = request.module_context::<Module>() {
-            if !ctx.done.load(Ordering::Relaxed) {
-                return Status::NGX_AGAIN;
+        async move {
+            if !enabled {
+                return None;
             }
 
-            return Status::NGX_OK;
-        }
-
-        let connection = request.connection();
-        let request_ptr = (request as *mut http::Request).cast::<ngx_http_request_t>();
-        let Ok(ctx) = request.get_or_insert_module_context_with::<Module>(RequestCTX::default)
-        else {
-            return Status::NGX_ERROR;
-        };
-
-        ctx.event.handler = Some(check_async_work_done);
-        ctx.event.data = connection.cast();
-        ctx.event.log = unsafe { (*connection).log };
-        unsafe { ngx_post_event(&raw mut ctx.event, &raw mut ngx_posted_next_events) };
-
-        // Only the raw request pointer is moved into the async block.
-        let req = AtomicPtr::new(request_ptr);
-        let done_flag = ctx.done.clone();
-
-        let rt = ngx_http_async_runtime();
-        ctx.task = Some(rt.spawn(async move {
             let start = Instant::now();
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let req = unsafe { http::Request::from_ngx_http_request(req.load(Ordering::Relaxed)) };
-            // not really thread safe, we should apply all these operation in nginx thread
-            // but this is just an example. proper way would be storing these headers in the request
-            // ctx and apply them when we get back to the nginx thread.
-            req.add_header_out("X-Async-Time", start.elapsed().as_millis().to_string().as_str());
+            ngx_async::sleep(Duration::from_millis(10)).await;
+            Some(start.elapsed().as_millis())
+        }
+    }
 
-            done_flag.store(true, Ordering::Release);
-            // there is a small issue here. If traffic is low we may get stuck behind a 300ms timer
-            // in the nginx event loop. To workaround it we can notify the event loop using
-            // pthread_kill( nginx_thread, SIGIO ) to wake up the event loop. (or patch nginx
-            // and use the same trick as the thread pool)
-        }));
-
-        Status::NGX_AGAIN
+    fn finish(request: &mut http::Request, elapsed: Self::Output) -> Self::Result {
+        let Some(elapsed) = elapsed else {
+            return Status::NGX_DECLINED;
+        };
+        let elapsed = elapsed.to_string();
+        if request.add_header_out("X-Async-Time", &elapsed).is_none() {
+            return Status::NGX_ERROR;
+        }
+        Status::NGX_OK
     }
 }
 
@@ -229,17 +158,4 @@ extern "C" fn ngx_http_async_commands_set_enable(
     };
 
     ngx::core::NGX_CONF_OK
-}
-
-fn ngx_http_async_runtime() -> &'static Runtime {
-    // Should not be called from the master process
-    assert_ne!(unsafe { ngx::ffi::ngx_process }, ngx::ffi::NGX_PROCESS_MASTER as _);
-
-    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime init")
-    })
 }
