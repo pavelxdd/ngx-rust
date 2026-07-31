@@ -2,6 +2,8 @@ mod conf;
 mod module;
 mod request;
 mod status;
+/// HTTP subrequest support.
+pub mod subrequest;
 mod upstream;
 
 pub use conf::*;
