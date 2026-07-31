@@ -134,6 +134,8 @@ println!("this nginx binary was built on FreeBSD");
 
 ### Version and build information
 
+- `DEP_NGINX_NAME`:
+  server product name, such as `nginx` or `freenginx`
 - `DEP_NGINX_VERSION_NUMBER`:
   a numeric representation with 3 digits for each component: `1026002`
 - `DEP_NGINX_VERSION`:
