@@ -152,17 +152,29 @@ impl HttpModuleConfExt for ngx_http_upstream_srv_conf_t {
 /// Trait to define and access main module configuration
 ///
 /// # Safety
-/// Caller must ensure that type `HttpModuleMainConf::MainConf` matches the configuration type
-/// for the specified module.
+/// Implementers must ensure that `Self::MainConf` is the actual main-configuration type for the
+/// module returned by `Self::module()`.
 pub unsafe trait HttpModuleMainConf: HttpModule {
     /// Type for main module configuration
     type MainConf;
     /// Get reference to main module configuration
-    fn main_conf(o: &impl HttpModuleConfExt) -> Option<&'static Self::MainConf> {
+    fn main_conf(o: &impl HttpModuleConfExt) -> Option<&Self::MainConf> {
         unsafe { Some(o.http_main_conf_unchecked(Self::module())?.as_ref()) }
     }
     /// Get mutable reference to main module configuration
-    fn main_conf_mut(o: &impl HttpModuleConfExt) -> Option<&'static mut Self::MainConf> {
+    ///
+    /// ```compile_fail
+    /// # use ngx::ffi::ngx_conf_t;
+    /// # use ngx::http::HttpModuleMainConf;
+    /// # fn access<M: HttpModuleMainConf>(cf: &mut ngx_conf_t) {
+    /// let _ = M::main_conf_mut(cf);
+    /// # }
+    /// ```
+    ///
+    /// # Safety
+    /// The caller must have exclusive access to the configuration slot for the full lifetime of
+    /// the returned reference. No other references to the same configuration may exist.
+    unsafe fn main_conf_mut(o: &mut impl HttpModuleConfExt) -> Option<&mut Self::MainConf> {
         unsafe { Some(o.http_main_conf_unchecked(Self::module())?.as_mut()) }
     }
 }
@@ -170,17 +182,29 @@ pub unsafe trait HttpModuleMainConf: HttpModule {
 /// Trait to define and access server-specific module configuration
 ///
 /// # Safety
-/// Caller must ensure that type `HttpModuleServerConf::ServerConf` matches the configuration type
-/// for the specified module.
+/// Implementers must ensure that `Self::ServerConf` is the actual server-configuration type for
+/// the module returned by `Self::module()`.
 pub unsafe trait HttpModuleServerConf: HttpModule {
     /// Type for server-specific module configuration
     type ServerConf;
     /// Get reference to server-specific module configuration
-    fn server_conf(o: &impl HttpModuleConfExt) -> Option<&'static Self::ServerConf> {
+    fn server_conf(o: &impl HttpModuleConfExt) -> Option<&Self::ServerConf> {
         unsafe { Some(o.http_server_conf_unchecked(Self::module())?.as_ref()) }
     }
     /// Get mutable reference to server-specific module configuration
-    fn server_conf_mut(o: &impl HttpModuleConfExt) -> Option<&'static mut Self::ServerConf> {
+    ///
+    /// ```compile_fail
+    /// # use ngx::ffi::ngx_conf_t;
+    /// # use ngx::http::HttpModuleServerConf;
+    /// # fn access<M: HttpModuleServerConf>(cf: &mut ngx_conf_t) {
+    /// let _ = M::server_conf_mut(cf);
+    /// # }
+    /// ```
+    ///
+    /// # Safety
+    /// The caller must have exclusive access to the configuration slot for the full lifetime of
+    /// the returned reference. No other references to the same configuration may exist.
+    unsafe fn server_conf_mut(o: &mut impl HttpModuleConfExt) -> Option<&mut Self::ServerConf> {
         unsafe { Some(o.http_server_conf_unchecked(Self::module())?.as_mut()) }
     }
 }
@@ -190,17 +214,29 @@ pub unsafe trait HttpModuleServerConf: HttpModule {
 /// Applies to a single `location`, `if` or `limit_except` block
 ///
 /// # Safety
-/// Caller must ensure that type `HttpModuleLocationConf::LocationConf` matches the configuration
-/// type for the specified module.
+/// Implementers must ensure that `Self::LocationConf` is the actual location-configuration type
+/// for the module returned by `Self::module()`.
 pub unsafe trait HttpModuleLocationConf: HttpModule {
     /// Type for location-specific module configuration
     type LocationConf;
     /// Get reference to location-specific module configuration
-    fn location_conf(o: &impl HttpModuleConfExt) -> Option<&'static Self::LocationConf> {
+    fn location_conf(o: &impl HttpModuleConfExt) -> Option<&Self::LocationConf> {
         unsafe { Some(o.http_location_conf_unchecked(Self::module())?.as_ref()) }
     }
     /// Get mutable reference to location-specific module configuration
-    fn location_conf_mut(o: &impl HttpModuleConfExt) -> Option<&'static mut Self::LocationConf> {
+    ///
+    /// ```compile_fail
+    /// # use ngx::ffi::ngx_conf_t;
+    /// # use ngx::http::HttpModuleLocationConf;
+    /// # fn access<M: HttpModuleLocationConf>(cf: &mut ngx_conf_t) {
+    /// let _ = M::location_conf_mut(cf);
+    /// # }
+    /// ```
+    ///
+    /// # Safety
+    /// The caller must have exclusive access to the configuration slot for the full lifetime of
+    /// the returned reference. No other references to the same configuration may exist.
+    unsafe fn location_conf_mut(o: &mut impl HttpModuleConfExt) -> Option<&mut Self::LocationConf> {
         unsafe { Some(o.http_location_conf_unchecked(Self::module())?.as_mut()) }
     }
 }
@@ -267,7 +303,7 @@ mod core {
     where
         H: HttpRequestHandler,
     {
-        let cmcf = NgxHttpCoreModule::main_conf_mut(cf).expect("http core main conf");
+        let cmcf = unsafe { NgxHttpCoreModule::main_conf_mut(cf) }.expect("http core main conf");
         let h: *mut nginx_sys::ngx_http_handler_pt = unsafe {
             nginx_sys::ngx_array_push(&raw mut cmcf.phases[H::PHASE as usize].handlers).cast()
         };
