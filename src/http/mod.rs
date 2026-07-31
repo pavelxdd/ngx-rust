@@ -1,3 +1,5 @@
+#[cfg(feature = "async")]
+mod async_request;
 mod conf;
 mod module;
 mod request;
@@ -6,6 +8,8 @@ mod status;
 pub mod subrequest;
 mod upstream;
 
+#[cfg(feature = "async")]
+pub use async_request::*;
 pub use conf::*;
 pub use module::*;
 pub use request::*;
