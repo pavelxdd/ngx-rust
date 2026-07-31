@@ -14,7 +14,11 @@ unsafe fn conf_slot<T>(slots: *mut *mut c_void, index: usize) -> Option<NonNull<
 }
 
 /// Raw access to Stream module main-configuration slots.
-pub trait StreamModuleMainConfExt {
+///
+/// # Safety
+/// Implementations must return pointers that remain valid for the source borrow when the caller
+/// supplies the correct module configuration type.
+pub unsafe trait StreamModuleMainConfExt {
     /// Gets a module's main-configuration slot as a typed pointer.
     ///
     /// # Safety
@@ -23,7 +27,11 @@ pub trait StreamModuleMainConfExt {
 }
 
 /// Raw access to Stream module server-configuration slots.
-pub trait StreamModuleServerConfExt {
+///
+/// # Safety
+/// Implementations must return pointers that remain valid for the source borrow when the caller
+/// supplies the correct module configuration type.
+pub unsafe trait StreamModuleServerConfExt {
     /// Gets a module's server-configuration slot as a typed pointer.
     ///
     /// # Safety
@@ -31,19 +39,19 @@ pub trait StreamModuleServerConfExt {
     unsafe fn stream_server_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>>;
 }
 
-impl StreamModuleMainConfExt for ngx_stream_conf_ctx_t {
+unsafe impl StreamModuleMainConfExt for ngx_stream_conf_ctx_t {
     unsafe fn stream_main_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
         unsafe { conf_slot(self.main_conf, module.ctx_index) }
     }
 }
 
-impl StreamModuleServerConfExt for ngx_stream_conf_ctx_t {
+unsafe impl StreamModuleServerConfExt for ngx_stream_conf_ctx_t {
     unsafe fn stream_server_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
         unsafe { conf_slot(self.srv_conf, module.ctx_index) }
     }
 }
 
-impl StreamModuleMainConfExt for ngx_cycle_t {
+unsafe impl StreamModuleMainConfExt for ngx_cycle_t {
     unsafe fn stream_main_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
         let conf_ctx = NonNull::new(self.conf_ctx)?;
         let stream_index = unsafe { nginx_sys::ngx_stream_module.index };
@@ -53,45 +61,45 @@ impl StreamModuleMainConfExt for ngx_cycle_t {
     }
 }
 
-impl StreamModuleMainConfExt for ngx_conf_t {
+unsafe impl StreamModuleMainConfExt for ngx_conf_t {
     unsafe fn stream_main_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
         let conf_ctx = NonNull::new(self.ctx.cast::<ngx_stream_conf_ctx_t>())?;
         unsafe { conf_ctx.as_ref().stream_main_conf_unchecked(module) }
     }
 }
 
-impl StreamModuleServerConfExt for ngx_conf_t {
+unsafe impl StreamModuleServerConfExt for ngx_conf_t {
     unsafe fn stream_server_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
         let conf_ctx = NonNull::new(self.ctx.cast::<ngx_stream_conf_ctx_t>())?;
         unsafe { conf_ctx.as_ref().stream_server_conf_unchecked(module) }
     }
 }
 
-impl StreamModuleMainConfExt for ngx_stream_core_srv_conf_t {
+unsafe impl StreamModuleMainConfExt for ngx_stream_core_srv_conf_t {
     unsafe fn stream_main_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
         unsafe { self.ctx.as_ref()?.stream_main_conf_unchecked(module) }
     }
 }
 
-impl StreamModuleServerConfExt for ngx_stream_core_srv_conf_t {
+unsafe impl StreamModuleServerConfExt for ngx_stream_core_srv_conf_t {
     unsafe fn stream_server_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
         unsafe { self.ctx.as_ref()?.stream_server_conf_unchecked(module) }
     }
 }
 
-impl StreamModuleMainConfExt for ngx_stream_session_t {
+unsafe impl StreamModuleMainConfExt for ngx_stream_session_t {
     unsafe fn stream_main_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
         unsafe { conf_slot(self.main_conf, module.ctx_index) }
     }
 }
 
-impl StreamModuleServerConfExt for ngx_stream_session_t {
+unsafe impl StreamModuleServerConfExt for ngx_stream_session_t {
     unsafe fn stream_server_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
         unsafe { conf_slot(self.srv_conf, module.ctx_index) }
     }
 }
 
-impl StreamModuleServerConfExt for ngx_stream_upstream_srv_conf_t {
+unsafe impl StreamModuleServerConfExt for ngx_stream_upstream_srv_conf_t {
     unsafe fn stream_server_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
         unsafe { conf_slot(self.srv_conf, module.ctx_index) }
     }
@@ -105,8 +113,12 @@ pub unsafe trait StreamModuleMainConf: StreamModule {
     /// The module's main-configuration type.
     type MainConf;
 
-    /// Gets the module's main configuration.
-    fn main_conf(source: &impl StreamModuleMainConfExt) -> Option<&Self::MainConf> {
+    /// Gets the module's main configuration from a raw configuration source.
+    ///
+    /// # Safety
+    /// `source` must be a valid nginx-owned value whose module slots remain live for the returned
+    /// reference's lifetime.
+    unsafe fn main_conf(source: &impl StreamModuleMainConfExt) -> Option<&Self::MainConf> {
         unsafe { Some(source.stream_main_conf_unchecked(Self::module())?.as_ref()) }
     }
 
@@ -138,8 +150,12 @@ pub unsafe trait StreamModuleServerConf: StreamModule {
     /// The module's server-configuration type.
     type ServerConf;
 
-    /// Gets the module's server configuration.
-    fn server_conf(source: &impl StreamModuleServerConfExt) -> Option<&Self::ServerConf> {
+    /// Gets the module's server configuration from a raw configuration source.
+    ///
+    /// # Safety
+    /// `source` must be a valid nginx-owned value whose module slots remain live for the returned
+    /// reference's lifetime.
+    unsafe fn server_conf(source: &impl StreamModuleServerConfExt) -> Option<&Self::ServerConf> {
         unsafe { Some(source.stream_server_conf_unchecked(Self::module())?.as_ref()) }
     }
 
@@ -172,7 +188,7 @@ mod core_module {
     /// Typed access to `ngx_stream_core_module` configuration.
     pub struct NgxStreamCoreModule;
 
-    impl StreamModule for NgxStreamCoreModule {
+    unsafe impl StreamModule for NgxStreamCoreModule {
         fn module() -> &'static crate::ffi::ngx_module_t {
             unsafe { &*core::ptr::addr_of!(ngx_stream_core_module) }
         }
@@ -197,7 +213,7 @@ mod ssl {
     /// Typed access to `ngx_stream_ssl_module` configuration.
     pub struct NgxStreamSslModule;
 
-    impl StreamModule for NgxStreamSslModule {
+    unsafe impl StreamModule for NgxStreamSslModule {
         fn module() -> &'static crate::ffi::ngx_module_t {
             unsafe { &*core::ptr::addr_of!(ngx_stream_ssl_module) }
         }
@@ -220,7 +236,7 @@ mod upstream {
     /// Typed access to `ngx_stream_upstream_module` configuration.
     pub struct NgxStreamUpstreamModule;
 
-    impl StreamModule for NgxStreamUpstreamModule {
+    unsafe impl StreamModule for NgxStreamUpstreamModule {
         fn module() -> &'static crate::ffi::ngx_module_t {
             unsafe { &*core::ptr::addr_of!(ngx_stream_upstream_module) }
         }
@@ -294,7 +310,7 @@ mod tests {
 
     struct TestStreamModule;
 
-    impl StreamModule for TestStreamModule {
+    unsafe impl StreamModule for TestStreamModule {
         fn module() -> &'static ngx_module_t {
             Box::leak(Box::new(module_with_index(0)))
         }
@@ -319,8 +335,8 @@ mod tests {
             srv_conf: server_slots.as_mut_ptr(),
         };
 
-        assert_eq!(TestStreamModule::main_conf(&context).copied(), Some(42));
-        assert_eq!(TestStreamModule::server_conf(&context).copied(), Some(99));
+        assert_eq!(unsafe { TestStreamModule::main_conf(&context) }.copied(), Some(42));
+        assert_eq!(unsafe { TestStreamModule::server_conf(&context) }.copied(), Some(99));
 
         if let Some(value) = unsafe { TestStreamModule::main_conf_mut(&mut context) } {
             *value = 7;

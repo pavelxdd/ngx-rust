@@ -46,7 +46,11 @@ impl Merge for () {
 }
 
 /// Defines a concrete NGINX Stream module and its configuration lifecycle.
-pub trait StreamModule {
+///
+/// # Safety
+/// `module()` must return this type's real live global module descriptor. Nginx must have
+/// initialized its module and context indexes before any typed configuration or session access.
+pub unsafe trait StreamModule {
     /// Returns the global module descriptor.
     fn module() -> &'static ngx_module_t;
 
@@ -195,7 +199,7 @@ mod tests {
 
     struct TestStreamModule;
 
-    impl StreamModule for TestStreamModule {
+    unsafe impl StreamModule for TestStreamModule {
         fn module() -> &'static ngx_module_t {
             test_module()
         }
@@ -244,7 +248,7 @@ mod tests {
 
     struct RejectStreamModule;
 
-    impl StreamModule for RejectStreamModule {
+    unsafe impl StreamModule for RejectStreamModule {
         fn module() -> &'static ngx_module_t {
             test_module()
         }
@@ -288,7 +292,7 @@ mod tests {
     struct AllocationStreamModule;
 
     #[cfg(feature = "test-link")]
-    impl StreamModule for AllocationStreamModule {
+    unsafe impl StreamModule for AllocationStreamModule {
         fn module() -> &'static ngx_module_t {
             test_module()
         }
