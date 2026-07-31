@@ -86,7 +86,8 @@ macro_rules! http_variable_get {
 /// in the `into_handler_status` method.
 ///
 /// There are predefined implementations for `ngx_int_t`, [`Status`], [`HTTPStatus`],
-/// [`Option`] with value type implementing [`IntoHandlerStatus`].
+/// [`Option`] with a value type implementing [`IntoHandlerStatus`], and [`Result`] with value and
+/// error types implementing [`IntoHandlerStatus`].
 pub trait IntoHandlerStatus
 where
     Self: Sized,
@@ -102,6 +103,20 @@ where
     #[inline]
     fn into_handler_status(self, r: &Request) -> ngx_int_t {
         self.map(|val| val.into_handler_status(r)).unwrap_or(NGX_ERROR as _)
+    }
+}
+
+impl<T, E> IntoHandlerStatus for Result<T, E>
+where
+    T: IntoHandlerStatus,
+    E: IntoHandlerStatus,
+{
+    #[inline]
+    fn into_handler_status(self, r: &Request) -> ngx_int_t {
+        match self {
+            Ok(value) => value.into_handler_status(r),
+            Err(error) => error.into_handler_status(r),
+        }
     }
 }
 
@@ -918,5 +933,16 @@ mod tests {
         raw.connection = &raw mut connection;
 
         assert_eq!(request_from(&mut raw).bytes_sent(), 8192);
+    }
+
+    #[test]
+    fn result_converts_the_selected_branch_into_handler_status() {
+        let mut raw = zeroed_request();
+        let request = request_from(&mut raw);
+        let success: Result<Status, HTTPStatus> = Ok(Status::NGX_AGAIN);
+        let error: Result<Status, HTTPStatus> = Err(HTTPStatus::BAD_REQUEST);
+
+        assert_eq!(success.into_handler_status(request), Status::NGX_AGAIN.0);
+        assert_eq!(error.into_handler_status(request), 400);
     }
 }
