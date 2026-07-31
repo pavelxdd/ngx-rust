@@ -74,3 +74,19 @@ if [ $HTTP = YES ]; then
         ngx_rust_module
     fi
 fi
+
+if [ "$STREAM" != NO ]; then
+    ngx_module_type=STREAM
+    ngx_module_incs=
+    ngx_module_deps=
+    ngx_module_order=
+
+    ngx_rust_target_type=EXAMPLE
+    ngx_rust_target_name=stream
+    ngx_rust_target_features=stream
+
+    ngx_module_name=ngx_stream_probe_module
+    ngx_module_libs=
+
+    ngx_rust_module
+fi

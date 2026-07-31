@@ -62,6 +62,12 @@ name = "subrequest"
 path = "subrequest.rs"
 crate-type = ["cdylib"]
 
+[[example]]
+name = "stream"
+path = "stream.rs"
+crate-type = ["cdylib"]
+required-features = ["stream"]
+
 [features]
 default = ["export-modules", "ngx/vendored"]
 # Generate `ngx_modules` table with module exports
@@ -72,6 +78,7 @@ default = ["export-modules", "ngx/vendored"]
 export-modules = []
 async = ["dep:log", "ngx/async", "ngx/log"]
 linux = []
+stream = ["nginx-sys/stream", "ngx/stream"]
 
 [lints]
 workspace = true
