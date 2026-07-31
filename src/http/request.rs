@@ -234,6 +234,11 @@ impl Request {
         self.0.internal() != 0
     }
 
+    /// Number of additional nested subrequests nginx permits from this request.
+    pub fn subrequests_available(&self) -> u32 {
+        self.0.subrequests().saturating_sub(1)
+    }
+
     /// Main request associated with this request.
     pub fn main(&self) -> &Request {
         if self.is_main() {
@@ -993,6 +998,20 @@ mod tests {
 
         raw.set_internal(1);
         assert!(request_from(&mut raw).is_internal());
+    }
+
+    #[test]
+    fn subrequests_available_reports_the_remaining_nested_budget() {
+        let mut raw = zeroed_request();
+
+        raw.set_subrequests(3);
+        assert_eq!(request_from(&mut raw).subrequests_available(), 2);
+
+        raw.set_subrequests(1);
+        assert_eq!(request_from(&mut raw).subrequests_available(), 0);
+
+        raw.set_subrequests(0);
+        assert_eq!(request_from(&mut raw).subrequests_available(), 0);
     }
 
     #[test]
