@@ -45,6 +45,7 @@ targets = []
 [dependencies]
 async-task = { version = "4.7.1", optional = true }
 lock_api = "0.4.13"
+log = { version = "0.4.27", optional = true }
 nginx-sys = { path = "nginx-sys", version = "0.5.0"}
 pin-project-lite = { version = "0.2.16", optional = true }
 
@@ -54,7 +55,7 @@ features = ["alloc", "fresh-rust"]
 version = "0.4.0"
 
 [features]
-default = ["std"]
+default = ["std", "log"]
 # Enables a minimal async runtime built on top of the NGINX event loop.
 async = [
     "dep:async-task",
@@ -64,6 +65,15 @@ async = [
 serde = [
     "allocator-api2/serde",
 ]
+# Enables the `log` facade backed by the nginx cycle logger.
+log = [
+    "std",
+    "dep:log",
+]
+# Allows debug records to reach the nginx runtime filter.
+log-debug = ["log"]
+# Allows trace records to reach the nginx runtime filter.
+log-trace = ["log-debug"]
 # Provides APIs that require the standard library.
 std = [
     "allocator-api2/std"

@@ -21,7 +21,7 @@ use Test::Nginx;
 select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
-my $t = Test::Nginx->new()->has(qw/http/)->plan(3)
+my $t = Test::Nginx->new()->has(qw/http/)->plan(4)
 	->write_file_expand('nginx.conf', <<'EOF');
 
 %%TEST_GLOBALS%%
@@ -65,5 +65,6 @@ my $response = http_get('/index.html');
 like($response, qr/X-Async-Time:/, 'async handler');
 like($response, qr/X-Async-Subrequest-Status: 204/, 'async subrequest');
 unlike(http_get('/disabled'), qr/X-Async-Time:/, 'disabled async handler');
+like($t->read_file('error.log'), qr/async log facade initialized/, 'log facade');
 
 ###############################################################################
