@@ -12,6 +12,8 @@ use crate::ffi::*;
 pub enum MergeConfigError {
     /// No value provided for configuration argument
     NoValue,
+    /// Module-specific configuration error
+    Message(&'static str),
 }
 
 impl error::Error for MergeConfigError {}
@@ -20,7 +22,14 @@ impl fmt::Display for MergeConfigError {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match self {
             MergeConfigError::NoValue => "no value".fmt(fmt),
+            MergeConfigError::Message(message) => message.fmt(fmt),
         }
+    }
+}
+
+impl From<&'static str> for MergeConfigError {
+    fn from(message: &'static str) -> Self {
+        Self::Message(message)
     }
 }
 
@@ -32,7 +41,8 @@ pub trait Merge {
     /// Module merge function.
     ///
     /// # Returns
-    /// Result, Ok on success or MergeConfigError on failure.
+    /// Result, Ok on success or MergeConfigError on failure. Merge errors are written to the
+    /// configuration log before nginx rejects the configuration.
     fn merge(&mut self, prev: &Self) -> Result<(), MergeConfigError>;
 }
 
@@ -121,7 +131,7 @@ pub trait HttpModule {
     /// Callers should provide valid non-null `ngx_conf_t` arguments. Implementers must
     /// guard against null inputs or risk runtime errors.
     unsafe extern "C" fn merge_srv_conf(
-        _cf: *mut ngx_conf_t,
+        cf: *mut ngx_conf_t,
         prev: *mut c_void,
         conf: *mut c_void,
     ) -> *mut c_char
@@ -129,12 +139,17 @@ pub trait HttpModule {
         Self: super::HttpModuleServerConf,
         Self::ServerConf: Merge,
     {
-        unsafe {
-            let prev = &mut *(prev as *mut Self::ServerConf);
-            let conf = &mut *(conf as *mut Self::ServerConf);
-            match conf.merge(prev) {
-                Ok(_) => ptr::null_mut(),
-                Err(_) => NGX_CONF_ERROR as _,
+        let prev = unsafe { &*(prev as *mut Self::ServerConf) };
+        let conf = unsafe { &mut *(conf as *mut Self::ServerConf) };
+        match conf.merge(prev) {
+            Ok(_) => ptr::null_mut(),
+            Err(error) => {
+                crate::ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    cf,
+                    "failed to merge server configuration: {error}"
+                );
+                NGX_CONF_ERROR as _
             }
         }
     }
@@ -162,7 +177,7 @@ pub trait HttpModule {
     /// Callers should provide valid non-null `ngx_conf_t` arguments. Implementers must
     /// guard against null inputs or risk runtime errors.
     unsafe extern "C" fn merge_loc_conf(
-        _cf: *mut ngx_conf_t,
+        cf: *mut ngx_conf_t,
         prev: *mut c_void,
         conf: *mut c_void,
     ) -> *mut c_char
@@ -170,12 +185,17 @@ pub trait HttpModule {
         Self: super::HttpModuleLocationConf,
         Self::LocationConf: Merge,
     {
-        unsafe {
-            let prev = &mut *(prev as *mut Self::LocationConf);
-            let conf = &mut *(conf as *mut Self::LocationConf);
-            match conf.merge(prev) {
-                Ok(_) => ptr::null_mut(),
-                Err(_) => NGX_CONF_ERROR as _,
+        let prev = unsafe { &*(prev as *mut Self::LocationConf) };
+        let conf = unsafe { &mut *(conf as *mut Self::LocationConf) };
+        match conf.merge(prev) {
+            Ok(_) => ptr::null_mut(),
+            Err(error) => {
+                crate::ngx_conf_log_error!(
+                    NGX_LOG_EMERG,
+                    cf,
+                    "failed to merge location configuration: {error}"
+                );
+                NGX_CONF_ERROR as _
             }
         }
     }
