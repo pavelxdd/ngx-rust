@@ -394,9 +394,7 @@ impl Request {
         // a valid Nginx string is stored in `value` if it successfully returns.
         unsafe {
             let mut value = ngx_str_t::default();
-            if ngx_http_complex_value(r, val, &raw mut value) != NGX_OK as ngx_int_t {
-                return None;
-            }
+            Status(ngx_http_complex_value(r, val, &raw mut value)).into_result().ok()?;
             Some(NgxStr::from_ngx_str(value))
         }
     }

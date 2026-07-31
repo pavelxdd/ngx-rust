@@ -15,6 +15,15 @@ impl Status {
     pub fn is_ok(&self) -> bool {
         self == &Status::NGX_OK
     }
+
+    /// Converts this status into a result that accepts only [`Status::NGX_OK`].
+    ///
+    /// Statuses such as [`Status::NGX_AGAIN`], [`Status::NGX_DONE`], and
+    /// [`Status::NGX_DECLINED`] can represent normal control flow. Callers that accept them must
+    /// handle them before using this method.
+    pub fn into_result(self) -> Result<(), Self> {
+        if self.is_ok() { Ok(()) } else { Err(self) }
+    }
 }
 
 impl fmt::Debug for Status {
@@ -22,6 +31,14 @@ impl fmt::Debug for Status {
         fmt::Debug::fmt(&self.0, f)
     }
 }
+
+impl fmt::Display for Status {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "nginx status {}", self.0)
+    }
+}
+
+impl core::error::Error for Status {}
 
 impl From<Status> for ngx_int_t {
     fn from(val: Status) -> Self {
@@ -68,3 +85,33 @@ ngx_codes! {
 pub const NGX_CONF_ERROR: *mut c_char = ptr::null_mut::<c_char>().wrapping_offset(-1);
 /// Configuration handler succeeded.
 pub const NGX_CONF_OK: *mut c_char = ptr::null_mut();
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+
+    use alloc::string::ToString;
+
+    use super::*;
+
+    fn require_ok(status: Status) -> Result<(), Status> {
+        status.into_result()?;
+        Ok(())
+    }
+
+    #[test]
+    fn into_result_accepts_only_ngx_ok() {
+        assert_eq!(require_ok(Status::NGX_OK), Ok(()));
+        assert_eq!(require_ok(Status::NGX_ERROR), Err(Status::NGX_ERROR));
+        assert_eq!(require_ok(Status::NGX_AGAIN), Err(Status::NGX_AGAIN));
+        assert_eq!(require_ok(Status::NGX_DONE), Err(Status::NGX_DONE));
+        assert_eq!(require_ok(Status::NGX_DECLINED), Err(Status::NGX_DECLINED));
+    }
+
+    #[test]
+    fn status_implements_error() {
+        let error: &dyn core::error::Error = &Status::NGX_ERROR;
+
+        assert_eq!(error.to_string(), "nginx status -1");
+    }
+}

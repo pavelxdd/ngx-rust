@@ -187,12 +187,11 @@ impl<'a> Resolution<'a> {
         // cache, the handler may get called from this stack. Otherwise, it
         // will be called later by nginx when it gets a dns response or a
         // timeout.
-        let ret = unsafe { Status(ngx_resolve_name(ctxp.as_ptr())) };
-        if !ret.is_ok() {
+        unsafe { Status(ngx_resolve_name(ctxp.as_ptr())) }.into_result().map_err(|_| {
             // ngx_resolve_name will free the context on error.
             core::mem::forget(this.ctx.take());
-            return Err(Error::Internal);
-        }
+            Error::Internal
+        })?;
 
         Ok(this)
     }

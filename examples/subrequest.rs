@@ -185,9 +185,7 @@ fn send_subrequest_response(
 
     let response_status =
         unsafe { ngx_http_send_response(request.as_mut(), status.0, content_type, &raw mut value) };
-    if response_status != NGX_OK as ngx_int_t {
-        return Err(ExampleError::Response(response_status));
-    }
+    Status(response_status).into_result().map_err(|status| ExampleError::Response(status.0))?;
     Ok(status.into())
 }
 
