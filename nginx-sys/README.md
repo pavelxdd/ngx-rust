@@ -22,6 +22,13 @@ of the nginx build you are planning to use in production.
 and some OS distributions are known to ship nginx packages with API-breaking
 patches applied.
 
+Generated bindings expose nginx symbols and the external C types required by
+the nginx ABI. Types from OpenSSL, PCRE, libc, or another native dependency are
+generated from the headers selected by the configured nginx build. They are not
+replaced with types from other `-sys` crates, because those crates may select a
+different native library. Cast between such types only after verifying that both
+crates use the same headers and native library.
+
 ## Features
 
 - `http` - **Enabled** by default. Allows generation of bindings for the HTTP
