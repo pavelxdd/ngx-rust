@@ -180,3 +180,15 @@ pub trait HttpModule {
         }
     }
 }
+
+/// Associates one request-context type with an HTTP module.
+///
+/// # Safety
+///
+/// The module's request context slot must be null or point to a valid initialized
+/// [`RequestContext`](Self::RequestContext) value allocated with a cleanup handler from the
+/// request pool. The value must remain registered with that pool until it is removed.
+pub unsafe trait HttpModuleRequestContext: HttpModule {
+    /// Value stored in the module's per-request context slot.
+    type RequestContext;
+}
