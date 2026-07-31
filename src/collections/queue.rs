@@ -117,8 +117,9 @@ where
     ///
     /// # Safety
     ///
-    /// `entry` must not be linked into any other queue, and no references obtained through a
-    /// queue may exist while it is inserted.
+    /// `entry` must not be linked into any other queue and must remain valid at the same address
+    /// until it is removed. No references obtained through this queue may exist while it is
+    /// inserted.
     pub unsafe fn push_back(&mut self, entry: &mut T) {
         if self.head.prev.is_null() {
             unsafe { ngx_queue_init(&raw mut self.head) }
@@ -131,8 +132,9 @@ where
     ///
     /// # Safety
     ///
-    /// `entry` must not be linked into any other queue, and no references obtained through a
-    /// queue may exist while it is inserted.
+    /// `entry` must not be linked into any other queue and must remain valid at the same address
+    /// until it is removed. No references obtained through this queue may exist while it is
+    /// inserted.
     pub unsafe fn push_front(&mut self, entry: &mut T) {
         if self.head.prev.is_null() {
             unsafe { ngx_queue_init(&raw mut self.head) }
@@ -147,7 +149,11 @@ where
     }
 
     /// Returns a mutable iterator over the entries of the queue.
-    pub fn iter_mut(&mut self) -> NgxQueueIterMut<'_, T> {
+    ///
+    /// # Safety
+    ///
+    /// The caller must not modify queue links through the returned entries.
+    pub unsafe fn iter_mut(&mut self) -> NgxQueueIterMut<'_, T> {
         unsafe { NgxQueueIterMut::new(&mut self.head) }
     }
 }
