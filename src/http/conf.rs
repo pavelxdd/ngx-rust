@@ -41,16 +41,25 @@ pub trait HttpModuleConfExt {
 impl HttpModuleConfExt for crate::ffi::ngx_http_conf_ctx_t {
     #[inline]
     unsafe fn http_main_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
+        if self.main_conf.is_null() {
+            return None;
+        }
         NonNull::new(unsafe { *self.main_conf.add(module.ctx_index) }.cast())
     }
 
     #[inline]
     unsafe fn http_server_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
+        if self.srv_conf.is_null() {
+            return None;
+        }
         NonNull::new(unsafe { *self.srv_conf.add(module.ctx_index) }.cast())
     }
 
     #[inline]
     unsafe fn http_location_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
+        if self.loc_conf.is_null() {
+            return None;
+        }
         NonNull::new(unsafe { *self.loc_conf.add(module.ctx_index) }.cast())
     }
 }
@@ -58,6 +67,9 @@ impl HttpModuleConfExt for crate::ffi::ngx_http_conf_ctx_t {
 impl HttpModuleConfExt for crate::ffi::ngx_cycle_t {
     #[inline]
     unsafe fn http_main_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
+        if self.conf_ctx.is_null() {
+            return None;
+        }
         let http_conf = unsafe { self.conf_ctx.add(nginx_sys::ngx_http_module.index).as_ref()? };
         let conf_ctx = (*http_conf).cast::<ngx_http_conf_ctx_t>();
         unsafe { conf_ctx.as_ref()?.http_main_conf_unchecked(module) }
@@ -74,10 +86,7 @@ impl HttpModuleConfExt for crate::ffi::ngx_conf_t {
     #[inline]
     unsafe fn http_server_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
         let conf_ctx = self.ctx.cast::<ngx_http_conf_ctx_t>();
-        unsafe {
-            let conf_ctx = conf_ctx.as_ref()?;
-            NonNull::new((*conf_ctx.srv_conf.add(module.ctx_index)).cast())
-        }
+        unsafe { conf_ctx.as_ref()?.http_server_conf_unchecked(module) }
     }
 
     #[inline]
@@ -124,16 +133,25 @@ impl HttpModuleConfExt for ngx_http_core_srv_conf_t {
 impl HttpModuleConfExt for ngx_http_request_t {
     #[inline]
     unsafe fn http_main_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
+        if self.main_conf.is_null() {
+            return None;
+        }
         NonNull::new(unsafe { *self.main_conf.add(module.ctx_index) }.cast())
     }
 
     #[inline]
     unsafe fn http_server_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
+        if self.srv_conf.is_null() {
+            return None;
+        }
         NonNull::new(unsafe { *self.srv_conf.add(module.ctx_index) }.cast())
     }
 
     #[inline]
     unsafe fn http_location_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
+        if self.loc_conf.is_null() {
+            return None;
+        }
         NonNull::new(unsafe { *self.loc_conf.add(module.ctx_index) }.cast())
     }
 }
@@ -409,3 +427,36 @@ mod http_v3 {
 
 #[cfg(ngx_feature = "http_v3")]
 pub use http_v3::NgxHttpV3Module;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_conf_slot_arrays_return_none() {
+        let ctx: ngx_http_conf_ctx_t = unsafe { ::core::mem::zeroed() };
+        let module: ngx_module_t = unsafe { ::core::mem::zeroed() };
+
+        assert_eq!(unsafe { ctx.http_main_conf_unchecked::<u8>(&module) }, None);
+        assert_eq!(unsafe { ctx.http_server_conf_unchecked::<u8>(&module) }, None);
+        assert_eq!(unsafe { ctx.http_location_conf_unchecked::<u8>(&module) }, None);
+    }
+
+    #[test]
+    fn null_request_slot_arrays_return_none() {
+        let request: ngx_http_request_t = unsafe { ::core::mem::zeroed() };
+        let module: ngx_module_t = unsafe { ::core::mem::zeroed() };
+
+        assert_eq!(unsafe { request.http_main_conf_unchecked::<u8>(&module) }, None);
+        assert_eq!(unsafe { request.http_server_conf_unchecked::<u8>(&module) }, None);
+        assert_eq!(unsafe { request.http_location_conf_unchecked::<u8>(&module) }, None);
+    }
+
+    #[test]
+    fn null_cycle_slot_array_returns_none() {
+        let cycle: crate::ffi::ngx_cycle_t = unsafe { ::core::mem::zeroed() };
+        let module: ngx_module_t = unsafe { ::core::mem::zeroed() };
+
+        assert_eq!(unsafe { cycle.http_main_conf_unchecked::<u8>(&module) }, None);
+    }
+}
