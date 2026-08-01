@@ -27,7 +27,8 @@ pub const LOG_BUFFER_SIZE: usize = NGX_MAX_ERROR_STR - b"1970/01/01 00:00:00 [in
 /// The function may panic if you call it before the main() in nginx creates an initial cycle.
 #[inline(always)]
 pub fn ngx_cycle_log() -> NonNull<ngx_log_t> {
-    NonNull::new(unsafe { (*nginx_sys::ngx_cycle).log }).expect("global logger")
+    let cycle = NonNull::new(unsafe { nginx_sys::ngx_cycle }).expect("global cycle");
+    NonNull::new(unsafe { cycle.as_ref().log }).expect("global logger")
 }
 
 /// Utility function to provide typed checking of the mask's field state.
@@ -319,6 +320,13 @@ mod tests {
                 == crate::ffi::NGX_LOG_DEBUG_LAST
         );
     }
+
+    #[test]
+    #[should_panic(expected = "global cycle")]
+    fn cycle_logger_panics_before_nginx_initialization() {
+        ngx_cycle_log();
+    }
+
     #[test]
     fn test_check_mask() {
         struct MockLog {
