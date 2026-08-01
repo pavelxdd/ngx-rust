@@ -90,9 +90,10 @@ impl ngx_str_t {
     /// avoid indeterminate behavior.
     ///
     /// # Returns
-    /// An `ngx_str_t` instance representing the given string slice.
-    pub unsafe fn from_str(pool: *mut ngx_pool_t, data: &str) -> Self {
-        unsafe { ngx_str_t { data: detail::str_to_uchar(pool, data), len: data.len() } }
+    /// An `ngx_str_t` instance representing the given string slice, or `None` if allocation fails.
+    pub unsafe fn from_str(pool: *mut ngx_pool_t, data: &str) -> Option<Self> {
+        let len = data.len();
+        unsafe { detail::str_to_uchar(pool, data).map(|data| ngx_str_t { data, len }) }
     }
 
     /// Divides one `ngx_str_t` into two at an index.
@@ -204,6 +205,13 @@ impl Ord for ngx_str_t {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_pool_allocation_is_fallible() {
+        let _: unsafe fn(*mut ngx_pool_t, &str) -> Option<*mut crate::u_char> =
+            detail::str_to_uchar;
+        let _: unsafe fn(*mut ngx_pool_t, &str) -> Option<ngx_str_t> = ngx_str_t::from_str;
+    }
 
     #[test]
     fn ngx_str_prefix() {

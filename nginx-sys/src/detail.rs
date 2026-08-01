@@ -33,7 +33,7 @@ pub unsafe fn bytes_to_uchar(pool: *mut ngx_pool_t, data: &[u8]) -> Option<*mut 
 /// allocation using `ngx_pnalloc`.
 ///
 /// # Returns
-/// A raw pointer (`*mut u_char`) to the allocated memory containing the converted string data.
+/// The allocated string data, or `None` if the pool allocation fails.
 ///
 /// # Example
 /// ```rust,ignore
@@ -41,11 +41,8 @@ pub unsafe fn bytes_to_uchar(pool: *mut ngx_pool_t, data: &[u8]) -> Option<*mut 
 /// let data: &str = "example"; // The string to convert
 /// let ptr = str_to_uchar(pool, data);
 /// ```
-pub unsafe fn str_to_uchar(pool: *mut ngx_pool_t, data: &str) -> *mut u_char {
-    let ptr: *mut u_char = unsafe { ngx_pnalloc(pool, data.len()) as _ };
-    debug_assert!(!ptr.is_null());
-    unsafe { copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
-    ptr
+pub unsafe fn str_to_uchar(pool: *mut ngx_pool_t, data: &str) -> Option<*mut u_char> {
+    unsafe { bytes_to_uchar(pool, data.as_bytes()) }
 }
 
 #[inline]
