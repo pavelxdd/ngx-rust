@@ -110,6 +110,17 @@ impl Default for SharedDictMainConfig {
     }
 }
 
+impl SharedDictMainConfig {
+    fn shm_zone(&self) -> Option<&ngx_shm_zone_t> {
+        unsafe { self.shm_zone.as_ref() }
+    }
+}
+
+fn variable_name(name: ngx_str_t) -> Option<ngx_str_t> {
+    let name = name.strip_prefix(b"$")?;
+    (!name.is_empty()).then_some(name)
+}
+
 extern "C" fn ngx_http_shared_dict_add_zone(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -216,15 +227,10 @@ extern "C" fn ngx_http_shared_dict_add_variable(
         return NGX_CONF_ERROR;
     }
 
-    let mut name = args[2];
-
-    if name.as_bytes()[0] != b'$' {
-        ngx_conf_log_error!(NGX_LOG_EMERG, cf, "invalid variable name \"{name}\"");
+    let Some(mut name) = variable_name(args[2]) else {
+        ngx_conf_log_error!(NGX_LOG_EMERG, cf, "invalid variable name \"{}\"", args[2]);
         return NGX_CONF_ERROR;
-    }
-
-    name.data = unsafe { name.data.add(1) };
-    name.len -= 1;
+    };
 
     let var = unsafe {
         ngx_http_add_variable(
@@ -261,13 +267,23 @@ extern "C" fn ngx_http_shared_dict_get_variable(
 
     let key = unsafe { NgxStr::from_ngx_str(key) };
     let smcf = HttpSharedDictModule::main_conf(r).expect("shared dict main config");
+    let Some(shm_zone) = smcf.shm_zone() else {
+        v.set_not_found(1);
+        return Status::NGX_OK.into();
+    };
 
-    let Ok(shared) = ngx_http_shared_dict_get_shared(unsafe { &*smcf.shm_zone }) else {
+    let Ok(shared) = ngx_http_shared_dict_get_shared(shm_zone) else {
         return Status::NGX_ERROR.into();
     };
 
-    let value =
-        shared.read().get(key).and_then(|x| unsafe { ngx_str_t::from_bytes(r.pool, x.as_bytes()) });
+    let value = {
+        let dict = shared.read();
+        let Some(value) = dict.get(key) else {
+            v.set_not_found(1);
+            return Status::NGX_OK.into();
+        };
+        unsafe { ngx_str_t::from_bytes(r.pool, value.as_bytes()) }
+    };
 
     ngx_log_debug!(
         unsafe { (*r.connection).log },
@@ -278,10 +294,7 @@ extern "C" fn ngx_http_shared_dict_get_variable(
         unsafe { nginx_sys::ngx_pid },
     );
 
-    let Some(value) = value else {
-        v.set_not_found(1);
-        return Status::NGX_ERROR.into();
-    };
+    let Some(value) = value else { return Status::NGX_ERROR.into() };
 
     v.data = value.data;
     v.set_len(value.len as _);
@@ -307,7 +320,8 @@ extern "C" fn ngx_http_shared_dict_set_variable(
     }
 
     let smcf = HttpSharedDictModule::main_conf(r).expect("shared dict main config");
-    let Ok(shared) = ngx_http_shared_dict_get_shared(unsafe { &*smcf.shm_zone }) else {
+    let Some(shm_zone) = smcf.shm_zone() else { return };
+    let Ok(shared) = ngx_http_shared_dict_get_shared(shm_zone) else {
         return;
     };
 
@@ -324,7 +338,7 @@ extern "C" fn ngx_http_shared_dict_set_variable(
 
         let _ = shared.write().remove(key);
     } else {
-        let alloc = unsafe { SlabPool::from_shm_zone(&*smcf.shm_zone).expect("slab pool") };
+        let alloc = unsafe { SlabPool::from_shm_zone(shm_zone).expect("slab pool") };
 
         let Ok(key) = NgxString::try_from_bytes_in(key.as_bytes(), alloc.clone()) else {
             return;
@@ -361,7 +375,11 @@ extern "C" fn ngx_http_shared_dict_get_entries(
 
     ngx_log_debug!(unsafe { (*r.connection).log }, "shared dict: get all entries");
 
-    let Ok(shared) = ngx_http_shared_dict_get_shared(unsafe { &*smcf.shm_zone }) else {
+    let Some(shm_zone) = smcf.shm_zone() else {
+        v.set_not_found(1);
+        return Status::NGX_OK.into();
+    };
+    let Ok(shared) = ngx_http_shared_dict_get_shared(shm_zone) else {
         return Status::NGX_ERROR.into();
     };
 
@@ -417,7 +435,8 @@ extern "C" fn ngx_http_shared_dict_set_entries(
 
     ngx_log_debug!(unsafe { (*r.connection).log }, "shared dict: clear");
 
-    let Ok(shared) = ngx_http_shared_dict_get_shared(unsafe { &*smcf.shm_zone }) else {
+    let Some(shm_zone) = smcf.shm_zone() else { return };
+    let Ok(shared) = ngx_http_shared_dict_get_shared(shm_zone) else {
         return;
     };
 
@@ -428,4 +447,23 @@ extern "C" fn ngx_http_shared_dict_set_entries(
     // This would check both .clear() and the drop implementation
     *shared.write() = tree;
     // shared.write().clear()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn variable_name_requires_a_nonempty_dollar_prefixed_name() {
+        let name = variable_name(ngx_string!("$value")).unwrap();
+        assert_eq!(name.as_bytes(), b"value");
+        assert!(variable_name(ngx_string!("")).is_none());
+        assert!(variable_name(ngx_string!("$")).is_none());
+        assert!(variable_name(ngx_string!("value")).is_none());
+    }
+
+    #[test]
+    fn default_config_has_no_shared_memory_zone() {
+        assert!(SharedDictMainConfig::default().shm_zone().is_none());
+    }
 }
