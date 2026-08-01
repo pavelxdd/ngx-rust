@@ -312,8 +312,11 @@ impl HttpRequestHandler for AwsSigV4HeaderHandler {
             s.sign()
         };
 
-        request.add_header_in("authorization", signature.as_str());
-        request.add_header_in("X-Amz-Date", datetime_now.as_str());
+        if request.add_header_in("authorization", signature.as_str()).is_none()
+            || request.add_header_in("X-Amz-Date", datetime_now.as_str()).is_none()
+        {
+            return Status::NGX_ERROR;
+        }
 
         for (name, value) in request.headers_out_iterator() {
             ngx_log_debug_http!(request, "headers_out {name}: {value}",);
