@@ -698,8 +698,26 @@ impl Method {
         }
     }
 
-    fn from_bytes(_t: &[u8]) -> Result<Method, InvalidMethod> {
-        todo!()
+    fn from_bytes(t: &[u8]) -> Result<Method, InvalidMethod> {
+        match t {
+            b"GET" => Ok(Self::GET),
+            b"HEAD" => Ok(Self::HEAD),
+            b"POST" => Ok(Self::POST),
+            b"PUT" => Ok(Self::PUT),
+            b"DELETE" => Ok(Self::DELETE),
+            b"MKCOL" => Ok(Self::MKCOL),
+            b"COPY" => Ok(Self::COPY),
+            b"MOVE" => Ok(Self::MOVE),
+            b"OPTIONS" => Ok(Self::OPTIONS),
+            b"PROPFIND" => Ok(Self::PROPFIND),
+            b"PROPPATCH" => Ok(Self::PROPPATCH),
+            b"LOCK" => Ok(Self::LOCK),
+            b"UNLOCK" => Ok(Self::UNLOCK),
+            b"PATCH" => Ok(Self::PATCH),
+            b"TRACE" => Ok(Self::TRACE),
+            b"CONNECT" => Ok(Self::CONNECT),
+            _ => Err(InvalidMethod::new()),
+        }
     }
 
     fn from_ngx(t: ngx_uint_t) -> Method {
@@ -823,7 +841,6 @@ impl FromStr for Method {
 }
 
 impl InvalidMethod {
-    #[allow(dead_code)]
     fn new() -> InvalidMethod {
         InvalidMethod { _priv: () }
     }
@@ -1096,5 +1113,37 @@ mod tests {
         raw.headers_out.status = 204;
 
         assert_eq!(request_from(&mut raw).status(), Some(HTTPStatus::NO_CONTENT));
+    }
+
+    #[test]
+    fn method_parses_supported_tokens() {
+        let methods = [
+            ("GET", Method::GET),
+            ("HEAD", Method::HEAD),
+            ("POST", Method::POST),
+            ("PUT", Method::PUT),
+            ("DELETE", Method::DELETE),
+            ("MKCOL", Method::MKCOL),
+            ("COPY", Method::COPY),
+            ("MOVE", Method::MOVE),
+            ("OPTIONS", Method::OPTIONS),
+            ("PROPFIND", Method::PROPFIND),
+            ("PROPPATCH", Method::PROPPATCH),
+            ("LOCK", Method::LOCK),
+            ("UNLOCK", Method::UNLOCK),
+            ("PATCH", Method::PATCH),
+            ("TRACE", Method::TRACE),
+            ("CONNECT", Method::CONNECT),
+        ];
+
+        for (token, expected) in methods {
+            assert_eq!(Method::try_from(token).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn method_rejects_unknown_or_lowercase_tokens() {
+        assert!(Method::try_from("UNKNOWN").is_err());
+        assert!(Method::try_from("get").is_err());
     }
 }
