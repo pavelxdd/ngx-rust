@@ -229,7 +229,7 @@ impl TryFrom<u32> for DebugMask {
             crate::ffi::NGX_LOG_DEBUG_MAIL => Ok(DebugMask::Mail),
             crate::ffi::NGX_LOG_DEBUG_STREAM => Ok(DebugMask::Stream),
             crate::ffi::NGX_LOG_DEBUG_ALL => Ok(DebugMask::All),
-            _ => Err(0),
+            _ => Err(value),
         }
     }
 }
@@ -320,6 +320,13 @@ mod tests {
 
         r = check_mask(DebugMask::Alloc, mock.log_level);
         assert!(!r);
+    }
+
+    #[test]
+    fn invalid_debug_mask_returns_input() {
+        let invalid = 0x1234_5678;
+
+        assert!(matches!(DebugMask::try_from(invalid), Err(value) if value == invalid));
     }
 
     #[test]
