@@ -14,6 +14,16 @@ use crate::{ngx_container_of, ngx_log_debug};
 /// Maximum duration that can be achieved using [ngx_add_timer].
 const NGX_TIMER_DURATION_MAX: Duration = Duration::from_millis(ngx_msec_int_t::MAX as _);
 
+#[cfg(any(test, target_pointer_width = "32"))]
+fn advance_timer(remaining: &mut Duration, elapsed: Duration) -> Option<ngx_msec_t> {
+    if *remaining <= elapsed {
+        return None;
+    }
+
+    *remaining = remaining.saturating_sub(elapsed);
+    Some((*remaining).min(NGX_TIMER_DURATION_MAX).as_millis() as ngx_msec_t)
+}
+
 /// Puts the current task to sleep for at least the specified amount of time.
 ///
 /// The function is a shorthand for [Sleep::new] using the global logger for debug output.
@@ -72,13 +82,13 @@ impl Future for Sleep {
         let mut this = self.project();
         // Handle ngx_msec_t overflow on 32-bit platforms.
         match this.timer.as_mut().poll_sleep(step.as_millis() as _, cx) {
-            // Last step
-            Poll::Ready(()) if this.duration == &step => Poll::Ready(()),
-            Poll::Ready(()) => {
-                *this.duration = this.duration.saturating_sub(step);
-                this.timer.as_mut().rearm();
-                this.timer.as_mut().poll_sleep(step.as_millis() as _, cx)
-            }
+            Poll::Ready(()) => match advance_timer(this.duration, step) {
+                None => Poll::Ready(()),
+                Some(next) => {
+                    this.timer.as_mut().rearm();
+                    this.timer.as_mut().poll_sleep(next, cx)
+                }
+            },
             x => x,
         }
     }
@@ -150,5 +160,20 @@ impl Drop for TimerEvent {
         if self.event.timer_set() != 0 {
             unsafe { ngx_del_timer(&raw mut self.event) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timer_remainder_uses_shorter_final_step() {
+        let mut remaining = NGX_TIMER_DURATION_MAX + Duration::from_millis(1);
+
+        let next = advance_timer(&mut remaining, NGX_TIMER_DURATION_MAX);
+
+        assert_eq!(remaining, Duration::from_millis(1));
+        assert_eq!(next, Some(1));
     }
 }
