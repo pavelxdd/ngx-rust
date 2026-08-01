@@ -37,7 +37,7 @@ impl http::HttpModule for Module {
 
 #[derive(Debug, Default)]
 struct ModuleConfig {
-    enable: bool,
+    enable: Option<bool>,
 }
 
 unsafe impl HttpModuleLocationConf for Module {
@@ -94,9 +94,7 @@ unsafe extern "C" fn ngx_http_async_init_process(_cycle: *mut ngx_cycle_t) -> ng
 
 impl http::Merge for ModuleConfig {
     fn merge(&mut self, prev: &ModuleConfig) -> Result<(), MergeConfigError> {
-        if prev.enable {
-            self.enable = true;
-        };
+        self.enable = self.enable.or(prev.enable).or(Some(false));
         Ok(())
     }
 }
@@ -182,8 +180,8 @@ impl AsyncHttpRequestHandler for AsyncAccessHandler {
         request: &mut http::Request,
     ) -> impl core::future::Future<Output = Self::Output> + 'static {
         let co = Module::location_conf(request).expect("module config is none");
-        ngx_log_debug_http!(request, "async module enabled: {}", co.enable);
-        let enabled = co.enable;
+        let enabled = co.enable.unwrap_or(false);
+        ngx_log_debug_http!(request, "async module enabled: {enabled}");
         let subrequest = enabled.then(|| {
             let started = Instant::now();
             SubRequestBuilder::new(request, "/async-target")
@@ -257,15 +255,40 @@ extern "C" fn ngx_http_async_commands_set_enable(
             }
         };
 
-        // set default value optionally
-        conf.enable = false;
-
         if val.eq_ignore_ascii_case("on") {
-            conf.enable = true;
+            conf.enable = Some(true);
         } else if val.eq_ignore_ascii_case("off") {
-            conf.enable = false;
+            conf.enable = Some(false);
+        } else {
+            ngx_conf_log_error!(NGX_LOG_EMERG, cf, "invalid value \"{val}\" in `async` directive");
+            return ngx::core::NGX_CONF_ERROR;
         }
     };
 
     ngx::core::NGX_CONF_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_disabled_child_overrides_enabled_parent() {
+        let parent = ModuleConfig { enable: Some(true) };
+        let mut child = ModuleConfig { enable: Some(false) };
+
+        http::Merge::merge(&mut child, &parent).unwrap();
+
+        assert_eq!(child.enable, Some(false));
+    }
+
+    #[test]
+    fn unset_child_inherits_parent() {
+        let parent = ModuleConfig { enable: Some(true) };
+        let mut child = ModuleConfig::default();
+
+        http::Merge::merge(&mut child, &parent).unwrap();
+
+        assert_eq!(child.enable, Some(true));
+    }
 }

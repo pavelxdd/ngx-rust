@@ -29,7 +29,7 @@ impl HttpModule for Module {
 
 #[derive(Debug, Default)]
 struct ModuleConfig {
-    enable: bool,
+    enable: Option<bool>,
     access_key: String,
     secret_key: String,
     s3_bucket: String,
@@ -112,15 +112,14 @@ pub static mut ngx_http_awssigv4_module: ngx_module_t = ngx_module_t {
 
 impl Merge for ModuleConfig {
     fn merge(&mut self, prev: &ModuleConfig) -> Result<(), MergeConfigError> {
-        if prev.enable {
-            self.enable = true;
-        };
+        self.enable = self.enable.or(prev.enable).or(Some(false));
+        let enabled = self.enable.unwrap_or(false);
 
         if self.access_key.is_empty() {
             self.access_key =
                 String::from(if !prev.access_key.is_empty() { &prev.access_key } else { "" });
         }
-        if self.enable && self.access_key.is_empty() {
+        if enabled && self.access_key.is_empty() {
             return Err("awssigv4_access_key is required when awssigv4 is enabled".into());
         }
 
@@ -128,7 +127,7 @@ impl Merge for ModuleConfig {
             self.secret_key =
                 String::from(if !prev.secret_key.is_empty() { &prev.secret_key } else { "" });
         }
-        if self.enable && self.secret_key.is_empty() {
+        if enabled && self.secret_key.is_empty() {
             return Err("awssigv4_secret_key is required when awssigv4 is enabled".into());
         }
 
@@ -136,7 +135,7 @@ impl Merge for ModuleConfig {
             self.s3_bucket =
                 String::from(if !prev.s3_bucket.is_empty() { &prev.s3_bucket } else { "" });
         }
-        if self.enable && self.s3_bucket.is_empty() {
+        if enabled && self.s3_bucket.is_empty() {
             return Err("awssigv4_s3_bucket is required when awssigv4 is enabled".into());
         }
 
@@ -167,13 +166,17 @@ extern "C" fn ngx_http_awssigv4_commands_set_enable(
             }
         };
 
-        // set default value optionally
-        conf.enable = false;
-
         if val.len() == 2 && val.eq_ignore_ascii_case("on") {
-            conf.enable = true;
+            conf.enable = Some(true);
         } else if val.len() == 3 && val.eq_ignore_ascii_case("off") {
-            conf.enable = false;
+            conf.enable = Some(false);
+        } else {
+            ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                cf,
+                "invalid value \"{val}\" in `awssigv4` directive"
+            );
+            return ngx::core::NGX_CONF_ERROR;
         }
     };
 
@@ -250,9 +253,9 @@ impl HttpRequestHandler for AwsSigV4HeaderHandler {
         // get Module Config from request
         let conf = Module::location_conf(request).expect("module conf");
         ngx_log_debug_http!(request, "AWS signature V4 module {}", {
-            if conf.enable { "enabled" } else { "disabled" }
+            if conf.enable.unwrap_or(false) { "enabled" } else { "disabled" }
         });
-        if !conf.enable {
+        if !conf.enable.unwrap_or(false) {
             return Status::NGX_DECLINED;
         }
 
@@ -320,5 +323,36 @@ impl HttpRequestHandler for AwsSigV4HeaderHandler {
         }
 
         Status::NGX_OK
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_disabled_child_overrides_enabled_parent() {
+        let parent = ModuleConfig { enable: Some(true), ..ModuleConfig::default() };
+        let mut child = ModuleConfig { enable: Some(false), ..ModuleConfig::default() };
+
+        child.merge(&parent).unwrap();
+
+        assert_eq!(child.enable, Some(false));
+    }
+
+    #[test]
+    fn unset_child_inherits_parent() {
+        let parent = ModuleConfig {
+            enable: Some(true),
+            access_key: "access".into(),
+            secret_key: "secret".into(),
+            s3_bucket: "bucket".into(),
+            ..ModuleConfig::default()
+        };
+        let mut child = ModuleConfig::default();
+
+        child.merge(&parent).unwrap();
+
+        assert_eq!(child.enable, Some(true));
     }
 }
