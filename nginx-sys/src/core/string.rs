@@ -13,6 +13,17 @@ impl ngx_str_t {
     ///
     /// The returned slice will **not** contain the optional nul terminator that `ngx_str_t.data`
     /// may have.
+    ///
+    /// The slice borrows the `ngx_str_t`; it cannot be created from an owned value with an
+    /// unrelated lifetime.
+    ///
+    /// ```compile_fail
+    /// use nginx_sys::ngx_str_t;
+    ///
+    /// fn into_static(value: ngx_str_t) -> &'static [u8] {
+    ///     value.into()
+    /// }
+    /// ```
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         if self.is_empty() {
@@ -164,15 +175,6 @@ impl fmt::Display for ngx_str_t {
     }
 }
 
-impl From<ngx_str_t> for &[u8] {
-    fn from(s: ngx_str_t) -> Self {
-        if s.len == 0 || s.data.is_null() {
-            return Default::default();
-        }
-        unsafe { slice::from_raw_parts(s.data, s.len) }
-    }
-}
-
 impl hash::Hash for ngx_str_t {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
         self.as_bytes().hash(state)
@@ -196,14 +198,6 @@ impl PartialOrd<Self> for ngx_str_t {
 impl Ord for ngx_str_t {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         Ord::cmp(self.as_bytes(), other.as_bytes())
-    }
-}
-
-impl TryFrom<ngx_str_t> for &str {
-    type Error = str::Utf8Error;
-
-    fn try_from(s: ngx_str_t) -> Result<Self, Self::Error> {
-        str::from_utf8(s.into())
     }
 }
 
