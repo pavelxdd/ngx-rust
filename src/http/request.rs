@@ -398,11 +398,19 @@ impl Request {
     /// Get the value of a [complex value].
     ///
     /// [complex value]: https://nginx.org/en/docs/dev/development_guide.html#http_complex_values
-    pub fn get_complex_value(&self, cv: &ngx_http_complex_value_t) -> Option<&NgxStr> {
-        let r = (self as *const Request as *mut Request).cast();
+    ///
+    /// ```compile_fail
+    /// # use ngx::ffi::ngx_http_complex_value_t;
+    /// # use ngx::http::Request;
+    /// # fn evaluate(request: &Request, value: &ngx_http_complex_value_t) {
+    /// let _ = request.get_complex_value(value);
+    /// # }
+    /// ```
+    pub fn get_complex_value(&mut self, cv: &ngx_http_complex_value_t) -> Option<&NgxStr> {
+        let r = (&raw mut self.0).cast();
         let val = cv as *const ngx_http_complex_value_t as *mut ngx_http_complex_value_t;
-        // SAFETY: `ngx_http_complex_value` does not mutate `r` or `val` and guarentees that
-        // a valid Nginx string is stored in `value` if it successfully returns.
+        // SAFETY: `r` is exclusively borrowed, `val` remains valid for the call, and nginx stores
+        // a valid pool-owned string in `value` when the call succeeds.
         unsafe {
             let mut value = ngx_str_t::default();
             Status(ngx_http_complex_value(r, val, &raw mut value)).into_result().ok()?;
@@ -513,26 +521,26 @@ impl Request {
         unsafe { Status(ngx_http_output_filter(&raw mut self.0, body)) }
     }
 
-    /// Perform internal redirect to a location
-    pub fn internal_redirect(&self, location: &str) -> Status {
+    /// Perform internal redirect to a location.
+    ///
+    /// ```compile_fail
+    /// # use ngx::http::Request;
+    /// # fn redirect(request: &Request) {
+    /// let _ = request.internal_redirect("/next");
+    /// # }
+    /// ```
+    pub fn internal_redirect(&mut self, location: &str) -> Status {
         assert!(!location.is_empty(), "uri location is empty");
-        let uri_ptr = unsafe { &mut ngx_str_t::from_str(self.0.pool, location) as *mut _ };
+        let mut uri = unsafe { ngx_str_t::from_str(self.0.pool, location) };
 
-        // FIXME: check status of ngx_http_named_location or ngx_http_internal_redirect
-        if location.starts_with('@') {
-            unsafe {
-                ngx_http_named_location((self as *const Request as *mut Request).cast(), uri_ptr);
-            }
+        let status = if location.starts_with('@') {
+            unsafe { ngx_http_named_location(&raw mut self.0, &raw mut uri) }
         } else {
             unsafe {
-                ngx_http_internal_redirect(
-                    (self as *const Request as *mut Request).cast(),
-                    uri_ptr,
-                    core::ptr::null_mut(),
-                );
+                ngx_http_internal_redirect(&raw mut self.0, &raw mut uri, core::ptr::null_mut())
             }
-        }
-        Status::NGX_DONE
+        };
+        Status(status)
     }
 
     /// Iterate over headers_in
