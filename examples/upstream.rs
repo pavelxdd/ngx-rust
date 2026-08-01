@@ -10,11 +10,11 @@ use core::ffi::{c_char, c_void};
 use core::mem;
 use core::ptr;
 
-use ngx::core::{Pool, Status};
+use ngx::core::Status;
 use ngx::ffi::{
-    NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_CONF_UNSET, NGX_ERROR, NGX_HTTP_MODULE,
-    NGX_HTTP_SRV_CONF_OFFSET, NGX_HTTP_UPS_CONF, NGX_LOG_EMERG, ngx_atoi, ngx_command_t,
-    ngx_conf_t, ngx_connection_t, ngx_event_free_peer_pt, ngx_event_get_peer_pt, ngx_http_module_t,
+    NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_ERROR, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF_OFFSET,
+    NGX_HTTP_UPS_CONF, NGX_LOG_EMERG, ngx_atoi, ngx_command_t, ngx_conf_t, ngx_connection_t,
+    ngx_event_free_peer_pt, ngx_event_get_peer_pt, ngx_http_module_t,
     ngx_http_upstream_init_peer_pt, ngx_http_upstream_init_pt, ngx_http_upstream_init_round_robin,
     ngx_http_upstream_srv_conf_t, ngx_http_upstream_t, ngx_int_t, ngx_module_t,
     ngx_peer_connection_t, ngx_str_t, ngx_uint_t,
@@ -310,28 +310,6 @@ struct Module;
 impl HttpModule for Module {
     fn module() -> &'static ngx_module_t {
         unsafe { &*::core::ptr::addr_of!(ngx_http_upstream_custom_module) }
-    }
-
-    unsafe extern "C" fn create_srv_conf(cf: *mut ngx_conf_t) -> *mut c_void {
-        let pool = unsafe { Pool::from_ngx_pool((*cf).pool) };
-        let conf = pool.alloc_type::<SrvConfig>();
-        if conf.is_null() {
-            ngx_conf_log_error!(
-                NGX_LOG_EMERG,
-                cf,
-                "CUSTOM UPSTREAM could not allocate memory for config"
-            );
-            return ptr::null_mut();
-        }
-
-        unsafe { (*conf).max = NGX_CONF_UNSET as u32 };
-
-        ngx_log_debug_mask!(
-            DebugMask::Http,
-            unsafe { (*cf).log },
-            "CUSTOM UPSTREAM end create_srv_conf"
-        );
-        conf as *mut c_void
     }
 }
 
