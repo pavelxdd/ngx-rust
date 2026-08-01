@@ -272,24 +272,26 @@ mod core {
     }
 
     /// HTTP phases in which a module can register handlers.
+    ///
+    /// Internal engine phases do not have handler arrays and are intentionally unavailable.
+    ///
+    /// ```compile_fail
+    /// use ngx::http::HttpPhase;
+    ///
+    /// let _ = HttpPhase::FindConfig;
+    /// ```
     #[repr(usize)]
     pub enum HttpPhase {
         /// Post-read phase
         PostRead = crate::ffi::ngx_http_phases_NGX_HTTP_POST_READ_PHASE as _,
         /// Server rewrite phase
         ServerRewrite = crate::ffi::ngx_http_phases_NGX_HTTP_SERVER_REWRITE_PHASE as _,
-        /// Find configuration phase
-        FindConfig = crate::ffi::ngx_http_phases_NGX_HTTP_FIND_CONFIG_PHASE as _,
         /// Rewrite phase
         Rewrite = crate::ffi::ngx_http_phases_NGX_HTTP_REWRITE_PHASE as _,
-        /// Post-rewrite phase
-        PostRewrite = crate::ffi::ngx_http_phases_NGX_HTTP_POST_REWRITE_PHASE as _,
         /// Pre-access phase
         Preaccess = crate::ffi::ngx_http_phases_NGX_HTTP_PREACCESS_PHASE as _,
         /// Access phase
         Access = crate::ffi::ngx_http_phases_NGX_HTTP_ACCESS_PHASE as _,
-        /// Post-access phase
-        PostAccess = crate::ffi::ngx_http_phases_NGX_HTTP_POST_ACCESS_PHASE as _,
         /// Pre-content phase
         PreContent = crate::ffi::ngx_http_phases_NGX_HTTP_PRECONTENT_PHASE as _,
         /// Content phase
