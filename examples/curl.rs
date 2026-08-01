@@ -21,7 +21,7 @@ impl HttpModule for Module {
 
 #[derive(Debug, Default)]
 struct ModuleConfig {
-    enable: bool,
+    enable: Option<bool>,
 }
 
 unsafe impl HttpModuleLocationConf for Module {
@@ -68,9 +68,7 @@ pub static mut ngx_http_curl_module: ngx_module_t = ngx_module_t {
 
 impl Merge for ModuleConfig {
     fn merge(&mut self, prev: &ModuleConfig) -> Result<(), MergeConfigError> {
-        if prev.enable {
-            self.enable = true;
-        };
+        self.enable = self.enable.or(prev.enable).or(Some(false));
         Ok(())
     }
 }
@@ -84,17 +82,14 @@ impl HttpRequestHandler for CurlRequestHandler {
     fn handler(request: &mut Request) -> Self::Output {
         let co = Module::location_conf(request).expect("module config is none");
 
-        ngx_log_debug_http!(request, "curl module enabled: {}", co.enable);
+        ngx_log_debug_http!(request, "curl module enabled: {}", co.enable.unwrap_or(false));
 
-        match co.enable {
-            true => {
-                if request.user_agent().is_some_and(|ua| ua.as_bytes().starts_with(b"curl")) {
-                    HTTPStatus::FORBIDDEN.into()
-                } else {
-                    Status::NGX_DECLINED
-                }
-            }
-            false => Status::NGX_DECLINED,
+        if co.enable.unwrap_or(false)
+            && request.user_agent().is_some_and(|ua| ua.as_bytes().starts_with(b"curl"))
+        {
+            HTTPStatus::FORBIDDEN.into()
+        } else {
+            Status::NGX_DECLINED
         }
     }
 }
@@ -116,15 +111,50 @@ extern "C" fn ngx_http_curl_commands_set_enable(
             }
         };
 
-        // set default value optionally
-        conf.enable = false;
-
         if val.len() == 2 && val.eq_ignore_ascii_case("on") {
-            conf.enable = true;
+            conf.enable = Some(true);
         } else if val.len() == 3 && val.eq_ignore_ascii_case("off") {
-            conf.enable = false;
+            conf.enable = Some(false);
+        } else {
+            ngx_conf_log_error!(NGX_LOG_EMERG, cf, "invalid value \"{val}\" in `curl` directive");
+            return NGX_CONF_ERROR;
         }
     };
 
     NGX_CONF_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_disabled_child_overrides_enabled_parent() {
+        let parent = ModuleConfig { enable: Some(true) };
+        let mut child = ModuleConfig { enable: Some(false) };
+
+        child.merge(&parent).unwrap();
+
+        assert_eq!(child.enable, Some(false));
+    }
+
+    #[test]
+    fn unset_child_inherits_parent() {
+        let parent = ModuleConfig { enable: Some(true) };
+        let mut child = ModuleConfig::default();
+
+        child.merge(&parent).unwrap();
+
+        assert_eq!(child.enable, Some(true));
+    }
+
+    #[test]
+    fn unset_root_defaults_to_disabled() {
+        let parent = ModuleConfig::default();
+        let mut child = ModuleConfig::default();
+
+        child.merge(&parent).unwrap();
+
+        assert_eq!(child.enable, Some(false));
+    }
 }
