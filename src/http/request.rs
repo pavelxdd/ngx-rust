@@ -531,7 +531,9 @@ impl Request {
     /// ```
     pub fn internal_redirect(&mut self, location: &str) -> Status {
         assert!(!location.is_empty(), "uri location is empty");
-        let mut uri = unsafe { ngx_str_t::from_str(self.0.pool, location) };
+        let Some(mut uri) = (unsafe { ngx_str_t::from_str(self.0.pool, location) }) else {
+            return Status::NGX_ERROR;
+        };
 
         let status = if location.starts_with('@') {
             unsafe { ngx_http_named_location(&raw mut self.0, &raw mut uri) }
