@@ -329,6 +329,7 @@ $ngx_rust_obj: .NGX_RUST_PHONY
 	$NGX_CARGO rustc \\
 		--config $ngx_cargo_config \\
 		--crate-type staticlib \\
+		--locked \\
 		--manifest-path "$ngx_cargo_manifest" \\
 		--no-default-features \\
 		--profile $ngx_cargo_profile \\
