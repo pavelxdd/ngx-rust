@@ -252,6 +252,16 @@ fn build_test_library(
         println!("cargo::warning=skipped {external_sources} configured external source files");
     }
 
+    let allocation_source = dunce::canonicalize(nginx.source_dir.join("src/os/unix/ngx_alloc.c"))
+        .expect("configured nginx allocation source");
+    let source_count = sources.len();
+    sources.retain(|source| source != &allocation_source);
+    assert_eq!(
+        sources.len(),
+        source_count - 1,
+        "configured nginx allocation source appears exactly once"
+    );
+
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let wrapper = out_dir.join("nginx_test_main.c");
     let mut file = File::create(&wrapper).expect("NGINX test main wrapper");
@@ -300,8 +310,75 @@ ngx_rs_test_delete_posted_event(ngx_event_t *ev)
         br"#include <ngx_config.h>
 #include <ngx_core.h>
 
+#define ngx_alloc ngx_rs_test_real_alloc
+#define ngx_calloc ngx_rs_test_real_calloc
+#define ngx_memalign ngx_rs_test_real_memalign
+#include <ngx_alloc.c>
+#undef ngx_memalign
+#undef ngx_calloc
+#undef ngx_alloc
+
 static void *ngx_rs_test_tracked_free;
 static ngx_uint_t ngx_rs_test_tracked_free_count;
+static _Thread_local ngx_uint_t ngx_rs_test_allocations_before_failure = (ngx_uint_t) -1;
+
+static ngx_flag_t
+ngx_rs_test_allocation_should_fail(void)
+{
+    if (ngx_rs_test_allocations_before_failure == (ngx_uint_t) -1) {
+        return 0;
+    }
+
+    if (ngx_rs_test_allocations_before_failure == 0) {
+        return 1;
+    }
+
+    ngx_rs_test_allocations_before_failure--;
+
+    return 0;
+}
+
+void
+ngx_rs_test_fail_allocations_after(ngx_uint_t successes)
+{
+    ngx_rs_test_allocations_before_failure = successes;
+}
+
+void
+ngx_rs_test_reset_allocation_failures(void)
+{
+    ngx_rs_test_allocations_before_failure = (ngx_uint_t) -1;
+}
+
+void *
+ngx_alloc(size_t size, ngx_log_t *log)
+{
+    if (ngx_rs_test_allocation_should_fail()) {
+        return NULL;
+    }
+
+    return ngx_rs_test_real_alloc(size, log);
+}
+
+void *
+ngx_calloc(size_t size, ngx_log_t *log)
+{
+    if (ngx_rs_test_allocation_should_fail()) {
+        return NULL;
+    }
+
+    return ngx_rs_test_real_calloc(size, log);
+}
+
+void *
+ngx_memalign(size_t alignment, size_t size, ngx_log_t *log)
+{
+    if (ngx_rs_test_allocation_should_fail()) {
+        return NULL;
+    }
+
+    return ngx_rs_test_real_memalign(alignment, size, log);
+}
 
 void
 ngx_rs_test_track_free(void *ptr)
@@ -330,8 +407,45 @@ ngx_rs_test_free(void *ptr)
     .expect("NGINX allocation test wrapper");
     sources.push(alloc_wrapper);
 
+    #[cfg(feature = "stream")]
+    {
+        let stream_variables =
+            dunce::canonicalize(nginx.source_dir.join("src/stream/ngx_stream_variables.c"))
+                .expect("configured nginx stream variables source");
+        if let Some(index) = sources.iter().position(|source| source == &stream_variables) {
+            sources.remove(index);
+
+            let stream_wrapper = out_dir.join("nginx_test_stream_variables.c");
+            let mut file =
+                File::create(&stream_wrapper).expect("NGINX stream variables test wrapper");
+            file.write_all(
+                br"#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_stream.h>
+
+#define ngx_stream_variable_proxy_protocol_addr_port \
+    ngx_rs_test_stream_proxy_protocol_addr_port_impl
+#include <ngx_stream_variables.c>
+#undef ngx_stream_variable_proxy_protocol_addr_port
+
+ngx_int_t
+ngx_rs_test_stream_proxy_protocol_addr_port(ngx_stream_session_t *session,
+    ngx_stream_variable_value_t *value, uintptr_t data)
+{
+    return ngx_rs_test_stream_proxy_protocol_addr_port_impl(session, value, data);
+}
+",
+            )
+            .expect("NGINX stream variables test wrapper");
+            sources.push(stream_wrapper);
+        }
+    }
+
     let mut build = cc::Build::new();
     build.include(nginx.source_dir.join("src/core"));
+    build.include(nginx.source_dir.join("src/os/unix"));
+    #[cfg(feature = "stream")]
+    build.include(nginx.source_dir.join("src/stream"));
     for include in includes {
         let include = resolve_makefile_path(nginx, include.to_str().expect("Unicode include path"));
         if include.is_dir() {
