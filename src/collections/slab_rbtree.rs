@@ -274,6 +274,13 @@ where
         self.node_links(node, parts)?;
 
         unsafe { ngx_rbtree_delete(self.tree.as_ptr(), node.as_ptr()) };
+        let mut root =
+            NonNull::new(unsafe { self.tree.as_ref().root }).ok_or(SlabRbTreeError::NullRoot)?;
+        if root != parts.sentinel {
+            self.check_node(root)?;
+            // nginx leaves this link pointing at the removed root when its only child is promoted.
+            unsafe { root.as_mut().parent = ptr::null_mut() };
+        }
         unsafe {
             let node = node.as_mut();
             node.left = ptr::null_mut();
