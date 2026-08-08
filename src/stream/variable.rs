@@ -4,7 +4,7 @@ use core::ptr::NonNull;
 
 use crate::core::NgxStr;
 use crate::ffi::{
-    NGX_STREAM_VAR_CHANGEABLE, NGX_STREAM_VAR_NOCACHEABLE, NGX_STREAM_VAR_NOHASH,
+    NGX_ERROR, NGX_STREAM_VAR_CHANGEABLE, NGX_STREAM_VAR_NOCACHEABLE, NGX_STREAM_VAR_NOHASH,
     NGX_STREAM_VAR_PREFIX, NGX_STREAM_VAR_WEAK, ngx_conf_t, ngx_int_t, ngx_stream_add_variable,
     ngx_stream_session_t, ngx_uint_t, ngx_variable_value_t,
 };
@@ -117,7 +117,8 @@ pub trait StreamVariableHandler {
     type Output: IntoHandlerStatus;
 
     /// Evaluates the variable for one active session.
-    fn get(session: &mut Session, value: &mut StreamVariableValue, data: usize) -> Self::Output;
+    fn get(session: &mut Session<'_>, value: &mut StreamVariableValue, data: usize)
+    -> Self::Output;
 }
 
 /// Registers a typed read-only Stream variable.
@@ -159,9 +160,13 @@ pub(crate) unsafe extern "C" fn raw_get_handler<H>(
 where
     H: StreamVariableHandler,
 {
-    let session = unsafe { Session::from_ngx_stream_session(session) };
-    let value = unsafe { StreamVariableValue::from_raw(value) };
-    H::get(session, value, data).into_handler_status(session)
+    unsafe {
+        Session::with_raw(session, |mut session| {
+            let value = StreamVariableValue::from_raw(value);
+            H::get(&mut session, value, data).into_handler_status(&session)
+        })
+    }
+    .unwrap_or(NGX_ERROR as _)
 }
 
 #[cfg(test)]
@@ -179,11 +184,11 @@ mod tests {
         type Output = Status;
 
         fn get(
-            session: &mut Session,
+            session: &mut Session<'_>,
             value: &mut StreamVariableValue,
             data: usize,
         ) -> Self::Output {
-            session.as_mut().status = data as _;
+            unsafe { (*session.as_ptr()).status = data as _ };
             value.set_static(b"detected").unwrap();
             Status::NGX_OK
         }
