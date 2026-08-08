@@ -1,8 +1,12 @@
 //! Access to nginx event-loop state.
 
-use core::marker::PhantomData;
+use core::marker::{PhantomData, PhantomPinned};
+use core::mem;
+use core::pin::Pin;
 use core::ptr::NonNull;
 
+use crate::allocator::AllocError;
+use crate::core::{Pool, PoolValue};
 use crate::ffi::{
     ngx_add_timer, ngx_del_timer, ngx_delete_posted_event, ngx_event_t, ngx_msec_t, ngx_post_event,
     ngx_posted_events, ngx_posted_next_events,
@@ -12,6 +16,7 @@ use crate::ffi::{
     ngx_atomic_t, ngx_stat_accepted, ngx_stat_active, ngx_stat_handled, ngx_stat_reading,
     ngx_stat_requests, ngx_stat_waiting, ngx_stat_writing,
 };
+use crate::ngx_container_of;
 
 /// Failure returned while validating a native nginx event pointer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +35,8 @@ pub enum PostedQueue {
     /// The next-cycle posted-event queue.
     Next,
 }
+
+static TIMER_IDENT: [usize; 1] = [0];
 
 /// Exclusive callback-scoped access to an nginx-owned event.
 ///
@@ -168,6 +175,251 @@ impl EventRef<'_> {
     }
 }
 
+/// Failure returned while arming a [`Timer`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimerError {
+    /// The timer is already armed and must be explicitly rearmed or canceled first.
+    AlreadyArmed,
+}
+
+/// Pinned owner of an nginx timer and its callback state.
+///
+/// A timer must be pinned before it can be armed. Rust-owned timers are canceled by [`Drop`]; use
+/// [`allocate_in_pool`](Self::allocate_in_pool) for a pool-owned timer so its cleanup is registered
+/// before the timer can be armed.
+///
+/// ```compile_fail
+/// use core::pin::Pin;
+/// use core::ptr::NonNull;
+/// use ngx::event::Timer;
+/// use ngx::ffi::ngx_log_t;
+///
+/// fn cannot_move_after_arming(log: NonNull<ngx_log_t>) {
+///     let mut timer = Box::pin(Timer::new(log, (), |_| {}));
+///     timer.as_mut().arm(1).unwrap();
+///     let _timer = Pin::into_inner(timer);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use core::ptr::NonNull;
+/// use ngx::event::Timer;
+/// use ngx::ffi::ngx_log_t;
+///
+/// fn cannot_retain_callback_state(log: NonNull<ngx_log_t>) {
+///     let mut escaped: Option<&mut u8> = None;
+///     let _timer = Timer::new(log, 0_u8, |mut timer| {
+///         escaped = Some(timer.state_mut());
+///     });
+/// }
+/// ```
+pub struct Timer<T, F> {
+    event: ngx_event_t,
+    state: T,
+    callback: F,
+    _pin: PhantomPinned,
+    _not_thread_safe: PhantomData<*mut ()>,
+}
+
+/// Callback-scoped access to a timer's state and event controls.
+///
+/// A value is created for each timer callback and cannot safely outlive that callback.
+pub struct TimerCallback<'callback, T> {
+    event: EventRef<'callback>,
+    state: &'callback mut T,
+}
+
+impl<T, F> Timer<T, F>
+where
+    F: for<'callback> FnMut(TimerCallback<'callback, T>),
+{
+    /// Creates an unarmed timer with the supplied state and callback.
+    ///
+    /// The returned timer must be pinned before calling [`arm`](Self::arm), [`rearm`](Self::rearm),
+    /// or [`cancel`](Self::cancel).
+    pub fn new(log: NonNull<crate::ffi::ngx_log_t>, state: T, callback: F) -> Self {
+        let mut event = unsafe { mem::zeroed::<ngx_event_t>() };
+        event.data = (&raw const TIMER_IDENT).cast_mut().cast();
+        event.handler = Some(timer_handler::<T, F>);
+        event.log = log.as_ptr();
+
+        Self { event, state, callback, _pin: PhantomPinned, _not_thread_safe: PhantomData }
+    }
+
+    /// Allocates a pinned timer in an nginx pool and registers its destructor before returning it.
+    ///
+    /// The returned [`PoolValue`] retains the stable address and pool cleanup. Its timer must be
+    /// armed through [`PoolValue::as_pin_mut`].
+    pub fn allocate_in_pool<'pool>(
+        pool: &Pool<'pool>,
+        log: NonNull<crate::ffi::ngx_log_t>,
+        state: T,
+        callback: F,
+    ) -> Result<PoolValue<'pool, Self>, AllocError>
+    where
+        T: 'static,
+        F: 'static,
+    {
+        pool.allocate_with_cleanup(|| Self::new(log, state, callback))
+    }
+
+    /// Returns the timer state outside a callback without mutable access.
+    pub fn state(&self) -> &T {
+        &self.state
+    }
+
+    /// Returns whether nginx has armed this timer.
+    pub fn is_armed(&self) -> bool {
+        self.event.timer_set() != 0
+    }
+
+    /// Returns whether nginx has delivered an expiry that has not yet been observed.
+    pub fn is_timed_out(&self) -> bool {
+        self.event.timedout() != 0
+    }
+
+    /// Returns whether nginx may cancel this timer during graceful worker shutdown.
+    pub fn is_cancelable(&self) -> bool {
+        self.event.cancelable() != 0
+    }
+
+    /// Arms an unarmed timer.
+    ///
+    /// Returns [`TimerError::AlreadyArmed`] instead of applying nginx's lazy timer update. Use
+    /// [`rearm`](Self::rearm) to replace an existing timeout deliberately.
+    pub fn arm(mut self: Pin<&mut Self>, timeout: ngx_msec_t) -> Result<(), TimerError> {
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        if this.event.timer_set() != 0 {
+            return Err(TimerError::AlreadyArmed);
+        }
+
+        this.event.set_timedout(0);
+        unsafe { ngx_add_timer(&raw mut this.event, timeout) };
+        Ok(())
+    }
+
+    /// Replaces the current timeout, if any, with a fresh timeout.
+    pub fn rearm(mut self: Pin<&mut Self>, timeout: ngx_msec_t) {
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        if this.event.timer_set() != 0 {
+            unsafe { ngx_del_timer(&raw mut this.event) };
+        }
+
+        this.event.set_timedout(0);
+        unsafe { ngx_add_timer(&raw mut this.event, timeout) };
+    }
+
+    /// Cancels the timer when it is armed.
+    ///
+    /// Returns whether a timeout was removed. Repeated cancellation is harmless.
+    pub fn cancel(mut self: Pin<&mut Self>) -> bool {
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        if this.event.timer_set() == 0 {
+            return false;
+        }
+
+        unsafe { ngx_del_timer(&raw mut this.event) };
+        true
+    }
+
+    /// Marks whether nginx may cancel this timer during graceful worker shutdown.
+    pub fn set_cancelable(mut self: Pin<&mut Self>, cancelable: bool) {
+        unsafe {
+            self.as_mut().get_unchecked_mut().event.set_cancelable(u32::from(cancelable));
+        }
+    }
+
+    /// Observes and clears a delivered timer expiry.
+    pub fn take_timeout(mut self: Pin<&mut Self>) -> bool {
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        if this.event.timedout() == 0 {
+            return false;
+        }
+
+        this.event.set_timedout(0);
+        true
+    }
+}
+
+impl<T> TimerCallback<'_, T> {
+    /// Returns the callback-scoped timer state.
+    pub fn state(&self) -> &T {
+        self.state
+    }
+
+    /// Returns mutable timer state for this callback only.
+    pub fn state_mut(&mut self) -> &mut T {
+        self.state
+    }
+
+    /// Returns whether nginx has armed this timer.
+    pub fn is_armed(&self) -> bool {
+        self.event.is_timer_set()
+    }
+
+    /// Returns whether nginx has delivered this timer expiry.
+    pub fn is_timed_out(&self) -> bool {
+        self.event.is_timedout()
+    }
+
+    /// Observes and clears a delivered timer expiry.
+    pub fn take_timeout(&mut self) -> bool {
+        if !self.event.is_timedout() {
+            return false;
+        }
+
+        self.event.clear_timedout();
+        true
+    }
+
+    /// Replaces the current timeout, if any, with a fresh timeout.
+    pub fn rearm(&mut self, timeout: ngx_msec_t) {
+        self.event.delete_timer();
+        self.event.clear_timedout();
+        self.event.add_timer(timeout);
+    }
+
+    /// Cancels the timer when it is armed.
+    ///
+    /// Returns whether a timeout was removed. Repeated cancellation is harmless.
+    pub fn cancel(&mut self) -> bool {
+        self.event.delete_timer()
+    }
+
+    /// Returns whether nginx may cancel this timer during graceful worker shutdown.
+    pub fn is_cancelable(&self) -> bool {
+        unsafe { self.event.raw.as_ref().cancelable() != 0 }
+    }
+
+    /// Marks whether nginx may cancel this timer during graceful worker shutdown.
+    pub fn set_cancelable(&mut self, cancelable: bool) {
+        unsafe { self.event.raw.as_mut().set_cancelable(u32::from(cancelable)) };
+    }
+}
+
+unsafe extern "C" fn timer_handler<T, F>(raw: *mut ngx_event_t)
+where
+    F: for<'callback> FnMut(TimerCallback<'callback, T>),
+{
+    let Ok(event) = (unsafe { EventRef::from_raw(raw) }) else {
+        return;
+    };
+    let timer = ngx_container_of!(event.as_ptr(), Timer<T, F>, event);
+    let timer = unsafe { &mut *timer };
+    let callback = &mut timer.callback;
+    let state = &mut timer.state;
+
+    callback(TimerCallback { event, state });
+}
+
+impl<T, F> Drop for Timer<T, F> {
+    fn drop(&mut self) {
+        if self.event.timer_set() != 0 {
+            unsafe { ngx_del_timer(&raw mut self.event) };
+        }
+    }
+}
+
 /// A snapshot of nginx's connection counters.
 ///
 /// Each counter is read independently, so values can change while the snapshot is collected.
@@ -283,17 +535,27 @@ mod event_tests {
     extern crate std;
 
     use alloc::boxed::Box;
+    use alloc::rc::Rc;
+    use core::cell::Cell;
     use core::mem::MaybeUninit;
-    use core::ptr;
+    use core::ptr::{self, NonNull};
     use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard};
 
-    use super::{EventError, EventRef, PostedQueue};
+    use super::{EventError, EventRef, PostedQueue, Timer, TimerError};
+    use crate::core::Pool;
     use crate::ffi::{
-        ngx_current_msec, ngx_cycle_t, ngx_event_move_posted_next, ngx_event_process_posted,
-        ngx_event_t, ngx_event_timer_init, ngx_log_t, ngx_posted_events, ngx_posted_next_events,
-        ngx_queue_empty, ngx_queue_init, ngx_queue_t,
+        NGX_AGAIN, NGX_OK, ngx_create_pool, ngx_current_msec, ngx_cycle_t, ngx_destroy_pool,
+        ngx_event_expire_timers, ngx_event_move_posted_next, ngx_event_no_timers_left,
+        ngx_event_process_posted, ngx_event_t, ngx_event_timer_init, ngx_log_t, ngx_msec_int_t,
+        ngx_msec_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events, ngx_queue_empty,
+        ngx_queue_init, ngx_queue_t, ngx_uint_t,
     };
+
+    unsafe extern "C" {
+        fn ngx_rs_test_fail_allocations_after(successes: ngx_uint_t);
+        fn ngx_rs_test_reset_allocation_failures();
+    }
 
     static EVENT_GLOBALS: Mutex<()> = Mutex::new(());
     static POSTED_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
@@ -361,6 +623,42 @@ mod event_tests {
 
         fn raw(&mut self) -> *mut ngx_cycle_t {
             &raw mut self.cycle
+        }
+    }
+
+    struct TestPool {
+        raw: *mut ngx_pool_t,
+        log: Box<ngx_log_t>,
+    }
+
+    impl TestPool {
+        fn new() -> Self {
+            let mut log = Box::new(unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() });
+            let raw = unsafe { ngx_create_pool(4096, &raw mut *log) };
+            assert!(!raw.is_null());
+            Self { raw, log }
+        }
+
+        fn handle(&self) -> Pool<'_> {
+            unsafe { Pool::from_raw(self.raw) }.unwrap()
+        }
+
+        fn log(&mut self) -> NonNull<ngx_log_t> {
+            NonNull::from(&mut *self.log)
+        }
+    }
+
+    impl Drop for TestPool {
+        fn drop(&mut self) {
+            unsafe { ngx_destroy_pool(self.raw) };
+        }
+    }
+
+    struct DropState(Rc<Cell<usize>>);
+
+    impl Drop for DropState {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
         }
     }
 
@@ -478,5 +776,268 @@ mod event_tests {
             .unwrap();
         }
         assert_eq!(event.event.timedout(), 0);
+    }
+
+    #[test]
+    fn timer_owner_invokes_callback_on_expiry() {
+        let _globals = EventGlobals::lock();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let calls = Rc::new(Cell::new(0));
+        let callback_calls = calls.clone();
+        let mut timer = Box::pin(Timer::new(NonNull::from(&mut log), 0_usize, move |mut timer| {
+            assert!(timer.is_timed_out());
+            assert!(timer.take_timeout());
+            assert!(!timer.is_timed_out());
+            *timer.state_mut() += 1;
+            callback_calls.set(callback_calls.get() + 1);
+            if *timer.state() == 1 {
+                timer.rearm(5);
+            }
+        }));
+
+        timer.as_mut().arm(5).unwrap();
+        unsafe {
+            ngx_current_msec = 5;
+            ngx_event_expire_timers();
+        }
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(*timer.state(), 1);
+        assert!(timer.is_armed());
+        assert!(!timer.is_timed_out());
+
+        unsafe {
+            ngx_current_msec = 10;
+            ngx_event_expire_timers();
+        }
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(*timer.state(), 2);
+        assert!(!timer.is_armed());
+        assert!(!timer.is_timed_out());
+    }
+
+    #[test]
+    fn timer_exposes_explicit_arm_cancelable_and_cancel_states() {
+        let _globals = EventGlobals::lock();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut timer = Box::pin(Timer::new(NonNull::from(&mut log), (), |_| {}));
+
+        assert!(!timer.is_armed());
+        assert!(!timer.is_timed_out());
+        assert!(!timer.is_cancelable());
+
+        timer.as_mut().set_cancelable(true);
+        assert!(timer.is_cancelable());
+        timer.as_mut().arm(5).unwrap();
+        assert_eq!(timer.as_mut().arm(5), Err(TimerError::AlreadyArmed));
+        assert!(timer.as_mut().cancel());
+        assert!(!timer.is_armed());
+        assert!(!timer.as_mut().cancel());
+
+        timer.as_mut().set_cancelable(false);
+        assert!(!timer.is_cancelable());
+    }
+
+    #[test]
+    fn timer_arms_zero_maximum_and_wrapping_deadlines() {
+        let _globals = EventGlobals::lock();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let zero_calls = Rc::new(Cell::new(0));
+        let full_range_calls = Rc::new(Cell::new(0));
+        let maximum_calls = Rc::new(Cell::new(0));
+        let wrapping_calls = Rc::new(Cell::new(0));
+
+        let zero_callback_calls = zero_calls.clone();
+        let mut zero = Box::pin(Timer::new(NonNull::from(&mut log), (), move |_| {
+            zero_callback_calls.set(zero_callback_calls.get() + 1);
+        }));
+        zero.as_mut().arm(0).unwrap();
+        unsafe { ngx_event_expire_timers() };
+        assert_eq!(zero_calls.get(), 1);
+
+        let full_range_callback_calls = full_range_calls.clone();
+        let mut full_range = Box::pin(Timer::new(NonNull::from(&mut log), (), move |_| {
+            full_range_callback_calls.set(full_range_callback_calls.get() + 1);
+        }));
+        full_range.as_mut().arm(ngx_msec_t::MAX).unwrap();
+        unsafe { ngx_event_expire_timers() };
+        assert_eq!(full_range_calls.get(), 1);
+
+        let maximum_callback_calls = maximum_calls.clone();
+        let mut maximum = Box::pin(Timer::new(NonNull::from(&mut log), (), move |_| {
+            maximum_callback_calls.set(maximum_callback_calls.get() + 1);
+        }));
+        let maximum_timeout = ngx_msec_int_t::MAX as ngx_msec_t;
+        maximum.as_mut().arm(maximum_timeout).unwrap();
+        unsafe {
+            ngx_current_msec = maximum_timeout - 1;
+            ngx_event_expire_timers();
+        }
+        assert_eq!(maximum_calls.get(), 0);
+        unsafe {
+            ngx_current_msec = maximum_timeout;
+            ngx_event_expire_timers();
+        }
+        assert_eq!(maximum_calls.get(), 1);
+
+        let wrapping_callback_calls = wrapping_calls.clone();
+        let mut wrapping = Box::pin(Timer::new(NonNull::from(&mut log), (), move |_| {
+            wrapping_callback_calls.set(wrapping_callback_calls.get() + 1);
+        }));
+        unsafe { ngx_current_msec = ngx_msec_t::MAX - 2 };
+        wrapping.as_mut().arm(5).unwrap();
+        assert_eq!(wrapping.as_ref().get_ref().event.timer.key, 2);
+        unsafe {
+            ngx_current_msec = 1;
+            ngx_event_expire_timers();
+        }
+        assert_eq!(wrapping_calls.get(), 0);
+        unsafe {
+            ngx_current_msec = 2;
+            ngx_event_expire_timers();
+        }
+        assert_eq!(wrapping_calls.get(), 1);
+    }
+
+    #[test]
+    fn timer_rearm_bypasses_nginx_lazy_update() {
+        let _globals = EventGlobals::lock();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let calls = Rc::new(Cell::new(0));
+        let callback_calls = calls.clone();
+        let mut timer = Box::pin(Timer::new(NonNull::from(&mut log), (), move |_| {
+            callback_calls.set(callback_calls.get() + 1);
+        }));
+
+        timer.as_mut().arm(300).unwrap();
+        timer.as_mut().rearm(301);
+        assert_eq!(timer.as_ref().get_ref().event.timer.key, 301);
+
+        unsafe {
+            ngx_current_msec = 300;
+            ngx_event_expire_timers();
+        }
+        assert_eq!(calls.get(), 0);
+        unsafe {
+            ngx_current_msec = 301;
+            ngx_event_expire_timers();
+        }
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn timer_arm_clears_timeout_and_cancel_after_expiry_is_idempotent() {
+        let _globals = EventGlobals::lock();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut timer = Box::pin(Timer::new(NonNull::from(&mut log), (), |_| {}));
+
+        timer.as_mut().arm(5).unwrap();
+        unsafe {
+            ngx_current_msec = 5;
+            ngx_event_expire_timers();
+        }
+        assert!(timer.is_timed_out());
+        assert!(!timer.as_mut().cancel());
+        assert!(timer.as_mut().take_timeout());
+        assert!(!timer.as_mut().take_timeout());
+
+        timer.as_mut().arm(5).unwrap();
+        assert!(!timer.is_timed_out());
+        assert!(timer.as_mut().cancel());
+        assert!(!timer.as_mut().cancel());
+    }
+
+    #[test]
+    fn timer_cancelable_state_allows_worker_exit() {
+        let _globals = EventGlobals::lock();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut timer = Box::pin(Timer::new(NonNull::from(&mut log), (), |_| {}));
+
+        timer.as_mut().arm(5).unwrap();
+        assert_eq!(unsafe { ngx_event_no_timers_left() }, NGX_AGAIN as _);
+        timer.as_mut().set_cancelable(true);
+        assert_eq!(unsafe { ngx_event_no_timers_left() }, NGX_OK as _);
+        assert!(timer.as_mut().cancel());
+    }
+
+    #[test]
+    fn dropped_timer_cancels_its_pending_callback() {
+        let _globals = EventGlobals::lock();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let calls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+
+        {
+            let callback_calls = calls.clone();
+            let mut timer = Box::pin(Timer::new(
+                NonNull::from(&mut log),
+                DropState(drops.clone()),
+                move |_| callback_calls.set(callback_calls.get() + 1),
+            ));
+            timer.as_mut().arm(5).unwrap();
+        }
+        assert_eq!(drops.get(), 1);
+
+        unsafe {
+            ngx_current_msec = 5;
+            ngx_event_expire_timers();
+        }
+
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn pool_owned_timer_cancels_before_pool_cleanup_drops_state() {
+        let _globals = EventGlobals::lock();
+        let mut owner = TestPool::new();
+        let calls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+
+        {
+            let log = owner.log();
+            let pool = owner.handle();
+            let callback_calls = calls.clone();
+            let timer = Timer::allocate_in_pool(&pool, log, DropState(drops.clone()), move |_| {
+                callback_calls.set(1)
+            })
+            .unwrap();
+            let address = timer.as_non_null();
+            let mut timer = timer;
+            assert_eq!(timer.as_non_null(), address);
+            timer.as_pin_mut().arm(5).unwrap();
+            assert_eq!(timer.as_non_null(), address);
+        }
+
+        drop(owner);
+        assert_eq!(drops.get(), 1);
+
+        unsafe {
+            ngx_current_msec = 5;
+            ngx_event_expire_timers();
+        }
+
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn pool_timer_does_not_publish_cleanup_when_allocation_fails() {
+        let _globals = EventGlobals::lock();
+        let mut owner = TestPool::new();
+        let cleanup = unsafe { (*owner.raw).cleanup };
+        unsafe { (*owner.raw).max = 0 };
+
+        for successes in 0..=1 {
+            let drops = Rc::new(Cell::new(0));
+            let log = owner.log();
+            let pool = owner.handle();
+            unsafe { ngx_rs_test_fail_allocations_after(successes) };
+            let result = Timer::allocate_in_pool(&pool, log, DropState(drops.clone()), |_| {});
+            unsafe { ngx_rs_test_reset_allocation_failures() };
+
+            assert!(result.is_err());
+            assert_eq!(unsafe { (*owner.raw).cleanup }, cleanup);
+            assert_eq!(drops.get(), 1);
+        }
     }
 }
