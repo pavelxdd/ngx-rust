@@ -157,7 +157,6 @@ pub mod collections;
 pub mod core;
 
 /// Access to nginx event-loop state.
-#[cfg(ngx_feature = "stat_stub")]
 pub mod event;
 
 /// The ffi module.
