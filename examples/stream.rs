@@ -100,7 +100,7 @@ impl StreamVariableHandler for ProbeVariable {
 
     fn get(
         session: &mut Session<'_>,
-        value: &mut StreamVariableValue,
+        value: &mut StreamVariableValue<'_>,
         _data: usize,
     ) -> Self::Output {
         let seen = match session.module_context::<Module>() {
