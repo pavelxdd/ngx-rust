@@ -4,6 +4,7 @@ mod conf;
 mod pool;
 /// Imports commonly needed by nginx modules.
 pub mod prelude;
+/// Guard-scoped access to nginx shared slab pools.
 pub mod slab;
 mod status;
 mod string;
@@ -12,7 +13,7 @@ pub use buffer::*;
 pub use command::*;
 pub use conf::*;
 pub use pool::*;
-pub use slab::SlabPool;
+pub use slab::{SlabError, SlabGuard, SlabPool};
 pub use status::*;
 pub use string::*;
 
