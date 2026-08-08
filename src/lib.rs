@@ -139,8 +139,11 @@
 #![no_std]
 
 extern crate alloc;
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", test))]
 extern crate std;
+
+#[cfg(all(test, feature = "test-link"))]
+pub(crate) static TEST_NGINX_GLOBALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub mod allocator;
 #[cfg(feature = "async")]
