@@ -706,6 +706,23 @@ fn check_chain_ptr(chain: *mut ngx_chain_t) -> Result<(), ChainError> {
     Ok(())
 }
 
+pub(crate) fn validate_native_buffer(buffer: &ngx_buf_t) -> Result<(), BufferError> {
+    if in_memory(buffer) {
+        let pos = NonNull::new(buffer.pos).ok_or(BufferError::InvalidMemoryRange)?;
+        let last = NonNull::new(buffer.last).ok_or(BufferError::InvalidMemoryRange)?;
+        let len = (last.as_ptr() as usize).checked_sub(pos.as_ptr() as usize)
+            .ok_or(BufferError::InvalidMemoryRange)?;
+        if len > isize::MAX as usize {
+            return Err(BufferError::InvalidMemoryRange);
+        }
+        if buffer.temporary() != 0 && (buffer.end.is_null() || buffer.end < buffer.last) {
+            return Err(BufferError::InvalidMemoryRange);
+        }
+    }
+    file_range(buffer)?;
+    Ok(())
+}
+
 fn in_memory(buffer: &ngx_buf_t) -> bool {
     buffer.temporary() != 0 || buffer.memory() != 0 || buffer.mmap() != 0
 }
@@ -734,6 +751,8 @@ fn file_range(buffer: &ngx_buf_t) -> Result<Option<FileView<'_>>, BufferError> {
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+
     use super::*;
 
     /// Builds the shape `ngx_create_temp_buf` produces: `pos == last == start`.
