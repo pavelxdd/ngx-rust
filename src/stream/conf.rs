@@ -104,6 +104,24 @@ fn server_conf_slot<T>(
     Ok(unsafe { conf_slot(slots, indexes.context, indexes.stream_slots) })
 }
 
+pub(crate) fn session_context_index(module: &ngx_module_t) -> Result<usize, StreamConfigError> {
+    Ok(live_module_indexes(module)?.context)
+}
+
+pub(crate) fn session_main_conf_slot<T>(
+    session: &ngx_stream_session_t,
+    module: &ngx_module_t,
+) -> Result<Option<NonNull<T>>, StreamConfigError> {
+    main_conf_slot(session.main_conf, module)
+}
+
+pub(crate) fn session_server_conf_slot<T>(
+    session: &ngx_stream_session_t,
+    module: &ngx_module_t,
+) -> Result<Option<NonNull<T>>, StreamConfigError> {
+    server_conf_slot(session.srv_conf, module)
+}
+
 pub(crate) mod sealed {
     pub trait MainConfSource {}
     pub trait MainConfSourceMut: MainConfSource {}
@@ -299,44 +317,6 @@ impl StreamModuleServerConfMutExt for ngx_stream_core_srv_conf_t {
             return Ok(None);
         };
         unsafe { context.as_mut().stream_server_conf_mut(module) }
-    }
-}
-
-impl sealed::MainConfSource for ngx_stream_session_t {}
-impl sealed::MainConfSourceMut for ngx_stream_session_t {}
-impl sealed::ServerConfSource for ngx_stream_session_t {}
-impl sealed::ServerConfSourceMut for ngx_stream_session_t {}
-
-impl StreamModuleMainConfExt for ngx_stream_session_t {
-    fn stream_main_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, StreamConfigError> {
-        Ok(main_conf_slot(self.main_conf, module)?.map(|value| unsafe { value.as_ref() }))
-    }
-}
-
-impl StreamModuleMainConfMutExt for ngx_stream_session_t {
-    fn stream_main_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, StreamConfigError> {
-        Ok(main_conf_slot(self.main_conf, module)?.map(|mut value| unsafe { value.as_mut() }))
-    }
-}
-
-impl StreamModuleServerConfExt for ngx_stream_session_t {
-    fn stream_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, StreamConfigError> {
-        Ok(server_conf_slot(self.srv_conf, module)?.map(|value| unsafe { value.as_ref() }))
-    }
-}
-
-impl StreamModuleServerConfMutExt for ngx_stream_session_t {
-    fn stream_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, StreamConfigError> {
-        Ok(server_conf_slot(self.srv_conf, module)?.map(|mut value| unsafe { value.as_mut() }))
     }
 }
 

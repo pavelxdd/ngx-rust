@@ -75,7 +75,7 @@ impl StreamSessionHandler for ProbeHandler {
     const PHASE: StreamPhase = StreamPhase::Preread;
     type Output = Result<Status, Status>;
 
-    fn handler(session: &mut Session) -> Self::Output {
+    fn handler(session: &mut Session<'_>) -> Self::Output {
         let enabled = session
             .server_conf::<Module>()
             .map_err(|_| Status::NGX_ERROR)?
@@ -98,8 +98,15 @@ struct ProbeVariable;
 impl StreamVariableHandler for ProbeVariable {
     type Output = Status;
 
-    fn get(session: &mut Session, value: &mut StreamVariableValue, _data: usize) -> Self::Output {
-        let seen = session.module_context::<Module>().is_some_and(|context| context.seen);
+    fn get(
+        session: &mut Session<'_>,
+        value: &mut StreamVariableValue,
+        _data: usize,
+    ) -> Self::Output {
+        let seen = match session.module_context::<Module>() {
+            Ok(context) => context.is_some_and(|context| context.seen),
+            Err(_) => return Status::NGX_ERROR,
+        };
         let bytes = if seen { b"seen".as_slice() } else { b"not-seen".as_slice() };
         value.set_static(bytes).map_or(Status::NGX_ERROR, |_| Status::NGX_OK)
     }

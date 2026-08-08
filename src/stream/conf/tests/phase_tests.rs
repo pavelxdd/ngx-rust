@@ -94,7 +94,7 @@ impl StreamSessionHandler for PrereadHandler {
     const PHASE: StreamPhase = StreamPhase::Preread;
     type Output = Status;
 
-    fn handler(_session: &mut Session) -> Self::Output {
+    fn handler(_session: &mut Session<'_>) -> Self::Output {
         Status::NGX_DECLINED
     }
 }
@@ -111,7 +111,7 @@ impl StreamSessionHandler for PostAcceptHandler {
     const PHASE: StreamPhase = StreamPhase::PostAccept;
     type Output = Status;
 
-    fn handler(_session: &mut Session) -> Self::Output {
+    fn handler(_session: &mut Session<'_>) -> Self::Output {
         Status::NGX_DECLINED
     }
 }
@@ -122,7 +122,7 @@ impl StreamSessionHandler for PreaccessHandler {
     const PHASE: StreamPhase = StreamPhase::Preaccess;
     type Output = Status;
 
-    fn handler(_session: &mut Session) -> Self::Output {
+    fn handler(_session: &mut Session<'_>) -> Self::Output {
         Status::NGX_DECLINED
     }
 }
@@ -133,7 +133,7 @@ impl StreamSessionHandler for AccessHandler {
     const PHASE: StreamPhase = StreamPhase::Access;
     type Output = Status;
 
-    fn handler(_session: &mut Session) -> Self::Output {
+    fn handler(_session: &mut Session<'_>) -> Self::Output {
         Status::NGX_DECLINED
     }
 }
@@ -144,7 +144,7 @@ impl StreamSessionHandler for SslHandler {
     const PHASE: StreamPhase = StreamPhase::Ssl;
     type Output = Status;
 
-    fn handler(_session: &mut Session) -> Self::Output {
+    fn handler(_session: &mut Session<'_>) -> Self::Output {
         Status::NGX_DECLINED
     }
 }
@@ -155,7 +155,7 @@ impl StreamSessionHandler for LogHandler {
     const PHASE: StreamPhase = StreamPhase::Log;
     type Output = Status;
 
-    fn handler(_session: &mut Session) -> Self::Output {
+    fn handler(_session: &mut Session<'_>) -> Self::Output {
         Status::NGX_DECLINED
     }
 }
@@ -170,7 +170,7 @@ impl StreamSessionHandler for FirstPrereadHandler {
     const PHASE: StreamPhase = StreamPhase::Preread;
     type Output = Status;
 
-    fn handler(_session: &mut Session) -> Self::Output {
+    fn handler(_session: &mut Session<'_>) -> Self::Output {
         FIRST_HANDLER_ORDER
             .store(NEXT_HANDLER_ORDER.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         Status::NGX_DECLINED
@@ -183,7 +183,7 @@ impl StreamSessionHandler for SecondPrereadHandler {
     const PHASE: StreamPhase = StreamPhase::Preread;
     type Output = Status;
 
-    fn handler(_session: &mut Session) -> Self::Output {
+    fn handler(_session: &mut Session<'_>) -> Self::Output {
         SECOND_HANDLER_ORDER
             .store(NEXT_HANDLER_ORDER.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         Status::NGX_DECLINED
