@@ -196,7 +196,7 @@ impl<'r, H> SubRequestBuilder<'r, H> {
         };
 
         let post = if let Some(handler) = self.handler.take() {
-            let handler = unsafe { pool.allocate_with_cleanup(|| Some(handler))? };
+            let handler = pool.allocate_with_cleanup(|| Some(handler))?.into_non_null();
             let post: *mut ngx_http_post_subrequest_t =
                 pool.alloc(mem::size_of::<ngx_http_post_subrequest_t>()).cast();
             if post.is_null() {

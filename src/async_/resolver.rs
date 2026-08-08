@@ -105,7 +105,7 @@ impl From<NonZero<isize>> for ResolverError {
     }
 }
 
-type Res = Result<Vec<ngx_addr_t, Pool>, Error>;
+type Res<'pool> = Result<Vec<ngx_addr_t, Pool<'pool>>, Error>;
 
 /// A wrapper for an ngx_resolver_t which provides an async Rust API
 pub struct Resolver {
@@ -121,43 +121,53 @@ impl Resolver {
     }
 
     /// Resolve a name into a set of addresses.
-    pub async fn resolve_name(&self, name: &ngx_str_t, pool: &Pool) -> Res {
+    pub async fn resolve_name<'pool>(&self, name: &ngx_str_t, pool: &Pool<'pool>) -> Res<'pool> {
         let mut resolver = Resolution::new(name, &ngx_str_t::empty(), self, pool)?;
         resolver.as_mut().await
     }
 
     /// Resolve a service into a set of addresses.
-    pub async fn resolve_service(&self, name: &ngx_str_t, service: &ngx_str_t, pool: &Pool) -> Res {
+    pub async fn resolve_service<'pool>(
+        &self,
+        name: &ngx_str_t,
+        service: &ngx_str_t,
+        pool: &Pool<'pool>,
+    ) -> Res<'pool> {
         let mut resolver = Resolution::new(name, service, self, pool)?;
         resolver.as_mut().await
     }
 }
 
-struct Resolution<'a> {
+struct Resolution<'handle, 'pool> {
     // Storage for the result of the resolution `Res`. Populated by the
     // callback handler, and taken by the Future::poll impl.
-    complete: Option<Res>,
+    complete: Option<Res<'pool>>,
     // Storage for a pending Waker. Populated by the Future::poll impl,
     // and taken by the callback handler.
     waker: Option<Waker>,
     // Pool used for allocating `Vec<ngx_addr_t>` contents in `Res`. Read by
     // the callback handler.
-    pool: &'a Pool,
+    pool: &'handle Pool<'pool>,
     // Owned pointer to the ngx_resolver_ctx_t.
     ctx: Option<ResolverCtx>,
 }
 
-impl<'a> Resolution<'a> {
+impl<'handle, 'pool> Resolution<'handle, 'pool> {
     pub fn new(
         name: &ngx_str_t,
         service: &ngx_str_t,
         resolver: &Resolver,
-        pool: &'a Pool,
-    ) -> Result<Pin<Box<Self, Pool>>, Error> {
+        pool: &'handle Pool<'pool>,
+    ) -> Result<Pin<Box<Self, Pool<'pool>>>, Error> {
         // Create a pinned Resolution on the Pool, so that we can make
         // a stable pointer to the Resolution struct.
-        let mut this =
-            Box::pin_in(Resolution { complete: None, waker: None, pool, ctx: None }, pool.clone());
+        let this = Box::try_new_in(
+            Resolution { complete: None, waker: None, pool, ctx: None },
+            pool.clone(),
+        )
+        .map_err(|_| Error::AllocationFailed)?;
+        // SAFETY: the allocator-backed box keeps the value at one address until it is dropped.
+        let mut this = unsafe { Pin::new_unchecked(this) };
 
         // Set up the ctx with everything the resolver needs to resolve a
         // name, and the handler callback which is called on completion.
@@ -174,8 +184,8 @@ impl<'a> Resolution<'a> {
             // assured only one of those is on the stack at a time, except if
             // Self::handler wakes a task which polls or drops the Future,
             // which it only does after use of &mut Resolution is complete.
-            let ptr: &mut Resolution = unsafe { Pin::into_inner_unchecked(this.as_mut()) };
-            ctx.data = ptr as *mut Resolution as *mut c_void;
+            let ptr: &mut Resolution<'_, '_> = unsafe { Pin::into_inner_unchecked(this.as_mut()) };
+            ctx.data = ptr as *mut Resolution<'_, '_> as *mut c_void;
         }
 
         // Neither ownership nor borrows are tracked for this pointer,
@@ -200,8 +210,8 @@ impl<'a> Resolution<'a> {
     // result is in the cache, this could be called from inside ngx_resolve_name.
     // Otherwise, it will be called later on the event loop.
     unsafe extern "C" fn handler(ctx: *mut ngx_resolver_ctx_t) {
-        let mut data = unsafe { NonNull::new_unchecked((*ctx).data as *mut Resolution) };
-        let this: &mut Resolution = unsafe { data.as_mut() };
+        let mut data = unsafe { NonNull::new_unchecked((*ctx).data as *mut Resolution<'_, '_>) };
+        let this: &mut Resolution<'_, '_> = unsafe { data.as_mut() };
 
         if let Some(ctx) = this.ctx.take() {
             this.complete = Some(ctx.into_result(this.pool));
@@ -215,8 +225,8 @@ impl<'a> Resolution<'a> {
     }
 }
 
-impl core::future::Future for Resolution<'_> {
-    type Output = Result<Vec<ngx_addr_t, Pool>, Error>;
+impl<'pool> core::future::Future for Resolution<'_, 'pool> {
+    type Output = Res<'pool>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Resolution is Unpin, so we can use it as just a &mut Resolution
@@ -282,9 +292,12 @@ impl ResolverCtx {
     }
 
     /// Take the results in a ctx and make an owned copy as a
-    /// Result<Vec<ngx_addr_t, Pool>, Error>, where the Vec and the internals
+    /// `Result<Vec<ngx_addr_t, Pool<'pool>>, Error>`, where the Vec and the internals
     /// of the ngx_addr_t are allocated on the given Pool
-    pub fn into_result(self, pool: &Pool) -> Result<Vec<ngx_addr_t, Pool>, Error> {
+    pub fn into_result<'pool>(
+        self,
+        pool: &Pool<'pool>,
+    ) -> Result<Vec<ngx_addr_t, Pool<'pool>>, Error> {
         if let Some(e) = NonZero::new(self.state) {
             return Err(Error::Resolver(ResolverError::from(e), self.name.to_string()));
         }
@@ -310,7 +323,7 @@ impl ResolverCtx {
 /// an ngx_addr_t, using the Pool for allocation of the internals.
 fn copy_resolved_addr(
     addr: &nginx_sys::ngx_resolver_addr_t,
-    pool: &Pool,
+    pool: &Pool<'_>,
 ) -> Result<ngx_addr_t, Error> {
     let sockaddr = pool.alloc(addr.socklen as usize) as *mut nginx_sys::sockaddr;
     if sockaddr.is_null() {

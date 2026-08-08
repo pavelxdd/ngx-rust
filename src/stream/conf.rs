@@ -111,7 +111,7 @@ unsafe impl StreamModuleServerConfExt for ngx_stream_upstream_srv_conf_t {
 /// `MainConf` must be the main-configuration type stored for `Self::module()`.
 pub unsafe trait StreamModuleMainConf: StreamModule {
     /// The module's main-configuration type.
-    type MainConf;
+    type MainConf: 'static;
 
     /// Gets the module's main configuration from a raw configuration source.
     ///
@@ -148,7 +148,7 @@ pub unsafe trait StreamModuleMainConf: StreamModule {
 /// `ServerConf` must be the server-configuration type stored for `Self::module()`.
 pub unsafe trait StreamModuleServerConf: StreamModule {
     /// The module's server-configuration type.
-    type ServerConf;
+    type ServerConf: 'static;
 
     /// Gets the module's server configuration from a raw configuration source.
     ///

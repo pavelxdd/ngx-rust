@@ -1,6 +1,10 @@
 use core::alloc::Layout;
+use core::convert::Infallible;
 use core::ffi::c_void;
+use core::marker::PhantomData;
 use core::mem;
+use core::ops::{Deref, DerefMut};
+use core::pin::Pin;
 use core::ptr::{self, NonNull};
 
 use nginx_sys::{
@@ -15,15 +19,156 @@ use crate::core::buffer::{Buffer, MemoryBuffer, TemporaryBuffer};
 /// pools.
 ///
 /// See <https://nginx.org/en/docs/dev/development_guide.html#pool>
+///
+/// The native pool remains opaque to safe Rust:
+///
+/// ```compile_fail
+/// # use ngx::core::Pool;
+/// # use ngx::ffi::ngx_pool_t;
+/// # fn native_reference(pool: &Pool<'_>) {
+/// let _: &ngx_pool_t = pool.as_ref();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # use ngx::core::Pool;
+/// # use ngx::ffi::ngx_pool_t;
+/// # fn native_reference(pool: &mut Pool<'_>) {
+/// let _: &mut ngx_pool_t = pool.as_mut();
+/// # }
+/// ```
+///
+/// A raw pointer can be passed to nginx, but dereferencing it is explicitly unsafe:
+///
+/// ```compile_fail
+/// # use ngx::core::Pool;
+/// # fn native_reference(pool: &Pool<'_>) {
+/// let _native = &*pool.as_ptr();
+/// # }
+/// ```
+///
+/// Pool handles cannot be detached from their proven lifetime or moved to another thread:
+///
+/// ```compile_fail
+/// # use ngx::core::Pool;
+/// fn erase_lifetime(pool: Pool<'_>) -> Pool<'static> {
+///     pool
+/// }
+/// ```
+///
+/// ```compile_fail
+/// # use ngx::core::Pool;
+/// # fn require_send<T: Send>(_: T) {}
+/// # fn send_pool(pool: Pool<'_>) {
+/// require_send(pool);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # use ngx::core::Pool;
+/// # fn require_sync<T: Sync>(_: &T) {}
+/// # fn share_pool(pool: &Pool<'_>) {
+/// require_sync(pool);
+/// # }
+/// ```
+///
+/// Cleanup values cannot borrow shorter-lived storage because nginx may retain them until the
+/// pool is destroyed:
+///
+/// ```compile_fail
+/// # use core::cell::Cell;
+/// # use ngx::core::Pool;
+/// # fn register_borrowed(pool: &Pool<'_>, counter: &Cell<usize>) {
+/// struct Borrowed<'a>(&'a Cell<usize>);
+/// impl Drop for Borrowed<'_> {
+///     fn drop(&mut self) {
+///         self.0.set(self.0.get() + 1);
+///     }
+/// }
+/// let _value = pool.allocate_with_cleanup(|| Borrowed(counter)).unwrap();
+/// # }
+/// ```
 #[derive(Clone, Debug)]
 #[repr(transparent)]
-pub struct Pool(NonNull<ngx_pool_t>);
+pub struct Pool<'pool> {
+    raw: NonNull<ngx_pool_t>,
+    _lifetime: PhantomData<&'pool ngx_pool_t>,
+}
+
+/// Error returned when a pool cleanup value cannot be allocated or constructed.
+#[derive(Debug, Eq, PartialEq)]
+pub enum PoolCleanupError<E> {
+    /// Nginx could not allocate the cleanup entry or value storage.
+    Allocation,
+    /// The value constructor returned an error.
+    Construction(E),
+}
+
+/// A stable, pool-owned value registered with an nginx cleanup handler.
+///
+/// Moving this handle does not move the value. Dropping the handle leaves the value owned by the
+/// pool; [`remove`](Self::remove) unlinks and drops it early.
+#[derive(Debug)]
+pub struct PoolValue<'pool, T> {
+    value: NonNull<T>,
+    cleanup: NonNull<ngx_pool_cleanup_t>,
+    pool: Pool<'pool>,
+}
+
+impl<T> PoolValue<'_, T> {
+    /// Returns the stable address of the pool-owned value.
+    pub fn as_non_null(&self) -> NonNull<T> {
+        self.value
+    }
+
+    /// Discards the safe handle and returns the stable address retained by the pool cleanup.
+    ///
+    /// Dereferencing the returned pointer remains unsafe, and the pointer must not be used after
+    /// the nginx pool is destroyed or the cleanup is removed.
+    pub fn into_non_null(self) -> NonNull<T> {
+        self.value
+    }
+
+    /// Returns a pinned exclusive reference to the stable pool allocation.
+    pub fn as_pin_mut(&mut self) -> Pin<&mut T> {
+        unsafe { Pin::new_unchecked(self.value.as_mut()) }
+    }
+
+    /// Unlinks the cleanup entry and drops the value.
+    ///
+    /// Returns `false` only when external unsafe code has already unlinked the cleanup entry.
+    pub fn remove(self) -> bool {
+        if self.pool.unlink_cleanup(self.cleanup).is_none() {
+            return false;
+        }
+
+        unsafe {
+            (*self.cleanup.as_ptr()).handler = None;
+            cleanup_type::<T>(self.value.as_ptr().cast());
+        }
+        true
+    }
+}
+
+impl<T> Deref for PoolValue<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.value.as_ref() }
+    }
+}
+
+impl<T: Unpin> DerefMut for PoolValue<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { self.value.as_mut() }
+    }
+}
 
 fn cleanup_type_fits_pool<T>() -> bool {
     mem::align_of::<T>() <= NGX_ALIGNMENT
 }
 
-unsafe impl Allocator for Pool {
+unsafe impl Allocator for Pool<'_> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         // SAFETY:
         // * This wrapper should be constructed with a valid pointer to ngx_pool_t.
@@ -35,21 +180,19 @@ unsafe impl Allocator for Pool {
             // one will be used internally.
             return Ok(NonNull::slice_from_raw_parts(dangling_for_layout(&layout), layout.size()));
         } else if layout.align() == 1 {
-            unsafe { ngx_pnalloc(self.0.as_ptr(), layout.size()) }
+            unsafe { ngx_pnalloc(self.raw.as_ptr(), layout.size()) }
         } else if layout.align() <= NGX_ALIGNMENT {
-            unsafe { ngx_palloc(self.0.as_ptr(), layout.size()) }
+            unsafe { ngx_palloc(self.raw.as_ptr(), layout.size()) }
         } else if cfg!(any(ngx_feature = "have_posix_memalign", ngx_feature = "have_memalign")) {
             // ngx_pmemalign is always defined, but does not guarantee the requested alignment
             // unless memalign/posix_memalign exists.
-            unsafe { ngx_pmemalign(self.0.as_ptr(), layout.size(), layout.align()) }
+            unsafe { ngx_pmemalign(self.raw.as_ptr(), layout.size(), layout.align()) }
         } else {
             return Err(AllocError);
         };
 
-        // Verify the alignment of the result
-        debug_assert_eq!(ptr.align_offset(layout.align()), 0);
-
-        let ptr = NonNull::new(ptr.cast()).ok_or(AllocError)?;
+        let ptr = NonNull::<u8>::new(ptr.cast()).ok_or(AllocError)?;
+        debug_assert_eq!(ptr.as_ptr().align_offset(layout.align()), 0);
         Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
     }
 
@@ -61,9 +204,10 @@ unsafe impl Allocator for Pool {
         //  - use-after-free on large allocation
         //  - multiple cleanup handlers attached to a dangling ptr (these are not unique)
         if layout.size() > 0 // 0 is dangling ptr
-            && (layout.size() > self.as_ref().max || layout.align() > NGX_ALIGNMENT)
+            && (layout.size() > unsafe { (*self.raw.as_ptr()).max }
+                || layout.align() > NGX_ALIGNMENT)
         {
-            unsafe { ngx_pfree(self.0.as_ptr(), ptr.as_ptr().cast()) };
+            unsafe { ngx_pfree(self.raw.as_ptr(), ptr.as_ptr().cast()) };
         }
     }
 
@@ -116,60 +260,77 @@ unsafe impl Allocator for Pool {
     }
 }
 
-impl AsRef<ngx_pool_t> for Pool {
-    #[inline]
-    fn as_ref(&self) -> &ngx_pool_t {
-        // SAFETY: this wrapper should be constructed with a valid pointer to ngx_pool_t
-        unsafe { self.0.as_ref() }
-    }
-}
-
-impl AsMut<ngx_pool_t> for Pool {
-    #[inline]
-    fn as_mut(&mut self) -> &mut ngx_pool_t {
-        // SAFETY: this wrapper should be constructed with a valid pointer to ngx_pool_t
-        unsafe { self.0.as_mut() }
-    }
-}
-
-impl Pool {
-    /// Creates a new `Pool` from an `ngx_pool_t` pointer.
+impl<'pool> Pool<'pool> {
+    /// Creates a non-owning pool handle from an [`ngx_pool_t`] pointer.
     ///
     /// # Safety
-    /// The caller must ensure that a valid `ngx_pool_t` pointer is provided, pointing to valid
-    /// memory and non-null. A null argument will cause an assertion failure and panic.
-    pub unsafe fn from_ngx_pool(pool: *mut ngx_pool_t) -> Pool {
-        unsafe {
-            debug_assert!(!pool.is_null());
-            debug_assert!(pool.is_aligned());
-            Pool(NonNull::new_unchecked(pool))
+    /// The pointer must identify a live nginx pool for all of `'pool`. The caller must also ensure
+    /// nginx pool operations remain confined to the owning worker thread. Null and misaligned
+    /// pointers are rejected.
+    ///
+    /// ```compile_fail
+    /// # use ngx::core::Pool;
+    /// # use ngx::ffi::ngx_pool_t;
+    /// # fn construct(raw: *mut ngx_pool_t) {
+    /// let _pool = Pool::from_raw(raw);
+    /// # }
+    /// ```
+    pub unsafe fn from_raw(pool: *mut ngx_pool_t) -> Option<Self> {
+        let raw = NonNull::new(pool)?;
+        if !pool.is_aligned() {
+            return None;
         }
+
+        Some(Self { raw, _lifetime: PhantomData })
+    }
+
+    /// Invokes a closure with a pool handle that cannot escape the closure through a safe value.
+    ///
+    /// # Safety
+    /// The pointer must identify a live nginx pool for the complete closure call. Nginx pool
+    /// operations must remain confined to the owning worker thread.
+    ///
+    /// ```compile_fail
+    /// # use ngx::core::Pool;
+    /// # use ngx::ffi::ngx_pool_t;
+    /// # fn escape(raw: *mut ngx_pool_t) {
+    /// let _value = unsafe {
+    ///     Pool::with_raw(raw, |pool| pool.allocate_with_cleanup(|| 42_u32).unwrap())
+    /// };
+    /// # }
+    /// ```
+    pub unsafe fn with_raw<R>(
+        pool: *mut ngx_pool_t,
+        f: impl for<'scope> FnOnce(Pool<'scope>) -> R,
+    ) -> Option<R> {
+        let pool = unsafe { Pool::from_raw(pool) }?;
+        Some(f(pool))
     }
 
     /// Expose the underlying `ngx_pool_t` pointer, for use with `ngx::ffi`
     /// functions.
     pub fn as_ptr(&self) -> *mut ngx_pool_t {
-        self.0.as_ptr()
+        self.raw.as_ptr()
     }
 
     /// Creates a buffer of the specified size in the memory pool.
     ///
     /// Returns `Some(TemporaryBuffer)` if the buffer is successfully created, or `None` if
     /// allocation fails.
-    pub fn create_buffer(&self, size: usize) -> Option<TemporaryBuffer> {
-        let buf = unsafe { ngx_create_temp_buf(self.0.as_ptr(), size) };
+    pub fn create_buffer(&self, size: usize) -> Option<TemporaryBuffer<'pool>> {
+        let buf = unsafe { ngx_create_temp_buf(self.raw.as_ptr(), size) };
         if buf.is_null() {
             return None;
         }
 
-        Some(TemporaryBuffer::from_ngx_buf(buf))
+        unsafe { TemporaryBuffer::from_ngx_buf(buf) }
     }
 
     /// Creates a buffer from a string in the memory pool.
     ///
     /// Returns `Some(TemporaryBuffer)` if the buffer is successfully created, or `None` if
     /// allocation fails.
-    pub fn create_buffer_from_str(&self, str: &str) -> Option<TemporaryBuffer> {
+    pub fn create_buffer_from_str(&self, str: &str) -> Option<TemporaryBuffer<'pool>> {
         let mut buffer = self.create_buffer(str.len())?;
         unsafe {
             let buf = buffer.as_ngx_buf_mut();
@@ -183,7 +344,7 @@ impl Pool {
     ///
     /// Returns `Some(MemoryBuffer)` if the buffer is successfully created, or `None` if allocation
     /// fails.
-    pub fn create_buffer_from_static_str(&self, str: &'static str) -> Option<MemoryBuffer> {
+    pub fn create_buffer_from_static_str(&self, str: &'static str) -> Option<MemoryBuffer<'pool>> {
         let buf = self.calloc_type::<ngx_buf_t>();
         if buf.is_null() {
             return None;
@@ -201,46 +362,63 @@ impl Pool {
             (*buf).set_memory(1);
         }
 
-        Some(MemoryBuffer::from_ngx_buf(buf))
+        unsafe { MemoryBuffer::from_ngx_buf(buf) }
     }
 
     /// Allocates a value and registers its destructor with the pool.
     ///
     /// The constructor is called only after nginx allocates storage for the value. The destructor
-    /// runs when the pool is destroyed or when [`remove`](Self::remove) removes the value.
-    ///
-    /// # Safety
-    ///
-    /// The returned pointer must not outlive the pool and must not be freed manually. The caller
-    /// must not access the value after the pool is destroyed or after passing its pointer to
-    /// [`remove`](Self::remove).
-    pub unsafe fn allocate_with_cleanup<T>(
+    /// runs when the pool is destroyed or when [`PoolValue::remove`] removes the value.
+    pub fn allocate_with_cleanup<T: 'static>(
         &self,
         constructor: impl FnOnce() -> T,
-    ) -> Result<NonNull<T>, AllocError> {
+    ) -> Result<PoolValue<'pool, T>, AllocError> {
+        match self.try_allocate_with_cleanup(|| Ok::<T, Infallible>(constructor())) {
+            Ok(value) => Ok(value),
+            Err(PoolCleanupError::Allocation) => Err(AllocError),
+            Err(PoolCleanupError::Construction(error)) => match error {},
+        }
+    }
+
+    /// Allocates a value with a cleanup handler using a fallible constructor.
+    ///
+    /// The cleanup handler is published only after construction succeeds. A failed constructor
+    /// leaves no cleanup entry linked into the pool.
+    pub fn try_allocate_with_cleanup<T: 'static, E>(
+        &self,
+        constructor: impl FnOnce() -> Result<T, E>,
+    ) -> Result<PoolValue<'pool, T>, PoolCleanupError<E>> {
         if !cleanup_type_fits_pool::<T>() {
-            return Err(AllocError);
+            return Err(PoolCleanupError::Allocation);
         }
 
-        let mut cleanup =
-            NonNull::new(unsafe { ngx_pool_cleanup_add(self.0.as_ptr(), mem::size_of::<T>()) })
-                .ok_or(AllocError)?;
+        let cleanup =
+            NonNull::new(unsafe { ngx_pool_cleanup_add(self.raw.as_ptr(), mem::size_of::<T>()) })
+                .ok_or(PoolCleanupError::Allocation)?;
 
         let data: NonNull<T> = if mem::size_of::<T>() == 0 {
             cleanup.cast()
         } else {
-            NonNull::new(unsafe { cleanup.as_ref().data.cast() }).ok_or(AllocError)?
+            NonNull::new(unsafe { (*cleanup.as_ptr()).data.cast() })
+                .ok_or(PoolCleanupError::Allocation)?
         };
         debug_assert_eq!(data.as_ptr().align_offset(mem::align_of::<T>()), 0);
 
-        let value = constructor();
+        let value = match constructor() {
+            Ok(value) => value,
+            Err(error) => {
+                let removed = self.unlink_cleanup(cleanup);
+                debug_assert!(removed.is_some());
+                return Err(PoolCleanupError::Construction(error));
+            }
+        };
         unsafe {
             data.as_ptr().write(value);
-            cleanup.as_mut().data = data.as_ptr().cast();
-            cleanup.as_mut().handler = Some(cleanup_type::<T>);
+            (*cleanup.as_ptr()).data = data.as_ptr().cast();
+            (*cleanup.as_ptr()).handler = Some(cleanup_type::<T>);
         }
 
-        Ok(data)
+        Ok(PoolValue { value: data, cleanup, pool: self.clone() })
     }
 
     /// Allocates memory from the pool of the specified size.
@@ -248,7 +426,7 @@ impl Pool {
     ///
     /// Returns a raw pointer to the allocated memory.
     pub fn alloc(&self, size: usize) -> *mut c_void {
-        unsafe { ngx_palloc(self.0.as_ptr(), size) }
+        unsafe { ngx_palloc(self.raw.as_ptr(), size) }
     }
 
     /// Allocates memory for a type from the pool.
@@ -264,7 +442,7 @@ impl Pool {
     ///
     /// Returns a raw pointer to the allocated memory.
     pub fn calloc(&self, size: usize) -> *mut c_void {
-        unsafe { ngx_pcalloc(self.0.as_ptr(), size) }
+        unsafe { ngx_pcalloc(self.raw.as_ptr(), size) }
     }
 
     /// Allocates zeroed memory for a type from the pool.
@@ -279,7 +457,7 @@ impl Pool {
     ///
     /// Returns a raw pointer to the allocated memory.
     pub fn alloc_unaligned(&self, size: usize) -> *mut c_void {
-        unsafe { ngx_pnalloc(self.0.as_ptr(), size) }
+        unsafe { ngx_pnalloc(self.raw.as_ptr(), size) }
     }
 
     /// Allocates unaligned memory for a type from the pool.
@@ -291,46 +469,55 @@ impl Pool {
 
     /// Runs the cleanup handler for a value and unlinks it from the pool.
     ///
-    /// Returns `None` when the value has no matching cleanup entry.
+    /// Returns `false` when the value has no matching cleanup entry.
     ///
     /// # Safety
     ///
-    /// `value` must be a non-null pointer returned by [`allocate_with_cleanup`](Self::allocate_with_cleanup)
-    /// for this pool. No references to the value may be live, the pointer must not be used after
-    /// this call, and no other handle may access the pool's cleanup list during this call.
-    pub unsafe fn remove<T>(&mut self, value: *const T) -> Option<()> {
-        let cleanup = self.remove_cleanup_if(|cleanup| ptr::addr_eq(cleanup.data, value))?;
-        let handler = cleanup.handler?;
+    /// `value` must be a pointer returned by
+    /// [`PoolValue::into_non_null`] for this pool. No references to the value may be live, and the
+    /// pointer must not be used after this call.
+    pub unsafe fn remove_cleanup<T>(&self, value: NonNull<T>) -> bool {
+        let Some(cleanup) = self
+            .unlink_cleanup_if(|cleanup| unsafe { ptr::addr_eq((*cleanup).data, value.as_ptr()) })
+        else {
+            return false;
+        };
+        let Some(handler) = (unsafe { (*cleanup.as_ptr()).handler }) else {
+            return false;
+        };
 
-        unsafe { handler(cleanup.data) };
-        Some(())
+        unsafe {
+            (*cleanup.as_ptr()).handler = None;
+            handler((*cleanup.as_ptr()).data);
+        }
+        true
     }
 
-    fn remove_cleanup_if(
-        &mut self,
-        predicate: impl Fn(&ngx_pool_cleanup_t) -> bool,
-    ) -> Option<&ngx_pool_cleanup_t> {
-        let mut head = ngx_pool_cleanup_t {
-            handler: None,
-            data: ptr::null_mut(),
-            next: self.as_ref().cleanup,
-        };
-        let head_ptr = &raw const head;
-        let mut previous = &mut head;
+    fn unlink_cleanup(
+        &self,
+        cleanup: NonNull<ngx_pool_cleanup_t>,
+    ) -> Option<NonNull<ngx_pool_cleanup_t>> {
+        self.unlink_cleanup_if(|candidate| ptr::eq(candidate, cleanup.as_ptr()))
+    }
 
-        while let Some(cleanup) = unsafe { previous.next.as_mut() } {
-            if predicate(cleanup) {
-                if ptr::eq(previous, head_ptr) {
-                    self.as_mut().cleanup = cleanup.next;
-                } else {
-                    previous.next = cleanup.next;
+    fn unlink_cleanup_if(
+        &self,
+        mut predicate: impl FnMut(*mut ngx_pool_cleanup_t) -> bool,
+    ) -> Option<NonNull<ngx_pool_cleanup_t>> {
+        let mut link = unsafe { &raw mut (*self.raw.as_ptr()).cleanup };
+
+        loop {
+            let cleanup = unsafe { *link };
+            let cleanup = NonNull::new(cleanup)?;
+            if predicate(cleanup.as_ptr()) {
+                unsafe {
+                    *link = (*cleanup.as_ptr()).next;
+                    (*cleanup.as_ptr()).next = ptr::null_mut();
                 }
                 return Some(cleanup);
             }
-            previous = cleanup;
+            link = unsafe { &raw mut (*cleanup.as_ptr()).next };
         }
-
-        None
     }
 
     /// Resizes a memory allocation in place if possible.
@@ -349,11 +536,11 @@ impl Pool {
         new_layout: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
         if unsafe {
-            ptr.byte_add(old_layout.size()).as_ptr() == self.as_ref().d.last
-                && ptr.byte_add(new_layout.size()).as_ptr() <= self.as_ref().d.end
+            ptr.byte_add(old_layout.size()).as_ptr() == (*self.raw.as_ptr()).d.last
+                && ptr.byte_add(new_layout.size()).as_ptr() <= (*self.raw.as_ptr()).d.end
                 && ptr.align_offset(new_layout.align()) == 0
         } {
-            let pool = self.0.as_ptr();
+            let pool = self.raw.as_ptr();
             unsafe { (*pool).d.last = ptr.byte_add(new_layout.size()).as_ptr() };
             Ok(NonNull::slice_from_raw_parts(ptr, new_layout.size()))
         } else {
@@ -380,17 +567,24 @@ unsafe extern "C" fn cleanup_type<T>(data: *mut c_void) {
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+
+    use alloc::boxed::Box;
+    use core::alloc::Layout;
     use core::cell::Cell;
-    use core::mem::{MaybeUninit, zeroed};
+    use core::mem;
+
+    use nginx_sys::{ngx_create_pool, ngx_destroy_pool, ngx_log_t};
 
     use super::*;
+    use crate::allocator::Allocator;
 
     #[repr(align(4096))]
     struct OverAligned;
 
-    struct DropCounter<'a>(&'a Cell<usize>);
+    struct DropCounter(alloc::rc::Rc<Cell<usize>>);
 
-    impl Drop for DropCounter<'_> {
+    impl Drop for DropCounter {
         fn drop(&mut self) {
             self.0.set(self.0.get() + 1);
         }
@@ -401,23 +595,195 @@ mod tests {
         assert!(!cleanup_type_fits_pool::<OverAligned>());
     }
 
+    #[cfg(feature = "test-link")]
     #[test]
-    fn remove_drops_value_and_unlinks_cleanup() {
-        let drops = Cell::new(0);
-        let mut value = MaybeUninit::new(DropCounter(&drops));
-        let mut cleanup = ngx_pool_cleanup_t {
-            handler: Some(cleanup_type::<DropCounter<'_>>),
-            data: value.as_mut_ptr().cast(),
-            next: ptr::null_mut(),
-        };
-        let mut raw_pool: ngx_pool_t = unsafe { zeroed() };
-        raw_pool.cleanup = &raw mut cleanup;
-        let mut pool = unsafe { Pool::from_ngx_pool(&raw mut raw_pool) };
+    fn cleanup_allocation_rejects_unsupported_alignment_without_linking_an_entry() {
+        let owner = TestPool::new();
+        let pool = owner.handle();
+        let head = unsafe { (*owner.raw).cleanup };
 
-        let removed = unsafe { pool.remove(value.as_ptr()) };
+        assert!(pool.allocate_with_cleanup(|| OverAligned).is_err());
+        assert_eq!(unsafe { (*owner.raw).cleanup }, head);
+    }
 
-        assert_eq!(removed, Some(()));
-        assert!(raw_pool.cleanup.is_null());
+    #[test]
+    fn raw_construction_rejects_null_and_misaligned_pointers() {
+        assert!(unsafe { Pool::from_raw(ptr::null_mut()) }.is_none());
+
+        let misaligned = ptr::without_provenance_mut::<ngx_pool_t>(1);
+        assert!(unsafe { Pool::from_raw(misaligned) }.is_none());
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn allocator_covers_zero_small_large_and_overaligned_layouts() {
+        let owner = TestPool::new();
+        let pool = owner.handle();
+        let cloned = pool.clone();
+
+        let zero = Layout::from_size_align(0, 64).unwrap();
+        let zero_ptr = pool.allocate(zero).unwrap().cast::<u8>();
+        assert_eq!(zero_ptr.as_ptr().align_offset(zero.align()), 0);
+
+        let small = Layout::from_size_align(32, 8).unwrap();
+        let small_ptr = pool.allocate(small).unwrap().cast::<u8>();
+        assert_eq!(small_ptr.as_ptr().align_offset(small.align()), 0);
+
+        let large = Layout::from_size_align(16 * 1024, 8).unwrap();
+        let large_ptr = cloned.allocate(large).unwrap().cast::<u8>();
+        assert_eq!(large_ptr.as_ptr().align_offset(large.align()), 0);
+
+        let over_aligned = Layout::from_size_align(128, 4096).unwrap();
+        let result = pool.allocate(over_aligned);
+        if cfg!(any(ngx_feature = "have_posix_memalign", ngx_feature = "have_memalign")) {
+            assert_eq!(result.unwrap().cast::<u8>().as_ptr().align_offset(4096), 0);
+        } else {
+            assert!(result.is_err());
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn resize_preserves_bytes_and_reuses_the_last_allocation() {
+        let owner = TestPool::new();
+        let pool = owner.handle();
+        let initial = Layout::from_size_align(16, 8).unwrap();
+        let grown = Layout::from_size_align(64, 8).unwrap();
+        let shrunk = Layout::from_size_align(8, 8).unwrap();
+        let ptr = pool.allocate(initial).unwrap().cast::<u8>();
+        unsafe { ptr.as_ptr().write_bytes(0x5a, initial.size()) };
+
+        let grown_ptr = unsafe { pool.grow(ptr, initial, grown) }.unwrap().cast::<u8>();
+        assert_eq!(grown_ptr, ptr);
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(grown_ptr.as_ptr(), initial.size()) },
+            [0x5a; 16]
+        );
+
+        let shrunk_ptr = unsafe { pool.shrink(grown_ptr, grown, shrunk) }.unwrap().cast::<u8>();
+        assert_eq!(shrunk_ptr, ptr);
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(shrunk_ptr.as_ptr(), shrunk.size()) },
+            [0x5a; 8]
+        );
+
+        let moving_layout = Layout::from_size_align(16, 8).unwrap();
+        let moved_layout = Layout::from_size_align(128, 8).unwrap();
+        let moving_ptr = pool.allocate(moving_layout).unwrap().cast::<u8>();
+        unsafe { moving_ptr.as_ptr().write_bytes(0xa5, moving_layout.size()) };
+        let _blocker = pool.allocate(moving_layout).unwrap();
+
+        let moved_ptr =
+            unsafe { pool.grow(moving_ptr, moving_layout, moved_layout) }.unwrap().cast::<u8>();
+        assert_ne!(moved_ptr, moving_ptr);
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(moved_ptr.as_ptr(), moving_layout.size()) },
+            [0xa5; 16]
+        );
+
+        let zeroed_initial = Layout::from_size_align(8, 8).unwrap();
+        let zeroed_grown = Layout::from_size_align(32, 8).unwrap();
+        let zeroed_ptr = pool.allocate(zeroed_initial).unwrap().cast::<u8>();
+        unsafe { zeroed_ptr.as_ptr().write_bytes(0x3c, zeroed_initial.size()) };
+
+        let zeroed_ptr = unsafe { pool.grow_zeroed(zeroed_ptr, zeroed_initial, zeroed_grown) }
+            .unwrap()
+            .cast::<u8>();
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(zeroed_ptr.as_ptr(), zeroed_initial.size()) },
+            [0x3c; 8]
+        );
+        assert!(
+            unsafe {
+                core::slice::from_raw_parts(
+                    zeroed_ptr.as_ptr().add(zeroed_initial.size()),
+                    zeroed_grown.size() - zeroed_initial.size(),
+                )
+            }
+            .iter()
+            .all(|byte| *byte == 0)
+        );
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn failed_constructor_is_never_published_as_cleanup() {
+        let owner = TestPool::new();
+        let pool = owner.handle();
+        let head = unsafe { (*owner.raw).cleanup };
+
+        let result = pool.try_allocate_with_cleanup(|| {
+            let pending = unsafe { (*owner.raw).cleanup };
+            assert_ne!(pending, head);
+            assert!(unsafe { (*pending).handler }.is_none());
+            Err::<DropCounter, _>("rejected")
+        });
+
+        assert!(matches!(result, Err(PoolCleanupError::Construction("rejected"))));
+        assert_eq!(unsafe { (*owner.raw).cleanup }, head);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn removal_and_pool_destruction_drop_each_value_once() {
+        let drops = alloc::rc::Rc::new(Cell::new(0));
+        let owner = TestPool::new();
+        let pool = owner.handle();
+        let removed = pool.allocate_with_cleanup(|| DropCounter(drops.clone())).unwrap();
+        let raw_removed = pool.allocate_with_cleanup(|| DropCounter(drops.clone())).unwrap();
+        let retained = pool.allocate_with_cleanup(|| DropCounter(drops.clone())).unwrap();
+        let raw_removed = raw_removed.into_non_null();
+        let _ = retained.into_non_null();
+
+        assert!(removed.remove());
         assert_eq!(drops.get(), 1);
+        assert!(unsafe { pool.remove_cleanup(raw_removed) });
+        assert_eq!(drops.get(), 2);
+
+        drop(owner);
+        assert_eq!(drops.get(), 3);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn cleanup_value_keeps_a_stable_address_when_its_handle_moves() {
+        let owner = TestPool::new();
+        let pool = owner.handle();
+        let value = pool.allocate_with_cleanup(|| 41_u64).unwrap();
+        let address = value.as_non_null();
+
+        let mut moved = value;
+        *moved = 42;
+
+        assert_eq!(moved.as_non_null(), address);
+        assert_eq!(*moved, 42);
+        assert!(moved.remove());
+    }
+
+    #[cfg(feature = "test-link")]
+    struct TestPool {
+        raw: *mut ngx_pool_t,
+        _log: Box<ngx_log_t>,
+    }
+
+    #[cfg(feature = "test-link")]
+    impl TestPool {
+        fn new() -> Self {
+            let mut log = Box::new(unsafe { mem::zeroed() });
+            let raw = unsafe { ngx_create_pool(4096, &raw mut *log) };
+            assert!(!raw.is_null());
+            Self { raw, _log: log }
+        }
+
+        fn handle(&self) -> Pool<'_> {
+            unsafe { Pool::from_raw(self.raw) }.unwrap()
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    impl Drop for TestPool {
+        fn drop(&mut self) {
+            unsafe { ngx_destroy_pool(self.raw) };
+        }
     }
 }
