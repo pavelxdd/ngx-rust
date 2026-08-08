@@ -4,15 +4,16 @@ use core::mem::{offset_of, size_of};
 use core::ptr::{self, NonNull};
 use core::slice;
 
-use crate::core::{BufferError, BufferMut, BufferRef, Pool, PoolBuffer};
+use crate::core::{BufferError, BufferMut, BufferRef, Pool, PoolBuffer, Status};
 use crate::event::{EventError, EventRef};
 #[cfg(unix)]
 use crate::ffi::sockaddr_un;
 use crate::ffi::{
     NGX_DECLINED, NGX_ERROR, NGX_OK, NGX_PROXY_PROTOCOL_MAX_HEADER, in_addr, in6_addr,
-    in6_addr__bindgen_ty_1, ngx_buf_t, ngx_connection_t, ngx_int_t, ngx_listening_t, ngx_log_t,
-    ngx_proxy_protocol_lookup_tlv, ngx_proxy_protocol_t, ngx_sin_addr_t, ngx_sock_ntop, ngx_str_t,
-    sa_family_t, sockaddr, sockaddr_in, sockaddr_in6, socklen_t,
+    in6_addr__bindgen_ty_1, ngx_buf_t, ngx_connection_local_sockaddr, ngx_connection_t, ngx_int_t,
+    ngx_listening_t, ngx_log_t, ngx_proxy_protocol_lookup_tlv, ngx_proxy_protocol_t,
+    ngx_sin_addr_t, ngx_sock_ntop, ngx_str_t, sa_family_t, sockaddr, sockaddr_in, sockaddr_in6,
+    socklen_t,
 };
 
 /// Failure returned while validating a native socket address.
@@ -715,6 +716,14 @@ impl<'callback> ConnectionRefMut<'callback> {
     /// Returns the checked local address recorded by nginx.
     pub fn local_address(&self) -> Result<SocketAddress<'_>, ConnectionError> {
         connection_local_address(self.raw)
+    }
+
+    /// Populates the local address through nginx when it was not resolved at accept time.
+    ///
+    /// Nginx may allocate the refreshed address from this connection's pool.
+    pub fn refresh_local_address(&mut self) -> Result<(), Status> {
+        Status(unsafe { ngx_connection_local_sockaddr(self.raw.as_ptr(), ptr::null_mut(), 0) })
+            .into_result()
     }
 
     /// Returns configured PROXY protocol metadata when nginx attached it.

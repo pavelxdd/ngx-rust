@@ -10,6 +10,10 @@ use core::mem::{self, size_of};
 use core::panic::AssertUnwindSafe;
 use core::ptr;
 use core::slice;
+#[cfg(all(feature = "test-link", unix))]
+use std::net::{TcpListener, TcpStream};
+#[cfg(all(feature = "test-link", unix))]
+use std::os::fd::AsRawFd;
 
 use super::{
     ConnectionError, ConnectionRef, ConnectionRefMut, ProxyProtocolAddress, ProxyProtocolBuilder,
@@ -301,6 +305,33 @@ fn peer_and_local_ipv4_addresses_keep_port_byte_order() {
     assert_eq!(local.ipv4_octets(), Some([198, 51, 100, 20]));
     assert_eq!(local.port().unwrap().host_order(), 443);
     assert_eq!(local.port().unwrap().network_order(), [0x01, 0xbb]);
+}
+
+#[cfg(all(feature = "test-link", unix))]
+#[test]
+fn local_address_refreshes_a_wildcard_placeholder_through_nginx() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let (server, _) = listener.accept().unwrap();
+
+    let owner = TestPool::new();
+    let mut placeholder: sockaddr_in = unsafe { mem::zeroed() };
+    placeholder.sin_family = libc::AF_INET as _;
+    placeholder.sin_port = port.to_be();
+
+    let mut connection = zeroed_connection();
+    connection.fd = server.as_raw_fd();
+    connection.pool = owner.raw;
+    connection.local_sockaddr = (&raw mut placeholder).cast();
+    connection.local_socklen = size_of::<sockaddr_in>() as _;
+    let mut connection =
+        unsafe { ConnectionRefMut::from_raw(raw_connection(&mut connection)) }.unwrap();
+
+    connection.refresh_local_address().unwrap();
+    let local = connection.local_address().unwrap();
+    assert_eq!(local.ipv4_octets(), Some([127, 0, 0, 1]));
+    assert_eq!(local.port().unwrap().host_order(), port);
 }
 
 #[test]
