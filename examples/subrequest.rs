@@ -18,7 +18,7 @@ use ngx::{ngx_log_error, ngx_string};
 
 struct Module;
 
-impl HttpModule for Module {
+unsafe impl HttpModule for Module {
     fn module() -> &'static ngx_module_t {
         unsafe { &*ptr::addr_of!(ngx_http_subrequest_module) }
     }
@@ -115,7 +115,9 @@ impl HttpRequestHandler for SubRequestAccessHandler {
     type Output = Result<Status, ExampleError>;
 
     fn handler(request: &mut Request) -> Self::Output {
-        let config = Module::location_conf(request).ok_or(ExampleError::Config)?;
+        let config = Module::location_conf(request)
+            .map_err(|_| ExampleError::Config)?
+            .ok_or(ExampleError::Config)?;
         if config.uri.data.is_null() {
             return Ok(Status::NGX_DECLINED);
         }

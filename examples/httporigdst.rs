@@ -268,7 +268,7 @@ http_variable_get!(
 
 struct Module;
 
-impl HttpModule for Module {
+unsafe impl HttpModule for Module {
     fn module() -> &'static ngx_module_t {
         unsafe { &*::core::ptr::addr_of!(ngx_http_orig_dst_module) }
     }

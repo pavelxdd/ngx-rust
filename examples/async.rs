@@ -21,7 +21,7 @@ use ngx::{async_ as ngx_async, ngx_conf_log_error, ngx_log_debug_http, ngx_strin
 
 struct Module;
 
-impl http::HttpModule for Module {
+unsafe impl http::HttpModule for Module {
     fn module() -> &'static ngx_module_t {
         unsafe { &*::core::ptr::addr_of!(ngx_http_async_module) }
     }
@@ -179,24 +179,35 @@ impl AsyncHttpRequestHandler for AsyncAccessHandler {
     fn start(
         request: &mut http::Request,
     ) -> impl core::future::Future<Output = Self::Output> + 'static {
-        let co = Module::location_conf(request).expect("module config is none");
-        let enabled = co.enable.unwrap_or(false);
-        ngx_log_debug_http!(request, "async module enabled: {enabled}");
-        let subrequest = enabled.then(|| {
-            let started = Instant::now();
-            SubRequestBuilder::new(request, "/async-target")
-                .and_then(|builder| {
-                    builder.waited().build_async(|subrequest, completion_status| {
-                        let status = subrequest
-                            .status()
-                            .or_else(|| HTTPStatus::try_from(completion_status).ok());
-                        (status, Status::NGX_OK)
-                    })
-                })
-                .map(|(future, _)| (started, future))
-        });
+        let enabled = Module::location_conf(request)
+            .map_err(|_| SubRequestError::Create(Status::NGX_ERROR.into()))
+            .and_then(|configuration| {
+                configuration
+                    .map(|configuration| configuration.enable.unwrap_or(false))
+                    .ok_or(SubRequestError::Create(Status::NGX_ERROR.into()))
+            });
+        let subrequest = match enabled {
+            Ok(enabled) => {
+                ngx_log_debug_http!(request, "async module enabled: {enabled}");
+                Ok(enabled.then(|| {
+                    let started = Instant::now();
+                    SubRequestBuilder::new(request, "/async-target")
+                        .and_then(|builder| {
+                            builder.waited().build_async(|subrequest, completion_status| {
+                                let status = subrequest
+                                    .status()
+                                    .or_else(|| HTTPStatus::try_from(completion_status).ok());
+                                (status, Status::NGX_OK)
+                            })
+                        })
+                        .map(|(future, _)| (started, future))
+                }))
+            }
+            Err(error) => Err(error),
+        };
 
         async move {
+            let subrequest = subrequest?;
             let Some(subrequest) = subrequest else {
                 return Ok(None);
             };
