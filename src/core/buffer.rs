@@ -131,6 +131,7 @@ pub enum BufferView<'buffer> {
 pub struct BufferRef<'buffer> {
     raw: NonNull<ngx_buf_t>,
     _lifetime: PhantomData<&'buffer ngx_buf_t>,
+    _not_thread_safe: PhantomData<*mut ()>,
 }
 
 impl<'buffer> BufferRef<'buffer> {
@@ -150,7 +151,7 @@ impl<'buffer> BufferRef<'buffer> {
     /// ```
     pub unsafe fn from_raw(buffer: *const ngx_buf_t) -> Result<Self, BufferError> {
         let raw = checked_buffer_ptr(buffer)?;
-        Ok(Self { raw, _lifetime: PhantomData })
+        Ok(Self { raw, _lifetime: PhantomData, _not_thread_safe: PhantomData })
     }
 
     /// Invokes a closure with a shared buffer view that cannot escape through a safe value.
@@ -192,6 +193,25 @@ impl<'buffer> BufferRef<'buffer> {
             return Ok(None);
         }
         Ok(Some(unsafe { slice::from_raw_parts(start.as_ptr(), len) }))
+    }
+
+    /// Returns whether a memory-backed buffer has writable bytes after its visible range.
+    pub fn has_space(self) -> Result<bool, BufferError> {
+        let buffer = unsafe { self.raw.as_ref() };
+        if !in_memory(buffer) {
+            return Ok(false);
+        }
+
+        memory_range(buffer)?;
+        let last = NonNull::new(buffer.last).ok_or(BufferError::InvalidMemoryRange)?;
+        let end = NonNull::new(buffer.end).ok_or(BufferError::InvalidMemoryRange)?;
+        let available = (end.as_ptr() as usize)
+            .checked_sub(last.as_ptr() as usize)
+            .ok_or(BufferError::InvalidMemoryRange)?;
+        if available > isize::MAX as usize {
+            return Err(BufferError::InvalidMemoryRange);
+        }
+        Ok(available != 0)
     }
 
     /// Returns a nonempty file range when nginx marks the buffer as file-backed.
@@ -243,6 +263,7 @@ impl<'buffer> BufferRef<'buffer> {
 pub struct BufferMut<'buffer> {
     raw: NonNull<ngx_buf_t>,
     _lifetime: PhantomData<&'buffer mut ngx_buf_t>,
+    _not_thread_safe: PhantomData<*mut ()>,
 }
 
 impl BufferMut<'_> {
@@ -256,7 +277,7 @@ impl BufferMut<'_> {
         buffer: *mut ngx_buf_t,
     ) -> Result<BufferMut<'buffer>, BufferError> {
         let raw = checked_buffer_ptr(buffer)?;
-        Ok(BufferMut { raw, _lifetime: PhantomData })
+        Ok(BufferMut { raw, _lifetime: PhantomData, _not_thread_safe: PhantomData })
     }
 
     /// Invokes a closure with an exclusive buffer view that cannot escape through a safe value.
@@ -281,7 +302,7 @@ impl BufferMut<'_> {
 
     /// Returns a checked shared reborrow.
     pub fn view(&self) -> BufferRef<'_> {
-        BufferRef { raw: self.raw, _lifetime: PhantomData }
+        BufferRef { raw: self.raw, _lifetime: PhantomData, _not_thread_safe: PhantomData }
     }
 
     /// Returns the native buffer pointer for FFI calls.
@@ -358,17 +379,21 @@ pub struct PoolBuffer<'pool> {
 impl<'pool> PoolBuffer<'pool> {
     /// Returns a checked shared view tied to this handle borrow.
     pub fn view(&self) -> BufferRef<'_> {
-        BufferRef { raw: self.raw, _lifetime: PhantomData }
+        BufferRef { raw: self.raw, _lifetime: PhantomData, _not_thread_safe: PhantomData }
     }
 
     /// Returns a checked exclusive view tied to this handle borrow.
     pub fn view_mut(&mut self) -> BufferMut<'_> {
-        BufferMut { raw: self.raw, _lifetime: PhantomData }
+        BufferMut { raw: self.raw, _lifetime: PhantomData, _not_thread_safe: PhantomData }
     }
 
     /// Returns the stable native buffer pointer for FFI calls.
     pub fn as_ptr(&self) -> *mut ngx_buf_t {
         self.raw.as_ptr()
+    }
+
+    pub(crate) fn pool_ptr(&self) -> *mut nginx_sys::ngx_pool_t {
+        self.pool.as_ptr()
     }
 
     /// Transfers the stable native buffer pointer while the pool retains ownership.
@@ -394,7 +419,7 @@ impl<'pool> PoolBuffer<'pool> {
     }
 
     fn pool_view(&self) -> BufferRef<'pool> {
-        BufferRef { raw: self.raw, _lifetime: PhantomData }
+        BufferRef { raw: self.raw, _lifetime: PhantomData, _not_thread_safe: PhantomData }
     }
 }
 

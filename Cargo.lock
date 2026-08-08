@@ -551,6 +551,7 @@ dependencies = [
  "allocator-api2",
  "async-task",
  "bitflags",
+ "libc",
  "lock_api",
  "log",
  "nginx-sys",
