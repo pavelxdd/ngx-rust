@@ -259,6 +259,41 @@ fn build_test_library(
         .expect("NGINX test main wrapper");
     sources.push(wrapper);
 
+    let event_wrapper = out_dir.join("nginx_test_event.c");
+    let mut file = File::create(&event_wrapper).expect("NGINX event test wrapper");
+    file.write_all(
+        br"#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_event.h>
+
+void
+ngx_rs_test_add_timer(ngx_event_t *ev, ngx_msec_t timer)
+{
+    ngx_add_timer(ev, timer);
+}
+
+void
+ngx_rs_test_del_timer(ngx_event_t *ev)
+{
+    ngx_del_timer(ev);
+}
+
+void
+ngx_rs_test_post_event(ngx_event_t *ev, ngx_queue_t *queue)
+{
+    ngx_post_event(ev, queue);
+}
+
+void
+ngx_rs_test_delete_posted_event(ngx_event_t *ev)
+{
+    ngx_delete_posted_event(ev);
+}
+",
+    )
+    .expect("NGINX event test wrapper");
+    sources.push(event_wrapper);
+
     let mut build = cc::Build::new();
     build.include(nginx.source_dir.join("src/core"));
     for include in includes {
