@@ -294,6 +294,42 @@ ngx_rs_test_delete_posted_event(ngx_event_t *ev)
     .expect("NGINX event test wrapper");
     sources.push(event_wrapper);
 
+    let alloc_wrapper = out_dir.join("nginx_test_alloc.c");
+    let mut file = File::create(&alloc_wrapper).expect("NGINX allocation test wrapper");
+    file.write_all(
+        br"#include <ngx_config.h>
+#include <ngx_core.h>
+
+static void *ngx_rs_test_tracked_free;
+static ngx_uint_t ngx_rs_test_tracked_free_count;
+
+void
+ngx_rs_test_track_free(void *ptr)
+{
+    ngx_rs_test_tracked_free = ptr;
+    ngx_rs_test_tracked_free_count = 0;
+}
+
+ngx_uint_t
+ngx_rs_test_free_count(void)
+{
+    return ngx_rs_test_tracked_free_count;
+}
+
+void
+ngx_rs_test_free(void *ptr)
+{
+    if (ptr == ngx_rs_test_tracked_free) {
+        ngx_rs_test_tracked_free_count++;
+    }
+
+    ngx_free(ptr);
+}
+",
+    )
+    .expect("NGINX allocation test wrapper");
+    sources.push(alloc_wrapper);
+
     let mut build = cc::Build::new();
     build.include(nginx.source_dir.join("src/core"));
     for include in includes {
