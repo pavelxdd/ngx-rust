@@ -78,8 +78,11 @@ pub unsafe fn ngx_queue_remove(q: *mut ngx_queue_t) {
     unsafe {
         (*(*q).next).prev = (*q).prev;
         (*(*q).prev).next = (*q).next;
-        (*q).prev = ptr::null_mut();
-        (*q).next = ptr::null_mut();
+        #[cfg(ngx_feature = "debug")]
+        {
+            (*q).prev = ptr::null_mut();
+            (*q).next = ptr::null_mut();
+        }
     }
 }
 
