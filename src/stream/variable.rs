@@ -4,6 +4,11 @@ use core::fmt;
 use core::marker::PhantomData;
 use core::ptr::{self, NonNull};
 
+#[cfg(feature = "std")]
+use core::panic::AssertUnwindSafe;
+#[cfg(feature = "std")]
+use std::panic::catch_unwind;
+
 use crate::allocator::Allocator;
 use crate::core::{ConnectionError, NgxStr, Pool};
 use crate::ffi::{
@@ -162,12 +167,13 @@ impl StreamVariableValue<'_> {
 
     unsafe fn from_raw<'callback>(
         value: *mut ngx_variable_value_t,
-    ) -> StreamVariableValue<'callback> {
-        StreamVariableValue {
-            raw: unsafe { NonNull::new_unchecked(value) },
-            _callback: PhantomData,
-            _not_thread_safe: PhantomData,
+    ) -> Option<StreamVariableValue<'callback>> {
+        let raw = NonNull::new(value)?;
+        if !value.is_aligned() {
+            return None;
         }
+
+        Some(StreamVariableValue { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
     }
 
     /// Returns a checked view of the current output state.
@@ -433,8 +439,24 @@ where
 {
     unsafe {
         Session::with_raw(session, |mut session| {
-            let mut value = StreamVariableValue::from_raw(value);
-            H::get(&mut session, &mut value, data).into_handler_status(&session)
+            let Some(mut value) = StreamVariableValue::from_raw(value) else {
+                return NGX_ERROR as _;
+            };
+
+            #[cfg(feature = "std")]
+            {
+                catch_unwind(AssertUnwindSafe(|| {
+                    H::get(&mut session, &mut value, data).into_handler_status(&session)
+                }))
+                .unwrap_or(NGX_ERROR as _)
+            }
+
+            #[cfg(not(feature = "std"))]
+            {
+                // An `extern "C"` trampoline must never unwind into nginx. A no-std panic that
+                // reaches this boundary aborts rather than crossing it.
+                H::get(&mut session, &mut value, data).into_handler_status(&session)
+            }
         })
     }
     .unwrap_or(NGX_ERROR as _)
@@ -444,20 +466,31 @@ where
 mod tests {
     #[cfg(feature = "test-link")]
     use alloc::boxed::Box;
+    #[cfg(feature = "test-link")]
+    use core::ffi::c_void;
     use core::mem::MaybeUninit;
     use core::ptr::{self, NonNull};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(feature = "test-link")]
+    use std::sync::MutexGuard;
 
     #[cfg(feature = "test-link")]
     use super::StreamVariablePoolBytes;
     use super::{
-        StreamVariableHandler, StreamVariableValue, StreamVariableValueError,
-        StreamVariableValueReadError, raw_get_handler,
+        StreamVariableFlags, StreamVariableHandler, StreamVariableValue, StreamVariableValueError,
+        StreamVariableValueReadError, add_variable, raw_get_handler,
     };
-    use crate::core::Status;
-    use crate::ffi::{NGX_STREAM_OK, ngx_stream_session_t, ngx_variable_value_t};
+    use crate::core::{NgxStr, Status};
+    use crate::ffi::{
+        NGX_ERROR, NGX_STREAM_OK, ngx_int_t, ngx_stream_session_t, ngx_variable_value_t,
+    };
     #[cfg(feature = "test-link")]
     use crate::ffi::{
-        ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_log_t, ngx_pool_t, ngx_uint_t,
+        NGX_OK, NGX_STREAM_MODULE, NGX_STREAM_VAR_INDEXED, ngx_array_t, ngx_conf_t,
+        ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_hash_key_t, ngx_log_t, ngx_pool_t,
+        ngx_stream_conf_ctx_t, ngx_stream_core_main_conf_t, ngx_stream_get_variable_pt,
+        ngx_stream_variable_t, ngx_stream_variables_add_core_vars, ngx_uint_t,
     };
     use crate::stream::Session;
 
@@ -469,6 +502,130 @@ mod tests {
 
     struct TestVariable;
 
+    static RAW_VARIABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static RAW_VARIABLE_DATA: AtomicUsize = AtomicUsize::new(0);
+
+    struct CountingVariable;
+
+    impl StreamVariableHandler for CountingVariable {
+        type Output = Status;
+
+        fn get(
+            _session: &mut Session<'_>,
+            value: &mut StreamVariableValue<'_>,
+            _data: usize,
+        ) -> Self::Output {
+            RAW_VARIABLE_CALLS.fetch_add(1, Ordering::Relaxed);
+            value.set_empty();
+            Status::NGX_OK
+        }
+    }
+
+    struct DataVariable;
+
+    impl StreamVariableHandler for DataVariable {
+        type Output = Status;
+
+        fn get(
+            _session: &mut Session<'_>,
+            value: &mut StreamVariableValue<'_>,
+            data: usize,
+        ) -> Self::Output {
+            RAW_VARIABLE_DATA.store(data, Ordering::Relaxed);
+            value.set_empty();
+            Status::NGX_DECLINED
+        }
+    }
+
+    struct RawStatusVariable;
+
+    impl StreamVariableHandler for RawStatusVariable {
+        type Output = ngx_int_t;
+
+        fn get(
+            _session: &mut Session<'_>,
+            value: &mut StreamVariableValue<'_>,
+            _data: usize,
+        ) -> Self::Output {
+            value.set_empty();
+            NGX_STREAM_OK as _
+        }
+    }
+
+    struct OptionalStatusVariable;
+
+    impl StreamVariableHandler for OptionalStatusVariable {
+        type Output = Option<Status>;
+
+        fn get(
+            _session: &mut Session<'_>,
+            value: &mut StreamVariableValue<'_>,
+            _data: usize,
+        ) -> Self::Output {
+            value.set_empty();
+            Some(Status::NGX_AGAIN)
+        }
+    }
+
+    struct MissingStatusVariable;
+
+    impl StreamVariableHandler for MissingStatusVariable {
+        type Output = Option<Status>;
+
+        fn get(
+            _session: &mut Session<'_>,
+            _value: &mut StreamVariableValue<'_>,
+            _data: usize,
+        ) -> Self::Output {
+            None
+        }
+    }
+
+    struct ResultStatusVariable;
+
+    impl StreamVariableHandler for ResultStatusVariable {
+        type Output = Result<Status, Status>;
+
+        fn get(
+            _session: &mut Session<'_>,
+            value: &mut StreamVariableValue<'_>,
+            _data: usize,
+        ) -> Self::Output {
+            value.set_empty();
+            Ok(Status::NGX_DECLINED)
+        }
+    }
+
+    struct ErrorStatusVariable;
+
+    impl StreamVariableHandler for ErrorStatusVariable {
+        type Output = Result<Status, Status>;
+
+        fn get(
+            _session: &mut Session<'_>,
+            _value: &mut StreamVariableValue<'_>,
+            _data: usize,
+        ) -> Self::Output {
+            Err(Status::NGX_AGAIN)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    struct PanickingVariable;
+
+    #[cfg(feature = "std")]
+    impl StreamVariableHandler for PanickingVariable {
+        type Output = Status;
+
+        fn get(
+            _session: &mut Session<'_>,
+            _value: &mut StreamVariableValue<'_>,
+            _data: usize,
+        ) -> Self::Output {
+            panic!("variable getter panic")
+        }
+    }
+
     fn poisoned_value() -> ngx_variable_value_t {
         let mut value = unsafe { MaybeUninit::<ngx_variable_value_t>::zeroed().assume_init() };
         value.set_len(17);
@@ -478,6 +635,106 @@ mod tests {
         value.set_escape(1);
         value.data = NonNull::<u8>::dangling().as_ptr();
         value
+    }
+
+    fn misaligned_ptr<T>(storage: &mut [u8]) -> *mut T {
+        let alignment = core::mem::align_of::<T>();
+        assert!(alignment > 1);
+        let offset = storage.as_mut_ptr().align_offset(alignment);
+        assert!(offset + 1 < storage.len());
+        unsafe { storage.as_mut_ptr().add(offset + 1).cast() }
+    }
+
+    fn raw_handler_status<H>() -> ngx_int_t
+    where
+        H: StreamVariableHandler,
+    {
+        let mut session = unsafe { MaybeUninit::<ngx_stream_session_t>::zeroed().assume_init() };
+        let mut value = unsafe { MaybeUninit::<ngx_variable_value_t>::zeroed().assume_init() };
+
+        unsafe { raw_get_handler::<H>(&raw mut session, &raw mut value, 0) }
+    }
+
+    #[test]
+    fn raw_variable_value_construction_rejects_null_and_misaligned_pointers() {
+        assert!(unsafe { StreamVariableValue::from_raw(ptr::null_mut()) }.is_none());
+
+        let mut storage = [0_u8;
+            core::mem::size_of::<ngx_variable_value_t>()
+                + core::mem::align_of::<ngx_variable_value_t>()];
+        let raw = misaligned_ptr::<ngx_variable_value_t>(&mut storage);
+        assert!(unsafe { StreamVariableValue::from_raw(raw) }.is_none());
+    }
+
+    #[test]
+    fn raw_variable_handler_rejects_invalid_callback_pointers_without_calling_the_getter() {
+        RAW_VARIABLE_CALLS.store(0, Ordering::Relaxed);
+        let mut session = unsafe { MaybeUninit::<ngx_stream_session_t>::zeroed().assume_init() };
+        let mut value = unsafe { MaybeUninit::<ngx_variable_value_t>::zeroed().assume_init() };
+
+        assert_eq!(
+            unsafe { raw_get_handler::<CountingVariable>(ptr::null_mut(), &raw mut value, 0) },
+            NGX_ERROR as _
+        );
+        assert_eq!(
+            unsafe { raw_get_handler::<CountingVariable>(&raw mut session, ptr::null_mut(), 0) },
+            NGX_ERROR as _
+        );
+
+        let mut session_storage = [0_u8;
+            core::mem::size_of::<ngx_stream_session_t>()
+                + core::mem::align_of::<ngx_stream_session_t>()];
+        let misaligned_session = misaligned_ptr::<ngx_stream_session_t>(&mut session_storage);
+        assert_eq!(
+            unsafe { raw_get_handler::<CountingVariable>(misaligned_session, &raw mut value, 0) },
+            NGX_ERROR as _
+        );
+
+        let mut value_storage = [0_u8;
+            core::mem::size_of::<ngx_variable_value_t>()
+                + core::mem::align_of::<ngx_variable_value_t>()];
+        let value = misaligned_ptr::<ngx_variable_value_t>(&mut value_storage);
+        assert_eq!(
+            unsafe { raw_get_handler::<CountingVariable>(&raw mut session, value, 0) },
+            NGX_ERROR as _
+        );
+        assert_eq!(RAW_VARIABLE_CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn raw_variable_handler_forwards_zero_and_maximum_data() {
+        RAW_VARIABLE_DATA.store(1, Ordering::Relaxed);
+        let mut session = unsafe { MaybeUninit::<ngx_stream_session_t>::zeroed().assume_init() };
+        let mut value = unsafe { MaybeUninit::<ngx_variable_value_t>::zeroed().assume_init() };
+
+        assert_eq!(
+            unsafe { raw_get_handler::<DataVariable>(&raw mut session, &raw mut value, 0) },
+            Status::NGX_DECLINED.0
+        );
+        assert_eq!(RAW_VARIABLE_DATA.load(Ordering::Relaxed), 0);
+
+        assert_eq!(
+            unsafe {
+                raw_get_handler::<DataVariable>(&raw mut session, &raw mut value, usize::MAX)
+            },
+            Status::NGX_DECLINED.0
+        );
+        assert_eq!(RAW_VARIABLE_DATA.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[test]
+    fn raw_variable_handler_converts_every_supported_status_output() {
+        assert_eq!(raw_handler_status::<RawStatusVariable>(), NGX_STREAM_OK as _);
+        assert_eq!(raw_handler_status::<OptionalStatusVariable>(), Status::NGX_AGAIN.0);
+        assert_eq!(raw_handler_status::<MissingStatusVariable>(), NGX_ERROR as _);
+        assert_eq!(raw_handler_status::<ResultStatusVariable>(), Status::NGX_DECLINED.0);
+        assert_eq!(raw_handler_status::<ErrorStatusVariable>(), Status::NGX_AGAIN.0);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn raw_variable_handler_converts_a_getter_panic_to_ngx_error() {
+        assert_eq!(raw_handler_status::<PanickingVariable>(), NGX_ERROR as _);
     }
 
     fn assert_found(
@@ -542,6 +799,176 @@ mod tests {
     }
 
     #[cfg(feature = "test-link")]
+    struct VariableGlobalState {
+        max_module: ngx_uint_t,
+        stream_max_module: ngx_uint_t,
+        stream_module_index: ngx_uint_t,
+        stream_core_module_type: ngx_uint_t,
+        stream_core_module_index: ngx_uint_t,
+        stream_core_module_context_index: ngx_uint_t,
+    }
+
+    #[cfg(feature = "test-link")]
+    struct VariableGlobals {
+        _guard: MutexGuard<'static, ()>,
+        previous: VariableGlobalState,
+    }
+
+    #[cfg(feature = "test-link")]
+    impl VariableGlobals {
+        fn new() -> Self {
+            let guard = crate::TEST_NGINX_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
+            let previous = unsafe {
+                VariableGlobalState {
+                    max_module: nginx_sys::ngx_max_module,
+                    stream_max_module: nginx_sys::ngx_stream_max_module,
+                    stream_module_index: (*core::ptr::addr_of!(nginx_sys::ngx_stream_module)).index,
+                    stream_core_module_type: (*core::ptr::addr_of!(
+                        nginx_sys::ngx_stream_core_module
+                    ))
+                    .type_,
+                    stream_core_module_index: (*core::ptr::addr_of!(
+                        nginx_sys::ngx_stream_core_module
+                    ))
+                    .index,
+                    stream_core_module_context_index: (*core::ptr::addr_of!(
+                        nginx_sys::ngx_stream_core_module
+                    ))
+                    .ctx_index,
+                }
+            };
+
+            unsafe {
+                nginx_sys::ngx_max_module = 1;
+                nginx_sys::ngx_stream_max_module = 1;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_module)).index = 0;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).type_ =
+                    NGX_STREAM_MODULE as _;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).index = 0;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).ctx_index = 0;
+            }
+
+            Self { _guard: guard, previous }
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    impl Drop for VariableGlobals {
+        fn drop(&mut self) {
+            unsafe {
+                nginx_sys::ngx_max_module = self.previous.max_module;
+                nginx_sys::ngx_stream_max_module = self.previous.stream_max_module;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_module)).index =
+                    self.previous.stream_module_index;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).type_ =
+                    self.previous.stream_core_module_type;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).index =
+                    self.previous.stream_core_module_index;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).ctx_index =
+                    self.previous.stream_core_module_context_index;
+            }
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    struct VariableFixture {
+        _globals: VariableGlobals,
+        main: Box<ngx_stream_core_main_conf_t>,
+        _main_conf: Box<[*mut c_void; 1]>,
+        _context: Box<ngx_stream_conf_ctx_t>,
+        cf: Box<ngx_conf_t>,
+        _pool: TestPool,
+    }
+
+    #[cfg(feature = "test-link")]
+    impl VariableFixture {
+        fn new() -> Self {
+            let globals = VariableGlobals::new();
+            let mut pool = TestPool::new();
+            let mut main = Box::new(unsafe {
+                MaybeUninit::<ngx_stream_core_main_conf_t>::zeroed().assume_init()
+            });
+            let mut main_conf: Box<[*mut c_void; 1]> = Box::new([(&raw mut *main).cast()]);
+            let mut context = Box::new(ngx_stream_conf_ctx_t {
+                main_conf: main_conf.as_mut_ptr(),
+                srv_conf: ptr::null_mut(),
+            });
+            let mut cf = Box::new(unsafe { MaybeUninit::<ngx_conf_t>::zeroed().assume_init() });
+            cf.pool = pool.raw;
+            cf.temp_pool = pool.raw;
+            cf.log = &raw mut *pool._log;
+            cf.ctx = (&raw mut *context).cast();
+            cf.module_type = NGX_STREAM_MODULE as _;
+
+            assert_eq!(unsafe { ngx_stream_variables_add_core_vars(&raw mut *cf) }, NGX_OK as _);
+
+            Self {
+                _globals: globals,
+                main,
+                _main_conf: main_conf,
+                _context: context,
+                cf,
+                _pool: pool,
+            }
+        }
+
+        fn configuration(&mut self) -> &mut ngx_conf_t {
+            &mut self.cf
+        }
+
+        fn exact_variables(&self) -> &[ngx_hash_key_t] {
+            let variables_keys = self.main.variables_keys;
+            assert!(!variables_keys.is_null());
+            array_values(unsafe { &(*variables_keys).keys })
+        }
+
+        fn prefix_variables(&self) -> &[ngx_stream_variable_t] {
+            array_values(&self.main.prefix_variables)
+        }
+
+        fn exact_variable(&self, name: &[u8]) -> &ngx_stream_variable_t {
+            let key = self.exact_variables().iter().find(|key| key.key.as_bytes() == name).unwrap();
+            assert!(!key.value.is_null());
+            unsafe { &*key.value.cast() }
+        }
+
+        fn prefix_variable(&self, name: &[u8]) -> &ngx_stream_variable_t {
+            self.prefix_variables()
+                .iter()
+                .find(|variable| variable.name.as_bytes() == name)
+                .unwrap()
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    fn array_values<T>(array: &ngx_array_t) -> &[T] {
+        if array.nelts == 0 {
+            return &[];
+        }
+
+        assert!(!array.elts.is_null());
+        unsafe { core::slice::from_raw_parts(array.elts.cast(), array.nelts) }
+    }
+
+    #[cfg(feature = "test-link")]
+    fn same_handler(left: ngx_stream_get_variable_pt, right: ngx_stream_get_variable_pt) -> bool {
+        match (left, right) {
+            (Some(left), Some(right)) => core::ptr::fn_addr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    fn assert_handler<H>(variable: &ngx_stream_variable_t, data: usize)
+    where
+        H: StreamVariableHandler,
+    {
+        assert!(same_handler(variable.get_handler, Some(raw_get_handler::<H>)));
+        assert_eq!(variable.data, data);
+    }
+
+    #[cfg(feature = "test-link")]
     fn with_session<R>(
         owner: &TestPool,
         f: impl for<'scope> FnOnce(&mut Session<'scope>) -> R,
@@ -584,8 +1011,244 @@ mod tests {
 
         assert_eq!(status, Status::NGX_OK.0);
         assert_eq!(session.status, NGX_STREAM_OK as _);
-        let value = unsafe { StreamVariableValue::from_raw(&raw mut raw_value) };
+        let value = unsafe { StreamVariableValue::from_raw(&raw mut raw_value) }.unwrap();
         assert_found(&raw_value, &value, b"detected", true, b"detected".as_ptr().cast_mut());
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn add_variable_supports_every_public_flag_and_preserves_name_bytes() {
+        let mut fixture = VariableFixture::new();
+        let cases: [(&[u8], &[u8], StreamVariableFlags, usize); 5] = [
+            (b"ngx_rs_changeable", b"ngx_rs_changeable", StreamVariableFlags::CHANGEABLE, 0),
+            (
+                b"ngx_rs_nocacheable",
+                b"ngx_rs_nocacheable",
+                StreamVariableFlags::NOCACHEABLE,
+                usize::MAX,
+            ),
+            (b"ngx_rs_nohash", b"ngx_rs_nohash", StreamVariableFlags::NOHASH, 8),
+            (b"ngx_rs_weak", b"ngx_rs_weak", StreamVariableFlags::WEAK, 16),
+            (
+                b"NgX_Rs_\xFF",
+                b"ngx_rs_\xFF",
+                StreamVariableFlags::NOCACHEABLE | StreamVariableFlags::NOHASH,
+                42,
+            ),
+        ];
+
+        for (name, lower_name, flags, data) in cases {
+            add_variable::<CountingVariable>(
+                fixture.configuration(),
+                NgxStr::from_bytes(name),
+                flags,
+                data,
+            )
+            .unwrap();
+            let variable = fixture.exact_variable(lower_name);
+            assert_eq!(variable.flags, flags.bits());
+            assert_handler::<CountingVariable>(variable, data);
+        }
+
+        let prefix_flags = StreamVariableFlags::PREFIX | StreamVariableFlags::CHANGEABLE;
+        add_variable::<CountingVariable>(
+            fixture.configuration(),
+            NgxStr::from_bytes(b"NgX_Rs_PrEfIx_"),
+            prefix_flags,
+            32,
+        )
+        .unwrap();
+        let prefix = fixture.prefix_variable(b"ngx_rs_prefix_");
+        assert_eq!(prefix.flags, prefix_flags.bits());
+        assert_handler::<CountingVariable>(prefix, 32);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn add_variable_preserves_registration_order() {
+        let mut fixture = VariableFixture::new();
+        let names: [&[u8]; 3] = [b"ngx_rs_order_one", b"ngx_rs_order_two", b"ngx_rs_order_three"];
+
+        for (index, name) in names.iter().enumerate() {
+            add_variable::<CountingVariable>(
+                fixture.configuration(),
+                NgxStr::from_bytes(name),
+                StreamVariableFlags::empty(),
+                index,
+            )
+            .unwrap();
+        }
+
+        let mut positions = [usize::MAX; 3];
+        for (index, key) in fixture.exact_variables().iter().enumerate() {
+            for (name_index, name) in names.iter().enumerate() {
+                if key.key.as_bytes() == *name {
+                    positions[name_index] = index;
+                }
+            }
+        }
+
+        assert!(positions.iter().all(|position| *position != usize::MAX));
+        assert!(positions[0] < positions[1]);
+        assert!(positions[1] < positions[2]);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn rejected_registration_preserves_existing_handler_state() {
+        let mut fixture = VariableFixture::new();
+        let name = b"ngx_rs_rejected";
+        add_variable::<CountingVariable>(
+            fixture.configuration(),
+            NgxStr::from_bytes(name),
+            StreamVariableFlags::empty(),
+            0,
+        )
+        .unwrap();
+        let before = fixture.exact_variable(name);
+        let before_handler = before.get_handler;
+        let before_flags = before.flags;
+        let before_data = before.data;
+        let exact_count = fixture.exact_variables().len();
+        let prefix_count = fixture.prefix_variables().len();
+
+        assert!(
+            add_variable::<DataVariable>(
+                fixture.configuration(),
+                NgxStr::from_bytes(b"NgX_Rs_ReJeCtEd"),
+                StreamVariableFlags::empty(),
+                usize::MAX,
+            )
+            .is_err()
+        );
+        let after = fixture.exact_variable(name);
+        assert!(same_handler(before_handler, after.get_handler));
+        assert_eq!(after.flags, before_flags);
+        assert_eq!(after.data, before_data);
+        assert_eq!(fixture.exact_variables().len(), exact_count);
+        assert_eq!(fixture.prefix_variables().len(), prefix_count);
+
+        assert!(
+            add_variable::<DataVariable>(
+                fixture.configuration(),
+                NgxStr::from_bytes(b""),
+                StreamVariableFlags::empty(),
+                1,
+            )
+            .is_err()
+        );
+        assert_eq!(fixture.exact_variables().len(), exact_count);
+        assert_eq!(fixture.prefix_variables().len(), prefix_count);
+
+        let internal = StreamVariableFlags::from_bits_retain(NGX_STREAM_VAR_INDEXED as _);
+        assert!(
+            add_variable::<DataVariable>(
+                fixture.configuration(),
+                NgxStr::from_bytes(b"ngx_rs_internal"),
+                internal,
+                2,
+            )
+            .is_err()
+        );
+        let unknown = StreamVariableFlags::from_bits_retain(1_usize << (usize::BITS - 1));
+        assert!(
+            add_variable::<DataVariable>(
+                fixture.configuration(),
+                NgxStr::from_bytes(b"ngx_rs_unknown"),
+                unknown,
+                3,
+            )
+            .is_err()
+        );
+        assert_eq!(fixture.exact_variables().len(), exact_count);
+        assert_eq!(fixture.prefix_variables().len(), prefix_count);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn allocation_failure_does_not_publish_a_variable_handler() {
+        let mut fixture = VariableFixture::new();
+        let exact_count = fixture.exact_variables().len();
+        let prefix_count = fixture.prefix_variables().len();
+
+        unsafe {
+            (*fixture._pool.raw).max = 0;
+            ngx_rs_test_fail_allocations_after(0);
+        }
+        let result = add_variable::<DataVariable>(
+            fixture.configuration(),
+            NgxStr::from_bytes(b"ngx_rs_allocation_failure"),
+            StreamVariableFlags::empty(),
+            1,
+        );
+        unsafe { ngx_rs_test_reset_allocation_failures() };
+
+        assert!(result.is_err());
+        assert_eq!(fixture.exact_variables().len(), exact_count);
+        assert_eq!(fixture.prefix_variables().len(), prefix_count);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn add_variable_keeps_nginx_duplicate_changeable_and_weak_rules() {
+        let mut fixture = VariableFixture::new();
+        let exact_name = b"ngx_rs_changeable_weak";
+        let weak_flags = StreamVariableFlags::CHANGEABLE | StreamVariableFlags::WEAK;
+
+        add_variable::<CountingVariable>(
+            fixture.configuration(),
+            NgxStr::from_bytes(exact_name),
+            weak_flags,
+            1,
+        )
+        .unwrap();
+        let variable = fixture.exact_variable(exact_name);
+        assert_eq!(variable.flags, weak_flags.bits());
+        assert_handler::<CountingVariable>(variable, 1);
+
+        add_variable::<DataVariable>(
+            fixture.configuration(),
+            NgxStr::from_bytes(b"NgX_Rs_ChAnGeAbLe_WeAk"),
+            weak_flags,
+            2,
+        )
+        .unwrap();
+        let variable = fixture.exact_variable(exact_name);
+        assert_eq!(variable.flags, weak_flags.bits());
+        assert_handler::<DataVariable>(variable, 2);
+
+        add_variable::<TestVariable>(
+            fixture.configuration(),
+            NgxStr::from_bytes(exact_name),
+            StreamVariableFlags::CHANGEABLE,
+            usize::MAX,
+        )
+        .unwrap();
+        let variable = fixture.exact_variable(exact_name);
+        assert_eq!(variable.flags, StreamVariableFlags::CHANGEABLE.bits());
+        assert_handler::<TestVariable>(variable, usize::MAX);
+
+        let prefix_name = b"ngx_rs_prefix_weak_";
+        add_variable::<CountingVariable>(
+            fixture.configuration(),
+            NgxStr::from_bytes(prefix_name),
+            weak_flags | StreamVariableFlags::PREFIX,
+            4,
+        )
+        .unwrap();
+        add_variable::<DataVariable>(
+            fixture.configuration(),
+            NgxStr::from_bytes(b"NgX_Rs_PrEfIx_WeAk_"),
+            StreamVariableFlags::CHANGEABLE | StreamVariableFlags::PREFIX,
+            5,
+        )
+        .unwrap();
+        let prefix = fixture.prefix_variable(prefix_name);
+        assert_eq!(
+            prefix.flags,
+            (StreamVariableFlags::CHANGEABLE | StreamVariableFlags::PREFIX).bits()
+        );
+        assert_handler::<DataVariable>(prefix, 5);
     }
 
     #[test]
@@ -594,7 +1257,7 @@ mod tests {
         static UNCACHED: &[u8] = b"uncached";
 
         let mut raw = poisoned_value();
-        let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) };
+        let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) }.unwrap();
 
         value.set_static(CACHED).unwrap();
         assert_found(&raw, &value, CACHED, true, CACHED.as_ptr().cast_mut());
@@ -606,7 +1269,7 @@ mod tests {
     #[test]
     fn empty_and_not_found_values_replace_every_output_field() {
         let mut raw = poisoned_value();
-        let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) };
+        let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) }.unwrap();
 
         value.set_empty();
         assert_found(&raw, &value, b"", true, ptr::null_mut());
@@ -621,7 +1284,7 @@ mod tests {
     #[test]
     fn length_and_null_data_errors_preserve_the_previous_output() {
         let mut raw = poisoned_value();
-        let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) };
+        let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) }.unwrap();
         let data = NonNull::<u8>::dangling().as_ptr();
 
         value.set_found(StreamVariableValue::MAX_LEN, data, true).unwrap();
@@ -659,7 +1322,7 @@ mod tests {
         raw.set_len(1);
         raw.set_not_found(0);
         raw.data = ptr::null_mut();
-        let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) };
+        let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) }.unwrap();
 
         assert!(matches!(value.read(), Err(StreamVariableValueReadError::NullData)));
 
@@ -674,7 +1337,7 @@ mod tests {
 
         with_session(&owner, |session| {
             let mut raw = poisoned_value();
-            let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) };
+            let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) }.unwrap();
             let bytes = StreamVariablePoolBytes::copy_from_session(&*session, b"pool").unwrap();
             let data = bytes.data.as_ptr();
             assert_eq!(bytes.bytes(), b"pool");
@@ -698,7 +1361,7 @@ mod tests {
 
         with_session(&owner, |session| {
             let mut raw = poisoned_value();
-            let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) };
+            let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) }.unwrap();
             let copied = *b"copied";
 
             value.copy_from_session(&*session, &copied).unwrap();
@@ -737,7 +1400,7 @@ mod tests {
                     let bytes =
                         StreamVariablePoolBytes::copy_from_session(&foreign, b"foreign").unwrap();
                     let mut raw = poisoned_value();
-                    let mut value = StreamVariableValue::from_raw(&raw mut raw);
+                    let mut value = StreamVariableValue::from_raw(&raw mut raw).unwrap();
                     let before = (
                         raw.len(),
                         raw.valid(),
@@ -778,7 +1441,7 @@ mod tests {
 
         with_session(&owner, |session| {
             let mut raw = poisoned_value();
-            let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) };
+            let mut value = unsafe { StreamVariableValue::from_raw(&raw mut raw) }.unwrap();
             let before = (
                 raw.len(),
                 raw.valid(),
