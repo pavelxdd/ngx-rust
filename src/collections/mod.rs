@@ -14,9 +14,14 @@ pub use hash::{NgxHash, NgxHashKey};
 pub use list::NgxList;
 pub use queue::Queue;
 pub use rbtree::RbTreeMap;
+pub use slab_rbtree::{
+    SlabRbTree, SlabRbTreeEntry, SlabRbTreeEntryMut, SlabRbTreeEntryRef, SlabRbTreeError,
+    SlabRbTreeIter,
+};
 
 pub mod array;
 pub mod hash;
 pub mod list;
 pub mod queue;
 pub mod rbtree;
+pub mod slab_rbtree;
