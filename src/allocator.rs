@@ -408,8 +408,8 @@ mod tests {
 
         let mut values = crate::collections::Vec::new_in(allocator);
         values.try_reserve_exact(2).unwrap();
-        values.try_push(DropCounter(drops.clone())).unwrap();
-        values.try_push(DropCounter(drops.clone())).unwrap();
+        values.push(DropCounter(drops.clone()));
+        values.push(DropCounter(drops.clone()));
         unsafe { ngx_rs_test_track_free(values.as_mut_ptr().cast()) };
         drop(values);
         assert_eq!(drops.get(), 3);
