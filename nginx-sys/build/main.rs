@@ -1,10 +1,14 @@
 extern crate bindgen;
 
+mod source;
+
 use core::error::Error as StdError;
 use std::env;
 use std::fs::{File, read_to_string};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+use source::NginxSource;
 
 const ENV_VARS_TRIGGERING_RECOMPILE: &[&str] = &["OUT_DIR", "NGINX_BUILD_DIR", "NGINX_SOURCE_DIR"];
 
@@ -87,6 +91,7 @@ fn main() -> Result<(), BoxError> {
         println!("cargo:rerun-if-env-changed={var}");
     }
     println!("cargo:rerun-if-changed=build/main.rs");
+    println!("cargo:rerun-if-changed=build/source.rs");
     println!("cargo:rerun-if-changed=build/wrapper.h");
 
     let nginx = NginxSource::from_env();
@@ -100,43 +105,17 @@ fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
-pub struct NginxSource {
-    source_dir: PathBuf,
-    build_dir: PathBuf,
-}
-
 impl NginxSource {
-    pub fn new(source_dir: impl AsRef<Path>, build_dir: impl AsRef<Path>) -> Self {
-        let source_dir = NginxSource::check_source_dir(source_dir).expect("source directory");
-        let build_dir = NginxSource::check_build_dir(build_dir).expect("build directory");
-
-        Self { source_dir, build_dir }
-    }
-
-    pub fn from_env() -> Self {
-        match (env::var_os("NGINX_SOURCE_DIR"), env::var_os("NGINX_BUILD_DIR")) {
-            (Some(source_dir), Some(build_dir)) => NginxSource::new(source_dir, build_dir),
-            (Some(source_dir), None) => Self::from_source_dir(source_dir),
-            (None, Some(build_dir)) => Self::from_build_dir(build_dir),
-            _ => Self::from_vendored(),
+    fn from_env() -> Self {
+        match Self::configured(env::var_os("NGINX_SOURCE_DIR"), env::var_os("NGINX_BUILD_DIR")) {
+            Ok(Some(nginx)) => nginx,
+            Ok(None) => Self::from_vendored(),
+            Err(error) => panic!("{error}"),
         }
     }
 
-    pub fn from_source_dir(source_dir: impl AsRef<Path>) -> Self {
-        let build_dir = source_dir.as_ref().join("objs");
-
-        // todo!("Build from source");
-
-        Self::new(source_dir, build_dir)
-    }
-
-    pub fn from_build_dir(build_dir: impl AsRef<Path>) -> Self {
-        let source_dir = build_dir.as_ref().parent().expect("source directory").to_owned();
-        Self::new(source_dir, build_dir)
-    }
-
     #[cfg(feature = "vendored")]
-    pub fn from_vendored() -> Self {
+    fn from_vendored() -> Self {
         nginx_src::print_cargo_metadata();
 
         let out_dir = env::var("OUT_DIR").unwrap();
@@ -147,43 +126,11 @@ impl NginxSource {
     }
 
     #[cfg(not(feature = "vendored"))]
-    pub fn from_vendored() -> Self {
+    fn from_vendored() -> Self {
         panic!(
             "\"nginx-sys/vendored\" feature is disabled and neither NGINX_SOURCE_DIR nor \
              NGINX_BUILD_DIR is set"
         );
-    }
-
-    fn check_source_dir(source_dir: impl AsRef<Path>) -> Result<PathBuf, BoxError> {
-        match dunce::canonicalize(&source_dir) {
-            Ok(path) if path.join("src/core/nginx.h").is_file() => Ok(path),
-            Err(err) => {
-                Err(format!("Invalid nginx source directory: {:?}. {}", source_dir.as_ref(), err)
-                    .into())
-            }
-            _ => Err(format!(
-                "Invalid nginx source directory: {:?}. NGINX_SOURCE_DIR is not specified or \
-                 contains invalid value.",
-                source_dir.as_ref()
-            )
-            .into()),
-        }
-    }
-
-    fn check_build_dir(build_dir: impl AsRef<Path>) -> Result<PathBuf, BoxError> {
-        match dunce::canonicalize(&build_dir) {
-            Ok(path) if path.join("ngx_auto_config.h").is_file() => Ok(path),
-            Err(err) => {
-                Err(format!("Invalid nginx build directory: {:?}. {}", build_dir.as_ref(), err)
-                    .into())
-            }
-            _ => Err(format!(
-                "Invalid NGINX build directory: {:?}. NGINX_BUILD_DIR is not specified or \
-                 contains invalid value.",
-                build_dir.as_ref()
-            )
-            .into()),
-        }
     }
 }
 
@@ -251,6 +198,7 @@ fn generate_binding(nginx: &NginxSource) {
         .rust_edition(bindgen::RustEdition::Edition2024)
         .wrap_unsafe_ops(true)
         .use_core()
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
         .expect("Unable to generate bindings");
 

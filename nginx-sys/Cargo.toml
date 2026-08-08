@@ -21,6 +21,10 @@ targets = []
 
 [dependencies]
 
+[dev-dependencies]
+dunce = "1.0.5"
+tempfile = { version = "3.27.0", default-features = false }
+
 [target.'cfg(not(windows))'.dependencies]
 errno = { version = "0.3.14", default-features = false }
 
