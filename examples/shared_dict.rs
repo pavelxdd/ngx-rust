@@ -1,7 +1,12 @@
 #![no_std]
+
+use core::alloc::Layout;
+use core::cmp::Ordering;
 use core::ffi::{c_char, c_void};
+use core::fmt::Write;
 use core::mem;
 use core::ptr::{self, NonNull};
+use core::slice;
 
 use nginx_sys::{
     NGX_CONF_TAKE2, NGX_HTTP_DELETE, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET,
@@ -9,10 +14,13 @@ use nginx_sys::{
     ngx_command_t, ngx_conf_t, ngx_http_add_variable, ngx_http_compile_complex_value_t,
     ngx_http_complex_value, ngx_http_complex_value_t, ngx_http_module_t, ngx_http_request_t,
     ngx_http_variable_t, ngx_http_variable_value_t, ngx_int_t, ngx_module_t, ngx_parse_size,
+    ngx_pool_t, ngx_queue_t, ngx_rbt_red, ngx_rbtree_key_t, ngx_rbtree_node_t, ngx_rbtree_t,
     ngx_shared_memory_add, ngx_shm_zone_t, ngx_str_t, ngx_uint_t,
 };
-use ngx::collections::RbTreeMap;
-use ngx::core::{NGX_CONF_ERROR, NGX_CONF_OK, NgxStr, NgxString, Pool, SlabPool, Status};
+use ngx::collections::{SlabQueue, SlabQueueEntry, SlabRbTree, SlabRbTreeEntry};
+use ngx::core::{
+    NGX_CONF_ERROR, NGX_CONF_OK, NgxStr, NgxString, Pool, SlabGuard, SlabPool, SlabRegion, Status,
+};
 use ngx::http::{HttpModule, HttpModuleMainConf};
 use ngx::{ngx_conf_log_error, ngx_log_debug, ngx_string};
 
@@ -82,8 +90,6 @@ static NGX_HTTP_SHARED_DICT_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
     merge_loc_conf: None,
 };
 
-// Generate the `ngx_modules` table with exported modules.
-// This feature is required to build a 'cdylib' dynamic module outside of the NGINX buildsystem.
 #[cfg(feature = "export-modules")]
 ngx::ngx_modules!(ngx_http_shared_dict_module);
 
@@ -97,7 +103,58 @@ pub static mut ngx_http_shared_dict_module: ngx_module_t = ngx_module_t {
     ..ngx_module_t::default()
 };
 
-type SharedData = ngx::sync::RwLock<RbTreeMap<NgxString<SlabPool>, NgxString<SlabPool>, SlabPool>>;
+/// Persistent root stored in `ngx_slab_pool_t::data` and reused on nginx reload.
+#[repr(C)]
+struct SharedDictState {
+    tree: ngx_rbtree_t,
+    sentinel: ngx_rbtree_node_t,
+    queue: ngx_queue_t,
+    entries: usize,
+}
+
+/// Persistent record with key bytes followed immediately by value bytes.
+#[repr(C)]
+struct SharedDictEntry {
+    tree: ngx_rbtree_node_t,
+    queue: ngx_queue_t,
+    key_len: usize,
+    value_len: usize,
+}
+
+unsafe impl SlabRbTreeEntry for SharedDictEntry {
+    type Payload = ();
+
+    unsafe fn from_rbtree_node(node: NonNull<ngx_rbtree_node_t>) -> NonNull<Self> {
+        node.cast()
+    }
+
+    unsafe fn rbtree_node(entry: NonNull<Self>) -> NonNull<ngx_rbtree_node_t> {
+        entry.cast()
+    }
+
+    unsafe fn payload(entry: NonNull<Self>) -> NonNull<Self::Payload> {
+        entry.cast()
+    }
+}
+
+unsafe impl SlabQueueEntry for SharedDictEntry {
+    type Payload = ();
+
+    unsafe fn from_queue(queue: NonNull<ngx_queue_t>) -> NonNull<Self> {
+        let entry = unsafe {
+            queue.as_ptr().byte_sub(mem::offset_of!(Self, queue)).cast::<SharedDictEntry>()
+        };
+        unsafe { NonNull::new_unchecked(entry) }
+    }
+
+    unsafe fn queue_node(entry: NonNull<Self>) -> NonNull<ngx_queue_t> {
+        unsafe { NonNull::new_unchecked(ptr::addr_of_mut!((*entry.as_ptr()).queue)) }
+    }
+
+    unsafe fn payload(entry: NonNull<Self>) -> NonNull<Self::Payload> {
+        entry.cast()
+    }
+}
 
 #[derive(Debug)]
 struct SharedDictMainConfig {
@@ -121,19 +178,458 @@ fn variable_name(name: ngx_str_t) -> Option<ngx_str_t> {
     (!name.is_empty()).then_some(name)
 }
 
+fn shared_dict_hash(key: &[u8]) -> ngx_rbtree_key_t {
+    key.iter().fold(0_u32, |hash, byte| hash.wrapping_mul(31).wrapping_add((*byte).into()))
+        as ngx_rbtree_key_t
+}
+
+unsafe fn shared_dict_state_tree(state: NonNull<SharedDictState>) -> NonNull<ngx_rbtree_t> {
+    unsafe { NonNull::new_unchecked(ptr::addr_of_mut!((*state.as_ptr()).tree)) }
+}
+
+unsafe fn shared_dict_state_sentinel(
+    state: NonNull<SharedDictState>,
+) -> NonNull<ngx_rbtree_node_t> {
+    unsafe { NonNull::new_unchecked(ptr::addr_of_mut!((*state.as_ptr()).sentinel)) }
+}
+
+unsafe fn shared_dict_state_queue(state: NonNull<SharedDictState>) -> NonNull<ngx_queue_t> {
+    unsafe { NonNull::new_unchecked(ptr::addr_of_mut!((*state.as_ptr()).queue)) }
+}
+
+unsafe fn shared_dict_entry_key(entry: &SharedDictEntry) -> &[u8] {
+    let data =
+        unsafe { (ptr::from_ref(entry).cast::<u8>()).add(mem::size_of::<SharedDictEntry>()) };
+    unsafe { slice::from_raw_parts(data, entry.key_len) }
+}
+
+unsafe fn shared_dict_entry_value(entry: &SharedDictEntry) -> &[u8] {
+    let data = unsafe {
+        (ptr::from_ref(entry).cast::<u8>())
+            .add(mem::size_of::<SharedDictEntry>())
+            .add(entry.key_len)
+    };
+    unsafe { slice::from_raw_parts(data, entry.value_len) }
+}
+
+unsafe extern "C" fn shared_dict_rbtree_insert(
+    mut current: *mut ngx_rbtree_node_t,
+    node: *mut ngx_rbtree_node_t,
+    sentinel: *mut ngx_rbtree_node_t,
+) {
+    loop {
+        let link = unsafe {
+            match (*node).key.cmp(&(*current).key) {
+                Ordering::Less => &mut (*current).left,
+                Ordering::Greater => &mut (*current).right,
+                Ordering::Equal => {
+                    let node = &*node.cast::<SharedDictEntry>();
+                    let current_entry = &*current.cast::<SharedDictEntry>();
+                    if shared_dict_entry_key(node).cmp(shared_dict_entry_key(current_entry))
+                        == Ordering::Less
+                    {
+                        &mut (*current).left
+                    } else {
+                        &mut (*current).right
+                    }
+                }
+            }
+        };
+        if ptr::addr_eq(*link, sentinel) {
+            *link = node;
+            break;
+        }
+        current = *link;
+    }
+
+    unsafe {
+        (*node).parent = current;
+        (*node).left = sentinel;
+        (*node).right = sentinel;
+        ngx_rbt_red(node);
+    }
+}
+
+fn shared_dict_entry_layout(key_len: usize, value_len: usize) -> Result<Layout, Status> {
+    let tail_len = key_len.checked_add(value_len).ok_or(Status::NGX_ERROR)?;
+    SlabRegion::flexible_layout::<SharedDictEntry>(tail_len).map_err(|_| Status::NGX_ERROR)
+}
+
+fn shared_dict_entry_layout_for(entry: NonNull<SharedDictEntry>) -> Result<Layout, Status> {
+    let entry = unsafe { entry.as_ref() };
+    shared_dict_entry_layout(entry.key_len, entry.value_len)
+}
+
+fn shared_dict_allocate_entry(
+    guard: &mut SlabGuard<'_, '_>,
+    key: &[u8],
+    value: &[u8],
+) -> Result<NonNull<SharedDictEntry>, Status> {
+    let layout = shared_dict_entry_layout(key.len(), value.len())?;
+    let region = guard
+        .try_calloc_region(layout, |bytes| {
+            let header_len = mem::size_of::<SharedDictEntry>();
+            let entry = bytes.as_mut_ptr().cast::<SharedDictEntry>();
+            unsafe {
+                (*entry).tree.key = shared_dict_hash(key);
+                (*entry).key_len = key.len();
+                (*entry).value_len = value.len();
+            }
+            let tail = &mut bytes[header_len..];
+            tail[..key.len()].copy_from_slice(key);
+            tail[key.len()..].copy_from_slice(value);
+            Ok::<_, Status>(())
+        })
+        .map_err(|_| Status::NGX_ERROR)?;
+    let entry = region.as_ptr().cast::<SharedDictEntry>();
+    let _ = region.into_raw_parts();
+    Ok(entry)
+}
+
+fn shared_dict_free_entry(
+    guard: &mut SlabGuard<'_, '_>,
+    entry: NonNull<SharedDictEntry>,
+) -> Result<(), Status> {
+    let layout = shared_dict_entry_layout_for(entry)?;
+    let region =
+        unsafe { guard.region_from_raw(entry.cast(), layout) }.map_err(|_| Status::NGX_ERROR)?;
+    unsafe { guard.free_region(region) }.map_err(|_| Status::NGX_ERROR)
+}
+
+fn shared_dict_pool(shm_zone: &ngx_shm_zone_t) -> Result<SlabPool<'_>, Status> {
+    unsafe { SlabPool::from_shm_zone(shm_zone) }.map_err(|_| Status::NGX_ERROR)
+}
+
+fn shared_dict_state(guard: &SlabGuard<'_, '_>) -> Result<NonNull<SharedDictState>, Status> {
+    let pool = unsafe { guard.raw_pool() };
+    let state = NonNull::new(unsafe { pool.as_ref().data }.cast::<SharedDictState>())
+        .ok_or(Status::NGX_ERROR)?;
+    unsafe { guard.get(state) }.map_err(|_| Status::NGX_ERROR)?;
+    Ok(state)
+}
+
+fn shared_dict_entries(state: NonNull<SharedDictState>) -> usize {
+    unsafe { (*state.as_ptr()).entries }
+}
+
+fn shared_dict_increment_entries(state: NonNull<SharedDictState>) -> Result<(), Status> {
+    let entries = shared_dict_entries(state).checked_add(1).ok_or(Status::NGX_ERROR)?;
+    unsafe { (*state.as_ptr()).entries = entries };
+    Ok(())
+}
+
+fn shared_dict_decrement_entries(state: NonNull<SharedDictState>) -> Result<(), Status> {
+    let entries = shared_dict_entries(state).checked_sub(1).ok_or(Status::NGX_ERROR)?;
+    unsafe { (*state.as_ptr()).entries = entries };
+    Ok(())
+}
+
+fn shared_dict_validate(
+    guard: &mut SlabGuard<'_, '_>,
+    state: NonNull<SharedDictState>,
+) -> Result<(), Status> {
+    {
+        let tree = unsafe {
+            SlabRbTree::<SharedDictEntry>::from_raw(guard, shared_dict_state_tree(state))
+        }
+        .map_err(|_| Status::NGX_ERROR)?;
+        tree.is_empty().map_err(|_| Status::NGX_ERROR)?;
+    }
+    {
+        let queue = unsafe {
+            SlabQueue::<SharedDictEntry>::from_raw(guard, shared_dict_state_queue(state))
+        }
+        .map_err(|_| Status::NGX_ERROR)?;
+        queue.is_empty().map_err(|_| Status::NGX_ERROR)?;
+    }
+    Ok(())
+}
+
+fn shared_dict_init_shared(shm_zone: &mut ngx_shm_zone_t) -> Result<(), Status> {
+    let mut pool = shared_dict_pool(shm_zone)?;
+    let mut guard = pool.lock();
+    let mut native_pool = unsafe { guard.raw_pool() };
+    let has_state = !unsafe { native_pool.as_ref().data }.is_null();
+
+    if shm_zone.shm.exists != 0 {
+        if !has_state {
+            return Err(Status::NGX_ERROR);
+        }
+        let state = shared_dict_state(&guard)?;
+        return shared_dict_validate(&mut guard, state);
+    }
+    if has_state {
+        return Err(Status::NGX_ERROR);
+    }
+
+    let region =
+        guard.calloc_region(Layout::new::<SharedDictState>()).map_err(|_| Status::NGX_ERROR)?;
+    let state = region.as_ptr().cast::<SharedDictState>();
+    unsafe { state.as_ptr().write(mem::zeroed()) };
+
+    if unsafe {
+        SlabRbTree::<SharedDictEntry>::init(
+            &mut guard,
+            shared_dict_state_tree(state),
+            shared_dict_state_sentinel(state),
+            Some(shared_dict_rbtree_insert),
+        )
+    }
+    .is_err()
+    {
+        unsafe { guard.free_region(region) }.map_err(|_| Status::NGX_ERROR)?;
+        return Err(Status::NGX_ERROR);
+    }
+    if unsafe { SlabQueue::<SharedDictEntry>::init(&mut guard, shared_dict_state_queue(state)) }
+        .is_err()
+    {
+        unsafe { guard.free_region(region) }.map_err(|_| Status::NGX_ERROR)?;
+        return Err(Status::NGX_ERROR);
+    }
+
+    unsafe { native_pool.as_mut().data = state.as_ptr().cast() };
+    let _ = region.into_raw_parts();
+    Ok(())
+}
+
+fn shared_dict_find(
+    guard: &mut SlabGuard<'_, '_>,
+    state: NonNull<SharedDictState>,
+    key: &[u8],
+) -> Result<Option<NonNull<SharedDictEntry>>, Status> {
+    let max_steps = shared_dict_entries(state).saturating_add(1);
+    let tree =
+        unsafe { SlabRbTree::<SharedDictEntry>::from_raw(guard, shared_dict_state_tree(state)) }
+            .map_err(|_| Status::NGX_ERROR)?;
+    let entry = unsafe {
+        tree.find_by(shared_dict_hash(key), max_steps, |entry| {
+            key.cmp(shared_dict_entry_key(entry))
+        })
+    }
+    .map_err(|_| Status::NGX_ERROR)?;
+    Ok(entry.map(|entry| NonNull::from(entry.entry())))
+}
+
+fn shared_dict_insert_tree(
+    guard: &mut SlabGuard<'_, '_>,
+    state: NonNull<SharedDictState>,
+    entry: NonNull<SharedDictEntry>,
+) -> Result<(), Status> {
+    let mut tree =
+        unsafe { SlabRbTree::<SharedDictEntry>::from_raw(guard, shared_dict_state_tree(state)) }
+            .map_err(|_| Status::NGX_ERROR)?;
+    unsafe { tree.insert(entry) }.map_err(|_| Status::NGX_ERROR)
+}
+
+fn shared_dict_remove_tree(
+    guard: &mut SlabGuard<'_, '_>,
+    state: NonNull<SharedDictState>,
+    entry: NonNull<SharedDictEntry>,
+) -> Result<(), Status> {
+    let mut tree =
+        unsafe { SlabRbTree::<SharedDictEntry>::from_raw(guard, shared_dict_state_tree(state)) }
+            .map_err(|_| Status::NGX_ERROR)?;
+    unsafe { tree.remove(entry) }.map_err(|_| Status::NGX_ERROR)
+}
+
+fn shared_dict_insert_queue(
+    guard: &mut SlabGuard<'_, '_>,
+    state: NonNull<SharedDictState>,
+    entry: NonNull<SharedDictEntry>,
+) -> Result<(), Status> {
+    let mut queue =
+        unsafe { SlabQueue::<SharedDictEntry>::from_raw(guard, shared_dict_state_queue(state)) }
+            .map_err(|_| Status::NGX_ERROR)?;
+    unsafe { queue.push_front(entry) }.map_err(|_| Status::NGX_ERROR)
+}
+
+fn shared_dict_remove_queue(
+    guard: &mut SlabGuard<'_, '_>,
+    state: NonNull<SharedDictState>,
+    entry: NonNull<SharedDictEntry>,
+) -> Result<(), Status> {
+    let mut queue =
+        unsafe { SlabQueue::<SharedDictEntry>::from_raw(guard, shared_dict_state_queue(state)) }
+            .map_err(|_| Status::NGX_ERROR)?;
+    unsafe { queue.remove(entry) }.map_err(|_| Status::NGX_ERROR)
+}
+
+fn shared_dict_link_entry(
+    guard: &mut SlabGuard<'_, '_>,
+    state: NonNull<SharedDictState>,
+    entry: NonNull<SharedDictEntry>,
+) -> Result<(), Status> {
+    shared_dict_insert_tree(guard, state, entry)?;
+    if shared_dict_insert_queue(guard, state, entry).is_err() {
+        shared_dict_remove_tree(guard, state, entry)?;
+        return Err(Status::NGX_ERROR);
+    }
+    Ok(())
+}
+
+fn shared_dict_detach_entry(
+    guard: &mut SlabGuard<'_, '_>,
+    state: NonNull<SharedDictState>,
+    entry: NonNull<SharedDictEntry>,
+) -> Result<(), Status> {
+    shared_dict_remove_queue(guard, state, entry)?;
+    if shared_dict_remove_tree(guard, state, entry).is_err() {
+        shared_dict_insert_queue(guard, state, entry)?;
+        return Err(Status::NGX_ERROR);
+    }
+    Ok(())
+}
+
+fn shared_dict_touch_entry(
+    guard: &mut SlabGuard<'_, '_>,
+    state: NonNull<SharedDictState>,
+    entry: NonNull<SharedDictEntry>,
+) -> Result<(), Status> {
+    let mut queue =
+        unsafe { SlabQueue::<SharedDictEntry>::from_raw(guard, shared_dict_state_queue(state)) }
+            .map_err(|_| Status::NGX_ERROR)?;
+    unsafe { queue.move_to_front(entry) }.map_err(|_| Status::NGX_ERROR)
+}
+
+fn shared_dict_set_value(
+    shm_zone: &ngx_shm_zone_t,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), Status> {
+    let mut pool = shared_dict_pool(shm_zone)?;
+    let mut guard = pool.lock();
+    let state = shared_dict_state(&guard)?;
+    let previous = shared_dict_find(&mut guard, state, key)?;
+    let entry = shared_dict_allocate_entry(&mut guard, key, value)?;
+
+    if let Some(previous) = previous {
+        shared_dict_detach_entry(&mut guard, state, previous)?;
+        if shared_dict_link_entry(&mut guard, state, entry).is_err() {
+            shared_dict_link_entry(&mut guard, state, previous)?;
+            return Err(Status::NGX_ERROR);
+        }
+        return shared_dict_free_entry(&mut guard, previous);
+    }
+
+    shared_dict_link_entry(&mut guard, state, entry)?;
+    shared_dict_increment_entries(state)
+}
+
+fn shared_dict_get_value(
+    shm_zone: &ngx_shm_zone_t,
+    key: &[u8],
+    request_pool: *mut ngx_pool_t,
+) -> Result<Option<ngx_str_t>, Status> {
+    let mut pool = shared_dict_pool(shm_zone)?;
+    let mut guard = pool.lock();
+    let state = shared_dict_state(&guard)?;
+    let Some(entry) = shared_dict_find(&mut guard, state, key)? else {
+        return Ok(None);
+    };
+    let value = unsafe { shared_dict_entry_value(entry.as_ref()) };
+    let value = unsafe { ngx_str_t::from_bytes(request_pool, value) }.ok_or(Status::NGX_ERROR)?;
+    shared_dict_touch_entry(&mut guard, state, entry)?;
+    Ok(Some(value))
+}
+
+fn shared_dict_delete_value(shm_zone: &ngx_shm_zone_t, key: &[u8]) -> Result<bool, Status> {
+    let mut pool = shared_dict_pool(shm_zone)?;
+    let mut guard = pool.lock();
+    let state = shared_dict_state(&guard)?;
+    let Some(entry) = shared_dict_find(&mut guard, state, key)? else {
+        return Ok(false);
+    };
+    shared_dict_detach_entry(&mut guard, state, entry)?;
+    shared_dict_free_entry(&mut guard, entry)?;
+    shared_dict_decrement_entries(state)?;
+    Ok(true)
+}
+
+fn shared_dict_entries_value(
+    shm_zone: &ngx_shm_zone_t,
+    request_pool: *mut ngx_pool_t,
+) -> Result<ngx_str_t, Status> {
+    let Some(request_pool) = (unsafe { Pool::from_raw(request_pool) }) else {
+        return Err(Status::NGX_ERROR);
+    };
+    let mut pool = shared_dict_pool(shm_zone)?;
+    let mut guard = pool.lock();
+    let state = shared_dict_state(&guard)?;
+    let entries = shared_dict_entries(state);
+    let max_entries = entries.saturating_add(1);
+    let queue = unsafe {
+        SlabQueue::<SharedDictEntry>::from_raw(&mut guard, shared_dict_state_queue(state))
+    }
+    .map_err(|_| Status::NGX_ERROR)?;
+
+    let mut len = entries.checked_ilog10().unwrap_or(0) as usize + b"0; ".len();
+    for entry in queue.iter(max_entries) {
+        let entry = entry.map_err(|_| Status::NGX_ERROR)?;
+        let entry = entry.entry();
+        let key = unsafe { shared_dict_entry_key(entry) };
+        let value = unsafe { shared_dict_entry_value(entry) };
+        len = len
+            .checked_add(key.len())
+            .and_then(|len| len.checked_add(value.len()))
+            .and_then(|len| len.checked_add(b" = ; ".len()))
+            .ok_or(Status::NGX_ERROR)?;
+    }
+
+    let mut output = NgxString::new_in(request_pool);
+    output.try_reserve(len).map_err(|_| Status::NGX_ERROR)?;
+    write!(output, "{entries}; ").map_err(|_| Status::NGX_ERROR)?;
+    for entry in queue.iter(max_entries) {
+        let entry = entry.map_err(|_| Status::NGX_ERROR)?;
+        let entry = entry.entry();
+        let key = unsafe { shared_dict_entry_key(entry) };
+        let value = unsafe { shared_dict_entry_value(entry) };
+        output.try_append(key).map_err(|_| Status::NGX_ERROR)?;
+        output.write_str(" = ").map_err(|_| Status::NGX_ERROR)?;
+        output.try_append(value).map_err(|_| Status::NGX_ERROR)?;
+        output.write_str("; ").map_err(|_| Status::NGX_ERROR)?;
+    }
+
+    let (data, len, _, _) = output.into_raw_parts();
+    Ok(ngx_str_t { data, len })
+}
+
+fn shared_dict_clear(shm_zone: &ngx_shm_zone_t) -> Result<(), Status> {
+    let mut pool = shared_dict_pool(shm_zone)?;
+    let mut guard = pool.lock();
+    let state = shared_dict_state(&guard)?;
+
+    while shared_dict_entries(state) != 0 {
+        let entry = {
+            let queue = unsafe {
+                SlabQueue::<SharedDictEntry>::from_raw(&mut guard, shared_dict_state_queue(state))
+            }
+            .map_err(|_| Status::NGX_ERROR)?;
+            queue
+                .front()
+                .map_err(|_| Status::NGX_ERROR)?
+                .map(|entry| NonNull::from(entry.entry()))
+                .ok_or(Status::NGX_ERROR)?
+        };
+        shared_dict_detach_entry(&mut guard, state, entry)?;
+        shared_dict_free_entry(&mut guard, entry)?;
+        shared_dict_decrement_entries(state)?;
+    }
+
+    Ok(())
+}
+
 extern "C" fn ngx_http_shared_dict_add_zone(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    // SAFETY: configuration handlers always receive a valid `cf` pointer.
-    let cf = unsafe { cf.as_mut().unwrap() };
-    let smcf =
-        unsafe { conf.cast::<SharedDictMainConfig>().as_mut().expect("shared dict main config") };
+    let Some(cf) = (unsafe { cf.as_mut() }) else {
+        return NGX_CONF_ERROR;
+    };
+    let Some(smcf) = (unsafe { conf.cast::<SharedDictMainConfig>().as_mut() }) else {
+        return NGX_CONF_ERROR;
+    };
 
-    // SAFETY:
-    // - `cf.args` is guaranteed to be a pointer to an array with 3 elements (NGX_CONF_TAKE2).
-    // - The pointers are well-aligned by construction method (`ngx_palloc`).
     debug_assert!(!cf.args.is_null() && unsafe { (*cf.args).nelts >= 3 });
     let args = unsafe { (*cf.args).as_slice_mut() };
 
@@ -162,39 +658,17 @@ extern "C" fn ngx_http_shared_dict_add_zone(
     NGX_CONF_OK
 }
 
-fn ngx_http_shared_dict_init_shared(shm_zone: &mut ngx_shm_zone_t) -> Result<(), Status> {
-    let mut alloc = unsafe { SlabPool::from_shm_zone(shm_zone) }.ok_or(Status::NGX_ERROR)?;
-
-    if alloc.as_mut().data.is_null() {
-        let shared: RbTreeMap<NgxString<SlabPool>, NgxString<SlabPool>, SlabPool> =
-            RbTreeMap::try_new_in(alloc.clone()).map_err(|_| Status::NGX_ERROR)?;
-
-        let shared = ngx::sync::RwLock::new(shared);
-
-        alloc.as_mut().data = ngx::allocator::allocate(shared, &alloc)
-            .map_err(|_| Status::NGX_ERROR)?
-            .as_ptr()
-            .cast();
-    }
-
-    Ok(())
-}
-
-fn ngx_http_shared_dict_get_shared(shm_zone: &ngx_shm_zone_t) -> Result<&SharedData, Status> {
-    let alloc = unsafe { SlabPool::from_shm_zone(shm_zone) }.ok_or(Status::NGX_ERROR)?;
-
-    unsafe { alloc.as_ref().data.cast::<SharedData>().as_ref().ok_or(Status::NGX_ERROR) }
-}
-
 extern "C" fn ngx_http_shared_dict_zone_init(
     shm_zone: *mut ngx_shm_zone_t,
     _data: *mut c_void,
 ) -> ngx_int_t {
-    let shm_zone = unsafe { &mut *shm_zone };
+    let Some(shm_zone) = (unsafe { shm_zone.as_mut() }) else {
+        return Status::NGX_ERROR.into();
+    };
 
-    match ngx_http_shared_dict_init_shared(shm_zone) {
-        Err(e) => e.into(),
-        Ok(_) => Status::NGX_OK.into(),
+    match shared_dict_init_shared(shm_zone) {
+        Err(status) => status.into(),
+        Ok(()) => Status::NGX_OK.into(),
     }
 }
 
@@ -203,8 +677,9 @@ extern "C" fn ngx_http_shared_dict_add_variable(
     _cmd: *mut ngx_command_t,
     _conf: *mut c_void,
 ) -> *mut c_char {
-    // SAFETY: configuration handlers always receive a valid `cf` pointer.
-    let cf = unsafe { cf.as_mut().unwrap() };
+    let Some(cf) = (unsafe { cf.as_mut() }) else {
+        return NGX_CONF_ERROR;
+    };
     let Some(pool) = (unsafe { Pool::from_raw(cf.pool) }) else {
         return NGX_CONF_ERROR;
     };
@@ -214,9 +689,6 @@ extern "C" fn ngx_http_shared_dict_add_variable(
         return NGX_CONF_ERROR;
     }
 
-    // SAFETY:
-    // - `cf.args` is guaranteed to be a pointer to an array with 3 elements (NGX_CONF_TAKE2).
-    // - The pointers are well-aligned by construction method (`ngx_palloc`).
     debug_assert!(!cf.args.is_null() && unsafe { (*cf.args).nelts >= 3 });
     let args = unsafe { (*cf.args).as_slice_mut() };
 
@@ -259,48 +731,46 @@ extern "C" fn ngx_http_shared_dict_get_variable(
     v: *mut ngx_http_variable_value_t,
     data: usize,
 ) -> ngx_int_t {
-    let r = unsafe { &mut *r };
-    let v = unsafe { &mut *v };
+    let Some(r) = (unsafe { r.as_mut() }) else {
+        return Status::NGX_ERROR.into();
+    };
+    let Some(v) = (unsafe { v.as_mut() }) else {
+        return Status::NGX_ERROR.into();
+    };
 
     let mut key = ngx_str_t::empty();
     if unsafe { ngx_http_complex_value(r, data as _, &raw mut key) } != Status::NGX_OK.into() {
         return Status::NGX_ERROR.into();
     }
 
-    let key = unsafe { NgxStr::from_ngx_str(key) };
-    let smcf = HttpSharedDictModule::main_conf(r).expect("shared dict main config");
+    let Some(smcf) = HttpSharedDictModule::main_conf(r) else {
+        return Status::NGX_ERROR.into();
+    };
     let Some(shm_zone) = smcf.shm_zone() else {
         v.set_not_found(1);
         return Status::NGX_OK.into();
     };
 
-    let Ok(shared) = ngx_http_shared_dict_get_shared(shm_zone) else {
-        return Status::NGX_ERROR.into();
-    };
-
-    let value = {
-        let dict = shared.read();
-        let Some(value) = dict.get(key) else {
+    let key = unsafe { NgxStr::from_ngx_str(key) };
+    let value = match shared_dict_get_value(shm_zone, key.as_bytes(), r.pool) {
+        Err(status) => return status.into(),
+        Ok(None) => {
             v.set_not_found(1);
             return Status::NGX_OK.into();
-        };
-        unsafe { ngx_str_t::from_bytes(r.pool, value.as_bytes()) }
+        }
+        Ok(Some(value)) => value,
     };
 
     ngx_log_debug!(
         unsafe { (*r.connection).log },
-        "shared dict: get \"{}\" -> {:?} w:{} p:{}",
+        "shared dict: get \"{}\" w:{} p:{}",
         key,
-        value.as_ref().map(|x| unsafe { NgxStr::from_ngx_str(*x) }),
         unsafe { nginx_sys::ngx_worker },
         unsafe { nginx_sys::ngx_pid },
     );
 
-    let Some(value) = value else { return Status::NGX_ERROR.into() };
-
     v.data = value.data;
     v.set_len(value.len as _);
-
     v.set_valid(1);
     v.set_no_cacheable(0);
     v.set_not_found(0);
@@ -313,53 +783,47 @@ extern "C" fn ngx_http_shared_dict_set_variable(
     v: *mut ngx_http_variable_value_t,
     data: usize,
 ) {
-    let r = unsafe { &mut *r };
-    let v = unsafe { &mut *v };
+    let Some(r) = (unsafe { r.as_mut() }) else {
+        return;
+    };
+    let Some(v) = (unsafe { v.as_mut() }) else {
+        return;
+    };
     let mut key = ngx_str_t::empty();
 
     if unsafe { ngx_http_complex_value(r, data as _, &raw mut key) } != Status::NGX_OK.into() {
         return;
     }
 
-    let smcf = HttpSharedDictModule::main_conf(r).expect("shared dict main config");
-    let Some(shm_zone) = smcf.shm_zone() else { return };
-    let Ok(shared) = ngx_http_shared_dict_get_shared(shm_zone) else {
+    let Some(smcf) = HttpSharedDictModule::main_conf(r) else {
         return;
     };
+    let Some(shm_zone) = smcf.shm_zone() else {
+        return;
+    };
+    let key = unsafe { NgxStr::from_ngx_str(key) };
 
     if r.method == NGX_HTTP_DELETE as _ {
-        let key = unsafe { NgxStr::from_ngx_str(key) };
+        if shared_dict_delete_value(shm_zone, key.as_bytes()).is_ok() {
+            ngx_log_debug!(
+                unsafe { (*r.connection).log },
+                "shared dict: delete \"{}\" w:{} p:{}",
+                key,
+                unsafe { nginx_sys::ngx_worker },
+                unsafe { nginx_sys::ngx_pid },
+            );
+        }
+        return;
+    }
 
+    if shared_dict_set_value(shm_zone, key.as_bytes(), v.as_bytes()).is_ok() {
         ngx_log_debug!(
             unsafe { (*r.connection).log },
-            "shared dict: delete \"{}\" w:{} p:{}",
+            "shared dict: set \"{}\" w:{} p:{}",
             key,
             unsafe { nginx_sys::ngx_worker },
             unsafe { nginx_sys::ngx_pid },
         );
-
-        let _ = shared.write().remove(key);
-    } else {
-        let alloc = unsafe { SlabPool::from_shm_zone(shm_zone).expect("slab pool") };
-
-        let Ok(key) = NgxString::try_from_bytes_in(key.as_bytes(), alloc.clone()) else {
-            return;
-        };
-
-        let Ok(value) = NgxString::try_from_bytes_in(v.as_bytes(), alloc.clone()) else {
-            return;
-        };
-
-        ngx_log_debug!(
-            unsafe { (*r.connection).log },
-            "shared dict: set \"{}\" -> \"{}\" w:{} p:{}",
-            key,
-            value,
-            unsafe { nginx_sys::ngx_worker },
-            unsafe { nginx_sys::ngx_pid },
-        );
-
-        let _ = shared.write().try_insert(key, value);
     }
 }
 
@@ -368,60 +832,29 @@ extern "C" fn ngx_http_shared_dict_get_entries(
     v: *mut ngx_http_variable_value_t,
     _data: usize,
 ) -> ngx_int_t {
-    use core::fmt::Write;
-
-    let r = unsafe { &mut *r };
-    let v = unsafe { &mut *v };
-    let Some(pool) = (unsafe { Pool::from_raw(r.pool) }) else {
+    let Some(r) = (unsafe { r.as_mut() }) else {
         return Status::NGX_ERROR.into();
     };
-    let smcf = HttpSharedDictModule::main_conf(r).expect("shared dict main config");
-
-    ngx_log_debug!(unsafe { (*r.connection).log }, "shared dict: get all entries");
+    let Some(v) = (unsafe { v.as_mut() }) else {
+        return Status::NGX_ERROR.into();
+    };
+    let Some(smcf) = HttpSharedDictModule::main_conf(r) else {
+        return Status::NGX_ERROR.into();
+    };
 
     let Some(shm_zone) = smcf.shm_zone() else {
         v.set_not_found(1);
         return Status::NGX_OK.into();
     };
-    let Ok(shared) = ngx_http_shared_dict_get_shared(shm_zone) else {
-        return Status::NGX_ERROR.into();
+    let value = match shared_dict_entries_value(shm_zone, r.pool) {
+        Err(status) => return status.into(),
+        Ok(value) => value,
     };
 
-    let mut str = NgxString::new_in(pool);
-    {
-        let dict = shared.read();
+    ngx_log_debug!(unsafe { (*r.connection).log }, "shared dict: get all entries");
 
-        let mut len: usize = 0;
-        let mut values: usize = 0;
-
-        for (key, value) in dict.iter() {
-            len += key.len() + value.len() + b" = ; ".len();
-            values += 1;
-        }
-
-        len += values.checked_ilog10().unwrap_or(0) as usize + b"0; ".len();
-
-        if str.try_reserve(len).is_err() {
-            return Status::NGX_ERROR.into();
-        }
-
-        if write!(str, "{values}; ").is_err() {
-            return Status::NGX_ERROR.into();
-        }
-
-        for (key, value) in dict.iter() {
-            if write!(str, "{key} = {value}; ").is_err() {
-                return Status::NGX_ERROR.into();
-            }
-        }
-    }
-
-    // The string is allocated on the `ngx_pool_t` and will be freed with the request.
-    let (data, len, _, _) = str.into_raw_parts();
-
-    v.data = data;
-    v.set_len(len as _);
-
+    v.data = value.data;
+    v.set_len(value.len as _);
     v.set_valid(1);
     v.set_no_cacheable(1);
     v.set_not_found(0);
@@ -434,23 +867,19 @@ extern "C" fn ngx_http_shared_dict_set_entries(
     _v: *mut ngx_http_variable_value_t,
     _data: usize,
 ) {
-    let r = unsafe { &mut *r };
-    let smcf = HttpSharedDictModule::main_conf(r).expect("shared dict main config");
-
-    ngx_log_debug!(unsafe { (*r.connection).log }, "shared dict: clear");
-
-    let Some(shm_zone) = smcf.shm_zone() else { return };
-    let Ok(shared) = ngx_http_shared_dict_get_shared(shm_zone) else {
+    let Some(r) = (unsafe { r.as_mut() }) else {
+        return;
+    };
+    let Some(smcf) = HttpSharedDictModule::main_conf(r) else {
+        return;
+    };
+    let Some(shm_zone) = smcf.shm_zone() else {
         return;
     };
 
-    let Ok(tree) = RbTreeMap::try_new_in(shared.read().allocator().clone()) else {
-        return;
-    };
-
-    // This would check both .clear() and the drop implementation
-    *shared.write() = tree;
-    // shared.write().clear()
+    if shared_dict_clear(shm_zone).is_ok() {
+        ngx_log_debug!(unsafe { (*r.connection).log }, "shared dict: clear");
+    }
 }
 
 #[cfg(test)]
@@ -469,5 +898,18 @@ mod tests {
     #[test]
     fn default_config_has_no_shared_memory_zone() {
         assert!(SharedDictMainConfig::default().shm_zone().is_none());
+    }
+
+    #[test]
+    fn rbtree_hash_keeps_colliding_keys_distinct_for_secondary_ordering() {
+        assert_eq!(shared_dict_hash(b"Aa"), shared_dict_hash(b"BB"));
+        assert_ne!(b"Aa".cmp(b"BB"), Ordering::Equal);
+    }
+
+    #[test]
+    fn flexible_entry_layout_covers_empty_and_overflowing_tails() {
+        let layout = shared_dict_entry_layout(0, 0).unwrap();
+        assert_eq!(layout.size(), mem::size_of::<SharedDictEntry>());
+        assert_eq!(shared_dict_entry_layout(usize::MAX, 1), Err(Status::NGX_ERROR));
     }
 }
