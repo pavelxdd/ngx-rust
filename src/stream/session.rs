@@ -2,6 +2,7 @@ use core::ffi::c_void;
 use core::fmt;
 use core::ptr::NonNull;
 
+use super::conf::sealed;
 use crate::allocator::AllocError;
 use crate::core::{NgxStr, Pool, Status};
 use crate::ffi::{
@@ -10,8 +11,9 @@ use crate::ffi::{
     ngx_stream_upstream_t,
 };
 use crate::stream::{
-    StreamModule, StreamModuleMainConf, StreamModuleMainConfExt, StreamModuleServerConf,
-    StreamModuleServerConfExt,
+    StreamConfigError, StreamModule, StreamModuleMainConf, StreamModuleMainConfExt,
+    StreamModuleMainConfMutExt, StreamModuleServerConf, StreamModuleServerConfExt,
+    StreamModuleServerConfMutExt,
 };
 
 /// Stream phases in which modules can register handlers.
@@ -192,19 +194,19 @@ impl Session {
     }
 
     /// Shared main configuration for module `M`.
-    pub fn main_conf<M>(&self) -> Option<&M::MainConf>
+    pub fn main_conf<M>(&self) -> Result<Option<&M::MainConf>, StreamConfigError>
     where
         M: StreamModuleMainConf,
     {
-        unsafe { M::main_conf(self) }
+        M::main_conf(self)
     }
 
     /// Shared server configuration for module `M`.
-    pub fn server_conf<M>(&self) -> Option<&M::ServerConf>
+    pub fn server_conf<M>(&self) -> Result<Option<&M::ServerConf>, StreamConfigError>
     where
         M: StreamModuleServerConf,
     {
-        unsafe { M::server_conf(self) }
+        M::server_conf(self)
     }
 
     fn module_context_slot(&self, module: &ngx_module_t) -> Option<NonNull<*mut c_void>> {
@@ -299,15 +301,41 @@ impl Session {
     }
 }
 
-unsafe impl StreamModuleMainConfExt for Session {
-    unsafe fn stream_main_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
-        unsafe { self.0.stream_main_conf_unchecked(module) }
+impl sealed::MainConfSource for Session {}
+impl sealed::MainConfSourceMut for Session {}
+impl sealed::ServerConfSource for Session {}
+impl sealed::ServerConfSourceMut for Session {}
+
+impl StreamModuleMainConfExt for Session {
+    fn stream_main_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, StreamConfigError> {
+        self.0.stream_main_conf(module)
     }
 }
 
-unsafe impl StreamModuleServerConfExt for Session {
-    unsafe fn stream_server_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
-        unsafe { self.0.stream_server_conf_unchecked(module) }
+impl StreamModuleMainConfMutExt for Session {
+    fn stream_main_conf_mut<T>(
+        &mut self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&mut T>, StreamConfigError> {
+        self.0.stream_main_conf_mut(module)
+    }
+}
+
+impl StreamModuleServerConfExt for Session {
+    fn stream_server_conf<T>(
+        &self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&T>, StreamConfigError> {
+        self.0.stream_server_conf(module)
+    }
+}
+
+impl StreamModuleServerConfMutExt for Session {
+    fn stream_server_conf_mut<T>(
+        &mut self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&mut T>, StreamConfigError> {
+        self.0.stream_server_conf_mut(module)
     }
 }
 
@@ -324,12 +352,15 @@ mod tests {
     extern crate std;
 
     use alloc::boxed::Box;
+    #[cfg(feature = "test-link")]
     use core::ffi::c_void;
     use core::mem::MaybeUninit;
     #[cfg(feature = "test-link")]
     use core::ptr;
     #[cfg(feature = "test-link")]
     use core::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(feature = "test-link")]
+    use std::sync::MutexGuard;
 
     #[cfg(feature = "test-link")]
     use super::StreamModuleSessionContext;
@@ -337,7 +368,10 @@ mod tests {
     use crate::core::Status;
     use crate::ffi::{NGX_ERROR, NGX_STREAM_OK, ngx_module_t, ngx_stream_session_t};
     #[cfg(feature = "test-link")]
-    use crate::ffi::{ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_log_t};
+    use crate::ffi::{
+        NGX_STREAM_MODULE, ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_log_t,
+        ngx_uint_t,
+    };
     use crate::stream::{StreamModule, StreamModuleMainConf, StreamModuleServerConf, StreamPhase};
 
     struct TestContextModule;
@@ -345,6 +379,8 @@ mod tests {
     unsafe impl StreamModule for TestContextModule {
         fn module() -> &'static ngx_module_t {
             let mut module = ngx_module_t::default();
+            module.type_ = NGX_STREAM_MODULE as _;
+            module.index = 0;
             module.ctx_index = 0;
             Box::leak(Box::new(module))
         }
@@ -366,8 +402,43 @@ mod tests {
         unsafe { Session::from_ngx_stream_session(raw) }
     }
 
+    #[cfg(feature = "test-link")]
+    struct StreamGlobals {
+        _guard: MutexGuard<'static, ()>,
+        max_module: ngx_uint_t,
+        stream_max_module: ngx_uint_t,
+    }
+
+    #[cfg(feature = "test-link")]
+    impl StreamGlobals {
+        fn new() -> Self {
+            let guard = crate::TEST_NGINX_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
+            let max_module = unsafe { nginx_sys::ngx_max_module };
+            let stream_max_module = unsafe { nginx_sys::ngx_stream_max_module };
+
+            unsafe {
+                nginx_sys::ngx_max_module = 1;
+                nginx_sys::ngx_stream_max_module = 1;
+            }
+
+            Self { _guard: guard, max_module, stream_max_module }
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    impl Drop for StreamGlobals {
+        fn drop(&mut self) {
+            unsafe {
+                nginx_sys::ngx_max_module = self.max_module;
+                nginx_sys::ngx_stream_max_module = self.stream_max_module;
+            }
+        }
+    }
+
+    #[cfg(feature = "test-link")]
     #[test]
     fn stream_configuration_access_follows_the_session_borrow() {
+        let _globals = StreamGlobals::new();
         let mut main = 7_u32;
         let mut server = 8_u32;
         let mut main_conf: [*mut c_void; 1] = [(&raw mut main).cast()];
@@ -377,8 +448,14 @@ mod tests {
         raw.srv_conf = server_conf.as_mut_ptr();
         let session = session_from(&mut raw);
 
-        assert_eq!(session.main_conf::<TestContextModule>().copied(), Some(7));
-        assert_eq!(session.server_conf::<TestContextModule>().copied(), Some(8));
+        assert_eq!(
+            session.main_conf::<TestContextModule>().map(|value| value.copied()),
+            Ok(Some(7))
+        );
+        assert_eq!(
+            session.server_conf::<TestContextModule>().map(|value| value.copied()),
+            Ok(Some(8))
+        );
     }
 
     struct TestHandler;

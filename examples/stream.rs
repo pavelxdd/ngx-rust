@@ -76,8 +76,11 @@ impl StreamSessionHandler for ProbeHandler {
     type Output = Result<Status, Status>;
 
     fn handler(session: &mut Session) -> Self::Output {
-        let enabled =
-            session.server_conf::<Module>().and_then(|conf| conf.enabled).unwrap_or(false);
+        let enabled = session
+            .server_conf::<Module>()
+            .map_err(|_| Status::NGX_ERROR)?
+            .and_then(|conf| conf.enabled)
+            .unwrap_or(false);
         if !enabled {
             return Ok(Status::NGX_DECLINED);
         }
