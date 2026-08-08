@@ -73,19 +73,17 @@ fn rejects_invalid_source_and_incomplete_build_directories() {
     fs::remove_file(source.join("src/core/nginx.h")).unwrap();
 
     let error = NginxSource::configured(Some(os_string(&source)), Some(os_string(&build)))
-        .err()
-        .expect("invalid source");
+        .expect_err("invalid source");
     assert!(error.to_string().contains("Invalid nginx source directory"));
 
     fs::write(source.join("src/core/nginx.h"), "").unwrap();
     fs::remove_file(build.join("Makefile")).unwrap();
     let error = NginxSource::configured(Some(os_string(&source)), Some(os_string(&build)))
-        .err()
-        .expect("incomplete build");
+        .expect_err("incomplete build");
     assert!(error.to_string().contains("Invalid nginx build directory"));
 
     let missing = temp.path().join("missing");
     let error =
-        NginxSource::configured(Some(os_string(&missing)), None).err().expect("missing source");
+        NginxSource::configured(Some(os_string(&missing)), None).expect_err("missing source");
     assert!(error.to_string().contains("Invalid nginx source directory"));
 }
