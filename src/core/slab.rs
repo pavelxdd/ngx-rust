@@ -221,7 +221,7 @@ impl SlabGuard<'_, '_> {
     /// `ptr` must identify an initialized, valid `T` in this mapping. The caller must preserve
     /// Rust aliasing rules and the value's validity for the returned borrow.
     pub unsafe fn get<T>(&self, ptr: NonNull<T>) -> Result<&T, SlabError> {
-        self.checked_typed(ptr)?;
+        self.check_typed(ptr)?;
         Ok(unsafe { ptr.as_ref() })
     }
 
@@ -232,7 +232,7 @@ impl SlabGuard<'_, '_> {
     /// `ptr` must identify an initialized, valid `T` in this mapping, and this guard must provide
     /// its only mutable access for the returned borrow.
     pub unsafe fn get_mut<T>(&mut self, mut ptr: NonNull<T>) -> Result<&mut T, SlabError> {
-        self.checked_typed(ptr)?;
+        self.check_typed(ptr)?;
         Ok(unsafe { ptr.as_mut() })
     }
 
@@ -275,7 +275,7 @@ impl SlabGuard<'_, '_> {
         unsafe { ngx_slab_free_locked(self.pool.raw.as_ptr(), ptr.as_ptr().cast()) }
     }
 
-    fn checked_typed<T>(&self, ptr: NonNull<T>) -> Result<(), SlabError> {
+    pub(crate) fn check_typed<T>(&self, ptr: NonNull<T>) -> Result<(), SlabError> {
         if !ptr.as_ptr().is_aligned() {
             return Err(SlabError::MisalignedPointer);
         }
@@ -306,7 +306,7 @@ fn allocation_size(layout: Layout) -> usize {
 }
 
 #[cfg(all(test, feature = "test-link"))]
-mod tests {
+pub(crate) mod tests {
     use alloc::boxed::Box;
     use core::alloc::Layout;
     use core::ffi::c_int;
@@ -389,7 +389,7 @@ mod tests {
         }
     }
 
-    struct TestZone {
+    pub(crate) struct TestZone {
         _globals: TestGlobals,
         _log: Box<ngx_log_t>,
         _cycle: Box<ngx_cycle_t>,
@@ -397,7 +397,7 @@ mod tests {
     }
 
     impl TestZone {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let globals = TestGlobals::new();
             let mut log = Box::new(unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() });
             let mut cycle = Box::new(unsafe { MaybeUninit::<ngx_cycle_t>::zeroed().assume_init() });
@@ -430,15 +430,15 @@ mod tests {
             Self { _globals: globals, _log: log, _cycle: cycle, zone }
         }
 
-        fn pool(&self) -> SlabPool<'_> {
+        pub(crate) fn pool(&self) -> SlabPool<'_> {
             unsafe { SlabPool::from_shm_zone(&self.zone) }.expect("initialized test slab")
         }
 
-        fn mapping(&self) -> *mut u8 {
+        pub(crate) fn mapping(&self) -> *mut u8 {
             self.zone.shm.addr
         }
 
-        fn mapping_len(&self) -> usize {
+        pub(crate) fn mapping_len(&self) -> usize {
             self.zone.shm.size
         }
 
