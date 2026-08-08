@@ -1,6 +1,6 @@
 #[cfg(feature = "async")]
 mod async_request;
-mod conf;
+pub(crate) mod conf;
 mod module;
 /// Imports commonly needed by HTTP modules.
 pub mod prelude;

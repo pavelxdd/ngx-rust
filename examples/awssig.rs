@@ -13,7 +13,7 @@ use ngx::{ngx_conf_log_error, ngx_log_debug_http, ngx_string};
 
 struct Module;
 
-impl HttpModule for Module {
+unsafe impl HttpModule for Module {
     fn module() -> &'static ngx_module_t {
         unsafe { &*::core::ptr::addr_of!(ngx_http_awssigv4_module) }
     }
@@ -120,7 +120,7 @@ impl Merge for ModuleConfig {
                 String::from(if !prev.access_key.is_empty() { &prev.access_key } else { "" });
         }
         if enabled && self.access_key.is_empty() {
-            return Err("awssigv4_access_key is required when awssigv4 is enabled".into());
+            return Err(c"awssigv4_access_key is required when awssigv4 is enabled".into());
         }
 
         if self.secret_key.is_empty() {
@@ -128,7 +128,7 @@ impl Merge for ModuleConfig {
                 String::from(if !prev.secret_key.is_empty() { &prev.secret_key } else { "" });
         }
         if enabled && self.secret_key.is_empty() {
-            return Err("awssigv4_secret_key is required when awssigv4 is enabled".into());
+            return Err(c"awssigv4_secret_key is required when awssigv4 is enabled".into());
         }
 
         if self.s3_bucket.is_empty() {
@@ -136,7 +136,7 @@ impl Merge for ModuleConfig {
                 String::from(if !prev.s3_bucket.is_empty() { &prev.s3_bucket } else { "" });
         }
         if enabled && self.s3_bucket.is_empty() {
-            return Err("awssigv4_s3_bucket is required when awssigv4 is enabled".into());
+            return Err(c"awssigv4_s3_bucket is required when awssigv4 is enabled".into());
         }
 
         if self.s3_endpoint.is_empty() {
@@ -251,7 +251,9 @@ impl HttpRequestHandler for AwsSigV4HeaderHandler {
 
     fn handler(request: &mut Request) -> Self::Output {
         // get Module Config from request
-        let conf = Module::location_conf(request).expect("module conf");
+        let Ok(Some(conf)) = Module::location_conf(request) else {
+            return Status::NGX_ERROR;
+        };
         ngx_log_debug_http!(request, "AWS signature V4 module {}", {
             if conf.enable.unwrap_or(false) { "enabled" } else { "disabled" }
         });

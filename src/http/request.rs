@@ -558,31 +558,90 @@ impl Request {
     }
 }
 
-impl crate::http::HttpModuleConfExt for Request {
-    #[inline]
-    unsafe fn http_main_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
+impl crate::http::conf::sealed::MainConfSource for Request {}
+impl crate::http::conf::sealed::MainConfSourceMut for Request {}
+impl crate::http::conf::sealed::ServerConfSource for Request {}
+impl crate::http::conf::sealed::ServerConfSourceMut for Request {}
+impl crate::http::conf::sealed::LocationConfSource for Request {}
+impl crate::http::conf::sealed::LocationConfSourceMut for Request {}
+
+impl crate::http::HttpModuleMainConfExt for Request {
+    unsafe fn http_main_conf<T>(
+        &self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&T>, crate::http::HttpConfigError> {
         unsafe {
-            // SAFETY: main_conf[module.ctx_index] is either NULL or allocated with ngx_p(c)alloc
-            // and explicitly initialized by the module
-            NonNull::new((*self.0.main_conf.add(module.ctx_index)).cast())
+            <ngx_http_request_t as crate::http::HttpModuleMainConfExt>::http_main_conf(
+                &self.0, module,
+            )
         }
     }
+}
 
-    #[inline]
-    unsafe fn http_server_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
+impl crate::http::HttpModuleMainConfMutExt for Request {
+    unsafe fn http_main_conf_mut<T>(
+        &mut self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&mut T>, crate::http::HttpConfigError> {
         unsafe {
-            // SAFETY: srv_conf[module.ctx_index] is either NULL or allocated with ngx_p(c)alloc and
-            // explicitly initialized by the module
-            NonNull::new((*self.0.srv_conf.add(module.ctx_index)).cast())
+            <ngx_http_request_t as crate::http::HttpModuleMainConfMutExt>::http_main_conf_mut(
+                &mut self.0,
+                module,
+            )
         }
     }
+}
 
-    #[inline]
-    unsafe fn http_location_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
+impl crate::http::HttpModuleServerConfExt for Request {
+    unsafe fn http_server_conf<T>(
+        &self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&T>, crate::http::HttpConfigError> {
         unsafe {
-            // SAFETY: loc_conf[module.ctx_index] is either NULL or allocated with ngx_p(c)alloc and
-            // explicitly initialized by the module
-            NonNull::new((*self.0.loc_conf.add(module.ctx_index)).cast())
+            <ngx_http_request_t as crate::http::HttpModuleServerConfExt>::http_server_conf(
+                &self.0, module,
+            )
+        }
+    }
+}
+
+impl crate::http::HttpModuleServerConfMutExt for Request {
+    unsafe fn http_server_conf_mut<T>(
+        &mut self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&mut T>, crate::http::HttpConfigError> {
+        unsafe {
+            <ngx_http_request_t as crate::http::HttpModuleServerConfMutExt>::http_server_conf_mut(
+                &mut self.0,
+                module,
+            )
+        }
+    }
+}
+
+impl crate::http::HttpModuleLocationConfExt for Request {
+    unsafe fn http_location_conf<T>(
+        &self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&T>, crate::http::HttpConfigError> {
+        unsafe {
+            <ngx_http_request_t as crate::http::HttpModuleLocationConfExt>::http_location_conf(
+                &self.0, module,
+            )
+        }
+    }
+}
+
+impl crate::http::HttpModuleLocationConfMutExt for Request {
+    unsafe fn http_location_conf_mut<T>(
+        &mut self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&mut T>, crate::http::HttpConfigError> {
+        unsafe {
+            <ngx_http_request_t as crate::http::HttpModuleLocationConfMutExt>::http_location_conf_mut(
+                &mut self.0,
+                module,
+            )
         }
     }
 }
@@ -905,7 +964,7 @@ mod tests {
 
     struct TestContextModule;
 
-    impl HttpModule for TestContextModule {
+    unsafe impl HttpModule for TestContextModule {
         fn module() -> &'static ngx_module_t {
             let mut module = ngx_module_t::default();
             module.ctx_index = 0;

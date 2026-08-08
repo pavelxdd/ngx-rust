@@ -5,7 +5,7 @@ use ngx::http::prelude::*;
 
 struct Module;
 
-impl HttpModule for Module {
+unsafe impl HttpModule for Module {
     fn module() -> &'static ngx_module_t {
         unsafe { &*::core::ptr::addr_of!(ngx_http_curl_module) }
     }
@@ -80,7 +80,9 @@ impl HttpRequestHandler for CurlRequestHandler {
     type Output = Status;
 
     fn handler(request: &mut Request) -> Self::Output {
-        let co = Module::location_conf(request).expect("module config is none");
+        let Ok(Some(co)) = Module::location_conf(request) else {
+            return Status::NGX_ERROR;
+        };
 
         ngx_log_debug_http!(request, "curl module enabled: {}", co.enable.unwrap_or(false));
 

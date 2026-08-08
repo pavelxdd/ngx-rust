@@ -26,7 +26,7 @@ use ngx::{ngx_conf_log_error, ngx_log_debug, ngx_string};
 
 struct HttpSharedDictModule;
 
-impl HttpModule for HttpSharedDictModule {
+unsafe impl HttpModule for HttpSharedDictModule {
     fn module() -> &'static ngx_module_t {
         unsafe { &*ptr::addr_of!(ngx_http_shared_dict_module) }
     }
@@ -743,7 +743,7 @@ extern "C" fn ngx_http_shared_dict_get_variable(
         return Status::NGX_ERROR.into();
     }
 
-    let Some(smcf) = HttpSharedDictModule::main_conf(r) else {
+    let Ok(Some(smcf)) = HttpSharedDictModule::main_conf(r) else {
         return Status::NGX_ERROR.into();
     };
     let Some(shm_zone) = smcf.shm_zone() else {
@@ -795,7 +795,7 @@ extern "C" fn ngx_http_shared_dict_set_variable(
         return;
     }
 
-    let Some(smcf) = HttpSharedDictModule::main_conf(r) else {
+    let Ok(Some(smcf)) = HttpSharedDictModule::main_conf(r) else {
         return;
     };
     let Some(shm_zone) = smcf.shm_zone() else {
@@ -838,7 +838,7 @@ extern "C" fn ngx_http_shared_dict_get_entries(
     let Some(v) = (unsafe { v.as_mut() }) else {
         return Status::NGX_ERROR.into();
     };
-    let Some(smcf) = HttpSharedDictModule::main_conf(r) else {
+    let Ok(Some(smcf)) = HttpSharedDictModule::main_conf(r) else {
         return Status::NGX_ERROR.into();
     };
 
@@ -870,7 +870,7 @@ extern "C" fn ngx_http_shared_dict_set_entries(
     let Some(r) = (unsafe { r.as_mut() }) else {
         return;
     };
-    let Some(smcf) = HttpSharedDictModule::main_conf(r) else {
+    let Ok(Some(smcf)) = HttpSharedDictModule::main_conf(r) else {
         return;
     };
     let Some(shm_zone) = smcf.shm_zone() else {
