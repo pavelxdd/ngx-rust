@@ -49,6 +49,7 @@ targets = []
 allocator-api2 = { version = "0.4.0", default-features = false, features = ["fresh-rust"] }
 async-task = { version = "4.7.1", optional = true }
 bitflags = { version = "2.13.1", default-features = false }
+libc = "0.2.189"
 lock_api = "0.4.14"
 log = { version = "0.4.33", optional = true }
 nginx-sys = { path = "nginx-sys", version = "0.5.0"}

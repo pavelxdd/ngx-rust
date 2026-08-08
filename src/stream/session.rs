@@ -1,14 +1,13 @@
 use core::ffi::c_void;
 use core::fmt;
-use core::ptr::NonNull;
+use core::ptr::{self, NonNull};
 
 use super::conf::sealed;
 use crate::allocator::AllocError;
-use crate::core::{NgxStr, Pool, Status};
+use crate::core::{ConnectionError, ConnectionRef, ConnectionRefMut, NgxStr, Pool, Status};
 use crate::ffi::{
-    NGX_ERROR, NGX_OK, ngx_connection_t, ngx_int_t, ngx_log_t, ngx_module_t, ngx_str_t,
-    ngx_stream_complex_value, ngx_stream_complex_value_t, ngx_stream_session_t,
-    ngx_stream_upstream_t,
+    NGX_ERROR, NGX_OK, ngx_int_t, ngx_log_t, ngx_module_t, ngx_str_t, ngx_stream_complex_value,
+    ngx_stream_complex_value_t, ngx_stream_session_t, ngx_stream_upstream_t,
 };
 use crate::stream::{
     StreamConfigError, StreamModule, StreamModuleMainConf, StreamModuleMainConfExt,
@@ -167,23 +166,26 @@ impl Session {
     }
 
     /// Client connection associated with this session.
-    pub fn connection(&self) -> &ngx_connection_t {
-        unsafe { &*self.0.connection }
+    pub fn connection(&self) -> Result<ConnectionRef<'_>, ConnectionError> {
+        unsafe { ConnectionRef::from_raw(self.0.connection) }
     }
 
     /// Exclusive access to the client connection associated with this session.
-    pub fn connection_mut(&mut self) -> &mut ngx_connection_t {
-        unsafe { &mut *self.0.connection }
+    pub fn connection_mut(&mut self) -> Result<ConnectionRefMut<'_>, ConnectionError> {
+        unsafe { ConnectionRefMut::from_raw(self.0.connection) }
     }
 
     /// Memory pool owned by the client connection.
-    fn pool(&self) -> Pool<'_> {
-        unsafe { Pool::from_raw(self.connection().pool).unwrap_unchecked() }
+    fn pool(&self) -> Option<Pool<'_>> {
+        self.connection().ok()?.pool().ok()
     }
 
     /// Logger associated with the client connection.
     pub fn log(&self) -> *mut ngx_log_t {
-        self.connection().log
+        self.connection()
+            .ok()
+            .and_then(|connection| connection.log().ok().flatten())
+            .map_or(ptr::null_mut(), NonNull::as_ptr)
     }
 
     /// Active upstream state, when nginx has created one.
@@ -261,7 +263,8 @@ impl Session {
             return Ok(unsafe { context.as_mut() });
         }
 
-        let mut context = self.pool().allocate_with_cleanup(constructor)?.into_non_null();
+        let mut context =
+            self.pool().ok_or(AllocError)?.allocate_with_cleanup(constructor)?.into_non_null();
         unsafe { *slot.as_ptr() = context.as_ptr().cast() };
         Ok(unsafe { context.as_mut() })
     }
@@ -271,11 +274,11 @@ impl Session {
     where
         M: StreamModuleSessionContext,
     {
+        let pool = self.pool()?;
         let slot = self.module_context_slot(M::module())?;
         let context = NonNull::new(unsafe { *slot.as_ptr() }.cast::<M::SessionContext>())?;
         unsafe { *slot.as_ptr() = core::ptr::null_mut() };
 
-        let pool = self.pool();
         if unsafe { pool.remove_cleanup(context) } {
             Some(())
         } else {
@@ -561,6 +564,20 @@ mod tests {
     #[cfg(feature = "test-link")]
     unsafe impl StreamModuleSessionContext for PoolContextModule {
         type SessionContext = TestContext;
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn context_removal_keeps_the_slot_when_the_connection_pool_is_unavailable() {
+        let mut context = TestContext(42);
+        let context_ptr = (&raw mut context).cast();
+        let mut contexts: [*mut c_void; 1] = [context_ptr];
+        let mut raw = zeroed_session();
+        raw.ctx = contexts.as_mut_ptr();
+        let session = session_from(&mut raw);
+
+        assert_eq!(session.remove_module_context::<PoolContextModule>(), None);
+        assert_eq!(contexts[0], context_ptr);
     }
 
     #[cfg(feature = "test-link")]
