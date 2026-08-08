@@ -13,7 +13,7 @@ pub use buffer::*;
 pub use command::*;
 pub use conf::*;
 pub use pool::*;
-pub use slab::{SlabError, SlabGuard, SlabPool};
+pub use slab::{SlabError, SlabGuard, SlabPool, SlabRegion, SlabRegionInitError};
 pub use status::*;
 pub use string::*;
 

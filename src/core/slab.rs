@@ -33,6 +33,116 @@ pub enum SlabError {
     Allocation,
 }
 
+/// A persistent, untyped allocation in an nginx shared slab pool.
+///
+/// A region stores only its address and layout. It does not own a Rust value and has no `Drop`
+/// implementation: the ABI owner initializes, validates, detaches, and explicitly frees its
+/// record through a live [`SlabGuard`].
+pub struct SlabRegion<'zone> {
+    ptr: NonNull<u8>,
+    layout: Layout,
+    _zone: PhantomData<&'zone ngx_shm_zone_t>,
+}
+
+impl<'zone> SlabRegion<'zone> {
+    /// Returns the layout of a header followed by `tail_len` raw bytes.
+    ///
+    /// The header and tail contents stay opaque here; their ABI owner defines and validates them.
+    pub fn flexible_layout<Header>(tail_len: usize) -> Result<Layout, SlabError> {
+        let tail = Layout::array::<u8>(tail_len).map_err(|_| SlabError::Overflow)?;
+        let (layout, _) = Layout::new::<Header>().extend(tail).map_err(|_| SlabError::Overflow)?;
+        Ok(layout)
+    }
+
+    /// Returns the allocation address without allowing dereference outside a slab guard.
+    pub fn as_ptr(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    /// Returns the allocation layout used for checked access and eventual freeing.
+    pub fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    /// Transfers this token into raw allocation identity.
+    ///
+    /// The allocation remains live. Reconstruct it with
+    /// [`SlabGuard::region_from_raw`] before checked access or freeing.
+    pub fn into_raw_parts(self) -> (NonNull<u8>, Layout) {
+        (self.ptr, self.layout)
+    }
+
+    /// Returns checked initialized bytes while `guard` holds the native slab mutex.
+    ///
+    /// # Safety
+    ///
+    /// The region must still identify one live allocation whose bytes are initialized. Its lifetime
+    /// is bounded by the guard and cannot escape after unlock:
+    ///
+    /// ```compile_fail
+    /// # use ngx::core::{SlabPool, SlabRegion};
+    /// fn escape<'zone>(pool: &mut SlabPool<'zone>, region: &SlabRegion<'zone>) -> &'static [u8] {
+    ///     let guard = pool.lock();
+    ///     unsafe { region.bytes(&guard) }.unwrap()
+    /// }
+    /// ```
+    pub unsafe fn bytes<'guard>(
+        &self,
+        guard: &'guard SlabGuard<'zone, '_>,
+    ) -> Result<&'guard [u8], SlabError> {
+        if self.layout.size() == 0 {
+            return Ok(unsafe { slice::from_raw_parts(self.ptr.as_ptr(), 0) });
+        }
+
+        unsafe { guard.bytes(self.ptr, self.layout.size()) }
+    }
+
+    /// Returns checked initialized bytes with exclusive access while `guard` holds the mutex.
+    ///
+    /// # Safety
+    ///
+    /// The region must still identify one live allocation whose bytes are initialized, and the
+    /// guard must provide its only mutable access for the returned borrow.
+    pub unsafe fn bytes_mut<'guard>(
+        &self,
+        guard: &'guard mut SlabGuard<'zone, '_>,
+    ) -> Result<&'guard mut [u8], SlabError> {
+        if self.layout.size() == 0 {
+            return Ok(unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), 0) });
+        }
+
+        unsafe { guard.bytes_mut(self.ptr, self.layout.size()) }
+    }
+}
+
+/// Failure while allocating or initializing a [`SlabRegion`].
+#[derive(Debug, Eq, PartialEq)]
+pub enum SlabRegionInitError<E> {
+    /// The native slab allocation or checked region access failed.
+    Slab(SlabError),
+    /// The caller rejected the zeroed region during initialization.
+    Init(E),
+}
+
+struct SlabRegionRollback<'guard, 'zone, 'lock> {
+    guard: &'guard mut SlabGuard<'zone, 'lock>,
+    allocation: Option<NonNull<u8>>,
+}
+
+impl SlabRegionRollback<'_, '_, '_> {
+    fn disarm(&mut self) {
+        self.allocation = None;
+    }
+}
+
+impl Drop for SlabRegionRollback<'_, '_, '_> {
+    fn drop(&mut self) {
+        if let Some(ptr) = self.allocation {
+            unsafe { self.guard.free_raw(ptr) };
+        }
+    }
+}
+
 /// Non-owning, zone-lifetime handle for an initialized nginx slab pool.
 ///
 /// The handle is neither cloneable nor transferable across threads. It records the complete
@@ -158,7 +268,65 @@ pub struct SlabGuard<'zone, 'lock> {
     pool: &'lock mut SlabPool<'zone>,
 }
 
-impl SlabGuard<'_, '_> {
+impl<'zone> SlabGuard<'zone, '_> {
+    /// Allocates an uninitialized persistent region while this guard holds the native mutex.
+    pub fn alloc_region(&mut self, layout: Layout) -> Result<SlabRegion<'zone>, SlabError> {
+        let ptr = self.alloc(layout)?.cast();
+        Ok(SlabRegion { ptr, layout, _zone: PhantomData })
+    }
+
+    /// Allocates a zeroed persistent region while this guard holds the native mutex.
+    pub fn calloc_region(&mut self, layout: Layout) -> Result<SlabRegion<'zone>, SlabError> {
+        let ptr = self.calloc(layout)?.cast();
+        Ok(SlabRegion { ptr, layout, _zone: PhantomData })
+    }
+
+    /// Reconstructs a checked region for a live persistent slab allocation.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must identify one live allocation from this slab pool with `layout`. Its contents must
+    /// remain valid according to the ABI owner until it is detached and freed.
+    pub unsafe fn region_from_raw(
+        &self,
+        ptr: NonNull<u8>,
+        layout: Layout,
+    ) -> Result<SlabRegion<'zone>, SlabError> {
+        self.check_region(ptr, layout)?;
+        Ok(SlabRegion { ptr, layout, _zone: PhantomData })
+    }
+
+    /// Initializes a zeroed persistent region and frees it if initialization returns an error or
+    /// unwinds.
+    ///
+    /// The callback must fully initialize the ABI-owned bytes before returning `Ok`. The region is
+    /// returned only after that succeeds.
+    pub fn try_calloc_region<E>(
+        &mut self,
+        layout: Layout,
+        initialize: impl FnOnce(&mut [u8]) -> Result<(), E>,
+    ) -> Result<SlabRegion<'zone>, SlabRegionInitError<E>> {
+        let region = self.calloc_region(layout).map_err(SlabRegionInitError::Slab)?;
+        let allocation = (layout.size() != 0).then_some(region.ptr);
+        let mut rollback = SlabRegionRollback { guard: self, allocation };
+        let bytes =
+            unsafe { region.bytes_mut(rollback.guard) }.map_err(SlabRegionInitError::Slab)?;
+        initialize(bytes).map_err(SlabRegionInitError::Init)?;
+        rollback.disarm();
+        Ok(region)
+    }
+
+    /// Frees a detached persistent region while this guard holds the native mutex.
+    ///
+    /// # Safety
+    ///
+    /// `region` must identify a live allocation from this slab pool and must already be detached
+    /// from every native intrusive structure. Its ABI owner must have completed any required
+    /// destructor or cleanup before this call.
+    pub unsafe fn free_region(&mut self, region: SlabRegion<'zone>) -> Result<(), SlabError> {
+        unsafe { self.free(region.ptr, region.layout) }
+    }
+
     /// Allocates uninitialized slab memory while this guard holds the native mutex.
     pub fn alloc(&mut self, layout: Layout) -> Result<NonNull<[u8]>, SlabError> {
         self.allocate(layout, false)
@@ -282,6 +450,17 @@ impl SlabGuard<'_, '_> {
         self.checked_bytes(ptr.cast(), mem::size_of::<T>())
     }
 
+    fn check_region(&self, ptr: NonNull<u8>, layout: Layout) -> Result<(), SlabError> {
+        if ptr.as_ptr().align_offset(layout.align()) != 0 {
+            return Err(SlabError::MisalignedPointer);
+        }
+        if layout.size() == 0 {
+            return Ok(());
+        }
+
+        self.checked_bytes(ptr, allocation_size(layout))
+    }
+
     fn checked_bytes(&self, ptr: NonNull<u8>, len: usize) -> Result<(), SlabError> {
         let start = ptr.as_ptr() as usize;
         if start < self.pool.mapping_start || start > self.pool.mapping_end {
@@ -323,7 +502,7 @@ pub(crate) mod tests {
         ngx_slab_sizes_init, ngx_uint_t,
     };
 
-    use super::{SlabError, SlabPool};
+    use super::{SlabError, SlabPool, SlabRegion, SlabRegionInitError};
 
     static SLAB_SIZES: Once = Once::new();
 
@@ -545,6 +724,66 @@ pub(crate) mod tests {
         let too_large = Layout::from_size_align(zone.mapping_len() * 2, 1).unwrap();
         assert_eq!(guard.alloc(too_large), Err(SlabError::Allocation));
         assert_eq!(guard.calloc(too_large), Err(SlabError::Allocation));
+    }
+
+    #[repr(C)]
+    struct FlexibleHeader {
+        kind: u16,
+        length: u16,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum InitError {
+        Rejected,
+    }
+
+    #[test]
+    fn slab_regions_initialize_flexible_storage_and_roll_back_errors() {
+        let zone = TestZone::new();
+        let mut pool = zone.pool();
+        let mut guard = pool.lock();
+        let layout = SlabRegion::flexible_layout::<FlexibleHeader>(0).unwrap();
+
+        assert_eq!(layout.size(), mem::size_of::<FlexibleHeader>());
+        assert_eq!(layout.align(), mem::align_of::<FlexibleHeader>());
+        assert_eq!(
+            SlabRegion::flexible_layout::<FlexibleHeader>(usize::MAX),
+            Err(SlabError::Overflow)
+        );
+
+        let region = guard
+            .try_calloc_region(layout, |bytes| {
+                assert!(bytes.iter().all(|byte| *byte == 0));
+                bytes[..mem::size_of::<u16>()].copy_from_slice(&0x1234_u16.to_ne_bytes());
+                Ok::<_, InitError>(())
+            })
+            .unwrap();
+        assert_eq!(
+            unsafe { region.bytes(&guard) }.unwrap()[..mem::size_of::<u16>()],
+            0x1234_u16.to_ne_bytes()
+        );
+
+        let (ptr, layout) = region.into_raw_parts();
+        let region = unsafe { guard.region_from_raw(ptr, layout) }.unwrap();
+        unsafe { guard.free_region(region) }.unwrap();
+
+        let rollback_layout = Layout::from_size_align(zone.mapping_len() / 2, 1).unwrap();
+        let rollback =
+            guard.try_calloc_region(rollback_layout, |_| Err::<(), _>(InitError::Rejected));
+        assert!(matches!(rollback, Err(SlabRegionInitError::Init(InitError::Rejected))));
+        let region = guard.calloc_region(rollback_layout).unwrap();
+        unsafe { guard.free_region(region) }.unwrap();
+
+        let unwind = catch_unwind(AssertUnwindSafe(|| {
+            guard
+                .try_calloc_region(rollback_layout, |_| -> Result<(), InitError> {
+                    panic!("reject region initialization")
+                })
+                .unwrap();
+        }));
+        assert!(unwind.is_err());
+        let region = guard.calloc_region(rollback_layout).unwrap();
+        unsafe { guard.free_region(region) }.unwrap();
     }
 
     fn return_after_lock(pool: &mut SlabPool<'_>) {
