@@ -8,8 +8,8 @@ use core::ptr::NonNull;
 use crate::allocator::AllocError;
 use crate::core::{Pool, PoolValue};
 use crate::ffi::{
-    ngx_add_timer, ngx_del_timer, ngx_delete_posted_event, ngx_event_t, ngx_msec_t, ngx_post_event,
-    ngx_posted_events, ngx_posted_next_events,
+    NGX_OK, ngx_add_timer, ngx_del_timer, ngx_delete_posted_event, ngx_event_actions, ngx_event_t,
+    ngx_msec_t, ngx_post_event, ngx_posted_events, ngx_posted_next_events,
 };
 #[cfg(ngx_feature = "stat_stub")]
 use crate::ffi::{
@@ -36,7 +36,32 @@ pub enum PostedQueue {
     Next,
 }
 
+/// Failure returned by [`notify`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotifyError {
+    /// The selected nginx event module has no cross-thread notification entrypoint.
+    Unavailable,
+    /// The selected nginx event module rejected the notification.
+    Failed,
+}
+
+/// Requests that the selected nginx event module invoke a notification handler.
+///
+/// # Safety
+///
+/// The selected event module must support notification from the calling thread, `handler` must
+/// remain valid until nginx invokes it, and callers selecting different handlers must be
+/// serialized according to that module's notification contract.
+pub unsafe fn notify(handler: unsafe extern "C" fn(*mut ngx_event_t)) -> Result<(), NotifyError> {
+    let Some(notify) = (unsafe { ngx_event_actions.notify }) else {
+        return Err(NotifyError::Unavailable);
+    };
+
+    if unsafe { notify(Some(handler)) } == NGX_OK as _ { Ok(()) } else { Err(NotifyError::Failed) }
+}
+
 static TIMER_IDENT: [usize; 1] = [0];
+static POSTED_EVENT_IDENT: [usize; 1] = [0];
 
 /// Exclusive callback-scoped access to an nginx-owned event.
 ///
@@ -420,6 +445,257 @@ impl<T, F> Drop for Timer<T, F> {
     }
 }
 
+/// Failure returned while posting a [`PostedEvent`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PostedEventError {
+    /// The event has been shut down and cannot be posted again.
+    Shutdown,
+}
+
+/// Pinned owner of an nginx posted event and its callback state.
+///
+/// A posted event must be pinned before it can be posted, canceled, or shut down. Rust-owned
+/// events are canceled by [`Drop`]; use [`allocate_in_pool`](Self::allocate_in_pool) for a
+/// pool-owned event so its cleanup is registered before it can be posted.
+///
+/// ```compile_fail
+/// use core::pin::Pin;
+/// use core::ptr::NonNull;
+/// use ngx::event::{PostedEvent, PostedQueue};
+/// use ngx::ffi::ngx_log_t;
+///
+/// fn cannot_move_after_post(log: NonNull<ngx_log_t>) {
+///     let mut event = Box::pin(PostedEvent::new(log, (), |_| {}));
+///     event.as_mut().post(PostedQueue::Normal).unwrap();
+///     let _event = Pin::into_inner(event);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use core::ptr::NonNull;
+/// use ngx::event::PostedEvent;
+/// use ngx::ffi::ngx_log_t;
+///
+/// fn cannot_retain_callback_state(log: NonNull<ngx_log_t>) {
+///     let mut escaped: Option<&mut u8> = None;
+///     let _event = PostedEvent::new(log, 0_u8, |mut event| {
+///         escaped = Some(event.state_mut());
+///     });
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use core::ptr::NonNull;
+/// use ngx::event::PostedEvent;
+/// use ngx::ffi::ngx_log_t;
+///
+/// fn cannot_move_to_another_thread(log: NonNull<ngx_log_t>) {
+///     let event = PostedEvent::new(log, (), |_| {});
+///     std::thread::spawn(move || drop(event));
+/// }
+/// ```
+pub struct PostedEvent<T, F> {
+    event: ngx_event_t,
+    state: T,
+    callback: F,
+    stopped: bool,
+    _pin: PhantomPinned,
+    _not_thread_safe: PhantomData<*mut ()>,
+}
+
+/// Callback-scoped access to a posted event's state and queue controls.
+///
+/// A value is created for each posted-event callback and cannot safely outlive that callback.
+pub struct PostedEventCallback<'callback, T> {
+    event: EventRef<'callback>,
+    state: &'callback mut T,
+    stopped: &'callback mut bool,
+}
+
+impl<T, F> PostedEvent<T, F>
+where
+    F: for<'callback> FnMut(PostedEventCallback<'callback, T>),
+{
+    /// Creates an event that has not been posted or shut down.
+    ///
+    /// The returned event must be pinned before calling [`post`](Self::post),
+    /// [`cancel`](Self::cancel), or [`shutdown`](Self::shutdown).
+    pub fn new(log: NonNull<crate::ffi::ngx_log_t>, state: T, callback: F) -> Self {
+        let mut event = unsafe { mem::zeroed::<ngx_event_t>() };
+        event.data = (&raw const POSTED_EVENT_IDENT).cast_mut().cast();
+        event.handler = Some(posted_event_handler::<T, F>);
+        event.log = log.as_ptr();
+
+        Self {
+            event,
+            state,
+            callback,
+            stopped: false,
+            _pin: PhantomPinned,
+            _not_thread_safe: PhantomData,
+        }
+    }
+
+    /// Allocates a pinned posted event in an nginx pool and registers its destructor first.
+    ///
+    /// The returned [`PoolValue`] retains the stable address and pool cleanup. Its event is posted
+    /// through [`PoolValue::as_pin_mut`].
+    pub fn allocate_in_pool<'pool>(
+        pool: &Pool<'pool>,
+        log: NonNull<crate::ffi::ngx_log_t>,
+        state: T,
+        callback: F,
+    ) -> Result<PoolValue<'pool, Self>, AllocError>
+    where
+        T: 'static,
+        F: 'static,
+    {
+        pool.allocate_with_cleanup(|| Self::new(log, state, callback))
+    }
+
+    /// Returns the event state outside a callback without mutable access.
+    pub fn state(&self) -> &T {
+        &self.state
+    }
+
+    /// Returns whether nginx has this event on a posted-event queue.
+    pub fn is_posted(&self) -> bool {
+        self.event.posted() != 0
+    }
+
+    /// Returns whether this event has been shut down permanently.
+    pub fn is_shutdown(&self) -> bool {
+        self.stopped
+    }
+
+    /// Posts this event to the selected nginx queue.
+    ///
+    /// Returns `Ok(false)` when nginx has already queued the event. Posting is only valid on the
+    /// owning nginx event-loop thread; foreign threads must use [`notify`] instead.
+    pub fn post(mut self: Pin<&mut Self>, queue: PostedQueue) -> Result<bool, PostedEventError> {
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        post_owned_event(&mut this.event, this.stopped, queue)
+    }
+
+    /// Removes this event from its posted queue when it is queued.
+    ///
+    /// Returns whether a queue entry was removed. Repeated cancellation is harmless.
+    pub fn cancel(mut self: Pin<&mut Self>) -> bool {
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        cancel_owned_event(&mut this.event)
+    }
+
+    /// Permanently stops this event and cancels a pending queue entry.
+    ///
+    /// Returns whether a queue entry was removed. Repeated shutdown is harmless.
+    pub fn shutdown(mut self: Pin<&mut Self>) -> bool {
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        this.stopped = true;
+        cancel_owned_event(&mut this.event)
+    }
+}
+
+impl<T> PostedEventCallback<'_, T> {
+    /// Returns the callback-scoped event state.
+    pub fn state(&self) -> &T {
+        self.state
+    }
+
+    /// Returns mutable event state for this callback only.
+    pub fn state_mut(&mut self) -> &mut T {
+        self.state
+    }
+
+    /// Returns whether nginx has this event on a posted-event queue.
+    pub fn is_posted(&self) -> bool {
+        self.event.is_posted()
+    }
+
+    /// Returns whether this event has been shut down permanently.
+    pub fn is_shutdown(&self) -> bool {
+        *self.stopped
+    }
+
+    /// Posts this event to the selected nginx queue.
+    ///
+    /// Returns `Ok(false)` when nginx has already queued the event.
+    pub fn post(&mut self, queue: PostedQueue) -> Result<bool, PostedEventError> {
+        // SAFETY: EventRef owns exclusive callback-scoped access to this live event.
+        let event = unsafe { self.event.raw.as_mut() };
+        post_owned_event(event, *self.stopped, queue)
+    }
+
+    /// Removes this event from its posted queue when it is queued.
+    ///
+    /// Returns whether a queue entry was removed. Repeated cancellation is harmless.
+    pub fn cancel(&mut self) -> bool {
+        // SAFETY: EventRef owns exclusive callback-scoped access to this live event.
+        let event = unsafe { self.event.raw.as_mut() };
+        cancel_owned_event(event)
+    }
+
+    /// Permanently stops this event and cancels a pending queue entry.
+    ///
+    /// Returns whether a queue entry was removed. Repeated shutdown is harmless.
+    pub fn shutdown(&mut self) -> bool {
+        *self.stopped = true;
+        self.cancel()
+    }
+}
+
+fn post_owned_event(
+    event: &mut ngx_event_t,
+    stopped: bool,
+    queue: PostedQueue,
+) -> Result<bool, PostedEventError> {
+    if stopped {
+        return Err(PostedEventError::Shutdown);
+    }
+    if event.posted() != 0 {
+        return Ok(false);
+    }
+
+    unsafe {
+        let queue = match queue {
+            PostedQueue::Normal => &raw mut ngx_posted_events,
+            PostedQueue::Next => &raw mut ngx_posted_next_events,
+        };
+        ngx_post_event(event, queue);
+    }
+    Ok(true)
+}
+
+fn cancel_owned_event(event: &mut ngx_event_t) -> bool {
+    if event.posted() == 0 {
+        return false;
+    }
+
+    unsafe { ngx_delete_posted_event(event) };
+    true
+}
+
+unsafe extern "C" fn posted_event_handler<T, F>(raw: *mut ngx_event_t)
+where
+    F: for<'callback> FnMut(PostedEventCallback<'callback, T>),
+{
+    let Ok(event) = (unsafe { EventRef::from_raw(raw) }) else {
+        return;
+    };
+    let posted = ngx_container_of!(event.as_ptr(), PostedEvent<T, F>, event);
+    let posted = unsafe { &mut *posted };
+    let callback = &mut posted.callback;
+    let state = &mut posted.state;
+    let stopped = &mut posted.stopped;
+
+    callback(PostedEventCallback { event, state, stopped });
+}
+
+impl<T, F> Drop for PostedEvent<T, F> {
+    fn drop(&mut self) {
+        cancel_owned_event(&mut self.event);
+    }
+}
+
 /// A snapshot of nginx's connection counters.
 ///
 /// Each counter is read independently, so values can change while the snapshot is collected.
@@ -536,20 +812,25 @@ mod event_tests {
 
     use alloc::boxed::Box;
     use alloc::rc::Rc;
-    use core::cell::Cell;
+    use alloc::vec::Vec;
+    use core::cell::{Cell, RefCell};
     use core::mem::MaybeUninit;
     use core::ptr::{self, NonNull};
     use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard};
 
-    use super::{EventError, EventRef, PostedQueue, Timer, TimerError};
+    use super::{
+        EventError, EventRef, NotifyError, PostedEvent, PostedEventError, PostedQueue, Timer,
+        TimerError, notify,
+    };
     use crate::core::Pool;
     use crate::ffi::{
         NGX_AGAIN, NGX_OK, ngx_create_pool, ngx_current_msec, ngx_cycle_t, ngx_destroy_pool,
-        ngx_event_expire_timers, ngx_event_move_posted_next, ngx_event_no_timers_left,
-        ngx_event_process_posted, ngx_event_t, ngx_event_timer_init, ngx_log_t, ngx_msec_int_t,
-        ngx_msec_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events, ngx_queue_empty,
-        ngx_queue_init, ngx_queue_t, ngx_uint_t,
+        ngx_event_actions, ngx_event_expire_timers, ngx_event_handler_pt,
+        ngx_event_move_posted_next, ngx_event_no_timers_left, ngx_event_process_posted,
+        ngx_event_t, ngx_event_timer_init, ngx_int_t, ngx_log_t, ngx_msec_int_t, ngx_msec_t,
+        ngx_pool_t, ngx_posted_events, ngx_posted_next_events, ngx_queue_empty, ngx_queue_init,
+        ngx_queue_t, ngx_uint_t,
     };
 
     unsafe extern "C" {
@@ -560,16 +841,39 @@ mod event_tests {
     static EVENT_GLOBALS: Mutex<()> = Mutex::new(());
     static POSTED_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
     static CALLBACK_POSTED: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static NOTIFIED_HANDLER: Mutex<ngx_event_handler_pt> = Mutex::new(None);
+    static NOTIFICATION_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
 
     struct EventGlobals {
+        _global: MutexGuard<'static, ()>,
         _guard: MutexGuard<'static, ()>,
+    }
+
+    struct NotifyOverride {
+        previous: Option<unsafe extern "C" fn(ngx_event_handler_pt) -> ngx_int_t>,
+    }
+
+    impl NotifyOverride {
+        fn install(replacement: unsafe extern "C" fn(ngx_event_handler_pt) -> ngx_int_t) -> Self {
+            let previous = unsafe { ngx_event_actions.notify };
+            unsafe { ngx_event_actions.notify = Some(replacement) };
+            Self { previous }
+        }
+    }
+
+    impl Drop for NotifyOverride {
+        fn drop(&mut self) {
+            unsafe { ngx_event_actions.notify = self.previous };
+        }
     }
 
     impl EventGlobals {
         fn lock() -> Self {
+            let global =
+                crate::TEST_NGINX_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
             let guard = EVENT_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
             reset_event_globals();
-            Self { _guard: guard }
+            Self { _global: global, _guard: guard }
         }
     }
 
@@ -760,6 +1064,223 @@ mod event_tests {
         assert_eq!(CALLBACK_POSTED.load(Ordering::Relaxed), 0);
         assert_eq!(event.event.posted(), 0);
         unsafe { assert!(ngx_queue_empty(&raw const ngx_posted_events)) };
+    }
+
+    #[test]
+    fn posted_owner_coalesces_duplicate_posts_and_preserves_fifo_order() {
+        let _globals = EventGlobals::lock();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let first_order = order.clone();
+        let second_order = order.clone();
+        let mut first =
+            Box::pin(PostedEvent::new(NonNull::from(&mut log), 1_usize, move |event| {
+                first_order.borrow_mut().push(*event.state())
+            }));
+        let mut second =
+            Box::pin(PostedEvent::new(NonNull::from(&mut log), 2_usize, move |event| {
+                second_order.borrow_mut().push(*event.state())
+            }));
+        let first_address = first.as_ref().get_ref() as *const _;
+
+        assert_eq!(first.as_mut().post(PostedQueue::Normal), Ok(true));
+        assert_eq!(first.as_mut().post(PostedQueue::Next), Ok(false));
+        assert_eq!(second.as_mut().post(PostedQueue::Normal), Ok(true));
+        assert_eq!(first.as_ref().get_ref() as *const _, first_address);
+
+        let mut cycle = TestCycle::new();
+        unsafe { ngx_event_process_posted(cycle.raw(), &raw mut ngx_posted_events) };
+
+        assert_eq!(order.borrow().as_slice(), &[1, 2]);
+        assert!(!first.is_posted());
+        assert!(!second.is_posted());
+    }
+
+    #[test]
+    fn posted_owner_moves_next_queue_at_the_next_cycle_boundary() {
+        let _globals = EventGlobals::lock();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let calls = Rc::new(Cell::new(0));
+        let callback_calls = calls.clone();
+        let mut posted = Box::pin(PostedEvent::new(NonNull::from(&mut log), (), move |_| {
+            callback_calls.set(callback_calls.get() + 1);
+        }));
+
+        assert_eq!(posted.as_mut().post(PostedQueue::Next), Ok(true));
+        unsafe {
+            assert!(ngx_queue_empty(&raw const ngx_posted_events));
+            assert!(!ngx_queue_empty(&raw const ngx_posted_next_events));
+        }
+
+        let mut cycle = TestCycle::new();
+        unsafe {
+            ngx_event_move_posted_next(cycle.raw());
+            ngx_event_process_posted(cycle.raw(), &raw mut ngx_posted_events);
+        }
+
+        assert_eq!(calls.get(), 1);
+        assert!(!posted.is_posted());
+    }
+
+    #[test]
+    fn posted_owner_cancels_queued_callback_before_dispatch() {
+        let _globals = EventGlobals::lock();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let calls = Rc::new(Cell::new(0));
+        let callback_calls = calls.clone();
+        let mut posted = Box::pin(PostedEvent::new(NonNull::from(&mut log), (), move |_| {
+            callback_calls.set(callback_calls.get() + 1);
+        }));
+
+        assert_eq!(posted.as_mut().post(PostedQueue::Normal), Ok(true));
+        assert!(posted.as_mut().cancel());
+        assert!(!posted.as_mut().cancel());
+
+        let mut cycle = TestCycle::new();
+        unsafe { ngx_event_process_posted(cycle.raw(), &raw mut ngx_posted_events) };
+
+        assert_eq!(calls.get(), 0);
+        assert_eq!(posted.as_mut().post(PostedQueue::Normal), Ok(true));
+        unsafe { ngx_event_process_posted(cycle.raw(), &raw mut ngx_posted_events) };
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn posted_owner_callback_can_repost_after_nginx_clears_its_flag() {
+        let _globals = EventGlobals::lock();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let calls = Rc::new(Cell::new(0));
+        let callback_calls = calls.clone();
+        let mut posted =
+            Box::pin(PostedEvent::new(NonNull::from(&mut log), 0_usize, move |mut event| {
+                assert!(!event.is_posted());
+                *event.state_mut() += 1;
+                callback_calls.set(callback_calls.get() + 1);
+                if *event.state() == 1 {
+                    assert_eq!(event.post(PostedQueue::Normal), Ok(true));
+                }
+            }));
+
+        assert_eq!(posted.as_mut().post(PostedQueue::Normal), Ok(true));
+        let mut cycle = TestCycle::new();
+        unsafe { ngx_event_process_posted(cycle.raw(), &raw mut ngx_posted_events) };
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(*posted.state(), 2);
+        assert!(!posted.is_posted());
+    }
+
+    #[test]
+    fn posted_owner_shutdown_cancels_the_queue_and_rejects_new_posts() {
+        let _globals = EventGlobals::lock();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let calls = Rc::new(Cell::new(0));
+        let callback_calls = calls.clone();
+        let mut posted = Box::pin(PostedEvent::new(NonNull::from(&mut log), (), move |_| {
+            callback_calls.set(callback_calls.get() + 1);
+        }));
+
+        assert_eq!(posted.as_mut().post(PostedQueue::Next), Ok(true));
+        assert!(posted.as_mut().shutdown());
+        assert!(posted.is_shutdown());
+        assert_eq!(posted.as_mut().post(PostedQueue::Normal), Err(PostedEventError::Shutdown));
+        assert!(!posted.as_mut().shutdown());
+
+        let mut cycle = TestCycle::new();
+        unsafe {
+            ngx_event_move_posted_next(cycle.raw());
+            ngx_event_process_posted(cycle.raw(), &raw mut ngx_posted_events);
+        }
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn dropped_posted_owner_cancels_before_destroying_its_state() {
+        let _globals = EventGlobals::lock();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let calls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+
+        {
+            let callback_calls = calls.clone();
+            let mut posted = Box::pin(PostedEvent::new(
+                NonNull::from(&mut log),
+                DropState(drops.clone()),
+                move |_| callback_calls.set(callback_calls.get() + 1),
+            ));
+            assert_eq!(posted.as_mut().post(PostedQueue::Normal), Ok(true));
+        }
+        assert_eq!(drops.get(), 1);
+
+        let mut cycle = TestCycle::new();
+        unsafe { ngx_event_process_posted(cycle.raw(), &raw mut ngx_posted_events) };
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn pool_posted_owner_cancels_queued_callback_before_pool_cleanup_drops_state() {
+        let _globals = EventGlobals::lock();
+        let mut owner = TestPool::new();
+        let calls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+
+        {
+            let log = owner.log();
+            let pool = owner.handle();
+            let callback_calls = calls.clone();
+            let posted =
+                PostedEvent::allocate_in_pool(&pool, log, DropState(drops.clone()), move |_| {
+                    callback_calls.set(callback_calls.get() + 1)
+                })
+                .unwrap();
+            let address = posted.as_non_null();
+            let mut posted = posted;
+            assert_eq!(posted.as_non_null(), address);
+            assert_eq!(posted.as_pin_mut().post(PostedQueue::Next), Ok(true));
+            assert_eq!(posted.as_non_null(), address);
+        }
+
+        drop(owner);
+        assert_eq!(drops.get(), 1);
+
+        let mut cycle = TestCycle::new();
+        unsafe {
+            ngx_event_move_posted_next(cycle.raw());
+            ngx_event_process_posted(cycle.raw(), &raw mut ngx_posted_events);
+        }
+        assert_eq!(calls.get(), 0);
+    }
+
+    unsafe extern "C" fn capture_notification(handler: ngx_event_handler_pt) -> ngx_int_t {
+        *NOTIFIED_HANDLER.lock().unwrap_or_else(|error| error.into_inner()) = handler;
+        NGX_OK as _
+    }
+
+    unsafe extern "C" fn notification_handler(_event: *mut ngx_event_t) {
+        NOTIFICATION_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn foreign_thread_handoff_uses_the_selected_event_module_notification() {
+        let _globals = EventGlobals::lock();
+        NOTIFICATION_CALLBACKS.store(0, Ordering::Relaxed);
+        *NOTIFIED_HANDLER.lock().unwrap_or_else(|error| error.into_inner()) = None;
+        let _notify = NotifyOverride::install(capture_notification);
+
+        let result = std::thread::spawn(|| unsafe { notify(notification_handler) }).join().unwrap();
+        assert_eq!(result, Ok(()));
+        assert_eq!(NOTIFICATION_CALLBACKS.load(Ordering::Relaxed), 0);
+
+        let handler = NOTIFIED_HANDLER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("notification handler was not forwarded");
+        unsafe { handler(ptr::null_mut()) };
+        assert_eq!(NOTIFICATION_CALLBACKS.load(Ordering::Relaxed), 1);
+
+        unsafe { ngx_event_actions.notify = None };
+        assert_eq!(unsafe { notify(notification_handler) }, Err(NotifyError::Unavailable));
     }
 
     #[test]
