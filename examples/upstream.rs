@@ -125,8 +125,11 @@ http_upstream_init_peer_pt!(
         // SAFETY: this function is called with non-NULL uf always
         let us = unsafe { &mut *us };
         let original_init_peer = match Module::server_conf(us) {
-            Some(hccf) => hccf.original_init_peer.unwrap(),
-            None => return Status::NGX_ERROR,
+            Ok(Some(hccf)) => match hccf.original_init_peer {
+                Some(callback) => callback,
+                None => return Status::NGX_ERROR,
+            },
+            Ok(None) | Err(_) => return Status::NGX_ERROR,
         };
 
         if unsafe { original_init_peer(request.into(), us) != Status::NGX_OK.into() } {
@@ -134,8 +137,8 @@ http_upstream_init_peer_pt!(
         }
 
         let hccf = match Module::server_conf(us) {
-            Some(hccf) => ptr::from_ref(hccf),
-            None => return Status::NGX_ERROR,
+            Ok(Some(hccf)) => ptr::from_ref(hccf),
+            Ok(None) | Err(_) => return Status::NGX_ERROR,
         };
 
         let maybe_upstream = request.upstream();
@@ -225,7 +228,7 @@ unsafe extern "C" fn ngx_http_upstream_init_custom(
     // SAFETY: this function is called with non-NULL uf always
     let us = unsafe { &mut *us };
     let init_upstream_ptr = {
-        let Some(hccf) = (unsafe { Module::server_conf_mut(us) }) else {
+        let Ok(Some(hccf)) = Module::server_conf_mut(us) else {
             ngx_conf_log_error!(NGX_LOG_EMERG, cf, "CUSTOM UPSTREAM no upstream srv_conf");
             return isize::from(Status::NGX_ERROR);
         };
@@ -241,7 +244,7 @@ unsafe extern "C" fn ngx_http_upstream_init_custom(
     }
 
     let original_init_peer = us.peer.init;
-    let Some(hccf) = (unsafe { Module::server_conf_mut(us) }) else {
+    let Ok(Some(hccf)) = Module::server_conf_mut(us) else {
         ngx_conf_log_error!(NGX_LOG_EMERG, cf, "CUSTOM UPSTREAM no upstream srv_conf");
         return isize::from(Status::NGX_ERROR);
     };
@@ -286,8 +289,10 @@ unsafe extern "C" fn ngx_http_upstream_commands_set_custom(
         ccf.max = n as u32;
     }
 
-    let uscf =
-        unsafe { NgxHttpUpstreamModule::server_conf_mut(cf) }.expect("http upstream srv conf");
+    let Ok(Some(uscf)) = NgxHttpUpstreamModule::server_conf_mut(cf) else {
+        ngx_conf_log_error!(NGX_LOG_EMERG, cf, "CUSTOM UPSTREAM no upstream srv_conf");
+        return ngx::core::NGX_CONF_ERROR;
+    };
 
     ccf.original_init_upstream = if uscf.peer.init_upstream.is_some() {
         uscf.peer.init_upstream
@@ -307,7 +312,7 @@ unsafe extern "C" fn ngx_http_upstream_commands_set_custom(
 // implemented is our `create_srv_conf` method.
 struct Module;
 
-impl HttpModule for Module {
+unsafe impl HttpModule for Module {
     fn module() -> &'static ngx_module_t {
         unsafe { &*::core::ptr::addr_of!(ngx_http_upstream_custom_module) }
     }

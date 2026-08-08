@@ -8,8 +8,10 @@ pub use crate::ffi::{
 #[cfg(feature = "async")]
 pub use crate::http::{AsyncHandlerContext, AsyncHttpRequestHandler};
 pub use crate::http::{
-    HTTPStatus, HttpModule, HttpModuleConfExt, HttpModuleLocationConf, HttpModuleMainConf,
-    HttpModuleRequestContext, HttpModuleServerConf, HttpPhase, HttpRequestHandler,
+    HTTPStatus, HttpConfigError, HttpModule, HttpModuleLocationConf, HttpModuleLocationConfExt,
+    HttpModuleLocationConfMutExt, HttpModuleMainConf, HttpModuleMainConfExt,
+    HttpModuleMainConfMutExt, HttpModuleRequestContext, HttpModuleServerConf,
+    HttpModuleServerConfExt, HttpModuleServerConfMutExt, HttpPhase, HttpRequestHandler,
     IntoHandlerStatus, Merge, MergeConfigError, Request, add_phase_handler,
 };
 pub use crate::ngx_log_debug_http;
