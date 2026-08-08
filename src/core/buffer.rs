@@ -184,15 +184,23 @@ impl<'buffer> BufferRef<'buffer> {
         BufferFlags::read(unsafe { self.raw.as_ref() })
     }
 
-    /// Returns nonempty memory bytes when nginx marks the buffer as memory-backed.
-    pub fn bytes(self) -> Result<Option<&'buffer [u8]>, BufferError> {
+    /// Returns memory bytes, including a valid empty memory range.
+    pub fn memory_bytes(self) -> Result<Option<&'buffer [u8]>, BufferError> {
         let Some((start, len)) = memory_range(unsafe { self.raw.as_ref() })? else {
             return Ok(None);
         };
-        if len == 0 {
+        Ok(Some(unsafe { slice::from_raw_parts(start.as_ptr(), len) }))
+    }
+
+    /// Returns nonempty memory bytes when nginx marks the buffer as memory-backed.
+    pub fn bytes(self) -> Result<Option<&'buffer [u8]>, BufferError> {
+        let Some(bytes) = self.memory_bytes()? else {
+            return Ok(None);
+        };
+        if bytes.is_empty() {
             return Ok(None);
         }
-        Ok(Some(unsafe { slice::from_raw_parts(start.as_ptr(), len) }))
+        Ok(Some(bytes))
     }
 
     /// Returns whether a memory-backed buffer has writable bytes after its visible range.
@@ -884,6 +892,18 @@ mod tests {
         let misaligned = ptr::without_provenance_mut::<ngx_buf_t>(1);
         assert_eq!(unsafe { BufferRef::from_raw(misaligned) }, Err(BufferError::MisalignedBuffer));
         assert_eq!(unsafe { BufferMut::from_raw(misaligned) }, Err(BufferError::MisalignedBuffer));
+    }
+
+    #[test]
+    fn memory_bytes_preserves_a_valid_empty_memory_range() {
+        let storage = [0_u8; 1];
+        let mut buffer = memory_buffer(&storage);
+        buffer.last = buffer.pos;
+
+        let view = unsafe { BufferRef::from_raw(&raw const buffer) }.unwrap();
+        assert_eq!(view.memory_bytes(), Ok(Some(b"".as_slice())));
+        assert_eq!(view.bytes(), Ok(None));
+        assert_eq!(view.has_space(), Ok(true));
     }
 
     #[test]
