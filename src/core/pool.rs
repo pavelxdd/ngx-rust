@@ -8,12 +8,11 @@ use core::pin::Pin;
 use core::ptr::{self, NonNull};
 
 use nginx_sys::{
-    NGX_ALIGNMENT, ngx_buf_t, ngx_create_temp_buf, ngx_palloc, ngx_pcalloc, ngx_pfree,
-    ngx_pmemalign, ngx_pnalloc, ngx_pool_cleanup_add, ngx_pool_cleanup_t, ngx_pool_t,
+    NGX_ALIGNMENT, ngx_palloc, ngx_pcalloc, ngx_pfree, ngx_pmemalign, ngx_pnalloc,
+    ngx_pool_cleanup_add, ngx_pool_cleanup_t, ngx_pool_t,
 };
 
 use crate::allocator::{AllocError, Allocator, dangling_for_layout};
-use crate::core::buffer::{Buffer, MemoryBuffer, TemporaryBuffer};
 
 /// Non-owning wrapper for an [`ngx_pool_t`] pointer, providing methods for working with memory
 /// pools.
@@ -311,58 +310,6 @@ impl<'pool> Pool<'pool> {
     /// functions.
     pub fn as_ptr(&self) -> *mut ngx_pool_t {
         self.raw.as_ptr()
-    }
-
-    /// Creates a buffer of the specified size in the memory pool.
-    ///
-    /// Returns `Some(TemporaryBuffer)` if the buffer is successfully created, or `None` if
-    /// allocation fails.
-    pub fn create_buffer(&self, size: usize) -> Option<TemporaryBuffer<'pool>> {
-        let buf = unsafe { ngx_create_temp_buf(self.raw.as_ptr(), size) };
-        if buf.is_null() {
-            return None;
-        }
-
-        unsafe { TemporaryBuffer::from_ngx_buf(buf) }
-    }
-
-    /// Creates a buffer from a string in the memory pool.
-    ///
-    /// Returns `Some(TemporaryBuffer)` if the buffer is successfully created, or `None` if
-    /// allocation fails.
-    pub fn create_buffer_from_str(&self, str: &str) -> Option<TemporaryBuffer<'pool>> {
-        let mut buffer = self.create_buffer(str.len())?;
-        unsafe {
-            let buf = buffer.as_ngx_buf_mut();
-            ptr::copy_nonoverlapping(str.as_ptr(), (*buf).pos, str.len());
-            (*buf).last = (*buf).pos.add(str.len());
-        }
-        Some(buffer)
-    }
-
-    /// Creates a buffer from a static string in the memory pool.
-    ///
-    /// Returns `Some(MemoryBuffer)` if the buffer is successfully created, or `None` if allocation
-    /// fails.
-    pub fn create_buffer_from_static_str(&self, str: &'static str) -> Option<MemoryBuffer<'pool>> {
-        let buf = self.calloc_type::<ngx_buf_t>();
-        if buf.is_null() {
-            return None;
-        }
-
-        // We cast away const, but buffers with the memory flag are read-only
-        let start = str.as_ptr() as *mut u8;
-        let end = unsafe { start.add(str.len()) };
-
-        unsafe {
-            (*buf).start = start;
-            (*buf).pos = start;
-            (*buf).last = end;
-            (*buf).end = end;
-            (*buf).set_memory(1);
-        }
-
-        unsafe { MemoryBuffer::from_ngx_buf(buf) }
     }
 
     /// Allocates a value and registers its destructor with the pool.
