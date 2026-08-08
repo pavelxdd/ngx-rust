@@ -21,7 +21,7 @@ use Test::Nginx;
 select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
-my $t = Test::Nginx->new()->has(qw/http rewrite/)->plan(12)
+my $t = Test::Nginx->new()->has(qw/http rewrite/)->plan(27)
 	->write_file_expand('nginx.conf', <<'EOF');
 
 %%TEST_GLOBALS%%
@@ -35,6 +35,8 @@ events {
 
 http {
     %%TEST_GLOBALS_HTTP%%
+
+    large_client_header_buffers 4 128k;
 
     shared_dict_zone z 64k;
     shared_dict $arg_key $foo;
@@ -94,6 +96,45 @@ like(http_get('/entries/'), qr/^1; fst = new_value; $/ms,
 like(http_get('/clear/'), qr/200 OK/, 'clear');
 
 like(http_get('/entries/'), qr/^0; $/ms, 'get entries - clear');
+
+like(http_get('/set/?key=Aa&value=first_collision'), qr/200 OK/, 'set collision value 1');
+like(http_get('/set/?key=BB&value=second_collision'), qr/200 OK/, 'set collision value 2');
+
+ok(check('/?key=Aa', qr/X-Value: first_collision/i), 'check collision value 1');
+ok(check('/?key=BB', qr/X-Value: second_collision/i), 'check collision value 2');
+
+like(http_delete('/set/?key=Aa'), qr/200 OK/, 'delete collision value 1');
+unlike(http_get('/?key=Aa'), qr/X-Value:/i, 'check deleted collision value');
+ok(check('/?key=BB', qr/X-Value: second_collision/i), 'keep collision value 2');
+
+like(http_get('/set/?key=fst&value=retained'), qr/200 OK/, 'set retained value');
+like(
+	http_get('/set/?key=fst&value=' . ('x' x 70_000)),
+	qr/200 OK/,
+	'keep request successful when shared allocation fails',
+);
+ok(check('/?key=fst', qr/X-Value: retained/i), 'keep retained value after allocation failure');
+
+$t->reload();
+ok(check('/?key=fst', qr/X-Value: retained/i), 'reuse shared zone after reload');
+
+my @sockets = map {
+	http_get("/set/?key=concurrent$_&value=value$_", start => 1)
+} 1 .. 16;
+my @replies = map { Test::Nginx::http_end($_) } @sockets;
+ok(!(grep { !defined($_) || $_ !~ /200 OK/ } @replies),
+	'set values through concurrent clients');
+my @concurrent_entries = map { "concurrent$_ = value$_" } 1 .. 16;
+my $entries = http_get('/entries/');
+ok(
+	$entries =~ /^18; /ms
+		&& !(grep { index($entries, $_) < 0 } @concurrent_entries),
+	'keep values from concurrent clients',
+);
+
+like(http_get('/clear/'), qr/200 OK/, 'clear reused shared zone');
+$t->reload();
+like(http_get('/entries/'), qr/^0; $/ms, 'keep cleared shared zone after reload');
 
 ###############################################################################
 
