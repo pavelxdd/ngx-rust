@@ -532,6 +532,7 @@ dependencies = [
  "nginx-src",
  "regex",
  "shlex",
+ "tempfile",
 ]
 
 [[package]]
