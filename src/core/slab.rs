@@ -522,6 +522,9 @@ mod tests {
         assert_eq!(unsafe { guard.free(allocation, layout) }, Ok(()));
 
         let zeroed = guard.calloc(layout).unwrap().cast::<u8>();
+        assert!(
+            unsafe { guard.bytes(zeroed, layout.size()) }.unwrap().iter().all(|byte| *byte == 0)
+        );
         unsafe { guard.bytes_mut(zeroed, layout.size()).unwrap().fill(0xa5) };
         assert_eq!(unsafe { guard.bytes(zeroed, layout.size()) }.unwrap(), [0xa5; 64]);
         unsafe { guard.bytes_mut(zeroed, layout.size()).unwrap().fill(0) };
