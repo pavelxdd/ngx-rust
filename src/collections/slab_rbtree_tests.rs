@@ -249,6 +249,22 @@ fn removes_a_root_with_two_children_before_freeing_it() {
 }
 
 #[test]
+fn removes_a_root_with_one_child_and_normalizes_the_new_root() {
+    let zone = TestZone::new();
+    let mut pool = zone.pool();
+    let mut guard = pool.lock();
+    let (mut tree, _, _) = init_tree(&mut guard);
+    let root = insert(&mut tree, 2, 0, 20);
+    let child = insert(&mut tree, 1, 0, 10);
+
+    unsafe { tree.remove(root) }.unwrap();
+
+    assert!(unsafe { child.cast::<ngx_rbtree_node_t>().as_ref() }.parent.is_null());
+    assert_eq!(lookup(&tree, 1, 0), Ok(Some(10)));
+    free_detached(&mut tree, root);
+}
+
+#[test]
 fn removes_a_leaf_before_freeing_it() {
     let zone = TestZone::new();
     let mut pool = zone.pool();
