@@ -313,6 +313,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "global cycle")]
     fn cycle_logger_panics_before_nginx_initialization() {
+        #[cfg(feature = "test-link")]
+        let _guard = crate::TEST_NGINX_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
+
         ngx_cycle_log();
     }
 
