@@ -93,13 +93,16 @@ pub trait StreamSessionHandler {
 /// C-compatible adapter for a typed Stream phase handler.
 ///
 /// # Safety
-/// `session` must be a valid non-null pointer to a live session that nginx has made exclusively
-/// available to the current phase handler.
+/// A non-null `session` must point to a live session that nginx has made exclusively available to
+/// the current phase handler. A null pointer returns `NGX_ERROR`.
 pub(crate) unsafe extern "C" fn raw_handler<H>(session: *mut ngx_stream_session_t) -> ngx_int_t
 where
     H: StreamSessionHandler,
 {
-    let session = unsafe { Session::from_ngx_stream_session(session) };
+    let Some(session) = NonNull::new(session) else {
+        return NGX_ERROR as _;
+    };
+    let session = unsafe { Session::from_ngx_stream_session(session.as_ptr()) };
     H::handler(session).into_handler_status(session)
 }
 
@@ -355,9 +358,7 @@ mod tests {
     #[cfg(feature = "test-link")]
     use core::ffi::c_void;
     use core::mem::MaybeUninit;
-    #[cfg(feature = "test-link")]
     use core::ptr;
-    #[cfg(feature = "test-link")]
     use core::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(feature = "test-link")]
     use std::sync::MutexGuard;
@@ -470,6 +471,21 @@ mod tests {
         }
     }
 
+    static RAW_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct RawHandler;
+
+    impl StreamSessionHandler for RawHandler {
+        const PHASE: StreamPhase = StreamPhase::Preread;
+        type Output = Status;
+
+        fn handler(session: &mut Session) -> Self::Output {
+            RAW_HANDLER_CALLS.fetch_add(1, Ordering::Relaxed);
+            session.as_mut().status = NGX_STREAM_OK as _;
+            Status::NGX_DECLINED
+        }
+    }
+
     #[test]
     fn typed_handler_mutates_the_session_and_converts_the_result() {
         let mut raw = zeroed_session();
@@ -482,13 +498,23 @@ mod tests {
     }
 
     #[test]
-    fn raw_handler_wraps_the_session_and_returns_the_converted_status() {
+    fn raw_handler_uses_one_fresh_session_borrow_and_converts_the_status() {
+        RAW_HANDLER_CALLS.store(0, Ordering::Relaxed);
         let mut raw = zeroed_session();
 
-        let status = unsafe { raw_handler::<TestHandler>(&raw mut raw) };
+        let status = unsafe { raw_handler::<RawHandler>(&raw mut raw) };
 
         assert_eq!(status, Status::NGX_DECLINED.0);
+        assert_eq!(RAW_HANDLER_CALLS.load(Ordering::Relaxed), 1);
         assert_eq!(raw.status, NGX_STREAM_OK as _);
+    }
+
+    #[test]
+    fn raw_handler_rejects_a_null_session_without_invoking_the_handler() {
+        RAW_HANDLER_CALLS.store(0, Ordering::Relaxed);
+
+        assert_eq!(unsafe { raw_handler::<RawHandler>(ptr::null_mut()) }, NGX_ERROR as _);
+        assert_eq!(RAW_HANDLER_CALLS.load(Ordering::Relaxed), 0);
     }
 
     #[test]

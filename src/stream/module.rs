@@ -97,16 +97,24 @@ pub unsafe trait StreamModule {
     /// Runs before nginx parses the Stream configuration block.
     ///
     /// # Safety
-    /// `cf` must be null or point to a valid nginx configuration parser state.
-    unsafe extern "C" fn preconfiguration(_cf: *mut ngx_conf_t) -> ngx_int_t {
+    /// `cf` must point to a valid nginx configuration parser state.
+    unsafe extern "C" fn preconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
+        if cf.is_null() {
+            return Status::NGX_ERROR.into();
+        }
+
         Status::NGX_OK.into()
     }
 
     /// Runs after nginx parses the Stream configuration block.
     ///
     /// # Safety
-    /// `cf` must be null or point to a valid nginx configuration parser state.
-    unsafe extern "C" fn postconfiguration(_cf: *mut ngx_conf_t) -> ngx_int_t {
+    /// `cf` must point to a valid nginx configuration parser state.
+    unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
+        if cf.is_null() {
+            return Status::NGX_ERROR.into();
+        }
+
         Status::NGX_OK.into()
     }
 
@@ -188,7 +196,6 @@ mod tests {
 
     use alloc::boxed::Box;
     use core::ffi::c_void;
-    #[cfg(feature = "test-link")]
     use core::mem;
     use core::ptr;
     #[cfg(feature = "test-link")]
@@ -244,13 +251,23 @@ mod tests {
     }
 
     #[test]
-    fn default_configuration_hooks_accept_the_configuration() {
+    fn default_configuration_hooks_reject_null_parser_context() {
         assert_eq!(
             unsafe { TestStreamModule::preconfiguration(ptr::null_mut()) },
-            Status::NGX_OK.0
+            Status::NGX_ERROR.0
         );
         assert_eq!(
             unsafe { TestStreamModule::postconfiguration(ptr::null_mut()) },
+            Status::NGX_ERROR.0
+        );
+
+        let mut configuration = unsafe { mem::zeroed::<ngx_conf_t>() };
+        assert_eq!(
+            unsafe { TestStreamModule::preconfiguration(&raw mut configuration) },
+            Status::NGX_OK.0
+        );
+        assert_eq!(
+            unsafe { TestStreamModule::postconfiguration(&raw mut configuration) },
             Status::NGX_OK.0
         );
     }

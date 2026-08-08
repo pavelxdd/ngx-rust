@@ -522,22 +522,24 @@ mod core_module {
     where
         H: StreamSessionHandler,
     {
-        let Some(main) = NgxStreamCoreModule::main_conf_mut(cf).ok().flatten() else {
-            return Err(AllocError);
-        };
-        let handlers = unsafe {
-            NgxArray::<ngx_stream_handler_pt>::from_ngx_array_mut(
-                &mut main.phases[H::PHASE as usize].handlers,
-            )
-        }
-        .expect("stream phase handler array type");
+        let result = (|| {
+            let main = NgxStreamCoreModule::main_conf_mut(cf)
+                .map_err(|_| AllocError)?
+                .ok_or(AllocError)?;
+            let phase = main.phases.get_mut(H::PHASE as usize).ok_or(AllocError)?;
+            let handlers = unsafe {
+                NgxArray::<ngx_stream_handler_pt>::from_ngx_array_mut(&mut phase.handlers)
+            }
+            .ok_or(AllocError)?;
 
-        if handlers.push(Some(crate::stream::raw_handler::<H>)).is_err() {
+            handlers.push(Some(crate::stream::raw_handler::<H>)).map(|_| ())
+        })();
+
+        if result.is_err() && !cf.log.is_null() {
             ngx_conf_log_error!(NGX_LOG_EMERG, cf, "failed to register {} handler", H::name(),);
-            return Err(AllocError);
         }
 
-        Ok(())
+        result
     }
 }
 
@@ -749,6 +751,9 @@ mod tests {
         max_module: ngx_uint_t,
         stream_max_module: ngx_uint_t,
         stream_module_index: ngx_uint_t,
+        stream_core_module_type: ngx_uint_t,
+        stream_core_module_index: ngx_uint_t,
+        stream_core_module_context_index: ngx_uint_t,
     }
 
     #[cfg(feature = "test-link")]
@@ -767,6 +772,18 @@ mod tests {
                     max_module: nginx_sys::ngx_max_module,
                     stream_max_module: nginx_sys::ngx_stream_max_module,
                     stream_module_index: (*core::ptr::addr_of!(nginx_sys::ngx_stream_module)).index,
+                    stream_core_module_type: (*core::ptr::addr_of!(
+                        nginx_sys::ngx_stream_core_module
+                    ))
+                    .type_,
+                    stream_core_module_index: (*core::ptr::addr_of!(
+                        nginx_sys::ngx_stream_core_module
+                    ))
+                    .index,
+                    stream_core_module_context_index: (*core::ptr::addr_of!(
+                        nginx_sys::ngx_stream_core_module
+                    ))
+                    .ctx_index,
                 }
             };
 
@@ -775,6 +792,10 @@ mod tests {
                 nginx_sys::ngx_max_module = module_slots;
                 nginx_sys::ngx_stream_max_module = stream_slots;
                 (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_module)).index = 0;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).type_ =
+                    NGX_STREAM_MODULE as _;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).index = 0;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).ctx_index = 0;
             }
 
             Self { _guard: guard, previous }
@@ -802,9 +823,19 @@ mod tests {
                 nginx_sys::ngx_stream_max_module = self.previous.stream_max_module;
                 (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_module)).index =
                     self.previous.stream_module_index;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).type_ =
+                    self.previous.stream_core_module_type;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).index =
+                    self.previous.stream_core_module_index;
+                (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).ctx_index =
+                    self.previous.stream_core_module_context_index;
             }
         }
     }
+
+    #[cfg(feature = "test-link")]
+    #[path = "phase_tests.rs"]
+    mod phase_tests;
 
     #[cfg(feature = "test-link")]
     #[test]
