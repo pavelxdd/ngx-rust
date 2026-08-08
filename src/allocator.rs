@@ -406,7 +406,8 @@ mod tests {
         assert_eq!(drops.get(), 1);
         assert_eq!(unsafe { ngx_rs_test_free_count() }, 1);
 
-        let mut values = crate::collections::Vec::try_with_capacity_in(2, allocator).unwrap();
+        let mut values = crate::collections::Vec::new_in(allocator);
+        values.try_reserve_exact(2).unwrap();
         values.try_push(DropCounter(drops.clone())).unwrap();
         values.try_push(DropCounter(drops.clone())).unwrap();
         unsafe { ngx_rs_test_track_free(values.as_mut_ptr().cast()) };
