@@ -1,7 +1,7 @@
 use core::error;
 use core::ffi::{c_char, c_void};
 use core::fmt;
-use core::ptr::{self, NonNull};
+use core::ptr;
 
 use crate::core::NGX_CONF_ERROR;
 use crate::core::*;
@@ -88,9 +88,11 @@ pub trait HttpModule {
         Self::MainConf: Default,
     {
         unsafe {
-            let pool = Pool::from_ngx_pool((*cf).pool);
+            let Some(pool) = Pool::from_raw((*cf).pool) else {
+                return ptr::null_mut();
+            };
             pool.allocate_with_cleanup(Self::MainConf::default)
-                .map(NonNull::as_ptr)
+                .map(|value| value.into_non_null().as_ptr())
                 .unwrap_or(ptr::null_mut())
                 .cast()
         }
@@ -118,9 +120,11 @@ pub trait HttpModule {
         Self::ServerConf: Default,
     {
         unsafe {
-            let pool = Pool::from_ngx_pool((*cf).pool);
+            let Some(pool) = Pool::from_raw((*cf).pool) else {
+                return ptr::null_mut();
+            };
             pool.allocate_with_cleanup(Self::ServerConf::default)
-                .map(NonNull::as_ptr)
+                .map(|value| value.into_non_null().as_ptr())
                 .unwrap_or(ptr::null_mut())
                 .cast()
         }
@@ -164,9 +168,11 @@ pub trait HttpModule {
         Self::LocationConf: Default,
     {
         unsafe {
-            let pool = Pool::from_ngx_pool((*cf).pool);
+            let Some(pool) = Pool::from_raw((*cf).pool) else {
+                return ptr::null_mut();
+            };
             pool.allocate_with_cleanup(Self::LocationConf::default)
-                .map(NonNull::as_ptr)
+                .map(|value| value.into_non_null().as_ptr())
                 .unwrap_or(ptr::null_mut())
                 .cast()
         }
@@ -210,5 +216,5 @@ pub trait HttpModule {
 /// request pool. The value must remain registered with that pool until it is removed.
 pub unsafe trait HttpModuleRequestContext: HttpModule {
     /// Value stored in the module's per-request context slot.
-    type RequestContext;
+    type RequestContext: 'static;
 }

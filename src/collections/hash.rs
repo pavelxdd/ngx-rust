@@ -43,7 +43,7 @@ impl<T> NgxHash<T> {
     /// hash or references obtained from it are used. The configured nginx global state, including
     /// its cache-line size, must be initialized.
     pub unsafe fn build(
-        pool: &Pool,
+        pool: &Pool<'_>,
         name: &CStr,
         max_size: usize,
         bucket_size: usize,
@@ -231,8 +231,8 @@ mod tests {
             Self { pool, _log: log, cacheline_size, _global_lock: global_lock }
         }
 
-        fn handle(&self) -> Pool {
-            unsafe { Pool::from_ngx_pool(self.pool) }
+        fn handle(&self) -> Pool<'_> {
+            unsafe { Pool::from_raw(self.pool) }.unwrap()
         }
     }
 

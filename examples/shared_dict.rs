@@ -205,7 +205,9 @@ extern "C" fn ngx_http_shared_dict_add_variable(
 ) -> *mut c_char {
     // SAFETY: configuration handlers always receive a valid `cf` pointer.
     let cf = unsafe { cf.as_mut().unwrap() };
-    let pool = unsafe { Pool::from_ngx_pool(cf.pool) };
+    let Some(pool) = (unsafe { Pool::from_raw(cf.pool) }) else {
+        return NGX_CONF_ERROR;
+    };
 
     let key = pool.calloc_type::<ngx_http_complex_value_t>();
     if key.is_null() {
@@ -370,7 +372,9 @@ extern "C" fn ngx_http_shared_dict_get_entries(
 
     let r = unsafe { &mut *r };
     let v = unsafe { &mut *v };
-    let pool = unsafe { Pool::from_ngx_pool(r.pool) };
+    let Some(pool) = (unsafe { Pool::from_raw(r.pool) }) else {
+        return Status::NGX_ERROR.into();
+    };
     let smcf = HttpSharedDictModule::main_conf(r).expect("shared dict main config");
 
     ngx_log_debug!(unsafe { (*r.connection).log }, "shared dict: get all entries");

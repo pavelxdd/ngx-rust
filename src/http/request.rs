@@ -257,9 +257,9 @@ impl Request {
     }
 
     /// Request pool.
-    pub fn pool(&self) -> Pool {
+    pub fn pool(&self) -> Pool<'_> {
         // SAFETY: This request is allocated from `pool`, thus must be a valid pool.
-        unsafe { Pool::from_ngx_pool(self.0.pool) }
+        unsafe { Pool::from_raw(self.0.pool).unwrap_unchecked() }
     }
 
     /// Returns the result as an `Option` if it exists, otherwise `None`.
@@ -366,7 +366,7 @@ impl Request {
             return Ok(unsafe { context.as_mut() });
         }
 
-        let mut context = unsafe { self.pool().allocate_with_cleanup(constructor)? };
+        let mut context = self.pool().allocate_with_cleanup(constructor)?.into_non_null();
         self.set_module_ctx_ptr(context.as_ptr().cast(), M::module());
         Ok(unsafe { context.as_mut() })
     }
@@ -380,8 +380,8 @@ impl Request {
             NonNull::new(self.get_module_ctx_ptr(M::module()).cast::<M::RequestContext>())?;
         self.set_module_ctx_ptr(core::ptr::null_mut(), M::module());
 
-        let mut pool = self.pool();
-        if unsafe { pool.remove(context.as_ptr()) }.is_some() {
+        let pool = self.pool();
+        if unsafe { pool.remove_cleanup(context) } {
             Some(())
         } else {
             self.set_module_ctx_ptr(context.as_ptr().cast(), M::module());
