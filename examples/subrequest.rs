@@ -4,11 +4,11 @@ use core::ptr::{self, NonNull};
 
 use nginx_sys::{
     NGX_CONF_TAKE1, NGX_ERROR, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MODULE,
-    NGX_HTTP_SPECIAL_RESPONSE, NGX_LOG_ERR, NGX_OK, ngx_buf_t, ngx_chain_t, ngx_command_t,
-    ngx_conf_t, ngx_http_complex_value_t, ngx_http_module_t, ngx_http_send_response, ngx_int_t,
-    ngx_module_t, ngx_str_t, ngx_uint_t,
+    NGX_HTTP_SPECIAL_RESPONSE, NGX_LOG_ERR, NGX_OK, ngx_chain_t, ngx_command_t, ngx_conf_t,
+    ngx_http_complex_value_t, ngx_http_module_t, ngx_http_send_response, ngx_int_t, ngx_module_t,
+    ngx_str_t, ngx_uint_t,
 };
-use ngx::core::Status;
+use ngx::core::{BufferView, ChainRef, Status};
 use ngx::http::subrequest::{SubRequestBuilder, SubRequestError};
 use ngx::http::{
     HTTPStatus, HttpModule, HttpModuleLocationConf, HttpModuleRequestContext, HttpPhase,
@@ -193,15 +193,19 @@ fn copy_buffered_body(
     request: &Request,
     output: Option<NonNull<ngx_chain_t>>,
 ) -> Result<ngx_str_t, ExampleError> {
+    let head = output.map_or(ptr::null_mut(), NonNull::as_ptr);
+    // SAFETY: the subrequest output chain remains live and immutable while the main request
+    // copies its buffered response in this handler invocation.
+    let chain = unsafe { ChainRef::from_raw(head) }.map_err(|_| ExampleError::InvalidBody)?;
     let mut length = 0usize;
-    let mut current = output;
-    while let Some(chain) = current {
-        let chain = unsafe { chain.as_ref() };
-        let buffer = NonNull::new(chain.buf).ok_or(ExampleError::InvalidBody)?;
-        length = length
-            .checked_add(buffer_length(unsafe { buffer.as_ref() })?)
-            .ok_or(ExampleError::InvalidBody)?;
-        current = NonNull::new(chain.next);
+    for buffer in chain.iter() {
+        let buffer = buffer.map_err(|_| ExampleError::InvalidBody)?;
+        let size = match buffer.kind().map_err(|_| ExampleError::InvalidBody)? {
+            BufferView::Memory(bytes) => bytes.len(),
+            BufferView::Control(_) => 0,
+            BufferView::File(_) => return Err(ExampleError::InvalidBody),
+        };
+        length = length.checked_add(size).ok_or(ExampleError::InvalidBody)?;
     }
 
     if length == 0 {
@@ -213,27 +217,19 @@ fn copy_buffered_body(
     }
 
     let mut offset = 0;
-    let mut current = output;
-    while let Some(chain) = current {
-        let chain = unsafe { chain.as_ref() };
-        let buffer = unsafe { NonNull::new_unchecked(chain.buf).as_ref() };
-        let buffer_length = buffer_length(buffer)?;
-        if buffer_length != 0 {
-            unsafe { ptr::copy_nonoverlapping(buffer.pos, data.add(offset), buffer_length) };
+    for buffer in chain.iter() {
+        let buffer = buffer.map_err(|_| ExampleError::InvalidBody)?;
+        match buffer.kind().map_err(|_| ExampleError::InvalidBody)? {
+            BufferView::Memory(bytes) => {
+                unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), data.add(offset), bytes.len()) };
+                offset += bytes.len();
+            }
+            BufferView::Control(_) => {}
+            BufferView::File(_) => return Err(ExampleError::InvalidBody),
         }
-        offset += buffer_length;
-        current = NonNull::new(chain.next);
     }
 
     Ok(ngx_str_t { len: length, data })
-}
-
-fn buffer_length(buffer: &ngx_buf_t) -> Result<usize, ExampleError> {
-    if buffer.pos.is_null() || buffer.last.is_null() {
-        return if buffer.pos == buffer.last { Ok(0) } else { Err(ExampleError::InvalidBody) };
-    }
-
-    (buffer.last as usize).checked_sub(buffer.pos as usize).ok_or(ExampleError::InvalidBody)
 }
 
 static MODULE_CONTEXT: ngx_http_module_t = ngx_http_module_t {
