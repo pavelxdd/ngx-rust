@@ -33,7 +33,7 @@ bindgen = "0.72.1"
 cc = "1.4.0"
 dunce = "1.0.5"
 regex = "1.13.1"
-nginx-src = { version = "~1.28.5", optional = true, path = "../nginx-src" }
+nginx-src = { version = "~1.30.0", optional = true, path = "../nginx-src" }
 shlex = "2.0.1"
 
 [features]

@@ -46,7 +46,7 @@ For example, this is how you would compile the [examples](#examples) using a
 specific version of NGINX:
 
 ```sh
-NGINX_BUILD_DIR=/path/to/nginx-1.28.3/objs cargo build --package=examples --examples
+NGINX_BUILD_DIR=/path/to/nginx-1.30.4/objs cargo build --package=examples --examples
 ```
 
 ### Windows
