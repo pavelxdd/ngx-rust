@@ -298,6 +298,453 @@ impl<E> From<PoolCleanupError<E>> for RequestContextCreateError<E> {
     }
 }
 
+/// Failure returned while validating an nginx HTTP header list.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeaderListError {
+    /// The nginx list layout, part bounds, or part chain is invalid.
+    InvalidList,
+    /// A header key has a nonzero length but no data pointer.
+    MissingKeyData,
+    /// A header value has a nonzero length but no data pointer.
+    MissingValueData,
+    /// A header key is too long to create a Rust slice.
+    KeyTooLong,
+    /// A header value is too long to create a Rust slice.
+    ValueTooLong,
+}
+
+/// Failure returned while preparing a replacement nginx HTTP header set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeaderBuildError {
+    /// The request could not provide a usable pool.
+    Request(RequestError),
+    /// The requested initial list capacity is zero or cannot describe a list allocation.
+    InvalidCapacity,
+    /// Nginx could not allocate request-pool storage.
+    Allocation,
+    /// The input header count cannot be represented by nginx.
+    CountOverflow,
+}
+
+impl From<RequestError> for HeaderBuildError {
+    fn from(error: RequestError) -> Self {
+        Self::Request(error)
+    }
+}
+
+/// One checked byte-oriented nginx HTTP header entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HttpHeaderRef<'header> {
+    key: &'header [u8],
+    value: &'header [u8],
+    lowercase_key: Option<&'header [u8]>,
+    hash: ngx_uint_t,
+}
+
+impl HttpHeaderRef<'_> {
+    /// Returns the raw header-name bytes.
+    pub fn key(&self) -> &[u8] {
+        self.key
+    }
+
+    /// Returns the raw header-value bytes.
+    pub fn value(&self) -> &[u8] {
+        self.value
+    }
+
+    /// Returns nginx's lowercase header-name bytes when they are available.
+    pub fn lowercase_key(&self) -> Option<&[u8]> {
+        self.lowercase_key
+    }
+
+    /// Returns nginx's header hash.
+    pub fn hash(&self) -> ngx_uint_t {
+        self.hash
+    }
+
+    /// Returns whether nginx has not disabled this header.
+    pub fn is_enabled(&self) -> bool {
+        self.hash != 0
+    }
+}
+
+/// Checked byte-oriented view over an nginx HTTP header list.
+#[derive(Debug)]
+pub struct HttpHeaderList<'header> {
+    headers: &'header NgxList<ngx_table_elt_t>,
+}
+
+impl HttpHeaderList<'_> {
+    /// Returns the total number of entries across all nginx list parts.
+    pub fn len(&self) -> usize {
+        self.headers.len()
+    }
+
+    /// Returns whether the list contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.headers.is_empty()
+    }
+
+    /// Iterates over checked byte-oriented header entries in list order.
+    pub fn iter(&self) -> HttpHeaderIter<'_> {
+        HttpHeaderIter(self.headers.iter())
+    }
+}
+
+/// Iterator over [`HttpHeaderList`] entries.
+pub struct HttpHeaderIter<'header>(NgxListIter<'header, ngx_table_elt_t>);
+
+impl<'header> Iterator for HttpHeaderIter<'header> {
+    type Item = HttpHeaderRef<'header>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|header| unsafe { http_header_from_raw(header) })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl ExactSizeIterator for HttpHeaderIter<'_> {}
+
+/// Request-pool builder for atomically replacing HTTP input headers.
+pub struct HttpHeadersInBuilder<'request, 'callback> {
+    request: &'request mut RequestRefMut<'callback>,
+    pool: *mut ngx_pool_t,
+    headers: ngx_http_headers_in_t,
+}
+
+impl<'request, 'callback> HttpHeadersInBuilder<'request, 'callback> {
+    fn new(
+        request: &'request mut RequestRefMut<'callback>,
+        capacity: usize,
+    ) -> Result<Self, HeaderBuildError> {
+        let pool = request.pool()?.as_ptr();
+        let mut headers: ngx_http_headers_in_t = unsafe { core::mem::zeroed() };
+        headers.headers = create_header_list(pool, capacity)?;
+        headers.content_length_n = -1;
+        headers.keep_alive_n = -1;
+
+        Ok(Self { request, pool, headers })
+    }
+
+    /// Adds a copied raw input header to the candidate list.
+    pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<(), HeaderBuildError> {
+        let count = self.headers.count.checked_add(1).ok_or(HeaderBuildError::CountOverflow)?;
+        let header = append_pool_header(&mut self.headers.headers, self.pool, key, value)?;
+        self.headers.count = count;
+        unsafe { bind_headers_in(&mut self.headers, header.as_ptr()) };
+        Ok(())
+    }
+
+    /// Publishes the complete input-header candidate to the request.
+    pub fn commit(self) {
+        let request = unsafe { self.request.raw.as_mut() };
+        request.headers_in = self.headers;
+        repair_header_list_last(&mut request.headers_in.headers);
+    }
+}
+
+/// Request-pool builder for atomically replacing HTTP output headers.
+pub struct HttpHeadersOutBuilder<'request, 'callback> {
+    request: &'request mut RequestRefMut<'callback>,
+    pool: *mut ngx_pool_t,
+    headers: ngx_http_headers_out_t,
+}
+
+impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
+    fn new(
+        request: &'request mut RequestRefMut<'callback>,
+        capacity: usize,
+    ) -> Result<Self, HeaderBuildError> {
+        let pool = request.pool()?.as_ptr();
+        let mut headers = unsafe { request.raw.as_ref().headers_out };
+        headers.headers = create_header_list(pool, capacity)?;
+        clear_headers_out_slots(&mut headers);
+
+        Ok(Self { request, pool, headers })
+    }
+
+    /// Adds a copied raw output header to the candidate list.
+    ///
+    /// `Content-Type` is represented by nginx's dedicated output field rather than a list entry.
+    pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<(), HeaderBuildError> {
+        if key.eq_ignore_ascii_case(b"Content-Type") {
+            return self.set_content_type(value);
+        }
+
+        let header = append_pool_header(&mut self.headers.headers, self.pool, key, value)?;
+        unsafe { bind_headers_out(&mut self.headers, header.as_ptr()) };
+        Ok(())
+    }
+
+    /// Sets the copied nginx output Content-Type field.
+    pub fn set_content_type(&mut self, value: &[u8]) -> Result<(), HeaderBuildError> {
+        let value = copy_pool_bytes(self.pool, value)?;
+        self.headers.content_type_len = value.len;
+        self.headers.content_type = value;
+        self.headers.charset = ngx_str_t::empty();
+        self.headers.content_type_lowcase = ptr::null_mut();
+        self.headers.content_type_hash = 0;
+        Ok(())
+    }
+
+    /// Publishes the complete output-header candidate to the request.
+    pub fn commit(self) {
+        let request = unsafe { self.request.raw.as_mut() };
+        request.headers_out = self.headers;
+        repair_header_list_last(&mut request.headers_out.headers);
+    }
+}
+
+fn checked_header_list(headers: &ngx_list_t) -> Result<HttpHeaderList<'_>, HeaderListError> {
+    let headers = unsafe { NgxList::<ngx_table_elt_t>::from_ngx_list(headers) }
+        .ok_or(HeaderListError::InvalidList)?;
+    for header in headers.iter() {
+        checked_header_bytes(
+            header.key,
+            HeaderListError::MissingKeyData,
+            HeaderListError::KeyTooLong,
+        )?;
+        checked_header_bytes(
+            header.value,
+            HeaderListError::MissingValueData,
+            HeaderListError::ValueTooLong,
+        )?;
+    }
+
+    Ok(HttpHeaderList { headers })
+}
+
+fn checked_header_bytes<'header>(
+    value: ngx_str_t,
+    missing: HeaderListError,
+    too_long: HeaderListError,
+) -> Result<&'header [u8], HeaderListError> {
+    if value.len == 0 {
+        return Ok(&[]);
+    }
+    if value.len > isize::MAX as usize {
+        return Err(too_long);
+    }
+
+    let data = NonNull::new(value.data).ok_or(missing)?;
+    Ok(unsafe { slice::from_raw_parts(data.as_ptr(), value.len) })
+}
+
+unsafe fn http_header_from_raw(header: &ngx_table_elt_t) -> HttpHeaderRef<'_> {
+    let key = unsafe { header_bytes_unchecked(header.key) };
+    let value = unsafe { header_bytes_unchecked(header.value) };
+    let lowercase_key = NonNull::new(header.lowcase_key)
+        .map(|key| unsafe { slice::from_raw_parts(key.as_ptr(), header.key.len) });
+
+    HttpHeaderRef { key, value, lowercase_key, hash: header.hash }
+}
+
+unsafe fn header_bytes_unchecked<'header>(value: ngx_str_t) -> &'header [u8] {
+    if value.len == 0 {
+        return &[];
+    }
+
+    unsafe { slice::from_raw_parts(value.data, value.len) }
+}
+
+fn create_header_list(
+    pool: *mut ngx_pool_t,
+    capacity: usize,
+) -> Result<ngx_list_t, HeaderBuildError> {
+    if capacity == 0
+        || capacity
+            .checked_mul(core::mem::size_of::<ngx_table_elt_t>())
+            .is_none_or(|size| size > isize::MAX as usize)
+    {
+        return Err(HeaderBuildError::InvalidCapacity);
+    }
+
+    let mut headers: ngx_list_t = unsafe { core::mem::zeroed() };
+    if unsafe {
+        ngx_list_init(&raw mut headers, pool, capacity, core::mem::size_of::<ngx_table_elt_t>())
+    } != NGX_OK as ngx_int_t
+    {
+        return Err(HeaderBuildError::Allocation);
+    }
+
+    Ok(headers)
+}
+
+fn copy_pool_bytes(pool: *mut ngx_pool_t, bytes: &[u8]) -> Result<ngx_str_t, HeaderBuildError> {
+    if bytes.is_empty() {
+        return Ok(ngx_str_t::empty());
+    }
+
+    let data = NonNull::new(unsafe { ngx_pnalloc(pool, bytes.len()).cast::<u_char>() })
+        .ok_or(HeaderBuildError::Allocation)?;
+    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), data.as_ptr(), bytes.len()) };
+    Ok(ngx_str_t { len: bytes.len(), data: data.as_ptr() })
+}
+
+fn append_pool_header(
+    headers: &mut ngx_list_t,
+    pool: *mut ngx_pool_t,
+    key: &[u8],
+    value: &[u8],
+) -> Result<NonNull<ngx_table_elt_t>, HeaderBuildError> {
+    let key = copy_pool_bytes(pool, key)?;
+    let value = copy_pool_bytes(pool, value)?;
+    let lowcase_key = if key.len == 0 {
+        ptr::null_mut()
+    } else {
+        NonNull::new(unsafe { ngx_pnalloc(pool, key.len).cast::<u_char>() })
+            .ok_or(HeaderBuildError::Allocation)?
+            .as_ptr()
+    };
+    let hash = if lowcase_key.is_null() {
+        0
+    } else {
+        unsafe { ngx_hash_strlow(lowcase_key, key.data, key.len) }
+    };
+    repair_header_list_last(headers);
+    let header = NonNull::new(unsafe { ngx_list_push(headers).cast::<ngx_table_elt_t>() })
+        .ok_or(HeaderBuildError::Allocation)?;
+
+    unsafe {
+        header.as_ptr().write(ngx_table_elt_t {
+            hash,
+            key,
+            value,
+            lowcase_key,
+            next: ptr::null_mut(),
+        });
+    }
+    Ok(header)
+}
+
+fn repair_header_list_last(headers: &mut ngx_list_t) {
+    let mut last = &raw mut headers.part;
+    while !unsafe { (*last).next }.is_null() {
+        last = unsafe { (*last).next };
+    }
+    headers.last = last;
+}
+
+unsafe fn append_header_slot(slot: &mut *mut ngx_table_elt_t, header: *mut ngx_table_elt_t) {
+    let mut tail = slot;
+    while !(*tail).is_null() {
+        tail = unsafe { &mut (**tail).next };
+    }
+    unsafe {
+        *tail = header;
+        (*header).next = ptr::null_mut();
+    }
+}
+
+unsafe fn bind_headers_in(headers: &mut ngx_http_headers_in_t, header: *mut ngx_table_elt_t) {
+    if unsafe { (*header).hash } == 0 {
+        return;
+    }
+    let key = unsafe { header_bytes_unchecked((*header).key) };
+
+    if key.eq_ignore_ascii_case(b"Host") {
+        if headers.host.is_null() {
+            headers.server = unsafe { (*header).value };
+        }
+        unsafe { append_header_slot(&mut headers.host, header) };
+    } else if key.eq_ignore_ascii_case(b"Content-Length") {
+        unsafe { append_header_slot(&mut headers.content_length, header) };
+    } else if key.eq_ignore_ascii_case(b"Content-Type") {
+        unsafe { append_header_slot(&mut headers.content_type, header) };
+    } else if key.eq_ignore_ascii_case(b"User-Agent") {
+        unsafe { append_header_slot(&mut headers.user_agent, header) };
+    } else if key.eq_ignore_ascii_case(b"Referer") {
+        unsafe { append_header_slot(&mut headers.referer, header) };
+    } else if key.eq_ignore_ascii_case(b"Authorization") {
+        unsafe { append_header_slot(&mut headers.authorization, header) };
+    } else if key.eq_ignore_ascii_case(b"Proxy-Authorization") {
+        unsafe { append_header_slot(&mut headers.proxy_authorization, header) };
+    } else if key.eq_ignore_ascii_case(b"Cookie") {
+        unsafe { append_header_slot(&mut headers.cookie, header) };
+    } else if key.eq_ignore_ascii_case(b"Expect") {
+        unsafe { append_header_slot(&mut headers.expect, header) };
+    } else if key.eq_ignore_ascii_case(b"Range") {
+        unsafe { append_header_slot(&mut headers.range, header) };
+    } else if key.eq_ignore_ascii_case(b"If-Modified-Since") {
+        unsafe { append_header_slot(&mut headers.if_modified_since, header) };
+    } else if key.eq_ignore_ascii_case(b"If-Unmodified-Since") {
+        unsafe { append_header_slot(&mut headers.if_unmodified_since, header) };
+    } else if key.eq_ignore_ascii_case(b"If-Match") {
+        unsafe { append_header_slot(&mut headers.if_match, header) };
+    } else if key.eq_ignore_ascii_case(b"If-None-Match") {
+        unsafe { append_header_slot(&mut headers.if_none_match, header) };
+    } else if key.eq_ignore_ascii_case(b"If-Range") {
+        unsafe { append_header_slot(&mut headers.if_range, header) };
+    } else if key.eq_ignore_ascii_case(b"Content-Range") {
+        unsafe { append_header_slot(&mut headers.content_range, header) };
+    }
+}
+
+unsafe fn bind_headers_out(headers: &mut ngx_http_headers_out_t, header: *mut ngx_table_elt_t) {
+    if unsafe { (*header).hash } == 0 {
+        return;
+    }
+    let key = unsafe { header_bytes_unchecked((*header).key) };
+
+    if key.eq_ignore_ascii_case(b"Server") {
+        unsafe { append_header_slot(&mut headers.server, header) };
+    } else if key.eq_ignore_ascii_case(b"Date") {
+        unsafe { append_header_slot(&mut headers.date, header) };
+    } else if key.eq_ignore_ascii_case(b"Content-Length") {
+        unsafe { append_header_slot(&mut headers.content_length, header) };
+    } else if key.eq_ignore_ascii_case(b"Content-Encoding") {
+        unsafe { append_header_slot(&mut headers.content_encoding, header) };
+    } else if key.eq_ignore_ascii_case(b"Location") {
+        unsafe { append_header_slot(&mut headers.location, header) };
+    } else if key.eq_ignore_ascii_case(b"Refresh") {
+        unsafe { append_header_slot(&mut headers.refresh, header) };
+    } else if key.eq_ignore_ascii_case(b"Last-Modified") {
+        unsafe { append_header_slot(&mut headers.last_modified, header) };
+    } else if key.eq_ignore_ascii_case(b"Content-Range") {
+        unsafe { append_header_slot(&mut headers.content_range, header) };
+    } else if key.eq_ignore_ascii_case(b"Accept-Ranges") {
+        unsafe { append_header_slot(&mut headers.accept_ranges, header) };
+    } else if key.eq_ignore_ascii_case(b"WWW-Authenticate") {
+        unsafe { append_header_slot(&mut headers.www_authenticate, header) };
+    } else if key.eq_ignore_ascii_case(b"Proxy-Authenticate") {
+        unsafe { append_header_slot(&mut headers.proxy_authenticate, header) };
+    } else if key.eq_ignore_ascii_case(b"Expires") {
+        unsafe { append_header_slot(&mut headers.expires, header) };
+    } else if key.eq_ignore_ascii_case(b"ETag") {
+        unsafe { append_header_slot(&mut headers.etag, header) };
+    } else if key.eq_ignore_ascii_case(b"Cache-Control") {
+        unsafe { append_header_slot(&mut headers.cache_control, header) };
+    } else if key.eq_ignore_ascii_case(b"Link") {
+        unsafe { append_header_slot(&mut headers.link, header) };
+    }
+}
+
+fn clear_headers_out_slots(headers: &mut ngx_http_headers_out_t) {
+    headers.server = ptr::null_mut();
+    headers.date = ptr::null_mut();
+    headers.content_length = ptr::null_mut();
+    headers.content_encoding = ptr::null_mut();
+    headers.location = ptr::null_mut();
+    headers.refresh = ptr::null_mut();
+    headers.last_modified = ptr::null_mut();
+    headers.content_range = ptr::null_mut();
+    headers.accept_ranges = ptr::null_mut();
+    headers.www_authenticate = ptr::null_mut();
+    headers.proxy_authenticate = ptr::null_mut();
+    headers.expires = ptr::null_mut();
+    headers.etag = ptr::null_mut();
+    headers.cache_control = ptr::null_mut();
+    headers.link = ptr::null_mut();
+    headers.content_type_len = 0;
+    headers.content_type = ngx_str_t::empty();
+    headers.charset = ngx_str_t::empty();
+    headers.content_type_lowcase = ptr::null_mut();
+    headers.content_type_hash = 0;
+}
+
 #[repr(C)]
 struct RequestContextOwner<T> {
     context: T,
@@ -599,6 +1046,16 @@ impl RequestRef<'_> {
         unsafe { self.raw.as_ref().header_only() != 0 }
     }
 
+    /// Returns a checked byte-oriented view over input headers.
+    pub fn headers_in(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
+        checked_header_list(unsafe { &self.raw.as_ref().headers_in.headers })
+    }
+
+    /// Returns a checked byte-oriented view over output headers.
+    pub fn headers_out(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
+        checked_header_list(unsafe { &self.raw.as_ref().headers_out.headers })
+    }
+
     /// Returns the active upstream pointer for an explicit nginx FFI operation.
     ///
     /// # Safety
@@ -689,7 +1146,7 @@ pub struct RequestRefMut<'callback> {
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
-impl RequestRefMut<'_> {
+impl<'callback> RequestRefMut<'callback> {
     /// Creates a checked exclusive request view from an nginx callback pointer.
     ///
     /// # Safety
@@ -985,6 +1442,32 @@ impl RequestRefMut<'_> {
     /// Whether nginx marked the response as header-only.
     pub fn header_only(&self) -> bool {
         self.view().header_only()
+    }
+
+    /// Returns a checked byte-oriented view over input headers.
+    pub fn headers_in(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
+        checked_header_list(unsafe { &self.raw.as_ref().headers_in.headers })
+    }
+
+    /// Returns a checked byte-oriented view over output headers.
+    pub fn headers_out(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
+        checked_header_list(unsafe { &self.raw.as_ref().headers_out.headers })
+    }
+
+    /// Starts constructing a complete replacement input-header list in the request pool.
+    pub fn headers_in_builder(
+        &mut self,
+        capacity: usize,
+    ) -> Result<HttpHeadersInBuilder<'_, 'callback>, HeaderBuildError> {
+        HttpHeadersInBuilder::new(self, capacity)
+    }
+
+    /// Starts constructing a complete replacement output-header list in the request pool.
+    pub fn headers_out_builder(
+        &mut self,
+        capacity: usize,
+    ) -> Result<HttpHeadersOutBuilder<'_, 'callback>, HeaderBuildError> {
+        HttpHeadersOutBuilder::new(self, capacity)
     }
 
     /// Returns the active upstream pointer for an explicit nginx FFI operation.
@@ -2093,6 +2576,656 @@ mod tests {
             .collect();
 
         assert_eq!(values, [("X-First", "one"), ("X-Second", "two")]);
+    }
+
+    #[test]
+    fn checked_header_views_keep_raw_bytes_parts_and_disabled_entries() {
+        let input_key = [b'X', b'-', 0xff];
+        let input_value = [0, 0xff];
+        let input_lowcase = [b'x', b'-', 0xff];
+        let mut input_headers: [ngx_table_elt_t; 1] =
+            unsafe { MaybeUninit::zeroed().assume_init() };
+        input_headers[0].hash = 17;
+        input_headers[0].key =
+            ngx_str_t { len: input_key.len(), data: input_key.as_ptr().cast_mut() };
+        input_headers[0].value =
+            ngx_str_t { len: input_value.len(), data: input_value.as_ptr().cast_mut() };
+        input_headers[0].lowcase_key = input_lowcase.as_ptr().cast_mut();
+
+        let mut empty_headers: [ngx_table_elt_t; 1] =
+            unsafe { MaybeUninit::zeroed().assume_init() };
+        let disabled_key = [b'X', b'-', b'D', b'i', b's', b'a', b'b', b'l', b'e', b'd'];
+        let disabled_value = [0xff, b'!'];
+        let disabled_lowcase = [b'x', b'-', b'd', b'i', b's', b'a', b'b', b'l', b'e', b'd'];
+        let mut disabled_headers: [ngx_table_elt_t; 1] =
+            unsafe { MaybeUninit::zeroed().assume_init() };
+        disabled_headers[0].hash = 0;
+        disabled_headers[0].key =
+            ngx_str_t { len: disabled_key.len(), data: disabled_key.as_ptr().cast_mut() };
+        disabled_headers[0].value =
+            ngx_str_t { len: disabled_value.len(), data: disabled_value.as_ptr().cast_mut() };
+        disabled_headers[0].lowcase_key = disabled_lowcase.as_ptr().cast_mut();
+
+        let mut disabled_part = ngx_list_part_t {
+            elts: disabled_headers.as_mut_ptr().cast(),
+            nelts: disabled_headers.len(),
+            next: core::ptr::null_mut(),
+        };
+        let mut empty_part = ngx_list_part_t {
+            elts: empty_headers.as_mut_ptr().cast(),
+            nelts: 0,
+            next: &raw mut disabled_part,
+        };
+        let mut raw = zeroed_request();
+        raw.headers_in.headers = ngx_list_t {
+            last: &raw mut disabled_part,
+            part: ngx_list_part_t {
+                elts: input_headers.as_mut_ptr().cast(),
+                nelts: input_headers.len(),
+                next: &raw mut empty_part,
+            },
+            size: core::mem::size_of::<ngx_table_elt_t>(),
+            nalloc: 1,
+            pool: core::ptr::null_mut(),
+        };
+
+        let request = request_from(&mut raw);
+        let input = request.headers_in().unwrap();
+        let headers: Vec<_> = input.iter().collect();
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].key(), input_key);
+        assert_eq!(headers[0].value(), input_value);
+        assert_eq!(headers[0].lowercase_key(), Some(input_lowcase.as_slice()));
+        assert_eq!(headers[0].hash(), 17);
+        assert!(headers[0].is_enabled());
+        assert_eq!(headers[1].key(), disabled_key);
+        assert_eq!(headers[1].value(), disabled_value);
+        assert_eq!(headers[1].lowercase_key(), Some(disabled_lowcase.as_slice()));
+        assert!(!headers[1].is_enabled());
+
+        let output_key = [b'Y', 0xfe];
+        let output_value = [0xff, b'!'];
+        let output_lowcase = [b'y', 0xfe];
+        let mut output_headers: [ngx_table_elt_t; 1] =
+            unsafe { MaybeUninit::zeroed().assume_init() };
+        output_headers[0].hash = 23;
+        output_headers[0].key =
+            ngx_str_t { len: output_key.len(), data: output_key.as_ptr().cast_mut() };
+        output_headers[0].value =
+            ngx_str_t { len: output_value.len(), data: output_value.as_ptr().cast_mut() };
+        output_headers[0].lowcase_key = output_lowcase.as_ptr().cast_mut();
+        raw.headers_out.headers = ngx_list_t {
+            last: &raw mut raw.headers_out.headers.part,
+            part: ngx_list_part_t {
+                elts: output_headers.as_mut_ptr().cast(),
+                nelts: output_headers.len(),
+                next: core::ptr::null_mut(),
+            },
+            size: core::mem::size_of::<ngx_table_elt_t>(),
+            nalloc: output_headers.len(),
+            pool: core::ptr::null_mut(),
+        };
+
+        let request = request_from(&mut raw);
+        let output = request.headers_out().unwrap();
+        let header = output.iter().next().unwrap();
+        assert_eq!(header.key(), output_key);
+        assert_eq!(header.value(), output_value);
+        assert_eq!(header.lowercase_key(), Some(output_lowcase.as_slice()));
+        assert_eq!(header.hash(), 23);
+    }
+
+    #[test]
+    fn checked_header_views_reject_invalid_list_and_string_state() {
+        let mut raw = zeroed_request();
+        raw.headers_in.headers = ngx_list_t {
+            last: &raw mut raw.headers_in.headers.part,
+            part: ngx_list_part_t {
+                elts: core::ptr::null_mut(),
+                nelts: 1,
+                next: core::ptr::null_mut(),
+            },
+            size: core::mem::size_of::<ngx_table_elt_t>(),
+            nalloc: 1,
+            pool: core::ptr::null_mut(),
+        };
+        assert!(matches!(request_from(&mut raw).headers_in(), Err(HeaderListError::InvalidList)));
+
+        let mut header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        raw.headers_in.headers.part.elts = &raw mut header as *mut _ as *mut _;
+        raw.headers_in.headers.part.nelts = 2;
+        assert!(matches!(request_from(&mut raw).headers_in(), Err(HeaderListError::InvalidList)));
+
+        raw.headers_in.headers.part.nelts = 1;
+        raw.headers_in.headers.part.next = &raw mut raw.headers_in.headers.part;
+        assert!(matches!(request_from(&mut raw).headers_in(), Err(HeaderListError::InvalidList)));
+
+        raw.headers_in.headers.part.next = core::ptr::null_mut();
+        header.key.len = 1;
+        assert!(matches!(
+            request_from(&mut raw).headers_in(),
+            Err(HeaderListError::MissingKeyData)
+        ));
+
+        let key = [b'X'];
+        header.key.data = key.as_ptr().cast_mut();
+        header.value.len = 1;
+        assert!(matches!(
+            request_from(&mut raw).headers_in(),
+            Err(HeaderListError::MissingValueData)
+        ));
+
+        header.value.data = key.as_ptr().cast_mut();
+        header.key.len = isize::MAX as usize + 1;
+        assert!(matches!(request_from(&mut raw).headers_in(), Err(HeaderListError::KeyTooLong)));
+
+        header.key.len = 1;
+        header.value.len = isize::MAX as usize + 1;
+        assert!(matches!(request_from(&mut raw).headers_in(), Err(HeaderListError::ValueTooLong)));
+
+        raw.headers_out.headers = raw.headers_in.headers;
+        raw.headers_out.headers.last = &raw mut raw.headers_out.headers.part;
+        raw.headers_out.headers.part.next = &raw mut raw.headers_out.headers.part;
+        assert!(matches!(request_from(&mut raw).headers_out(), Err(HeaderListError::InvalidList)));
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn input_header_builder_copies_bytes_binds_slots_and_keeps_duplicates() {
+        let owner = TestPool::new();
+        let source_key = [b'X', 0xff];
+        let source_value = [0, 0xfe];
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+
+        let standard_headers = [
+            (b"Host".as_slice(), b"example.test".as_slice()),
+            (b"Content-Length".as_slice(), b"7".as_slice()),
+            (b"Content-Type".as_slice(), b"application/test".as_slice()),
+            (b"User-Agent".as_slice(), b"agent".as_slice()),
+            (b"Referer".as_slice(), b"https://example.test/".as_slice()),
+            (b"Authorization".as_slice(), b"Basic token".as_slice()),
+            (b"Proxy-Authorization".as_slice(), b"Basic proxy".as_slice()),
+            (b"Cookie".as_slice(), b"a=b".as_slice()),
+            (b"Expect".as_slice(), b"100-continue".as_slice()),
+            (b"Range".as_slice(), b"bytes=0-1".as_slice()),
+            (b"If-Modified-Since".as_slice(), b"Wed, 21 Oct 2015 07:28:00 GMT".as_slice()),
+            (b"If-Unmodified-Since".as_slice(), b"Wed, 21 Oct 2015 07:28:00 GMT".as_slice()),
+            (b"If-Match".as_slice(), b"one".as_slice()),
+            (b"If-None-Match".as_slice(), b"two".as_slice()),
+            (b"If-Range".as_slice(), b"three".as_slice()),
+            (b"Content-Range".as_slice(), b"bytes 0-1/2".as_slice()),
+        ];
+
+        {
+            let mut request = request_from(&mut raw);
+            let mut headers = request.headers_in_builder(1).unwrap();
+            for (key, value) in standard_headers {
+                headers.add(key, value).unwrap();
+            }
+            headers.add(&source_key, &source_value).unwrap();
+            headers.add(b"X-Duplicate", b"one").unwrap();
+            headers.add(b"X-Duplicate", b"two").unwrap();
+            headers.commit();
+        }
+
+        let mut expected_lowcase = [0; 2];
+        let expected_hash = unsafe {
+            ngx_hash_strlow(
+                expected_lowcase.as_mut_ptr(),
+                source_key.as_ptr().cast_mut(),
+                source_key.len(),
+            )
+        };
+        let request = request_from(&mut raw);
+        let headers = request.headers_in().unwrap();
+        let source = headers.iter().find(|header| header.key() == source_key).unwrap();
+        assert_eq!(source.value(), source_value);
+        assert_eq!(source.lowercase_key(), Some(expected_lowcase.as_slice()));
+        assert_eq!(source.hash(), expected_hash);
+        assert_ne!(source.key().as_ptr(), source_key.as_ptr());
+        assert_ne!(source.value().as_ptr(), source_value.as_ptr());
+        assert_eq!(headers.iter().filter(|header| header.key() == b"X-Duplicate").count(), 2);
+
+        assert_eq!(raw.headers_in.count, standard_headers.len() + 3);
+        assert_eq!(
+            unsafe { checked_ngx_str(raw.headers_in.server) }.unwrap().as_bytes(),
+            b"example.test"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.host).value) }.unwrap().as_bytes(),
+            b"example.test"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.content_length).value) }.unwrap().as_bytes(),
+            b"7"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.content_type).value) }.unwrap().as_bytes(),
+            b"application/test"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.user_agent).value) }.unwrap().as_bytes(),
+            b"agent"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.referer).value) }.unwrap().as_bytes(),
+            b"https://example.test/"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.authorization).value) }.unwrap().as_bytes(),
+            b"Basic token"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.proxy_authorization).value) }
+                .unwrap()
+                .as_bytes(),
+            b"Basic proxy"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.cookie).value) }.unwrap().as_bytes(),
+            b"a=b"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.expect).value) }.unwrap().as_bytes(),
+            b"100-continue"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.range).value) }.unwrap().as_bytes(),
+            b"bytes=0-1"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.if_modified_since).value) }
+                .unwrap()
+                .as_bytes(),
+            b"Wed, 21 Oct 2015 07:28:00 GMT"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.if_unmodified_since).value) }
+                .unwrap()
+                .as_bytes(),
+            b"Wed, 21 Oct 2015 07:28:00 GMT"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.if_match).value) }.unwrap().as_bytes(),
+            b"one"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.if_none_match).value) }.unwrap().as_bytes(),
+            b"two"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.if_range).value) }.unwrap().as_bytes(),
+            b"three"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.content_range).value) }.unwrap().as_bytes(),
+            b"bytes 0-1/2"
+        );
+        assert_eq!(raw.headers_in.content_length_n, -1);
+        assert_eq!(raw.headers_in.keep_alive_n, -1);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn output_header_builder_binds_slots_and_preserves_response_state() {
+        let owner = TestPool::new();
+        let content_type = b"application/test";
+        let status_line = b"201 Created";
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        raw.headers_out.status = 201;
+        raw.headers_out.status_line =
+            ngx_str_t { len: status_line.len(), data: status_line.as_ptr().cast_mut() };
+        raw.headers_out.content_length_n = 91;
+        raw.headers_out.content_offset = 7;
+        raw.headers_out.date_time = 11;
+        raw.headers_out.last_modified_time = 13;
+
+        let standard_headers = [
+            (b"Server".as_slice(), b"ngx".as_slice()),
+            (b"Date".as_slice(), b"Wed, 21 Oct 2015 07:28:00 GMT".as_slice()),
+            (b"Content-Length".as_slice(), b"91".as_slice()),
+            (b"Content-Encoding".as_slice(), b"identity".as_slice()),
+            (b"Location".as_slice(), b"/next".as_slice()),
+            (b"Refresh".as_slice(), b"1".as_slice()),
+            (b"Last-Modified".as_slice(), b"Wed, 21 Oct 2015 07:28:00 GMT".as_slice()),
+            (b"Content-Range".as_slice(), b"bytes 0-1/2".as_slice()),
+            (b"Accept-Ranges".as_slice(), b"bytes".as_slice()),
+            (b"WWW-Authenticate".as_slice(), b"Basic".as_slice()),
+            (b"Proxy-Authenticate".as_slice(), b"Basic".as_slice()),
+            (b"Expires".as_slice(), b"0".as_slice()),
+            (b"ETag".as_slice(), b"tag".as_slice()),
+            (b"Cache-Control".as_slice(), b"no-cache".as_slice()),
+            (b"Link".as_slice(), b"</next>; rel=next".as_slice()),
+        ];
+
+        {
+            let mut request = request_from(&mut raw);
+            let mut headers = request.headers_out_builder(1).unwrap();
+            headers.add(b"Content-Type", content_type).unwrap();
+            for (key, value) in standard_headers {
+                headers.add(key, value).unwrap();
+            }
+            headers.add(b"X-Duplicate", b"one").unwrap();
+            headers.add(b"X-Duplicate", b"two").unwrap();
+            headers.commit();
+        }
+
+        assert_eq!(raw.headers_out.status, 201);
+        assert_eq!(raw.headers_out.status_line.len, status_line.len());
+        assert_eq!(raw.headers_out.status_line.data, status_line.as_ptr().cast_mut());
+        assert_eq!(raw.headers_out.content_length_n, 91);
+        assert_eq!(raw.headers_out.content_offset, 7);
+        assert_eq!(raw.headers_out.date_time, 11);
+        assert_eq!(raw.headers_out.last_modified_time, 13);
+        assert_eq!(
+            unsafe { checked_ngx_str(raw.headers_out.content_type) }.unwrap().as_bytes(),
+            content_type
+        );
+        assert_eq!(raw.headers_out.content_type_len, content_type.len());
+        assert_ne!(raw.headers_out.content_type.data, content_type.as_ptr().cast_mut());
+        assert!(raw.headers_out.content_type_lowcase.is_null());
+        assert_eq!(raw.headers_out.content_type_hash, 0);
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.server).value) }.unwrap().as_bytes(),
+            b"ngx"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.date).value) }.unwrap().as_bytes(),
+            b"Wed, 21 Oct 2015 07:28:00 GMT"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.content_length).value) }.unwrap().as_bytes(),
+            b"91"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.content_encoding).value) }
+                .unwrap()
+                .as_bytes(),
+            b"identity"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.location).value) }.unwrap().as_bytes(),
+            b"/next"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.refresh).value) }.unwrap().as_bytes(),
+            b"1"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.last_modified).value) }.unwrap().as_bytes(),
+            b"Wed, 21 Oct 2015 07:28:00 GMT"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.content_range).value) }.unwrap().as_bytes(),
+            b"bytes 0-1/2"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.accept_ranges).value) }.unwrap().as_bytes(),
+            b"bytes"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.www_authenticate).value) }
+                .unwrap()
+                .as_bytes(),
+            b"Basic"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.proxy_authenticate).value) }
+                .unwrap()
+                .as_bytes(),
+            b"Basic"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.expires).value) }.unwrap().as_bytes(),
+            b"0"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.etag).value) }.unwrap().as_bytes(),
+            b"tag"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.cache_control).value) }.unwrap().as_bytes(),
+            b"no-cache"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.link).value) }.unwrap().as_bytes(),
+            b"</next>; rel=next"
+        );
+
+        let request = request_from(&mut raw);
+        let headers = request.headers_out().unwrap();
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|header| header.key().eq_ignore_ascii_case(b"Content-Type"))
+                .count(),
+            0
+        );
+        assert_eq!(headers.iter().filter(|header| header.key() == b"X-Duplicate").count(), 2);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn input_header_builder_keeps_live_headers_when_each_pool_allocation_fails() {
+        let mut reached_success = false;
+
+        for successes in 0..32 {
+            let owner = TestPool::new();
+            let mut old_header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
+            let mut raw = zeroed_request();
+            raw.pool = owner.raw;
+            raw.headers_in.host = &raw mut old_header;
+            raw.headers_in.count = 41;
+            raw.headers_in.content_length_n = 42;
+            raw.headers_in.keep_alive_n = 43;
+            let original = (
+                raw.headers_in.headers.part.elts,
+                raw.headers_in.headers.part.nelts,
+                raw.headers_in.headers.part.next,
+                raw.headers_in.headers.last,
+                raw.headers_in.headers.size,
+                raw.headers_in.headers.nalloc,
+                raw.headers_in.headers.pool,
+                raw.headers_in.host,
+                raw.headers_in.count,
+                raw.headers_in.content_length_n,
+                raw.headers_in.keep_alive_n,
+            );
+
+            unsafe {
+                (*owner.raw).max = 0;
+                ngx_rs_test_fail_allocations_after(successes);
+            }
+            let result = (|| {
+                let mut request = request_from(&mut raw);
+                let mut headers = request.headers_in_builder(1)?;
+                headers.add(b"X-First", b"one")?;
+                headers.add(b"X-Second", b"two")?;
+                headers.commit();
+                Ok::<(), HeaderBuildError>(())
+            })();
+            unsafe { ngx_rs_test_reset_allocation_failures() };
+
+            if result.is_ok() {
+                reached_success = true;
+                break;
+            }
+            assert_eq!(result, Err(HeaderBuildError::Allocation));
+            assert_eq!(
+                (
+                    raw.headers_in.headers.part.elts,
+                    raw.headers_in.headers.part.nelts,
+                    raw.headers_in.headers.part.next,
+                    raw.headers_in.headers.last,
+                    raw.headers_in.headers.size,
+                    raw.headers_in.headers.nalloc,
+                    raw.headers_in.headers.pool,
+                    raw.headers_in.host,
+                    raw.headers_in.count,
+                    raw.headers_in.content_length_n,
+                    raw.headers_in.keep_alive_n,
+                ),
+                original
+            );
+        }
+
+        assert!(reached_success);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn output_header_builder_keeps_live_headers_when_each_pool_allocation_fails() {
+        let mut reached_success = false;
+
+        for successes in 0..32 {
+            let owner = TestPool::new();
+            let mut old_header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
+            let mut raw = zeroed_request();
+            raw.pool = owner.raw;
+            raw.headers_out.server = &raw mut old_header;
+            raw.headers_out.status = 201;
+            raw.headers_out.content_length_n = 42;
+            let original = (
+                raw.headers_out.headers.part.elts,
+                raw.headers_out.headers.part.nelts,
+                raw.headers_out.headers.part.next,
+                raw.headers_out.headers.last,
+                raw.headers_out.headers.size,
+                raw.headers_out.headers.nalloc,
+                raw.headers_out.headers.pool,
+                raw.headers_out.server,
+                raw.headers_out.status,
+                raw.headers_out.content_length_n,
+            );
+
+            unsafe {
+                (*owner.raw).max = 0;
+                ngx_rs_test_fail_allocations_after(successes);
+            }
+            let result = (|| {
+                let mut request = request_from(&mut raw);
+                let mut headers = request.headers_out_builder(1)?;
+                headers.add(b"Content-Type", b"text/plain")?;
+                headers.add(b"X-First", b"one")?;
+                headers.add(b"X-Second", b"two")?;
+                headers.commit();
+                Ok::<(), HeaderBuildError>(())
+            })();
+            unsafe { ngx_rs_test_reset_allocation_failures() };
+
+            if result.is_ok() {
+                reached_success = true;
+                break;
+            }
+            assert_eq!(result, Err(HeaderBuildError::Allocation));
+            assert_eq!(
+                (
+                    raw.headers_out.headers.part.elts,
+                    raw.headers_out.headers.part.nelts,
+                    raw.headers_out.headers.part.next,
+                    raw.headers_out.headers.last,
+                    raw.headers_out.headers.size,
+                    raw.headers_out.headers.nalloc,
+                    raw.headers_out.headers.pool,
+                    raw.headers_out.server,
+                    raw.headers_out.status,
+                    raw.headers_out.content_length_n,
+                ),
+                original
+            );
+        }
+
+        assert!(reached_success);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn header_builders_copy_temporary_bytes_before_publication() {
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+
+        {
+            let mut request = request_from(&mut raw);
+            let mut headers = request.headers_in_builder(1).unwrap();
+            {
+                let mut key = [b'X', b'-', b'I', b'n'];
+                let mut value = [b'i', b'n', b'p', b'u', b't'];
+                headers.add(&key, &value).unwrap();
+                key.fill(b'!');
+                value.fill(b'!');
+            }
+            headers.commit();
+        }
+
+        {
+            let mut request = request_from(&mut raw);
+            let mut headers = request.headers_out_builder(1).unwrap();
+            {
+                let mut value = [b't', b'e', b'x', b't', b'/', b'p', b'l', b'a', b'i', b'n'];
+                headers.add(b"Content-Type", &value).unwrap();
+                value.fill(b'!');
+            }
+            headers.commit();
+        }
+
+        let request = request_from(&mut raw);
+        let headers = request.headers_in().unwrap();
+        let input = headers.iter().next().unwrap();
+        assert_eq!(input.key(), b"X-In");
+        assert_eq!(input.value(), b"input");
+        assert_eq!(
+            unsafe { checked_ngx_str(raw.headers_out.content_type) }.unwrap().as_bytes(),
+            b"text/plain"
+        );
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn header_builders_publish_empty_lists() {
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+
+        {
+            let mut request = request_from(&mut raw);
+            request.headers_in_builder(1).unwrap().commit();
+        }
+
+        assert_eq!(raw.headers_in.count, 0);
+        assert_eq!(raw.headers_in.content_length_n, -1);
+        assert_eq!(raw.headers_in.keep_alive_n, -1);
+        assert!(request_from(&mut raw).headers_in().unwrap().is_empty());
+
+        {
+            let mut request = request_from(&mut raw);
+            request.headers_out_builder(1).unwrap().commit();
+        }
+
+        assert!(request_from(&mut raw).headers_out().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn header_builders_reject_unrepresentable_capacity() {
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        let capacity = isize::MAX as usize / core::mem::size_of::<ngx_table_elt_t>() + 1;
+        let mut request = request_from(&mut raw);
+
+        assert!(matches!(request.headers_in_builder(0), Err(HeaderBuildError::InvalidCapacity)));
+        assert!(matches!(request.headers_out_builder(0), Err(HeaderBuildError::InvalidCapacity)));
+        assert!(matches!(
+            request.headers_in_builder(capacity),
+            Err(HeaderBuildError::InvalidCapacity)
+        ));
+        assert!(matches!(
+            request.headers_out_builder(capacity),
+            Err(HeaderBuildError::InvalidCapacity)
+        ));
     }
 
     #[test]
