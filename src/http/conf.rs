@@ -2,11 +2,12 @@ use ::core::ffi::c_void;
 use ::core::ptr::NonNull;
 
 use crate::ffi::{
-    NGX_HTTP_MODULE, ngx_conf_t, ngx_cycle_t, ngx_http_conf_ctx_t, ngx_http_connection_t,
-    ngx_http_core_srv_conf_t, ngx_http_request_t, ngx_http_upstream_srv_conf_t, ngx_module_t,
-    ngx_uint_t,
+    NGX_CORE_MODULE, NGX_HTTP_MODULE, ngx_conf_t, ngx_cycle_t, ngx_http_conf_ctx_t,
+    ngx_http_connection_t, ngx_http_core_srv_conf_t, ngx_http_request_t,
+    ngx_http_upstream_srv_conf_t, ngx_module_t, ngx_uint_t,
 };
 use crate::http::HttpModule;
+use crate::http::module::ProcessCycle;
 
 /// Failure while resolving a typed HTTP configuration slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -27,6 +28,8 @@ pub enum HttpConfigError {
     UnsetHttpModuleIndex,
     /// The HTTP core module index is outside the configured module array.
     HttpModuleIndexOutOfBounds,
+    /// The global HTTP block module is not an nginx core module.
+    WrongHttpModuleType,
 }
 
 #[derive(Clone, Copy)]
@@ -72,6 +75,49 @@ fn live_module_slot_count() -> usize {
 
 fn live_http_slot_count() -> usize {
     unsafe { nginx_sys::ngx_http_max_module }
+}
+
+unsafe fn cycle_http_context(
+    cycle: &ngx_cycle_t,
+    module_slots: usize,
+) -> Result<Option<&ngx_http_conf_ctx_t>, HttpConfigError> {
+    let http_module = unsafe { &*::core::ptr::addr_of!(nginx_sys::ngx_http_module) };
+    if http_module.type_ != NGX_CORE_MODULE as ngx_uint_t {
+        return Err(HttpConfigError::WrongHttpModuleType);
+    }
+
+    let http_index = usize_index(http_module.index, HttpConfigError::UnsetHttpModuleIndex)?;
+    if http_index >= module_slots {
+        return Err(HttpConfigError::HttpModuleIndexOutOfBounds);
+    }
+
+    let Some(contexts) = checked_pointer(cycle.conf_ctx) else {
+        return Ok(None);
+    };
+    let contexts = unsafe { ::core::slice::from_raw_parts(contexts.as_ptr(), module_slots) };
+    let Some(context) = contexts.get(http_index) else {
+        return Ok(None);
+    };
+    let Some(context) = checked_pointer((*context).cast::<ngx_http_conf_ctx_t>()) else {
+        return Ok(None);
+    };
+    Ok(Some(unsafe { context.as_ref() }))
+}
+
+unsafe fn main_conf_from_cycle<'cycle, T>(
+    cycle: &'cycle ngx_cycle_t,
+    module: &ngx_module_t,
+    http_slot_count: usize,
+) -> Result<Option<&'cycle T>, HttpConfigError> {
+    let indexes = module_indexes(module, live_module_slot_count(), http_slot_count)?;
+    let Some(context) = (unsafe { cycle_http_context(cycle, indexes.module_slots)? }) else {
+        return Ok(None);
+    };
+
+    Ok(unsafe {
+        conf_slot(context.main_conf, indexes.context, indexes.http_slots)
+            .map(|configuration| configuration.as_ref())
+    })
 }
 
 fn live_module_indexes(module: &ngx_module_t) -> Result<ModuleIndexes, HttpConfigError> {
@@ -256,6 +302,17 @@ impl HttpModuleMainConfMutExt for ngx_http_conf_ctx_t {
         module: &ngx_module_t,
     ) -> Result<Option<&mut T>, HttpConfigError> {
         Ok(main_conf_slot(self.main_conf, module)?.map(|mut value| unsafe { value.as_mut() }))
+    }
+}
+
+impl sealed::MainConfSource for ProcessCycle<'_> {}
+
+impl HttpModuleMainConfExt for ProcessCycle<'_> {
+    unsafe fn http_main_conf<T>(
+        &self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&T>, HttpConfigError> {
+        unsafe { main_conf_from_cycle(self.raw(), module, live_http_slot_count()) }
     }
 }
 
@@ -679,31 +736,7 @@ pub unsafe trait HttpModuleMainConf: HttpModule {
         cycle: &ngx_cycle_t,
         http_slot_count: usize,
     ) -> Result<Option<&Self::MainConf>, HttpConfigError> {
-        let indexes = module_indexes(Self::module(), live_module_slot_count(), http_slot_count)?;
-        let http_index = usize_index(
-            unsafe { nginx_sys::ngx_http_module.index },
-            HttpConfigError::UnsetHttpModuleIndex,
-        )?;
-        if http_index >= indexes.module_slots {
-            return Err(HttpConfigError::HttpModuleIndexOutOfBounds);
-        }
-
-        let Some(contexts) = checked_pointer(cycle.conf_ctx) else {
-            return Ok(None);
-        };
-        let contexts =
-            unsafe { ::core::slice::from_raw_parts(contexts.as_ptr(), indexes.module_slots) };
-        let Some(context) = contexts.get(http_index) else {
-            return Ok(None);
-        };
-        let Some(context) = checked_pointer((*context).cast::<ngx_http_conf_ctx_t>()) else {
-            return Ok(None);
-        };
-        let context = unsafe { context.as_ref() };
-        Ok(unsafe {
-            conf_slot(context.main_conf, indexes.context, indexes.http_slots)
-                .map(|configuration| configuration.as_ref())
-        })
+        unsafe { main_conf_from_cycle(cycle, Self::module(), http_slot_count) }
     }
 
     /// Runs a closure with the active cycle's main configuration without creating a `'static`
@@ -987,19 +1020,26 @@ mod tests {
     use ::core::ptr;
     use alloc::boxed::Box;
     #[cfg(feature = "test-link")]
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(feature = "test-link")]
     use std::sync::MutexGuard;
 
     use super::{
         HttpConfigError, HttpModuleLocationConf, HttpModuleMainConf, HttpModuleServerConf,
         module_indexes,
     };
-    use crate::ffi::{NGX_HTTP_MODULE, ngx_http_conf_ctx_t, ngx_module_t, ngx_uint_t};
+    use crate::core::Status;
+    use crate::ffi::{
+        NGX_CORE_MODULE, NGX_HTTP_MODULE, ngx_http_conf_ctx_t, ngx_module_t, ngx_uint_t,
+    };
     #[cfg(feature = "test-link")]
     use crate::ffi::{
         ngx_conf_t, ngx_cycle_t, ngx_http_connection_t, ngx_http_core_srv_conf_t,
-        ngx_http_request_t, ngx_http_upstream_srv_conf_t,
+        ngx_http_request_t, ngx_http_upstream_srv_conf_t, ngx_int_t,
     };
-    use crate::http::{HttpModule, RequestRefMut};
+    use crate::http::{
+        HttpModule, HttpModuleMainConfExt, ProcessCycle, RequestRefMut, exit_process, init_process,
+    };
 
     fn http_module(index: ngx_uint_t, context_index: ngx_uint_t) -> ngx_module_t {
         let mut module = ngx_module_t::default();
@@ -1084,6 +1124,43 @@ mod tests {
         type LocationConf = u32;
     }
 
+    #[cfg(feature = "test-link")]
+    static PROCESS_INIT_TOTAL: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(feature = "test-link")]
+    static PROCESS_EXIT_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(feature = "test-link")]
+    struct ProcessModule;
+
+    #[cfg(feature = "test-link")]
+    unsafe impl HttpModule for ProcessModule {
+        fn module() -> &'static ngx_module_t {
+            test_module()
+        }
+
+        fn init_process(cycle: ProcessCycle<'_>) -> ngx_int_t {
+            match cycle.main_conf::<Self>() {
+                Ok(Some(configuration)) => {
+                    PROCESS_INIT_TOTAL.fetch_add(*configuration as usize, Ordering::Relaxed);
+                    Status::NGX_OK.0
+                }
+                Ok(None) => Status::NGX_OK.0,
+                Err(_) => Status::NGX_ERROR.0,
+            }
+        }
+
+        fn exit_process(cycle: ProcessCycle<'_>) {
+            if let Ok(Some(configuration)) = cycle.main_conf::<Self>() {
+                PROCESS_EXIT_TOTAL.fetch_add(*configuration as usize, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    unsafe impl HttpModuleMainConf for ProcessModule {
+        type MainConf = u32;
+    }
+
     fn wrong_type_module() -> &'static ngx_module_t {
         Box::leak(Box::new(ngx_module_t { index: 0, ctx_index: 0, ..ngx_module_t::default() }))
     }
@@ -1118,6 +1195,7 @@ mod tests {
         cycle: *mut ngx_cycle_t,
         max_module: ngx_uint_t,
         http_max_module: ngx_uint_t,
+        http_module_type: ngx_uint_t,
         http_module_index: ngx_uint_t,
         http_core_module_type: ngx_uint_t,
         http_core_module_index: ngx_uint_t,
@@ -1139,6 +1217,7 @@ mod tests {
                     cycle: nginx_sys::ngx_cycle,
                     max_module: nginx_sys::ngx_max_module,
                     http_max_module: nginx_sys::ngx_http_max_module,
+                    http_module_type: (*::core::ptr::addr_of!(nginx_sys::ngx_http_module)).type_,
                     http_module_index: (*::core::ptr::addr_of!(nginx_sys::ngx_http_module)).index,
                     http_core_module_type: (*::core::ptr::addr_of!(
                         nginx_sys::ngx_http_core_module
@@ -1159,6 +1238,8 @@ mod tests {
                 nginx_sys::ngx_cycle = ptr::null_mut();
                 nginx_sys::ngx_max_module = module_slots;
                 nginx_sys::ngx_http_max_module = http_slots;
+                (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_module)).type_ =
+                    NGX_CORE_MODULE as _;
                 (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_module)).index = 0;
                 (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_core_module)).type_ =
                     NGX_HTTP_MODULE as _;
@@ -1178,6 +1259,12 @@ mod tests {
         fn set_http_module_index(&self, index: ngx_uint_t) {
             unsafe {
                 (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_module)).index = index;
+            }
+        }
+
+        fn set_http_module_type(&self, type_: ngx_uint_t) {
+            unsafe {
+                (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_module)).type_ = type_;
             }
         }
 
@@ -1203,6 +1290,8 @@ mod tests {
                 nginx_sys::ngx_cycle = self.previous.cycle;
                 nginx_sys::ngx_max_module = self.previous.max_module;
                 nginx_sys::ngx_http_max_module = self.previous.http_max_module;
+                (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_module)).type_ =
+                    self.previous.http_module_type;
                 (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_module)).index =
                     self.previous.http_module_index;
                 (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_core_module)).type_ =
@@ -1486,5 +1575,211 @@ mod tests {
 
         globals.set_active_cycle(&raw mut old_cycle);
         assert_eq!(unsafe { TestHttpModule::with_active_main_conf(|value| *value) }, Ok(Some(11)));
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn process_cycle_checks_http_context_and_returns_its_main_configuration() {
+        let globals = HttpGlobals::new(2, 1);
+        let mut cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
+                })
+            },
+            Ok(Ok(None))
+        );
+
+        let mut value = 42_u32;
+        let mut slots: [*mut c_void; 1] = [(&raw mut value).cast()];
+        let mut context = ngx_http_conf_ctx_t {
+            main_conf: slots.as_mut_ptr(),
+            srv_conf: ptr::null_mut(),
+            loc_conf: ptr::null_mut(),
+        };
+        let mut contexts: [*mut *mut *mut c_void; 2] = [(&raw mut context).cast(), ptr::null_mut()];
+        cycle.conf_ctx = contexts.as_mut_ptr();
+
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
+                })
+            },
+            Ok(Ok(Some(42)))
+        );
+
+        let unset_module = http_module(ngx_uint_t::MAX, 0);
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.http_main_conf::<u32>(&unset_module).map(|value| value.is_some())
+                })
+            },
+            Ok(Err(HttpConfigError::UnsetModuleIndex))
+        );
+        let out_of_range_module = http_module(2, 0);
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.http_main_conf::<u32>(&out_of_range_module).map(|value| value.is_some())
+                })
+            },
+            Ok(Err(HttpConfigError::ModuleIndexOutOfBounds))
+        );
+        let unset_context_module = http_module(1, ngx_uint_t::MAX);
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.http_main_conf::<u32>(&unset_context_module).map(|value| value.is_some())
+                })
+            },
+            Ok(Err(HttpConfigError::UnsetContextIndex))
+        );
+        let out_of_range_context_module = http_module(1, 1);
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle
+                        .http_main_conf::<u32>(&out_of_range_context_module)
+                        .map(|value| value.is_some())
+                })
+            },
+            Ok(Err(HttpConfigError::ContextIndexOutOfBounds))
+        );
+
+        globals.set_http_module_type(NGX_HTTP_MODULE as _);
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
+                })
+            },
+            Ok(Err(HttpConfigError::WrongHttpModuleType))
+        );
+        globals.set_http_module_type(NGX_CORE_MODULE as _);
+
+        globals.set_http_module_index(ngx_uint_t::MAX);
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
+                })
+            },
+            Ok(Err(HttpConfigError::UnsetHttpModuleIndex))
+        );
+        globals.set_http_module_index(2);
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
+                })
+            },
+            Ok(Err(HttpConfigError::HttpModuleIndexOutOfBounds))
+        );
+        globals.set_http_module_index(0);
+
+        contexts[0] = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
+                })
+            },
+            Ok(Ok(None))
+        );
+        contexts[0] = ptr::without_provenance_mut(1);
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
+                })
+            },
+            Ok(Ok(None))
+        );
+        contexts[0] = (&raw mut context).cast();
+
+        context.main_conf = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
+                })
+            },
+            Ok(Ok(None))
+        );
+        context.main_conf = slots.as_mut_ptr();
+        slots[0] = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
+                })
+            },
+            Ok(Ok(None))
+        );
+        slots[0] = (&raw mut value).cast();
+
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.main_conf::<WrongTypeModule>().map(|value| value.copied())
+                })
+            },
+            Ok(Err(HttpConfigError::WrongModuleType))
+        );
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn process_callbacks_keep_old_and_new_cycles_separate() {
+        let globals = HttpGlobals::new(2, 1);
+        PROCESS_INIT_TOTAL.store(0, Ordering::Relaxed);
+        PROCESS_EXIT_TOTAL.store(0, Ordering::Relaxed);
+
+        let mut empty_cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+        assert_eq!(
+            unsafe { init_process::<ProcessModule>(&raw mut empty_cycle) },
+            Status::NGX_OK.0
+        );
+        unsafe { exit_process::<ProcessModule>(&raw mut empty_cycle) };
+        assert_eq!(PROCESS_INIT_TOTAL.load(Ordering::Relaxed), 0);
+        assert_eq!(PROCESS_EXIT_TOTAL.load(Ordering::Relaxed), 0);
+
+        let mut old_value = 11_u32;
+        let mut old_slots: [*mut c_void; 1] = [(&raw mut old_value).cast()];
+        let mut old_context = ngx_http_conf_ctx_t {
+            main_conf: old_slots.as_mut_ptr(),
+            srv_conf: ptr::null_mut(),
+            loc_conf: ptr::null_mut(),
+        };
+        let mut old_contexts: [*mut *mut *mut c_void; 2] =
+            [(&raw mut old_context).cast(), ptr::null_mut()];
+        let mut old_cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+        old_cycle.conf_ctx = old_contexts.as_mut_ptr();
+
+        let mut new_value = 42_u32;
+        let mut new_slots: [*mut c_void; 1] = [(&raw mut new_value).cast()];
+        let mut new_context = ngx_http_conf_ctx_t {
+            main_conf: new_slots.as_mut_ptr(),
+            srv_conf: ptr::null_mut(),
+            loc_conf: ptr::null_mut(),
+        };
+        let mut new_contexts: [*mut *mut *mut c_void; 2] =
+            [(&raw mut new_context).cast(), ptr::null_mut()];
+        let mut new_cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+        new_cycle.conf_ctx = new_contexts.as_mut_ptr();
+
+        globals.set_active_cycle(&raw mut new_cycle);
+        assert_eq!(unsafe { init_process::<ProcessModule>(&raw mut old_cycle) }, Status::NGX_OK.0);
+        assert_eq!(unsafe { init_process::<ProcessModule>(&raw mut new_cycle) }, Status::NGX_OK.0);
+        unsafe { exit_process::<ProcessModule>(&raw mut old_cycle) };
+        unsafe { exit_process::<ProcessModule>(&raw mut old_cycle) };
+        unsafe { exit_process::<ProcessModule>(&raw mut new_cycle) };
+
+        assert_eq!(PROCESS_INIT_TOTAL.load(Ordering::Relaxed), 53);
+        assert_eq!(PROCESS_EXIT_TOTAL.load(Ordering::Relaxed), 64);
     }
 }

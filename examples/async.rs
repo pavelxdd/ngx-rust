@@ -9,8 +9,7 @@ use std::time::Instant;
 use ngx::core::Status;
 use ngx::ffi::{
     NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MODULE, NGX_LOG_EMERG,
-    ngx_command_t, ngx_conf_t, ngx_cycle_t, ngx_http_module_t, ngx_int_t, ngx_module_t, ngx_str_t,
-    ngx_uint_t,
+    ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_int_t, ngx_module_t, ngx_str_t, ngx_uint_t,
 };
 use ngx::http::subrequest::{SubRequestBuilder, SubRequestError};
 use ngx::http::{
@@ -29,6 +28,15 @@ unsafe impl http::HttpModule for Module {
     fn postconfigure(cf: &mut ngx_conf_t) -> ngx_int_t {
         http::add_async_phase_handler::<AsyncAccessHandler>(cf)
             .map_or(Status::NGX_ERROR.0, |_| Status::NGX_OK.0)
+    }
+
+    fn init_process(_cycle: http::ProcessCycle<'_>) -> ngx_int_t {
+        if ngx::log::interop::init().is_err() {
+            return Status::NGX_ERROR.0;
+        }
+
+        log::info!("async log facade initialized");
+        Status::NGX_OK.0
     }
 }
 
@@ -76,18 +84,10 @@ pub static mut ngx_http_async_module: ngx_module_t = ngx_module_t {
     ctx: &raw const NGX_HTTP_ASYNC_MODULE_CTX as _,
     commands: unsafe { &raw mut NGX_HTTP_ASYNC_COMMANDS[0] },
     type_: NGX_HTTP_MODULE as _,
-    init_process: Some(ngx_http_async_init_process),
+    init_process: Some(http::init_process::<Module>),
+    exit_process: Some(http::exit_process::<Module>),
     ..ngx_module_t::default()
 };
-
-unsafe extern "C" fn ngx_http_async_init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
-    if ngx::log::interop::init().is_err() {
-        return Status::NGX_ERROR.0;
-    }
-
-    log::info!("async log facade initialized");
-    Status::NGX_OK.0
-}
 
 impl http::Merge for ModuleConfig {
     fn merge(&mut self, prev: &ModuleConfig) -> Result<(), MergeConfigError> {
