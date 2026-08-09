@@ -153,7 +153,7 @@ unsafe extern "C" fn ordered_free_peer(
 ) {
     OBSERVED_FREE_PEER_DATA.store(unsafe { (*peer).data }, Ordering::Relaxed);
     OBSERVED_FREE_CALLBACK_DATA.store(data, Ordering::Relaxed);
-    OBSERVED_FREE_STATE.store(state as usize, Ordering::Relaxed);
+    OBSERVED_FREE_STATE.store(state, Ordering::Relaxed);
     CALLBACK_ORDER.fetch_add(1, Ordering::Relaxed);
 }
 

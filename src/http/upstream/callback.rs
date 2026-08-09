@@ -130,7 +130,7 @@ pub struct UpstreamConfiguration<'callback> {
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
-impl<'callback> UpstreamConfiguration<'callback> {
+impl UpstreamConfiguration<'_> {
     unsafe fn from_raw(configuration: *mut ngx_conf_t) -> Result<Self, UpstreamCallbackError> {
         let raw = NonNull::new(configuration).ok_or(UpstreamCallbackError::NullConfiguration)?;
         if !configuration.is_aligned() {
@@ -226,14 +226,8 @@ impl<'callback> UpstreamServerConf<'callback> {
 }
 
 /// Saved HTTP upstream initializer that can be called through checked callback views.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct UpstreamInitCallback(ngx_http_upstream_init_pt);
-
-impl Default for UpstreamInitCallback {
-    fn default() -> Self {
-        Self(None)
-    }
-}
 
 impl UpstreamInitCallback {
     /// Returns whether nginx provided an original initializer.
@@ -253,14 +247,8 @@ impl UpstreamInitCallback {
 }
 
 /// Saved HTTP request peer initializer that can be called through checked callback views.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct UpstreamPeerInitCallback(ngx_http_upstream_init_peer_pt);
-
-impl Default for UpstreamPeerInitCallback {
-    fn default() -> Self {
-        Self(None)
-    }
-}
 
 impl UpstreamPeerInitCallback {
     /// Returns whether nginx provided an original request peer initializer.
@@ -345,7 +333,7 @@ pub struct UpstreamPeerConnection<'callback> {
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
-impl<'callback> UpstreamPeerConnection<'callback> {
+impl UpstreamPeerConnection<'_> {
     unsafe fn from_raw(peer: *mut ngx_peer_connection_t) -> Result<Self, UpstreamCallbackError> {
         let raw = NonNull::new(peer).ok_or(UpstreamCallbackError::NullPeer)?;
         if !peer.is_aligned() {
@@ -514,7 +502,7 @@ fn upstream_callback_status(
 ) -> ngx_int_t {
     #[cfg(feature = "std")]
     {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)) {
+        match std::panic::catch_unwind(core::panic::AssertUnwindSafe(callback)) {
             Ok(Ok(status)) => status,
             Ok(Err(_)) | Err(_) => Status::NGX_ERROR.0,
         }
@@ -590,7 +578,7 @@ unsafe extern "C" fn raw_free_peer<H>(
 {
     #[cfg(feature = "std")]
     {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
             let result = (|| -> Result<(), UpstreamCallbackError> {
                 let mut peer = unsafe { UpstreamPeerConnection::from_raw(peer) }?;
                 let mut data = peer_data::<H>(&peer, data)?;
