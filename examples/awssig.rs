@@ -5,8 +5,8 @@ use http::HeaderMap;
 use ngx::core::Status;
 use ngx::ffi::{
     NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MODULE,
-    NGX_HTTP_SRV_CONF, NGX_LOG_EMERG, ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_int_t,
-    ngx_module_t, ngx_str_t, ngx_uint_t,
+    NGX_HTTP_SRV_CONF, NGX_LOG_EMERG, ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_module_t,
+    ngx_str_t, ngx_uint_t,
 };
 use ngx::http::*;
 use ngx::{ngx_conf_log_error, ngx_log_debug_http, ngx_string};
@@ -16,14 +16,6 @@ struct Module;
 unsafe impl HttpModule for Module {
     fn module() -> &'static ngx_module_t {
         unsafe { &*::core::ptr::addr_of!(ngx_http_awssigv4_module) }
-    }
-
-    unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
-        // SAFETY: this function is called with non-NULL cf always
-        let cf = unsafe { &mut *cf };
-        ngx::http::add_phase_handler::<AwsSigV4HeaderHandler>(cf)
-            .map_or(Status::NGX_ERROR, |_| Status::NGX_OK)
-            .into()
     }
 }
 
@@ -85,8 +77,8 @@ static mut NGX_HTTP_AWSSIGV4_COMMANDS: [ngx_command_t; 6] = [
 ];
 
 static NGX_HTTP_AWSSIGV4_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
-    preconfiguration: Some(Module::preconfiguration),
-    postconfiguration: Some(Module::postconfiguration),
+    preconfiguration: Some(preconfiguration::<Module>),
+    postconfiguration: Some(phase_handler_postconfiguration::<AwsSigV4HeaderHandler>),
     create_main_conf: None,
     init_main_conf: None,
     create_srv_conf: None,

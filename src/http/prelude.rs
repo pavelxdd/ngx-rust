@@ -13,6 +13,7 @@ pub use crate::http::{
     HttpModuleMainConfMutExt, HttpModuleRequestContext, HttpModuleServerConf,
     HttpModuleServerConfExt, HttpModuleServerConfMutExt, HttpPhase, HttpRequestHandler,
     IntoHandlerStatus, Merge, MergeConfigError, RequestContextError, RequestError, RequestRef,
-    RequestRefMut, add_phase_handler,
+    RequestRefMut, add_phase_handler, phase_handler_postconfiguration, postconfiguration,
+    preconfiguration,
 };
 pub use crate::ngx_log_debug_http;

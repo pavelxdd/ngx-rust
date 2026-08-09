@@ -1119,6 +1119,9 @@ mod tests {
         max_module: ngx_uint_t,
         http_max_module: ngx_uint_t,
         http_module_index: ngx_uint_t,
+        http_core_module_type: ngx_uint_t,
+        http_core_module_index: ngx_uint_t,
+        http_core_module_context_index: ngx_uint_t,
     }
 
     #[cfg(feature = "test-link")]
@@ -1137,6 +1140,18 @@ mod tests {
                     max_module: nginx_sys::ngx_max_module,
                     http_max_module: nginx_sys::ngx_http_max_module,
                     http_module_index: (*::core::ptr::addr_of!(nginx_sys::ngx_http_module)).index,
+                    http_core_module_type: (*::core::ptr::addr_of!(
+                        nginx_sys::ngx_http_core_module
+                    ))
+                    .type_,
+                    http_core_module_index: (*::core::ptr::addr_of!(
+                        nginx_sys::ngx_http_core_module
+                    ))
+                    .index,
+                    http_core_module_context_index: (*::core::ptr::addr_of!(
+                        nginx_sys::ngx_http_core_module
+                    ))
+                    .ctx_index,
                 }
             };
 
@@ -1145,6 +1160,10 @@ mod tests {
                 nginx_sys::ngx_max_module = module_slots;
                 nginx_sys::ngx_http_max_module = http_slots;
                 (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_module)).index = 0;
+                (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_core_module)).type_ =
+                    NGX_HTTP_MODULE as _;
+                (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_core_module)).index = 0;
+                (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_core_module)).ctx_index = 0;
             }
 
             Self { _guard: guard, previous }
@@ -1161,6 +1180,20 @@ mod tests {
                 (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_module)).index = index;
             }
         }
+
+        fn set_http_core_module(
+            &self,
+            type_: ngx_uint_t,
+            index: ngx_uint_t,
+            context_index: ngx_uint_t,
+        ) {
+            unsafe {
+                let module = &raw mut nginx_sys::ngx_http_core_module;
+                (*module).type_ = type_;
+                (*module).index = index;
+                (*module).ctx_index = context_index;
+            }
+        }
     }
 
     #[cfg(feature = "test-link")]
@@ -1172,9 +1205,19 @@ mod tests {
                 nginx_sys::ngx_http_max_module = self.previous.http_max_module;
                 (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_module)).index =
                     self.previous.http_module_index;
+                (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_core_module)).type_ =
+                    self.previous.http_core_module_type;
+                (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_core_module)).index =
+                    self.previous.http_core_module_index;
+                (*::core::ptr::addr_of_mut!(nginx_sys::ngx_http_core_module)).ctx_index =
+                    self.previous.http_core_module_context_index;
             }
         }
     }
+
+    #[cfg(feature = "test-link")]
+    #[path = "phase_tests.rs"]
+    mod phase_tests;
 
     #[cfg(feature = "test-link")]
     #[test]

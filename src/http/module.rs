@@ -86,6 +86,67 @@ unsafe fn checked_mut<'a, T>(pointer: *mut T) -> Option<&'a mut T> {
     Some(unsafe { pointer.as_mut() })
 }
 
+fn configuration_callback_status(
+    cf: *mut ngx_conf_t,
+    callback: impl FnOnce(&mut ngx_conf_t) -> ngx_int_t,
+) -> ngx_int_t {
+    let Some(cf) = (unsafe { checked_mut(cf) }) else {
+        return Status::NGX_ERROR.0;
+    };
+
+    #[cfg(feature = "std")]
+    {
+        catch_unwind(AssertUnwindSafe(|| callback(cf))).unwrap_or(Status::NGX_ERROR.0)
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        callback(cf)
+    }
+}
+
+/// C-compatible adapter for an HTTP module preconfiguration callback.
+///
+/// # Safety
+///
+/// `cf` must point to a live nginx configuration parser state for this callback invocation.
+/// Null and misaligned pointers return `NGX_ERROR`; Rust panics return `NGX_ERROR` instead of
+/// unwinding through nginx.
+pub unsafe extern "C" fn preconfiguration<M>(cf: *mut ngx_conf_t) -> ngx_int_t
+where
+    M: HttpModule,
+{
+    configuration_callback_status(cf, M::preconfigure)
+}
+
+/// C-compatible adapter for an HTTP module postconfiguration callback.
+///
+/// # Safety
+///
+/// `cf` must point to a live nginx configuration parser state for this callback invocation.
+/// Null and misaligned pointers return `NGX_ERROR`; Rust panics return `NGX_ERROR` instead of
+/// unwinding through nginx.
+pub unsafe extern "C" fn postconfiguration<M>(cf: *mut ngx_conf_t) -> ngx_int_t
+where
+    M: HttpModule,
+{
+    configuration_callback_status(cf, M::postconfigure)
+}
+
+/// C-compatible postconfiguration callback that registers one typed HTTP phase handler.
+///
+/// # Safety
+///
+/// `cf` must point to a live nginx configuration parser state for this callback invocation.
+pub unsafe extern "C" fn phase_handler_postconfiguration<H>(cf: *mut ngx_conf_t) -> ngx_int_t
+where
+    H: crate::http::HttpRequestHandler,
+{
+    configuration_callback_status(cf, |cf| {
+        crate::http::add_phase_handler::<H>(cf).map_or(Status::NGX_ERROR.0, |_| Status::NGX_OK.0)
+    })
+}
+
 fn configuration_pool(cf: &ngx_conf_t) -> Option<Pool<'_>> {
     unsafe { Pool::from_raw(cf.pool) }
 }
@@ -205,26 +266,16 @@ pub unsafe trait HttpModule {
 
     /// Runs before nginx parses the HTTP configuration block.
     ///
-    /// # Safety
-    /// `cf` must point to a valid nginx configuration parser state.
-    unsafe extern "C" fn preconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
-        if unsafe { checked_ref(cf) }.is_none() {
-            return Status::NGX_ERROR.into();
-        }
-
-        Status::NGX_OK.into()
+    /// The module descriptor must use [`preconfiguration`] as its FFI callback.
+    fn preconfigure(_cf: &mut ngx_conf_t) -> ngx_int_t {
+        Status::NGX_OK.0
     }
 
     /// Runs after nginx parses the HTTP configuration block.
     ///
-    /// # Safety
-    /// `cf` must point to a valid nginx configuration parser state.
-    unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
-        if unsafe { checked_ref(cf) }.is_none() {
-            return Status::NGX_ERROR.into();
-        }
-
-        Status::NGX_OK.into()
+    /// The module descriptor must use [`postconfiguration`] as its FFI callback.
+    fn postconfigure(_cf: &mut ngx_conf_t) -> ngx_int_t {
+        Status::NGX_OK.0
     }
 
     /// Allocates the module's main configuration in nginx's configuration pool.
@@ -335,9 +386,11 @@ mod tests {
     #[cfg(feature = "test-link")]
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{HttpModule, InitMainConf, Merge, MergeConfigError};
+    use super::{
+        HttpModule, InitMainConf, Merge, MergeConfigError, postconfiguration, preconfiguration,
+    };
     use crate::core::{NGX_CONF_ERROR, Status};
-    use crate::ffi::{ngx_conf_t, ngx_module_t};
+    use crate::ffi::{ngx_conf_t, ngx_int_t, ngx_module_t};
     #[cfg(feature = "test-link")]
     use crate::ffi::{ngx_create_pool, ngx_destroy_pool, ngx_log_t, ngx_pool_t, ngx_uint_t};
     use crate::http::{HttpModuleLocationConf, HttpModuleMainConf, HttpModuleServerConf};
@@ -393,6 +446,18 @@ mod tests {
         }
     }
 
+    struct PanicConfigurationModule;
+
+    unsafe impl HttpModule for PanicConfigurationModule {
+        fn module() -> &'static ngx_module_t {
+            test_module()
+        }
+
+        fn postconfigure(_cf: &mut ngx_conf_t) -> ngx_int_t {
+            panic!("configuration callback panic");
+        }
+    }
+
     unsafe impl HttpModuleMainConf for TestHttpModule {
         type MainConf = MainConf;
     }
@@ -408,26 +473,53 @@ mod tests {
     #[test]
     fn default_configuration_hooks_reject_null_and_misaligned_parser_contexts() {
         assert_eq!(
-            unsafe { TestHttpModule::preconfiguration(ptr::null_mut()) },
+            unsafe { preconfiguration::<TestHttpModule>(ptr::null_mut()) },
             Status::NGX_ERROR.0
         );
         assert_eq!(
-            unsafe { TestHttpModule::postconfiguration(ptr::null_mut()) },
+            unsafe { postconfiguration::<TestHttpModule>(ptr::null_mut()) },
             Status::NGX_ERROR.0
         );
 
         let misaligned = ptr::without_provenance_mut::<ngx_conf_t>(1);
-        assert_eq!(unsafe { TestHttpModule::preconfiguration(misaligned) }, Status::NGX_ERROR.0);
-        assert_eq!(unsafe { TestHttpModule::postconfiguration(misaligned) }, Status::NGX_ERROR.0);
+        assert_eq!(unsafe { preconfiguration::<TestHttpModule>(misaligned) }, Status::NGX_ERROR.0);
+        assert_eq!(unsafe { postconfiguration::<TestHttpModule>(misaligned) }, Status::NGX_ERROR.0);
 
         let mut configuration = unsafe { mem::zeroed::<ngx_conf_t>() };
         assert_eq!(
-            unsafe { TestHttpModule::preconfiguration(&raw mut configuration) },
+            unsafe { preconfiguration::<TestHttpModule>(&raw mut configuration) },
             Status::NGX_OK.0
         );
         assert_eq!(
-            unsafe { TestHttpModule::postconfiguration(&raw mut configuration) },
+            unsafe { postconfiguration::<TestHttpModule>(&raw mut configuration) },
             Status::NGX_OK.0
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn configuration_callbacks_reject_invalid_contexts_and_catch_panics() {
+        assert_eq!(
+            unsafe { preconfiguration::<TestHttpModule>(ptr::null_mut()) },
+            Status::NGX_ERROR.0
+        );
+        assert_eq!(
+            unsafe { postconfiguration::<TestHttpModule>(ptr::null_mut()) },
+            Status::NGX_ERROR.0
+        );
+
+        let misaligned = ptr::without_provenance_mut::<ngx_conf_t>(1);
+        assert_eq!(unsafe { preconfiguration::<TestHttpModule>(misaligned) }, Status::NGX_ERROR.0);
+        assert_eq!(unsafe { postconfiguration::<TestHttpModule>(misaligned) }, Status::NGX_ERROR.0);
+
+        let mut configuration = unsafe { mem::zeroed::<ngx_conf_t>() };
+        assert_eq!(
+            unsafe { preconfiguration::<TestHttpModule>(&raw mut configuration) },
+            Status::NGX_OK.0
+        );
+        assert_eq!(
+            unsafe { postconfiguration::<PanicConfigurationModule>(&raw mut configuration) },
+            Status::NGX_ERROR.0
         );
     }
 
