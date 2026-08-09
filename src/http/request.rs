@@ -1,7 +1,9 @@
+use core::convert::Infallible;
 use core::error;
 use core::ffi::c_void;
 use core::fmt;
 use core::marker::PhantomData;
+use core::pin::Pin;
 use core::ptr::{self, NonNull};
 use core::slice;
 use core::str::FromStr;
@@ -263,6 +265,61 @@ impl From<HttpConfigError> for RequestContextError {
 impl From<RequestError> for RequestContextError {
     fn from(error: RequestError) -> Self {
         Self::Request(error)
+    }
+}
+
+/// Failure returned while constructing a request module context.
+#[derive(Debug, Eq, PartialEq)]
+pub enum RequestContextCreateError<E> {
+    /// Request or module context state prevented construction.
+    Context(RequestContextError),
+    /// The caller's context constructor rejected construction.
+    Construction(E),
+}
+
+impl<E> From<RequestContextError> for RequestContextCreateError<E> {
+    fn from(error: RequestContextError) -> Self {
+        Self::Context(error)
+    }
+}
+
+impl<E> From<RequestError> for RequestContextCreateError<E> {
+    fn from(error: RequestError) -> Self {
+        Self::Context(error.into())
+    }
+}
+
+impl<E> From<PoolCleanupError<E>> for RequestContextCreateError<E> {
+    fn from(error: PoolCleanupError<E>) -> Self {
+        match error {
+            PoolCleanupError::Allocation => Self::Context(RequestContextError::Allocation),
+            PoolCleanupError::Construction(error) => Self::Construction(error),
+        }
+    }
+}
+
+#[repr(C)]
+struct RequestContextOwner<T> {
+    context: T,
+    slot: NonNull<*mut c_void>,
+    cleanup: fn(Pin<&mut T>),
+}
+
+impl<T> RequestContextOwner<T> {
+    fn context_ptr(owner: NonNull<Self>) -> NonNull<T> {
+        unsafe { NonNull::from(&mut (*owner.as_ptr()).context) }
+    }
+}
+
+impl<T> Drop for RequestContextOwner<T> {
+    fn drop(&mut self) {
+        let context = ptr::addr_of_mut!(self.context).cast::<c_void>();
+        unsafe {
+            if ptr::eq(*self.slot.as_ptr(), context) {
+                *self.slot.as_ptr() = ptr::null_mut();
+            }
+            (self.cleanup)(Pin::new_unchecked(&mut self.context));
+        }
     }
 }
 
@@ -758,38 +815,137 @@ impl RequestRefMut<'_> {
             .map(|context| unsafe { context.as_ref() }))
     }
 
-    /// Exclusive context associated with module `M` for this request.
+    /// Exclusive access to an explicitly movable context associated with module `M`.
     pub fn module_context_mut<M>(
         &mut self,
     ) -> Result<Option<&mut M::RequestContext>, RequestContextError>
     where
         M: HttpModuleRequestContext,
+        M::RequestContext: Unpin,
     {
         let slot = self.view().module_context_slot(M::module())?;
         Ok(RequestRef::context_from_slot::<M::RequestContext>(slot)?
             .map(|mut context| unsafe { context.as_mut() }))
     }
 
-    /// Returns the module context, inserting a pool-owned value when absent.
+    /// Returns pinned exclusive access to a context associated with module `M`.
+    pub fn pinned_module_context_mut<M>(
+        &mut self,
+    ) -> Result<Option<Pin<&mut M::RequestContext>>, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+    {
+        let slot = self.view().module_context_slot(M::module())?;
+        Ok(RequestRef::context_from_slot::<M::RequestContext>(slot)?
+            .map(|mut context| unsafe { Pin::new_unchecked(context.as_mut()) }))
+    }
+
+    /// Returns an explicitly movable module context, inserting a pool-owned value when absent.
     pub fn get_or_insert_module_context_with<M>(
         &mut self,
         constructor: impl FnOnce() -> M::RequestContext,
     ) -> Result<&mut M::RequestContext, RequestContextError>
     where
         M: HttpModuleRequestContext,
+        M::RequestContext: Unpin,
+    {
+        self.get_or_insert_pinned_module_context_with::<M>(constructor).map(Pin::into_inner)
+    }
+
+    /// Returns a pinned module context, inserting a pool-owned value when absent.
+    ///
+    /// The request context slot is published only after the context and its pool cleanup are
+    /// initialized. Pool cleanup clears the slot, calls [`HttpModuleRequestContext::cleanup`],
+    /// and then drops the value.
+    ///
+    /// ```compile_fail
+    /// use core::marker::PhantomPinned;
+    /// use core::pin::Pin;
+    /// use ngx::ffi::ngx_module_t;
+    /// use ngx::http::{HttpModule, HttpModuleRequestContext, RequestRefMut};
+    ///
+    /// struct Module;
+    /// unsafe impl HttpModule for Module {
+    ///     fn module() -> &'static ngx_module_t {
+    ///         unreachable!()
+    ///     }
+    /// }
+    /// struct Context(PhantomPinned);
+    /// unsafe impl HttpModuleRequestContext for Module {
+    ///     type RequestContext = Context;
+    /// }
+    /// fn cannot_move(request: &mut RequestRefMut<'_>) {
+    ///     let context = request
+    ///         .get_or_insert_pinned_module_context_with::<Module>(|| Context(PhantomPinned))
+    ///         .unwrap();
+    ///     let _ = Pin::into_inner(context);
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use ngx::ffi::ngx_module_t;
+    /// use ngx::http::{HttpModule, HttpModuleRequestContext, RequestRef, RequestRefMut};
+    ///
+    /// struct Module;
+    /// unsafe impl HttpModule for Module {
+    ///     fn module() -> &'static ngx_module_t {
+    ///         unreachable!()
+    ///     }
+    /// }
+    /// struct Context<'request> {
+    ///     request: RequestRef<'request>,
+    /// }
+    /// unsafe impl HttpModuleRequestContext for Module {
+    ///     type RequestContext = Context<'static>;
+    /// }
+    /// fn cannot_retain_request<'request>(request: &mut RequestRefMut<'request>) {
+    ///     let _ = request.get_or_insert_pinned_module_context_with::<Module>(|| Context {
+    ///         request: request.view(),
+    ///     });
+    /// }
+    /// ```
+    pub fn get_or_insert_pinned_module_context_with<M>(
+        &mut self,
+        constructor: impl FnOnce() -> M::RequestContext,
+    ) -> Result<Pin<&mut M::RequestContext>, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+    {
+        match self
+            .try_get_or_insert_pinned_module_context_with::<M, Infallible>(|| Ok(constructor()))
+        {
+            Ok(context) => Ok(context),
+            Err(RequestContextCreateError::Context(error)) => Err(error),
+            Err(RequestContextCreateError::Construction(error)) => match error {},
+        }
+    }
+
+    /// Returns a pinned module context, using a fallible constructor when it is absent.
+    pub fn try_get_or_insert_pinned_module_context_with<M, E>(
+        &mut self,
+        constructor: impl FnOnce() -> Result<M::RequestContext, E>,
+    ) -> Result<Pin<&mut M::RequestContext>, RequestContextCreateError<E>>
+    where
+        M: HttpModuleRequestContext,
     {
         let slot = self.view().module_context_slot(M::module())?;
         if let Some(mut context) = RequestRef::context_from_slot::<M::RequestContext>(slot)? {
-            return Ok(unsafe { context.as_mut() });
+            return Ok(unsafe { Pin::new_unchecked(context.as_mut()) });
         }
 
-        let mut context = self
+        let owner = self
             .pool()?
-            .allocate_with_cleanup(constructor)
-            .map_err(|_| RequestContextError::Allocation)?
+            .try_allocate_with_cleanup(|| {
+                constructor().map(|context| RequestContextOwner {
+                    context,
+                    slot,
+                    cleanup: M::cleanup,
+                })
+            })?
             .into_non_null();
+        let mut context = RequestContextOwner::context_ptr(owner);
         unsafe { *slot.as_ptr() = context.as_ptr().cast() };
-        Ok(unsafe { context.as_mut() })
+        Ok(unsafe { Pin::new_unchecked(context.as_mut()) })
     }
 
     /// Drops and removes the module context when present.
@@ -807,7 +963,8 @@ impl RequestRefMut<'_> {
         };
 
         unsafe { *slot.as_ptr() = ptr::null_mut() };
-        if unsafe { pool.remove_cleanup(context) } {
+        if unsafe { pool.remove_cleanup(context.cast::<RequestContextOwner<M::RequestContext>>()) }
+        {
             Ok(true)
         } else {
             unsafe { *slot.as_ptr() = context.as_ptr().cast() };
@@ -1447,12 +1604,35 @@ mod tests {
     extern crate alloc;
 
     use alloc::{boxed::Box, vec::Vec};
+    #[cfg(feature = "test-link")]
+    use core::marker::PhantomPinned;
     use core::mem::MaybeUninit;
+    #[cfg(feature = "test-link")]
+    use core::pin::Pin;
+    #[cfg(feature = "test-link")]
+    use core::ptr;
+    #[cfg(feature = "test-link")]
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     #[cfg(feature = "test-link")]
     use std::sync::MutexGuard;
 
     use super::*;
+    #[cfg(feature = "test-link")]
+    use crate::event::{PostedEvent, PostedEventCallback, PostedQueue, Timer, TimerCallback};
     use crate::http::{HttpModule, HttpModuleRequestContext};
+
+    #[cfg(feature = "test-link")]
+    use crate::ffi::{
+        ngx_create_pool, ngx_current_msec, ngx_cycle_t, ngx_destroy_pool, ngx_event_expire_timers,
+        ngx_event_move_posted_next, ngx_event_process_posted, ngx_event_timer_init, ngx_log_t,
+        ngx_pool_t, ngx_posted_events, ngx_posted_next_events, ngx_queue_init, ngx_uint_t,
+    };
+
+    #[cfg(feature = "test-link")]
+    unsafe extern "C" {
+        fn ngx_rs_test_fail_allocations_after(successes: ngx_uint_t);
+        fn ngx_rs_test_reset_allocation_failures();
+    }
 
     struct TestContextModule;
 
@@ -1471,6 +1651,117 @@ mod tests {
         type RequestContext = u32;
     }
 
+    #[cfg(feature = "test-link")]
+    static PINNED_CONTEXT_CONSTRUCTIONS: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(feature = "test-link")]
+    static PINNED_CONTEXT_CLEANUPS: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(feature = "test-link")]
+    static PINNED_CONTEXT_DROPS: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(feature = "test-link")]
+    static PINNED_CONTEXT_DROP_SAW_INVALIDATED_SLOT: AtomicBool = AtomicBool::new(false);
+    #[cfg(feature = "test-link")]
+    static EVENT_CONTEXT_DROPS: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(feature = "test-link")]
+    static TIMER_CONTEXT_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(feature = "test-link")]
+    static POSTED_CONTEXT_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(feature = "test-link")]
+    struct PinnedContext {
+        value: u32,
+        slot: *mut *mut c_void,
+        _pin: PhantomPinned,
+    }
+
+    #[cfg(feature = "test-link")]
+    impl Drop for PinnedContext {
+        fn drop(&mut self) {
+            PINNED_CONTEXT_DROP_SAW_INVALIDATED_SLOT
+                .store(unsafe { (*self.slot).is_null() }, Ordering::Relaxed);
+            PINNED_CONTEXT_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    struct PinnedContextModule;
+
+    #[cfg(feature = "test-link")]
+    unsafe impl HttpModule for PinnedContextModule {
+        fn module() -> &'static ngx_module_t {
+            Box::leak(Box::new(ngx_module_t {
+                type_: NGX_HTTP_MODULE as _,
+                index: 0,
+                ctx_index: 0,
+                ..ngx_module_t::default()
+            }))
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    unsafe impl HttpModuleRequestContext for PinnedContextModule {
+        type RequestContext = PinnedContext;
+
+        fn cleanup(context: Pin<&mut Self::RequestContext>) {
+            assert!(unsafe { (*context.as_ref().get_ref().slot).is_null() });
+            PINNED_CONTEXT_CLEANUPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    type TimerContextCallback = for<'callback> fn(TimerCallback<'callback, ()>);
+
+    #[cfg(feature = "test-link")]
+    fn timer_context_callback(_timer: TimerCallback<'_, ()>) {
+        TIMER_CONTEXT_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-link")]
+    type PostedContextCallback = for<'callback> fn(PostedEventCallback<'callback, ()>);
+
+    #[cfg(feature = "test-link")]
+    fn posted_context_callback(_event: PostedEventCallback<'_, ()>) {
+        POSTED_CONTEXT_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-link")]
+    struct EventContext {
+        timer: Timer<(), TimerContextCallback>,
+        posted: PostedEvent<(), PostedContextCallback>,
+    }
+
+    #[cfg(feature = "test-link")]
+    impl Drop for EventContext {
+        fn drop(&mut self) {
+            EVENT_CONTEXT_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    struct EventContextModule;
+
+    #[cfg(feature = "test-link")]
+    unsafe impl HttpModule for EventContextModule {
+        fn module() -> &'static ngx_module_t {
+            Box::leak(Box::new(ngx_module_t {
+                type_: NGX_HTTP_MODULE as _,
+                index: 0,
+                ctx_index: 0,
+                ..ngx_module_t::default()
+            }))
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    unsafe impl HttpModuleRequestContext for EventContextModule {
+        type RequestContext = EventContext;
+    }
+
+    #[cfg(feature = "test-link")]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ConstructorError {
+        Rejected,
+    }
+
     fn zeroed_request() -> ngx_http_request_t {
         unsafe { MaybeUninit::zeroed().assume_init() }
     }
@@ -1485,6 +1776,32 @@ mod tests {
     fn request_from(raw: &mut ngx_http_request_t) -> RequestRefMut<'_> {
         initialize_request(raw);
         unsafe { RequestRefMut::from_raw(raw).unwrap() }
+    }
+
+    #[cfg(feature = "test-link")]
+    fn pinned_context(slot: *mut *mut c_void) -> PinnedContext {
+        PinnedContext { value: 41, slot, _pin: PhantomPinned }
+    }
+
+    #[cfg(feature = "test-link")]
+    fn reset_pinned_context_state() {
+        PINNED_CONTEXT_CONSTRUCTIONS.store(0, Ordering::Relaxed);
+        PINNED_CONTEXT_CLEANUPS.store(0, Ordering::Relaxed);
+        PINNED_CONTEXT_DROPS.store(0, Ordering::Relaxed);
+        PINNED_CONTEXT_DROP_SAW_INVALIDATED_SLOT.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "test-link")]
+    fn reset_event_context_state() {
+        EVENT_CONTEXT_DROPS.store(0, Ordering::Relaxed);
+        TIMER_CONTEXT_CALLBACKS.store(0, Ordering::Relaxed);
+        POSTED_CONTEXT_CALLBACKS.store(0, Ordering::Relaxed);
+        unsafe {
+            assert_eq!(ngx_event_timer_init(ptr::null_mut()), 0);
+            ngx_current_msec = 0;
+            ngx_queue_init(&raw mut ngx_posted_events);
+            ngx_queue_init(&raw mut ngx_posted_next_events);
+        }
     }
 
     http_request_handler!(callback_status_handler, |_: &mut RequestRefMut<'_>| {
@@ -1531,6 +1848,33 @@ mod tests {
                 nginx_sys::ngx_max_module = self.max_module;
                 nginx_sys::ngx_http_max_module = self.http_max_module;
             }
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    struct TestPool {
+        raw: *mut ngx_pool_t,
+        _log: Box<ngx_log_t>,
+    }
+
+    #[cfg(feature = "test-link")]
+    impl TestPool {
+        fn new() -> Self {
+            let mut log = Box::new(unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() });
+            let raw = unsafe { ngx_create_pool(4096, &raw mut *log) };
+            assert!(!raw.is_null());
+            Self { raw, _log: log }
+        }
+
+        fn log(&mut self) -> NonNull<ngx_log_t> {
+            NonNull::from(&mut *self._log)
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    impl Drop for TestPool {
+        fn drop(&mut self) {
+            unsafe { ngx_destroy_pool(self.raw) };
         }
     }
 
@@ -1935,6 +2279,12 @@ mod tests {
             request_from(&mut raw).module_context::<TestContextModule>(),
             Err(RequestContextError::Configuration(HttpConfigError::ModuleIndexOutOfBounds))
         );
+        assert!(matches!(
+            request_from(&mut raw).get_or_insert_pinned_module_context_with::<PinnedContextModule>(
+                || { pinned_context(ptr::null_mut()) }
+            ),
+            Err(RequestContextError::Configuration(HttpConfigError::ModuleIndexOutOfBounds))
+        ));
     }
 
     #[cfg(feature = "test-link")]
@@ -1961,6 +2311,284 @@ mod tests {
         *request_from(&mut raw).module_context_mut::<TestContextModule>().unwrap().unwrap() = 42;
 
         assert_eq!(context, 42);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn pinned_request_context_reuses_its_stable_pool_address_and_invalidates_before_drop() {
+        let _globals = RequestGlobals::new(1, 1);
+        reset_pinned_context_state();
+        let owner = TestPool::new();
+        let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        raw.ctx = slots.as_mut_ptr();
+
+        let address = {
+            let mut request = request_from(&mut raw);
+            assert!(request.pinned_module_context_mut::<PinnedContextModule>().unwrap().is_none());
+
+            let address = {
+                let mut context = request
+                    .get_or_insert_pinned_module_context_with::<PinnedContextModule>(|| {
+                        PINNED_CONTEXT_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+                        pinned_context(slots.as_mut_ptr())
+                    })
+                    .unwrap();
+                let address = NonNull::from(context.as_ref().get_ref()).as_ptr();
+                unsafe { context.as_mut().get_unchecked_mut().value = 99 };
+                address
+            };
+
+            let context =
+                request.pinned_module_context_mut::<PinnedContextModule>().unwrap().unwrap();
+            assert_eq!(NonNull::from(context.as_ref().get_ref()).as_ptr(), address);
+            assert_eq!(context.as_ref().get_ref().value, 99);
+
+            let reused = request
+                .get_or_insert_pinned_module_context_with::<PinnedContextModule>(|| {
+                    panic!("existing context must be reused")
+                })
+                .unwrap();
+            assert_eq!(NonNull::from(reused.as_ref().get_ref()).as_ptr(), address);
+            assert_eq!(reused.as_ref().get_ref().value, 99);
+            address
+        };
+
+        assert_eq!(slots[0], address.cast());
+        assert_eq!(PINNED_CONTEXT_CONSTRUCTIONS.load(Ordering::Relaxed), 1);
+        drop(owner);
+        assert!(slots[0].is_null());
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
+        assert!(PINNED_CONTEXT_DROP_SAW_INVALIDATED_SLOT.load(Ordering::Relaxed));
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn failed_request_context_constructor_leaves_the_slot_unpublished_and_retries() {
+        let _globals = RequestGlobals::new(1, 1);
+        reset_pinned_context_state();
+        let owner = TestPool::new();
+        let cleanup = unsafe { (*owner.raw).cleanup };
+        let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        raw.ctx = slots.as_mut_ptr();
+
+        {
+            let mut request = request_from(&mut raw);
+            assert!(matches!(
+                request.try_get_or_insert_pinned_module_context_with::<PinnedContextModule, _>(
+                    || { Err::<PinnedContext, _>(ConstructorError::Rejected) }
+                ),
+                Err(RequestContextCreateError::Construction(ConstructorError::Rejected))
+            ));
+        }
+        assert!(slots[0].is_null());
+        assert_eq!(unsafe { (*owner.raw).cleanup }, cleanup);
+
+        {
+            let mut request = request_from(&mut raw);
+            let context = request
+                .try_get_or_insert_pinned_module_context_with::<PinnedContextModule, _>(|| {
+                    PINNED_CONTEXT_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+                    Ok::<PinnedContext, ConstructorError>(pinned_context(slots.as_mut_ptr()))
+                })
+                .unwrap();
+            assert_eq!(context.as_ref().get_ref().value, 41);
+        }
+        assert!(!slots[0].is_null());
+        assert_eq!(PINNED_CONTEXT_CONSTRUCTIONS.load(Ordering::Relaxed), 1);
+
+        drop(owner);
+        assert!(slots[0].is_null());
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn failed_request_context_cleanup_registration_keeps_the_slot_empty_and_retries() {
+        let _globals = RequestGlobals::new(1, 1);
+        reset_pinned_context_state();
+        let owner = TestPool::new();
+        let cleanup = unsafe { (*owner.raw).cleanup };
+        unsafe { (*owner.raw).max = 0 };
+        let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        raw.ctx = slots.as_mut_ptr();
+
+        for successes in 0..=1 {
+            unsafe { ngx_rs_test_fail_allocations_after(successes) };
+            let result = {
+                let mut request = request_from(&mut raw);
+                request
+                    .get_or_insert_pinned_module_context_with::<PinnedContextModule>(|| {
+                        PINNED_CONTEXT_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+                        pinned_context(slots.as_mut_ptr())
+                    })
+                    .map(|_| ())
+            };
+            unsafe { ngx_rs_test_reset_allocation_failures() };
+
+            assert_eq!(result, Err(RequestContextError::Allocation));
+            assert!(slots[0].is_null());
+            assert_eq!(unsafe { (*owner.raw).cleanup }, cleanup);
+        }
+        assert_eq!(PINNED_CONTEXT_CONSTRUCTIONS.load(Ordering::Relaxed), 0);
+
+        {
+            let mut request = request_from(&mut raw);
+            request
+                .get_or_insert_pinned_module_context_with::<PinnedContextModule>(|| {
+                    PINNED_CONTEXT_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+                    pinned_context(slots.as_mut_ptr())
+                })
+                .unwrap();
+        }
+        assert!(!slots[0].is_null());
+        assert_eq!(PINNED_CONTEXT_CONSTRUCTIONS.load(Ordering::Relaxed), 1);
+
+        drop(owner);
+        assert!(slots[0].is_null());
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn request_pool_cleanup_cancels_pinned_timer_and_posted_event_before_drop() {
+        let _globals = RequestGlobals::new(1, 1);
+        reset_event_context_state();
+        let mut owner = TestPool::new();
+        let log = owner.log();
+        let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        raw.ctx = slots.as_mut_ptr();
+
+        {
+            let mut request = request_from(&mut raw);
+            let mut context = request
+                .get_or_insert_pinned_module_context_with::<EventContextModule>(|| EventContext {
+                    timer: Timer::new(log, (), timer_context_callback as TimerContextCallback),
+                    posted: PostedEvent::new(
+                        log,
+                        (),
+                        posted_context_callback as PostedContextCallback,
+                    ),
+                })
+                .unwrap();
+            let mut timer =
+                unsafe { context.as_mut().map_unchecked_mut(|context| &mut context.timer) };
+            timer.as_mut().arm(5).unwrap();
+            let mut posted =
+                unsafe { context.as_mut().map_unchecked_mut(|context| &mut context.posted) };
+            assert_eq!(posted.as_mut().post(PostedQueue::Next), Ok(true));
+        }
+
+        drop(owner);
+        assert!(slots[0].is_null());
+        assert_eq!(EVENT_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
+
+        let mut cycle = unsafe { MaybeUninit::<ngx_cycle_t>::zeroed().assume_init() };
+        unsafe {
+            ngx_current_msec = 5;
+            ngx_event_expire_timers();
+            ngx_event_move_posted_next(&raw mut cycle);
+            ngx_event_process_posted(&raw mut cycle, &raw mut ngx_posted_events);
+        }
+        assert_eq!(TIMER_CONTEXT_CALLBACKS.load(Ordering::Relaxed), 0);
+        assert_eq!(POSTED_CONTEXT_CALLBACKS.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn removing_a_pinned_request_context_cleans_up_exactly_once() {
+        let _globals = RequestGlobals::new(1, 1);
+        reset_pinned_context_state();
+        let owner = TestPool::new();
+        let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        raw.ctx = slots.as_mut_ptr();
+
+        {
+            let mut request = request_from(&mut raw);
+            request
+                .get_or_insert_pinned_module_context_with::<PinnedContextModule>(|| {
+                    pinned_context(slots.as_mut_ptr())
+                })
+                .unwrap();
+            assert_eq!(request.remove_module_context::<PinnedContextModule>(), Ok(true));
+            assert!(slots[0].is_null());
+            assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
+            assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
+            assert!(PINNED_CONTEXT_DROP_SAW_INVALIDATED_SLOT.load(Ordering::Relaxed));
+            assert_eq!(request.remove_module_context::<PinnedContextModule>(), Ok(false));
+        }
+
+        drop(owner);
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn failed_request_context_cleanup_unlink_restores_its_slot() {
+        let _globals = RequestGlobals::new(1, 1);
+        reset_pinned_context_state();
+        let owner = TestPool::new();
+        let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        raw.ctx = slots.as_mut_ptr();
+
+        {
+            let mut request = request_from(&mut raw);
+            request
+                .get_or_insert_pinned_module_context_with::<PinnedContextModule>(|| {
+                    pinned_context(slots.as_mut_ptr())
+                })
+                .unwrap();
+        }
+
+        let context = slots[0];
+        let cleanup = unsafe { (*owner.raw).cleanup };
+        assert!(!cleanup.is_null());
+        unsafe {
+            (*owner.raw).cleanup = (*cleanup).next;
+            (*cleanup).next = ptr::null_mut();
+        }
+
+        {
+            let mut request = request_from(&mut raw);
+            assert_eq!(
+                request.remove_module_context::<PinnedContextModule>(),
+                Err(RequestContextError::MissingCleanup)
+            );
+        }
+        assert_eq!(slots[0], context);
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 0);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 0);
+
+        unsafe {
+            (*cleanup).next = (*owner.raw).cleanup;
+            (*owner.raw).cleanup = cleanup;
+        }
+        {
+            let mut request = request_from(&mut raw);
+            assert_eq!(request.remove_module_context::<PinnedContextModule>(), Ok(true));
+        }
+        assert!(slots[0].is_null());
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
+
+        drop(owner);
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
     }
 
     #[test]
