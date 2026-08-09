@@ -9,14 +9,6 @@ unsafe impl HttpModule for Module {
     fn module() -> &'static ngx_module_t {
         unsafe { &*::core::ptr::addr_of!(ngx_http_curl_module) }
     }
-
-    unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
-        // SAFETY: this function is called with non-NULL cf always
-        let cf = unsafe { &mut *cf };
-        add_phase_handler::<CurlRequestHandler>(cf)
-            .map_or(Status::NGX_ERROR, |_| Status::NGX_OK)
-            .into()
-    }
 }
 
 #[derive(Debug, Default)]
@@ -41,8 +33,8 @@ static mut NGX_HTTP_CURL_COMMANDS: [ngx_command_t; 2] = [
 ];
 
 static NGX_HTTP_CURL_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
-    preconfiguration: Some(Module::preconfiguration),
-    postconfiguration: Some(Module::postconfiguration),
+    preconfiguration: Some(preconfiguration::<Module>),
+    postconfiguration: Some(phase_handler_postconfiguration::<CurlRequestHandler>),
     create_main_conf: None,
     init_main_conf: None,
     create_srv_conf: None,

@@ -4,7 +4,7 @@ use core::ptr::{self, NonNull};
 
 use nginx_sys::{
     NGX_CONF_TAKE1, NGX_ERROR, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MODULE,
-    NGX_HTTP_SPECIAL_RESPONSE, NGX_LOG_ERR, NGX_OK, ngx_chain_t, ngx_command_t, ngx_conf_t,
+    NGX_HTTP_SPECIAL_RESPONSE, NGX_LOG_ERR, NGX_OK, ngx_chain_t, ngx_command_t,
     ngx_http_complex_value_t, ngx_http_module_t, ngx_http_send_response, ngx_int_t, ngx_module_t,
     ngx_str_t, ngx_uint_t,
 };
@@ -13,7 +13,7 @@ use ngx::http::subrequest::{SubRequestBuilder, SubRequestError};
 use ngx::http::{
     HTTPStatus, HttpModule, HttpModuleLocationConf, HttpModuleRequestContext, HttpPhase,
     HttpRequestHandler, IntoHandlerStatus, Merge, MergeConfigError, RequestRef, RequestRefMut,
-    add_phase_handler,
+    phase_handler_postconfiguration,
 };
 use ngx::{ngx_log_error, ngx_string};
 
@@ -22,13 +22,6 @@ struct Module;
 unsafe impl HttpModule for Module {
     fn module() -> &'static ngx_module_t {
         unsafe { &*ptr::addr_of!(ngx_http_subrequest_module) }
-    }
-
-    unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
-        let cf = unsafe { &mut *cf };
-        add_phase_handler::<SubRequestAccessHandler>(cf)
-            .map_or(Status::NGX_ERROR, |_| Status::NGX_OK)
-            .into()
     }
 }
 
@@ -248,7 +241,7 @@ fn copy_buffered_body(
 
 static MODULE_CONTEXT: ngx_http_module_t = ngx_http_module_t {
     preconfiguration: None,
-    postconfiguration: Some(Module::postconfiguration),
+    postconfiguration: Some(phase_handler_postconfiguration::<SubRequestAccessHandler>),
     create_main_conf: None,
     init_main_conf: None,
     create_srv_conf: None,

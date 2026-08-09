@@ -19,7 +19,9 @@ use ngx::ffi::{
     ngx_http_upstream_srv_conf_t, ngx_http_upstream_t, ngx_int_t, ngx_module_t,
     ngx_peer_connection_t, ngx_str_t, ngx_uint_t,
 };
-use ngx::http::{HttpModule, Merge, MergeConfigError, RequestRefMut};
+use ngx::http::{
+    HttpModule, Merge, MergeConfigError, RequestRefMut, postconfiguration, preconfiguration,
+};
 use ngx::http::{HttpModuleServerConf, NgxHttpUpstreamModule};
 use ngx::{
     http_upstream_init_peer_pt, ngx_conf_log_error, ngx_log_debug_http, ngx_log_debug_mask,
@@ -72,8 +74,8 @@ impl Default for UpstreamPeerData {
 }
 
 static NGX_HTTP_UPSTREAM_CUSTOM_CTX: ngx_http_module_t = ngx_http_module_t {
-    preconfiguration: Some(Module::preconfiguration),
-    postconfiguration: Some(Module::postconfiguration),
+    preconfiguration: Some(preconfiguration::<Module>),
+    postconfiguration: Some(postconfiguration::<Module>),
     create_main_conf: None,
     init_main_conf: None,
     create_srv_conf: Some(Module::create_srv_conf),
