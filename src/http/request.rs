@@ -19,7 +19,8 @@ use crate::ffi::*;
 use crate::http::status::*;
 use crate::http::{
     HttpConfigError, HttpFilter, HttpFilterError, HttpFilterSlot, HttpModuleLocationConf,
-    HttpModuleRequestContext, HttpPhase, NgxHttpCoreModule, conf,
+    HttpModuleRequestContext, HttpPhase, NgxHttpCoreModule, UpstreamStateError, UpstreamStates,
+    conf,
 };
 
 /// Define a static request handler.
@@ -1759,6 +1760,11 @@ impl RequestRef<'_> {
         RequestBodyRef::from_raw(unsafe { self.raw.as_ref().request_body })
     }
 
+    /// Returns checked upstream connection attempts recorded for this request.
+    pub fn upstream_states(&self) -> Result<Option<UpstreamStates<'_>>, UpstreamStateError> {
+        unsafe { UpstreamStates::from_raw(self.raw.as_ref().upstream_states) }
+    }
+
     /// Returns a checked byte-oriented view over output headers.
     pub fn headers_out(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
         checked_header_list(unsafe { &self.raw.as_ref().headers_out.headers })
@@ -2198,6 +2204,11 @@ impl<'callback> RequestRefMut<'callback> {
     /// Returns a checked callback-scoped view over the current request body, when nginx has one.
     pub fn request_body(&self) -> Result<Option<RequestBodyRef<'_>>, RequestBodyError> {
         RequestBodyRef::from_raw(unsafe { self.raw.as_ref().request_body })
+    }
+
+    /// Returns checked upstream connection attempts recorded for this request.
+    pub fn upstream_states(&self) -> Result<Option<UpstreamStates<'_>>, UpstreamStateError> {
+        unsafe { UpstreamStates::from_raw(self.raw.as_ref().upstream_states) }
     }
 
     /// Creates a request-pool owner for the configured HTTP temporary-file path.
@@ -3660,6 +3671,43 @@ mod tests {
         let mut patch = zeroed_request();
         patch.method = NGX_HTTP_PATCH as _;
         assert_eq!(request_from(&mut patch).method(), Method::PATCH);
+    }
+
+    #[test]
+    fn request_upstream_states_use_checked_array_views() {
+        let mut attempts =
+            [unsafe { MaybeUninit::<ngx_http_upstream_state_t>::zeroed().assume_init() }, unsafe {
+                MaybeUninit::<ngx_http_upstream_state_t>::zeroed().assume_init()
+            }];
+        attempts[0].status = 502;
+        attempts[1].status = 503;
+        let mut states = ngx_array_t {
+            elts: attempts.as_mut_ptr().cast(),
+            nelts: attempts.len(),
+            size: core::mem::size_of::<ngx_http_upstream_state_t>(),
+            nalloc: attempts.len(),
+            pool: core::ptr::null_mut(),
+        };
+        let mut raw = zeroed_request();
+        initialize_request(&mut raw);
+        raw.upstream_states = &raw mut states;
+
+        let request = request_from(&mut raw);
+        let states = request.upstream_states().unwrap().unwrap();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states.get(0).unwrap().status(), Some(502));
+        assert_eq!(
+            request.view().upstream_states().unwrap().unwrap().get(1).unwrap().status(),
+            Some(503)
+        );
+
+        let mut malformed = zeroed_request();
+        initialize_request(&mut malformed);
+        malformed.upstream_states = core::ptr::without_provenance_mut::<ngx_array_t>(1);
+        assert!(matches!(
+            request_from(&mut malformed).upstream_states(),
+            Err(UpstreamStateError::MisalignedArray)
+        ));
     }
 
     #[test]
