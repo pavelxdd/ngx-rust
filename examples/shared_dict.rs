@@ -31,18 +31,19 @@ unsafe impl HttpModule for HttpSharedDictModule {
         unsafe { &*ptr::addr_of!(ngx_http_shared_dict_module) }
     }
 
-    unsafe extern "C" fn preconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
+    fn preconfigure(cf: &mut ngx_conf_t) -> ngx_int_t {
         for mut v in unsafe { NGX_HTTP_SHARED_DICT_VARS } {
-            let var = NonNull::new(unsafe { ngx_http_add_variable(cf, &raw mut v.name, v.flags) });
-            if var.is_none() {
-                return Status::NGX_ERROR.into();
-            }
-            let var = unsafe { var.unwrap().as_mut() };
+            let Some(mut var) =
+                NonNull::new(unsafe { ngx_http_add_variable(cf, &raw mut v.name, v.flags) })
+            else {
+                return Status::NGX_ERROR.0;
+            };
+            let var = unsafe { var.as_mut() };
             var.get_handler = v.get_handler;
             var.set_handler = v.set_handler;
             var.data = v.data;
         }
-        Status::NGX_OK.into()
+        Status::NGX_OK.0
     }
 }
 
@@ -80,7 +81,7 @@ static mut NGX_HTTP_SHARED_DICT_VARS: [ngx_http_variable_t; 1] = [ngx_http_varia
 }];
 
 static NGX_HTTP_SHARED_DICT_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
-    preconfiguration: Some(HttpSharedDictModule::preconfiguration),
+    preconfiguration: Some(ngx::http::preconfiguration::<HttpSharedDictModule>),
     postconfiguration: None,
     create_main_conf: Some(HttpSharedDictModule::create_main_conf),
     init_main_conf: None,

@@ -26,12 +26,9 @@ unsafe impl http::HttpModule for Module {
         unsafe { &*::core::ptr::addr_of!(ngx_http_async_module) }
     }
 
-    unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
-        // SAFETY: this function is called with non-NULL cf always
-        let cf = unsafe { &mut *cf };
+    fn postconfigure(cf: &mut ngx_conf_t) -> ngx_int_t {
         http::add_async_phase_handler::<AsyncAccessHandler>(cf)
-            .map_or(Status::NGX_ERROR, |_| Status::NGX_OK)
-            .into()
+            .map_or(Status::NGX_ERROR.0, |_| Status::NGX_OK.0)
     }
 }
 
@@ -57,8 +54,8 @@ static mut NGX_HTTP_ASYNC_COMMANDS: [ngx_command_t; 2] = [
 ];
 
 static NGX_HTTP_ASYNC_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
-    preconfiguration: Some(Module::preconfiguration),
-    postconfiguration: Some(Module::postconfiguration),
+    preconfiguration: Some(http::preconfiguration::<Module>),
+    postconfiguration: Some(http::postconfiguration::<Module>),
     create_main_conf: None,
     init_main_conf: None,
     create_srv_conf: None,

@@ -70,8 +70,8 @@ impl NgxHttpOrigDstCtx {
 }
 
 static NGX_HTTP_ORIG_DST_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
-    preconfiguration: Some(Module::preconfiguration),
-    postconfiguration: Some(Module::postconfiguration),
+    preconfiguration: Some(http::preconfiguration::<Module>),
+    postconfiguration: Some(http::postconfiguration::<Module>),
     create_main_conf: None,
     init_main_conf: None,
     create_srv_conf: None,
@@ -285,19 +285,18 @@ unsafe impl HttpModule for Module {
         unsafe { &*::core::ptr::addr_of!(ngx_http_orig_dst_module) }
     }
 
-    // static ngx_int_t ngx_http_orig_dst_add_variables(ngx_conf_t *cf)
-    unsafe extern "C" fn preconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
+    fn preconfigure(cf: &mut ngx_conf_t) -> ngx_int_t {
         for mut v in unsafe { NGX_HTTP_ORIG_DST_VARS } {
-            let var = NonNull::new(unsafe { ngx_http_add_variable(cf, &raw mut v.name, v.flags) });
-            if var.is_none() {
-                return Status::NGX_ERROR.into();
-            }
-            let mut var = var.unwrap();
+            let Some(mut var) =
+                NonNull::new(unsafe { ngx_http_add_variable(cf, &raw mut v.name, v.flags) })
+            else {
+                return Status::NGX_ERROR.0;
+            };
             let var = unsafe { var.as_mut() };
             var.get_handler = v.get_handler;
             var.data = v.data;
         }
-        Status::NGX_OK.into()
+        Status::NGX_OK.0
     }
 }
 
