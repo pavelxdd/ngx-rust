@@ -3,11 +3,11 @@ use core::mem;
 use core::ptr::{self, NonNull};
 
 use libc::sockaddr_storage;
-use ngx::core::{Pool, Status};
+use ngx::core::{Pool, SocketType, Status};
 use ngx::ffi::{
-    NGX_HTTP_MODULE, in_port_t, ngx_conf_t, ngx_connection_local_sockaddr, ngx_http_add_variable,
-    ngx_http_module_t, ngx_http_variable_t, ngx_inet_get_port, ngx_int_t, ngx_module_t,
-    ngx_sock_ntop, ngx_str_t, ngx_variable_value_t, sockaddr,
+    NGX_HTTP_MODULE, in_port_t, ngx_conf_t, ngx_http_add_variable, ngx_http_module_t,
+    ngx_http_variable_t, ngx_inet_get_port, ngx_int_t, ngx_module_t, ngx_sock_ntop, ngx_str_t,
+    ngx_variable_value_t, sockaddr,
 };
 use ngx::http::{self, HttpModule, HttpModuleRequestContext};
 use ngx::{http_variable_get, ngx_log_debug_http, ngx_string};
@@ -120,20 +120,20 @@ static mut NGX_HTTP_ORIG_DST_VARS: [ngx_http_variable_t; 2] = [
     },
 ];
 
-unsafe fn ngx_get_origdst(request: &mut http::Request) -> Result<(String, in_port_t), Status> {
-    let c = request.connection();
-
-    if unsafe { (*c).type_ } != libc::SOCK_STREAM {
-        ngx_log_debug_http!(request, "httporigdst: connection is not type SOCK_STREAM");
-        return Err(Status::NGX_DECLINED);
+fn ngx_get_origdst(request: &mut http::RequestRefMut<'_>) -> Result<(String, in_port_t), Status> {
+    {
+        let mut connection = request.connection_mut().map_err(|_| Status::NGX_ERROR)?;
+        if !matches!(connection.socket_type(), Ok(SocketType::Stream)) {
+            ngx_log_debug_http!(request, "httporigdst: connection is not type SOCK_STREAM");
+            return Err(Status::NGX_DECLINED);
+        }
+        if connection.refresh_local_address().is_err() {
+            ngx_log_debug_http!(request, "httporigdst: no local sockaddr from connection");
+            return Err(Status::NGX_ERROR);
+        }
     }
 
-    Status(unsafe { ngx_connection_local_sockaddr(c, ptr::null_mut(), 0) }).into_result().map_err(
-        |_| {
-            ngx_log_debug_http!(request, "httporigdst: no local sockaddr from connection");
-            Status::NGX_ERROR
-        },
-    )?;
+    let c = unsafe { (*request.as_ptr()).connection };
 
     let level: c_int;
     let optname: c_int;
@@ -180,8 +180,11 @@ unsafe fn ngx_get_origdst(request: &mut http::Request) -> Result<(String, in_por
 
 http_variable_get!(
     ngx_http_orig_dst_addr_variable,
-    |request: &mut http::Request, v: *mut ngx_variable_value_t, _: usize| {
-        let ctx = request.module_context::<Module>();
+    |request: &mut http::RequestRefMut<'_>, v: *mut ngx_variable_value_t, _: usize| {
+        let ctx = match request.module_context::<Module>() {
+            Ok(ctx) => ctx,
+            Err(_) => return Status::NGX_ERROR,
+        };
         if let Some(obj) = ctx {
             ngx_log_debug_http!(request, "httporigdst: found context and binding variable",);
             unsafe { obj.bind_addr(v) };
@@ -193,7 +196,7 @@ http_variable_get!(
         //   set context
         // bind address
         ngx_log_debug_http!(request, "httporigdst: context not found, getting address");
-        let r = unsafe { ngx_get_origdst(request) };
+        let r = ngx_get_origdst(request);
         match r {
             Err(e) => {
                 return e;
@@ -202,7 +205,10 @@ http_variable_get!(
                 // create context,
                 // set context
                 ngx_log_debug_http!(request, "httporigdst: saving ip - {:?}, port - {}", ip, port,);
-                let raw_pool = request.pool().as_ptr();
+                let raw_pool = match request.pool() {
+                    Ok(pool) => pool.as_ptr(),
+                    Err(_) => return Status::NGX_ERROR,
+                };
                 let Ok(new_ctx) =
                     request.get_or_insert_module_context_with::<Module>(NgxHttpOrigDstCtx::default)
                 else {
@@ -224,8 +230,11 @@ http_variable_get!(
 
 http_variable_get!(
     ngx_http_orig_dst_port_variable,
-    |request: &mut http::Request, v: *mut ngx_variable_value_t, _: usize| {
-        let ctx = request.module_context::<Module>();
+    |request: &mut http::RequestRefMut<'_>, v: *mut ngx_variable_value_t, _: usize| {
+        let ctx = match request.module_context::<Module>() {
+            Ok(ctx) => ctx,
+            Err(_) => return Status::NGX_ERROR,
+        };
         if let Some(obj) = ctx {
             ngx_log_debug_http!(request, "httporigdst: found context and binding variable",);
             unsafe { obj.bind_port(v) };
@@ -237,7 +246,7 @@ http_variable_get!(
         //   set context
         // bind port
         ngx_log_debug_http!(request, "httporigdst: context not found, getting address");
-        let r = unsafe { ngx_get_origdst(request) };
+        let r = ngx_get_origdst(request);
         match r {
             Err(e) => {
                 return e;
@@ -246,7 +255,10 @@ http_variable_get!(
                 // create context,
                 // set context
                 ngx_log_debug_http!(request, "httporigdst: saving ip - {:?}, port - {}", ip, port,);
-                let raw_pool = request.pool().as_ptr();
+                let raw_pool = match request.pool() {
+                    Ok(pool) => pool.as_ptr(),
+                    Err(_) => return Status::NGX_ERROR,
+                };
                 let Ok(new_ctx) =
                     request.get_or_insert_module_context_with::<Module>(NgxHttpOrigDstCtx::default)
                 else {

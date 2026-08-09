@@ -12,7 +12,8 @@ use ngx::core::{BufferView, ChainRef, Status};
 use ngx::http::subrequest::{SubRequestBuilder, SubRequestError};
 use ngx::http::{
     HTTPStatus, HttpModule, HttpModuleLocationConf, HttpModuleRequestContext, HttpPhase,
-    HttpRequestHandler, IntoHandlerStatus, Merge, MergeConfigError, Request, add_phase_handler,
+    HttpRequestHandler, IntoHandlerStatus, Merge, MergeConfigError, RequestRef, RequestRefMut,
+    add_phase_handler,
 };
 use ngx::{ngx_log_error, ngx_string};
 
@@ -102,8 +103,10 @@ impl fmt::Display for ExampleError {
 }
 
 impl IntoHandlerStatus for ExampleError {
-    fn into_handler_status(self, request: &Request) -> ngx_int_t {
-        ngx_log_error!(NGX_LOG_ERR, request.log(), "subrequest example: {self}");
+    fn into_handler_status(self, request: &RequestRef<'_>) -> ngx_int_t {
+        if let Ok(Some(log)) = request.log() {
+            ngx_log_error!(NGX_LOG_ERR, log.as_ptr(), "subrequest example: {self}");
+        }
         NGX_ERROR as ngx_int_t
     }
 }
@@ -114,7 +117,7 @@ impl HttpRequestHandler for SubRequestAccessHandler {
     const PHASE: HttpPhase = HttpPhase::Access;
     type Output = Result<Status, ExampleError>;
 
-    fn handler(request: &mut Request) -> Self::Output {
+    fn handler(request: &mut RequestRefMut<'_>) -> Self::Output {
         let config = Module::location_conf(request)
             .map_err(|_| ExampleError::Config)?
             .ok_or(ExampleError::Config)?;
@@ -123,7 +126,9 @@ impl HttpRequestHandler for SubRequestAccessHandler {
         }
         let uri = config.uri;
 
-        if let Some(context) = request.module_context::<Module>() {
+        if let Some(context) =
+            request.module_context::<Module>().map_err(|_| ExampleError::ContextAllocation)?
+        {
             return context
                 .result
                 .map_or(Ok(Status::NGX_AGAIN), |result| send_subrequest_response(request, result));
@@ -134,28 +139,34 @@ impl HttpRequestHandler for SubRequestAccessHandler {
             .map_err(|_| ExampleError::ContextAllocation)?;
 
         let uri = uri.to_str().map_err(|_| ExampleError::InvalidUri)?;
-        let subrequest = SubRequestBuilder::new(request, uri)?
+        let mut subrequest = SubRequestBuilder::new(request, uri)?
             .args("probe=1")?
             .handler(subrequest_done)
             .in_memory()
             .waited()
             .build()?;
-        subrequest.add_header_in("X-Subrequest", "1").ok_or(ExampleError::AddHeader)?;
+        subrequest.add_header_in("X-Subrequest", "1").map_err(|_| ExampleError::AddHeader)?;
 
         Ok(Status::NGX_AGAIN)
     }
 }
 
-fn subrequest_done(request: &mut Request, completion_status: ngx_int_t) -> Status {
+fn subrequest_done(request: &mut RequestRefMut<'_>, completion_status: ngx_int_t) -> Status {
+    let raw = unsafe { request.as_ptr() };
     let result = SubRequestResult {
         completion_status,
         response_status: request.status().or_else(|| HTTPStatus::try_from(completion_status).ok()),
-        output: NonNull::new(request.as_ref().out),
-        content_type: request.as_ref().headers_out.content_type,
+        output: NonNull::new(unsafe { (*raw).out }),
+        content_type: unsafe { (*raw).headers_out.content_type },
     };
 
-    let Some(context) = request.main_mut().module_context_mut::<Module>() else {
-        ngx_log_error!(NGX_LOG_ERR, request.log(), "subrequest example: context is missing");
+    let Ok(mut main) = request.main_mut() else {
+        return Status::NGX_ERROR;
+    };
+    let Ok(Some(context)) = main.module_context_mut::<Module>() else {
+        if let Ok(Some(log)) = request.log() {
+            ngx_log_error!(NGX_LOG_ERR, log.as_ptr(), "subrequest example: context is missing");
+        }
         return Status::NGX_ERROR;
     };
     context.result = Some(result);
@@ -163,7 +174,7 @@ fn subrequest_done(request: &mut Request, completion_status: ngx_int_t) -> Statu
 }
 
 fn send_subrequest_response(
-    request: &mut Request,
+    request: &mut RequestRefMut<'_>,
     result: SubRequestResult,
 ) -> Result<Status, ExampleError> {
     if result.completion_status != NGX_OK as ngx_int_t
@@ -178,7 +189,7 @@ fn send_subrequest_response(
         return Ok(status.into());
     }
 
-    let body = copy_buffered_body(request, result.output)?;
+    let body = copy_buffered_body(&request.view(), result.output)?;
     let mut content_type = result.content_type;
     let content_type =
         if content_type.is_empty() { ptr::null_mut() } else { &raw mut content_type };
@@ -186,13 +197,13 @@ fn send_subrequest_response(
     value.value = body;
 
     let response_status =
-        unsafe { ngx_http_send_response(request.as_mut(), status.0, content_type, &raw mut value) };
+        unsafe { ngx_http_send_response(request.as_ptr(), status.0, content_type, &raw mut value) };
     Status(response_status).into_result().map_err(|status| ExampleError::Response(status.0))?;
     Ok(status.into())
 }
 
 fn copy_buffered_body(
-    request: &Request,
+    request: &RequestRef<'_>,
     output: Option<NonNull<ngx_chain_t>>,
 ) -> Result<ngx_str_t, ExampleError> {
     let head = output.map_or(ptr::null_mut(), NonNull::as_ptr);
@@ -213,7 +224,8 @@ fn copy_buffered_body(
     if length == 0 {
         return Ok(ngx_str_t::empty());
     }
-    let data = request.pool().alloc_unaligned(length).cast::<u8>();
+    let data =
+        request.pool().map_err(|_| ExampleError::InvalidBody)?.alloc_unaligned(length).cast::<u8>();
     if data.is_null() {
         return Err(ExampleError::InvalidBody);
     }

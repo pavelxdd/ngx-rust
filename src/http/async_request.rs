@@ -6,7 +6,7 @@ use crate::allocator::AllocError;
 use crate::async_::{Task, spawn};
 use crate::ffi::{NGX_AGAIN, NGX_ERROR, ngx_event_t, ngx_int_t, ngx_post_event, ngx_posted_events};
 use crate::http::{
-    HttpModuleRequestContext, HttpPhase, HttpRequestHandler, IntoHandlerStatus, Request,
+    HttpModuleRequestContext, HttpPhase, HttpRequestHandler, IntoHandlerStatus, RequestRefMut,
     add_phase_handler,
 };
 use crate::{ngx_log_debug_http, ngx_log_error};
@@ -27,10 +27,10 @@ pub trait AsyncHttpRequestHandler: Sized + 'static {
     type Result: IntoHandlerStatus;
 
     /// Starts the asynchronous work.
-    fn start(request: &mut Request) -> impl Future<Output = Self::Output> + 'static;
+    fn start(request: &mut RequestRefMut<'_>) -> impl Future<Output = Self::Output> + 'static;
 
     /// Applies the completed output to the request on the nginx event loop.
-    fn finish(request: &mut Request, output: Self::Output) -> Self::Result;
+    fn finish(request: &mut RequestRefMut<'_>, output: Self::Output) -> Self::Result;
 
     /// Handler name used in log messages.
     fn name() -> &'static str {
@@ -69,10 +69,17 @@ where
     const PHASE: HttpPhase = async_phase(H::PHASE);
     type Output = ngx_int_t;
 
-    fn handler(request: &mut Request) -> Self::Output {
-        if request.module_context::<H::Module>().is_some() {
+    fn handler(request: &mut RequestRefMut<'_>) -> Self::Output {
+        let has_context = match request.module_context::<H::Module>() {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(_) => return NGX_ERROR as ngx_int_t,
+        };
+        if has_context {
             let output = {
-                let context = request.module_context_mut::<H::Module>().expect("context exists");
+                let Ok(Some(context)) = request.module_context_mut::<H::Module>() else {
+                    return NGX_ERROR as ngx_int_t;
+                };
                 let Some(output) = context.output.take() else {
                     ngx_log_debug_http!(request, "async handler {} pending", H::name());
                     return NGX_AGAIN as ngx_int_t;
@@ -82,31 +89,41 @@ where
             };
 
             ngx_log_debug_http!(request, "async handler {} complete", H::name());
-            if request.remove_module_context::<H::Module>().is_none() {
-                ngx_log_error!(
-                    crate::ffi::NGX_LOG_ERR,
-                    request.log(),
-                    "async handler {} context removal failed",
-                    H::name()
-                );
+            if !matches!(request.remove_module_context::<H::Module>(), Ok(true)) {
+                if let Ok(Some(log)) = request.log() {
+                    ngx_log_error!(
+                        crate::ffi::NGX_LOG_ERR,
+                        log.as_ptr(),
+                        "async handler {} context removal failed",
+                        H::name()
+                    );
+                }
                 return NGX_ERROR as ngx_int_t;
             }
-            return H::finish(request, output).into_handler_status(request);
+            return H::finish(request, output).into_handler_status(&request.view());
         }
 
         let future = H::start(request);
-        let write_event = unsafe { (*request.connection()).write };
+        let write_event = match request.connection_mut() {
+            Ok(mut connection) => match connection.write_event() {
+                Ok(event) => event.as_ptr(),
+                Err(_) => return NGX_ERROR as ngx_int_t,
+            },
+            Err(_) => return NGX_ERROR as ngx_int_t,
+        };
         let context = match request
             .get_or_insert_module_context_with::<H::Module>(AsyncHandlerContext::new)
         {
             Ok(context) => context,
             Err(_) => {
-                ngx_log_error!(
-                    crate::ffi::NGX_LOG_ERR,
-                    request.log(),
-                    "async handler {} context allocation failed",
-                    H::name()
-                );
+                if let Ok(Some(log)) = request.log() {
+                    ngx_log_error!(
+                        crate::ffi::NGX_LOG_ERR,
+                        log.as_ptr(),
+                        "async handler {} context allocation failed",
+                        H::name()
+                    );
+                }
                 return NGX_ERROR as ngx_int_t;
             }
         };
