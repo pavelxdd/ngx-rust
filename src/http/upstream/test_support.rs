@@ -1,7 +1,7 @@
 #[cfg(feature = "test-link")]
-use core::mem::MaybeUninit;
+use alloc::boxed::Box;
 #[cfg(feature = "test-link")]
-use std::boxed::Box;
+use core::mem::MaybeUninit;
 
 #[cfg(feature = "test-link")]
 use crate::core::Pool;
