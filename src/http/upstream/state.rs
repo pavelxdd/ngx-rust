@@ -112,7 +112,7 @@ pub struct UpstreamStates<'request> {
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
-impl<'request> UpstreamStates<'request> {
+impl UpstreamStates<'_> {
     pub(crate) unsafe fn from_raw(
         array: *mut ngx_array_t,
     ) -> Result<Option<Self>, UpstreamStateError> {
