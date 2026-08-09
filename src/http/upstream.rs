@@ -75,13 +75,15 @@ impl UpstreamState {
 #[macro_export]
 macro_rules! http_upstream_init_peer_pt {
     ( $name: ident, $handler: expr ) => {
-        extern "C" fn $name(
+        unsafe extern "C" fn $name(
             r: *mut $crate::ffi::ngx_http_request_t,
             us: *mut $crate::ffi::ngx_http_upstream_srv_conf_t,
         ) -> $crate::ffi::ngx_int_t {
-            let request = unsafe { $crate::http::Request::from_ngx_http_request(r) };
-            let status: $crate::core::Status = $handler(request, us);
-            status.0
+            let handler: for<'scope> fn(
+                &mut $crate::http::RequestRefMut<'scope>,
+                *mut $crate::ffi::ngx_http_upstream_srv_conf_t,
+            ) -> _ = $handler;
+            unsafe { $crate::http::request_callback_status(r, |request| handler(request, us)) }
         }
     };
 }

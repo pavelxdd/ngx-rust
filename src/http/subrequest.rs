@@ -1,7 +1,7 @@
 use core::ffi::c_void;
 use core::fmt;
 use core::mem;
-use core::ptr;
+use core::ptr::{self, NonNull};
 
 #[cfg(feature = "async")]
 use alloc::rc::Rc;
@@ -22,11 +22,11 @@ use nginx_sys::{
 };
 
 use crate::allocator::AllocError;
-use crate::http::{IntoHandlerStatus, Request};
+use crate::http::{IntoHandlerStatus, RequestError, RequestRefMut, request_callback_status};
 use crate::ngx_log_debug_http;
 
 /// Default post-subrequest handler type.
-pub type DefaultSubRequestHandler = fn(&mut Request, ngx_int_t) -> ngx_int_t;
+pub type DefaultSubRequestHandler = fn(&mut RequestRefMut<'_>, ngx_int_t) -> ngx_int_t;
 
 /// Error returned while creating or awaiting a subrequest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +35,8 @@ pub enum SubRequestError {
     Alloc,
     /// Nginx rejected the subrequest with the contained status.
     Create(ngx_int_t),
+    /// The parent or produced request failed validation.
+    Request(RequestError),
     /// Nginx released the parent request before the subrequest completed.
     #[cfg(feature = "async")]
     Canceled,
@@ -46,11 +48,18 @@ impl From<AllocError> for SubRequestError {
     }
 }
 
+impl From<RequestError> for SubRequestError {
+    fn from(error: RequestError) -> Self {
+        Self::Request(error)
+    }
+}
+
 impl fmt::Display for SubRequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Alloc => f.write_str("subrequest allocation failed"),
             Self::Create(status) => write!(f, "subrequest creation failed with status {status}"),
+            Self::Request(error) => write!(f, "invalid request: {error:?}"),
             #[cfg(feature = "async")]
             Self::Canceled => f.write_str("subrequest canceled"),
         }
@@ -63,8 +72,8 @@ impl core::error::Error for SubRequestError {}
 ///
 /// The URI, arguments, and completion handler are owned by the request pool. By default, the
 /// subrequest gets an empty input-header list and a separate empty request body.
-pub struct SubRequestBuilder<'r, H = DefaultSubRequestHandler> {
-    request: &'r mut Request,
+pub struct SubRequestBuilder<'request, 'callback, H = DefaultSubRequestHandler> {
+    request: &'request mut RequestRefMut<'callback>,
     uri: ngx_str_t,
     args: Option<ngx_str_t>,
     flags: ngx_uint_t,
@@ -73,10 +82,13 @@ pub struct SubRequestBuilder<'r, H = DefaultSubRequestHandler> {
     handler: Option<H>,
 }
 
-impl<'r> SubRequestBuilder<'r> {
+impl<'request, 'callback> SubRequestBuilder<'request, 'callback> {
     /// Create a builder for `uri`.
-    pub fn new(request: &'r mut Request, uri: &str) -> Result<Self, SubRequestError> {
-        let uri = unsafe { ngx_str_t::from_bytes(request.pool().as_ptr(), uri.as_bytes()) }
+    pub fn new(
+        request: &'request mut RequestRefMut<'callback>,
+        uri: &str,
+    ) -> Result<Self, SubRequestError> {
+        let uri = unsafe { ngx_str_t::from_bytes(request.pool()?.as_ptr(), uri.as_bytes()) }
             .ok_or(SubRequestError::Alloc)?;
 
         Ok(Self {
@@ -91,20 +103,20 @@ impl<'r> SubRequestBuilder<'r> {
     }
 }
 
-impl<'r, H> SubRequestBuilder<'r, H> {
+impl<'request, 'callback, H> SubRequestBuilder<'request, 'callback, H> {
     /// Set the subrequest query string.
     pub fn args(mut self, args: &str) -> Result<Self, SubRequestError> {
         self.args = Some(
-            unsafe { ngx_str_t::from_bytes(self.request.pool().as_ptr(), args.as_bytes()) }
+            unsafe { ngx_str_t::from_bytes(self.request.pool()?.as_ptr(), args.as_bytes()) }
                 .ok_or(SubRequestError::Alloc)?,
         );
         Ok(self)
     }
 
     /// Run `handler` after nginx finalizes the subrequest.
-    pub fn handler<HT, O>(self, handler: HT) -> SubRequestBuilder<'r, HT>
+    pub fn handler<HT, O>(self, handler: HT) -> SubRequestBuilder<'request, 'callback, HT>
     where
-        HT: FnOnce(&mut Request, ngx_int_t) -> O + 'static,
+        HT: for<'scope> FnOnce(&mut RequestRefMut<'scope>, ngx_int_t) -> O + 'static,
         O: IntoHandlerStatus,
     {
         SubRequestBuilder {
@@ -159,12 +171,12 @@ impl<'r, H> SubRequestBuilder<'r, H> {
     /// Create and schedule the subrequest.
     ///
     /// The returned request can be modified until the current nginx handler returns.
-    pub fn build<O>(mut self) -> Result<&'r mut Request, SubRequestError>
+    pub fn build<O>(mut self) -> Result<RequestRefMut<'request>, SubRequestError>
     where
-        H: FnOnce(&mut Request, ngx_int_t) -> O + 'static,
+        H: for<'scope> FnOnce(&mut RequestRefMut<'scope>, ngx_int_t) -> O + 'static,
         O: IntoHandlerStatus,
     {
-        let pool = self.request.pool();
+        let pool = self.request.pool()?;
         let request_body = if self.keep_body {
             ptr::null_mut()
         } else {
@@ -214,7 +226,7 @@ impl<'r, H> SubRequestBuilder<'r, H> {
         };
 
         let args = self.args.as_mut().map_or(ptr::null_mut(), ptr::from_mut);
-        let request: *mut ngx_http_request_t = self.request.into();
+        let request = unsafe { self.request.as_ptr() };
         let mut subrequest = ptr::null_mut();
         let status = unsafe {
             nginx_sys::ngx_http_subrequest(
@@ -228,9 +240,9 @@ impl<'r, H> SubRequestBuilder<'r, H> {
         };
         crate::core::Status(status).into_result().map_err(|_| SubRequestError::Create(status))?;
 
-        let subrequest: &'r mut Request = unsafe { Request::from_ngx_http_request(subrequest) };
+        let mut subrequest = unsafe { RequestRefMut::from_raw(subrequest) }?;
         if !self.keep_body {
-            subrequest.as_mut().request_body = request_body;
+            unsafe { (*subrequest.as_ptr()).request_body = request_body };
         }
         if let Some(headers) = headers_in {
             subrequest.reset_headers_in(headers);
@@ -240,7 +252,7 @@ impl<'r, H> SubRequestBuilder<'r, H> {
 }
 
 #[cfg(feature = "async")]
-impl<'r> SubRequestBuilder<'r> {
+impl<'request> SubRequestBuilder<'request, '_> {
     /// Create a subrequest and return a future for its owned completion value.
     ///
     /// The completion handler runs with temporary access to the subrequest. Its first return value
@@ -250,10 +262,10 @@ impl<'r> SubRequestBuilder<'r> {
     pub fn build_async<T, H, O>(
         self,
         handler: H,
-    ) -> Result<(SubRequestFuture<T>, &'r mut Request), SubRequestError>
+    ) -> Result<(SubRequestFuture<T>, RequestRefMut<'request>), SubRequestError>
     where
         T: 'static,
-        H: FnOnce(&mut Request, ngx_int_t) -> (T, O) + 'static,
+        H: for<'scope> FnOnce(&mut RequestRefMut<'scope>, ngx_int_t) -> (T, O) + 'static,
         O: IntoHandlerStatus,
     {
         let state = Rc::new(RefCell::new(AsyncSubRequestState::new()));
@@ -358,14 +370,23 @@ unsafe extern "C" fn run_handler<H, O>(
     status: ngx_int_t,
 ) -> ngx_int_t
 where
-    H: FnOnce(&mut Request, ngx_int_t) -> O + 'static,
+    H: for<'scope> FnOnce(&mut RequestRefMut<'scope>, ngx_int_t) -> O + 'static,
     O: IntoHandlerStatus,
 {
-    let request = unsafe { Request::from_ngx_http_request(request) };
-    ngx_log_debug_http!(request, "subrequest handler called with status {status}");
+    let Some(mut handler) = NonNull::new(data.cast::<Option<H>>()) else {
+        return nginx_sys::NGX_ERROR as _;
+    };
+    if !handler.as_ptr().is_aligned() {
+        return nginx_sys::NGX_ERROR as _;
+    }
 
-    let handler = unsafe { &mut *data.cast::<Option<H>>() }.take();
-    handler.map_or(status, |handler| handler(request, status).into_handler_status(request))
+    let handler = unsafe { handler.as_mut() }.take();
+    let callback = |request: &mut RequestRefMut<'_>| {
+        ngx_log_debug_http!(request, "subrequest handler called with status {status}");
+        handler
+            .map_or(status, |handler| handler(request, status).into_handler_status(&request.view()))
+    };
+    unsafe { request_callback_status(request, callback) }
 }
 
 #[cfg(all(test, feature = "async"))]

@@ -78,6 +78,10 @@ fn live_module_indexes(module: &ngx_module_t) -> Result<ModuleIndexes, HttpConfi
     module_indexes(module, live_module_slot_count(), live_http_slot_count())
 }
 
+pub(crate) fn request_context_index(module: &ngx_module_t) -> Result<usize, HttpConfigError> {
+    Ok(live_module_indexes(module)?.context)
+}
+
 fn checked_pointer<T>(pointer: *mut T) -> Option<NonNull<T>> {
     let pointer = NonNull::new(pointer)?;
     if !pointer.as_ptr().is_aligned() {
@@ -995,7 +999,7 @@ mod tests {
         ngx_conf_t, ngx_cycle_t, ngx_http_connection_t, ngx_http_core_srv_conf_t,
         ngx_http_request_t, ngx_http_upstream_srv_conf_t,
     };
-    use crate::http::HttpModule;
+    use crate::http::{HttpModule, RequestRefMut};
 
     fn http_module(index: ngx_uint_t, context_index: ngx_uint_t) -> ngx_module_t {
         let mut module = ngx_module_t::default();
@@ -1337,11 +1341,16 @@ mod tests {
             *value = 7;
         }
 
-        let request = unsafe { crate::http::Request::from_ngx_http_request(&raw mut request) };
-        assert_eq!(TestHttpModule::main_conf(request).map(|value| value.copied()), Ok(Some(4)));
-        assert_eq!(TestHttpModule::server_conf(request).map(|value| value.copied()), Ok(Some(6)));
-        assert_eq!(TestHttpModule::location_conf(request).map(|value| value.copied()), Ok(Some(7)));
-        if let Some(value) = TestHttpModule::location_conf_mut(request).unwrap() {
+        request.signature = NGX_HTTP_MODULE as _;
+        request.main = &raw mut request;
+        let mut request = unsafe { RequestRefMut::from_raw(&raw mut request).unwrap() };
+        assert_eq!(TestHttpModule::main_conf(&request).map(|value| value.copied()), Ok(Some(4)));
+        assert_eq!(TestHttpModule::server_conf(&request).map(|value| value.copied()), Ok(Some(6)));
+        assert_eq!(
+            TestHttpModule::location_conf(&request).map(|value| value.copied()),
+            Ok(Some(7))
+        );
+        if let Some(value) = TestHttpModule::location_conf_mut(&mut request).unwrap() {
             *value = 8;
         }
 

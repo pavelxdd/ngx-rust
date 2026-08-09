@@ -48,6 +48,8 @@ pub enum ConnectionError {
     MisalignedListener,
     /// The connection logger pointer does not satisfy `ngx_log_t` alignment.
     MisalignedLog,
+    /// The connection sent-byte counter cannot be represented as an unsigned value.
+    NegativeBytesSent,
     /// The connection or listener has an unsupported socket type.
     UnsupportedSocketType(c_int),
     /// A socket address is invalid.
@@ -571,6 +573,12 @@ impl<'callback> ConnectionRef<'callback> {
         connection_log(self.raw)
     }
 
+    /// Returns the client connection's sent-byte counter.
+    pub fn bytes_sent(&self) -> Result<u64, ConnectionError> {
+        u64::try_from(unsafe { self.raw.as_ref().sent })
+            .map_err(|_| ConnectionError::NegativeBytesSent)
+    }
+
     /// Returns the configured socket type.
     pub fn socket_type(&self) -> Result<SocketType, ConnectionError> {
         connection_socket_type(self.raw)
@@ -696,6 +704,11 @@ impl<'callback> ConnectionRefMut<'callback> {
     /// Returns the connection logger when nginx configured one.
     pub fn log(&self) -> Result<Option<NonNull<ngx_log_t>>, ConnectionError> {
         connection_log(self.raw)
+    }
+
+    /// Returns the client connection's sent-byte counter.
+    pub fn bytes_sent(&self) -> Result<u64, ConnectionError> {
+        self.view().bytes_sent()
     }
 
     /// Returns the configured socket type.
