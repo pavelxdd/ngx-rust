@@ -86,7 +86,7 @@ unsafe fn checked_mut<'a, T>(pointer: *mut T) -> Option<&'a mut T> {
     Some(unsafe { pointer.as_mut() })
 }
 
-fn configuration_callback_status(
+pub(crate) fn configuration_callback_status(
     cf: *mut ngx_conf_t,
     callback: impl FnOnce(&mut ngx_conf_t) -> ngx_int_t,
 ) -> ngx_int_t {
