@@ -11,6 +11,7 @@ use crate::allocator::Allocator;
 use crate::core::{
     NgxStr, Pool, SocketAddress, SocketAddressError, SocketPort, Status, parse_socket_address,
 };
+use crate::event::{EventPeerAddress, EventPeerAddressError};
 use crate::ffi::{ngx_addr_t, ngx_str_t, ngx_url_t};
 
 /// Failure while parsing or viewing a configured upstream URL.
@@ -26,6 +27,8 @@ pub enum UpstreamUrlViewError {
     MisalignedAddresses,
     /// A selected native socket address is invalid.
     SocketAddress(SocketAddressError),
+    /// A selected address cannot initialize an event peer.
+    EventPeerAddress(EventPeerAddressError),
 }
 
 impl fmt::Display for UpstreamUrlViewError {
@@ -40,6 +43,9 @@ impl fmt::Display for UpstreamUrlViewError {
                 formatter.write_str("upstream URL address array is misaligned")
             }
             Self::SocketAddress(_) => formatter.write_str("upstream URL has an invalid address"),
+            Self::EventPeerAddress(_) => {
+                formatter.write_str("upstream URL has an invalid event-peer address")
+            }
         }
     }
 }
@@ -49,6 +55,12 @@ impl error::Error for UpstreamUrlViewError {}
 impl From<SocketAddressError> for UpstreamUrlViewError {
     fn from(error: SocketAddressError) -> Self {
         Self::SocketAddress(error)
+    }
+}
+
+impl From<EventPeerAddressError> for UpstreamUrlViewError {
+    fn from(error: EventPeerAddressError) -> Self {
+        Self::EventPeerAddress(error)
     }
 }
 
@@ -208,7 +220,7 @@ impl<'pool> ConfiguredUpstreamUrl<'pool> {
             return None;
         }
 
-        let port = SocketPort::from_host_order(raw.port as u16);
+        let port = SocketPort::from_host_order(raw.port);
         if raw.no_port() != 0 {
             Some(UpstreamPort::Default(port))
         } else {
@@ -219,8 +231,7 @@ impl<'pool> ConfiguredUpstreamUrl<'pool> {
     /// Returns the checked selected addresses nginx resolved for this URL.
     pub fn addresses(&self) -> Result<UpstreamAddresses<'_>, UpstreamUrlViewError> {
         let raw = unsafe { self.raw.as_ref() };
-        let len =
-            usize::try_from(raw.naddrs).map_err(|_| UpstreamUrlViewError::AddressCountOverflow)?;
+        let len = raw.naddrs;
         let Some(bytes) = mem::size_of::<ngx_addr_t>().checked_mul(len) else {
             return Err(UpstreamUrlViewError::AddressCountOverflow);
         };
@@ -340,6 +351,12 @@ impl UpstreamAddress<'_> {
     pub fn socket_address(&self) -> Result<SocketAddress<'_>, UpstreamUrlViewError> {
         let raw = unsafe { self.raw.as_ref() };
         unsafe { parse_socket_address(raw.sockaddr, raw.socklen) }.map_err(Into::into)
+    }
+
+    /// Returns this selected address as a checked event-peer address.
+    pub fn event_peer_address(&self) -> Result<EventPeerAddress<'_>, UpstreamUrlViewError> {
+        // The selected address is retained by this configuration-pool URL for the returned borrow.
+        unsafe { EventPeerAddress::from_raw(self.raw.as_ptr()) }.map_err(Into::into)
     }
 }
 
