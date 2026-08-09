@@ -910,7 +910,8 @@ impl<'callback> ListenerRef<'callback> {
     /// Returns the checked listener address.
     pub fn address(&self) -> Result<SocketAddress<'callback>, ConnectionError> {
         let listener = unsafe { self.raw.as_ref() };
-        parse_socket_address(listener.sockaddr, listener.socklen).map_err(ConnectionError::Address)
+        unsafe { parse_socket_address(listener.sockaddr, listener.socklen) }
+            .map_err(ConnectionError::Address)
     }
 }
 
@@ -971,14 +972,15 @@ fn connection_peer_address<'callback>(
     connection: NonNull<ngx_connection_t>,
 ) -> Result<SocketAddress<'callback>, ConnectionError> {
     let connection = unsafe { connection.as_ref() };
-    parse_socket_address(connection.sockaddr, connection.socklen).map_err(ConnectionError::Address)
+    unsafe { parse_socket_address(connection.sockaddr, connection.socklen) }
+        .map_err(ConnectionError::Address)
 }
 
 fn connection_local_address<'callback>(
     connection: NonNull<ngx_connection_t>,
 ) -> Result<SocketAddress<'callback>, ConnectionError> {
     let connection = unsafe { connection.as_ref() };
-    parse_socket_address(connection.local_sockaddr, connection.local_socklen)
+    unsafe { parse_socket_address(connection.local_sockaddr, connection.local_socklen) }
         .map_err(ConnectionError::Address)
 }
 
@@ -1215,7 +1217,13 @@ fn socket_type(raw: c_int) -> Result<SocketType, ConnectionError> {
     }
 }
 
-fn parse_socket_address<'callback>(
+/// Parses an nginx-owned socket address into a callback-scoped address view.
+///
+/// # Safety
+///
+/// `address` must point to a live native socket address for `'callback`. The address must not be
+/// mutated while the returned view exists.
+pub(crate) unsafe fn parse_socket_address<'callback>(
     address: *const sockaddr,
     socklen: socklen_t,
 ) -> Result<SocketAddress<'callback>, SocketAddressError> {
