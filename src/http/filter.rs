@@ -275,18 +275,22 @@ mod tests {
         BodyFilter, HeaderFilter, HttpFilter, HttpFilterError, HttpFilterSlot, body_filter,
         filter_postconfiguration, header_filter,
     };
-    use crate::core::{ChainRef, Status};
+    use crate::core::{ChainRef, ConnectionError, Status};
     use crate::ffi::{
-        NGX_HTTP_MODULE, ngx_buf_t, ngx_chain_t, ngx_conf_t, ngx_cycle_t,
+        NGX_HTTP_MODULE, ngx_buf_t, ngx_chain_t, ngx_conf_t, ngx_connection_t, ngx_cycle_t,
         ngx_http_output_body_filter_pt, ngx_http_output_header_filter_pt, ngx_http_request_t,
-        ngx_int_t, ngx_module_t,
+        ngx_int_t, ngx_log_t, ngx_module_t,
     };
-    use crate::http::{HttpModule, RequestRefMut};
+    use crate::http::{
+        HttpModule, RequestContinuationError, RequestError, RequestHold, RequestRefMut,
+    };
 
     static HEADER_FILTER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static BODY_FILTER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static NEXT_HEADER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static NEXT_BODY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FAILING_HEADER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FAILING_BODY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     const RELOAD_TEST_CHILD: &str = "NGX_HTTP_FILTER_RELOAD_TEST_CHILD";
 
@@ -307,6 +311,19 @@ mod tests {
     ) -> ngx_int_t {
         NEXT_BODY_CALLS.fetch_add(1, Ordering::Relaxed);
         Status::NGX_DECLINED.0
+    }
+
+    unsafe extern "C" fn failing_header(_request: *mut ngx_http_request_t) -> ngx_int_t {
+        FAILING_HEADER_CALLS.fetch_add(1, Ordering::Relaxed);
+        Status::NGX_ERROR.0
+    }
+
+    unsafe extern "C" fn failing_body(
+        _request: *mut ngx_http_request_t,
+        _chain: *mut crate::ffi::ngx_chain_t,
+    ) -> ngx_int_t {
+        FAILING_BODY_CALLS.fetch_add(1, Ordering::Relaxed);
+        Status::NGX_ERROR.0
     }
 
     struct FilterGlobals {
@@ -471,6 +488,33 @@ mod tests {
 
         fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
             DELAYED_BODY_CALLS.fetch_add(1, Ordering::Relaxed);
+            Status::NGX_DONE
+        }
+    }
+
+    struct ContinuationFilter;
+
+    static CONTINUATION_SLOT: HttpFilterSlot<ContinuationFilter> = HttpFilterSlot::new();
+
+    unsafe impl HttpModule for ContinuationFilter {
+        fn module() -> &'static ngx_module_t {
+            module()
+        }
+    }
+
+    unsafe impl HttpFilter for ContinuationFilter {
+        type HeaderOutput = Status;
+        type BodyOutput = Status;
+
+        fn filter_slot() -> &'static HttpFilterSlot<Self> {
+            &CONTINUATION_SLOT
+        }
+
+        fn header_filter(_request: &mut RequestRefMut<'_>) -> Self::HeaderOutput {
+            Status::NGX_DONE
+        }
+
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
             Status::NGX_DONE
         }
     }
@@ -955,6 +999,200 @@ mod tests {
         assert_eq!(DELAYED_BODY_CALLS.load(Ordering::Relaxed), 1);
         assert_eq!(NEXT_HEADER_CALLS.load(Ordering::Relaxed), 1);
         assert_eq!(NEXT_BODY_CALLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn terminal_continuation_calls_each_saved_filter_once() {
+        let _globals = FilterGlobals::new();
+        let mut cycle = unsafe { MaybeUninit::<ngx_cycle_t>::zeroed().assume_init() };
+        let mut configuration = configuration(&mut cycle);
+        NEXT_HEADER_CALLS.store(0, Ordering::Relaxed);
+        NEXT_BODY_CALLS.store(0, Ordering::Relaxed);
+        assert_eq!(
+            unsafe { filter_postconfiguration::<ContinuationFilter>(&raw mut configuration) },
+            Status::NGX_OK.0
+        );
+
+        let mut raw = request();
+        let mut connection = unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() };
+        raw.main = &raw mut raw;
+        raw.parent = &raw mut raw;
+        raw.connection = &raw mut connection;
+        raw.set_count(1);
+        let mut hold = None;
+        let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
+        request.hold(&mut hold).unwrap();
+        let mut continuation = RequestHold::take(&mut hold, request).unwrap();
+        let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
+
+        assert_eq!(continuation.call_next_header(&CONTINUATION_SLOT), Ok(Status::NGX_DECLINED));
+        assert_eq!(
+            continuation.call_next_header(&CONTINUATION_SLOT),
+            Err(RequestContinuationError::HeaderAlreadyContinued)
+        );
+        assert_eq!(
+            continuation.call_next_body(&CONTINUATION_SLOT, chain),
+            Ok(Status::NGX_DECLINED)
+        );
+        assert_eq!(
+            continuation.call_next_body(&CONTINUATION_SLOT, chain),
+            Err(RequestContinuationError::BodyAlreadyContinued)
+        );
+        assert_eq!(NEXT_HEADER_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(NEXT_BODY_CALLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn terminal_continuation_does_not_retry_failed_saved_filters() {
+        let globals = FilterGlobals::new();
+        globals.set(Some(failing_header), Some(failing_body));
+        let mut cycle = unsafe { MaybeUninit::<ngx_cycle_t>::zeroed().assume_init() };
+        let mut configuration = configuration(&mut cycle);
+        FAILING_HEADER_CALLS.store(0, Ordering::Relaxed);
+        FAILING_BODY_CALLS.store(0, Ordering::Relaxed);
+        assert_eq!(
+            unsafe { filter_postconfiguration::<ContinuationFilter>(&raw mut configuration) },
+            Status::NGX_OK.0
+        );
+
+        let mut raw = request();
+        let mut connection = unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() };
+        raw.main = &raw mut raw;
+        raw.parent = &raw mut raw;
+        raw.connection = &raw mut connection;
+        raw.set_count(1);
+        let mut hold = None;
+        let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
+        request.hold(&mut hold).unwrap();
+        let mut continuation = RequestHold::take(&mut hold, request).unwrap();
+        let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
+
+        assert_eq!(continuation.call_next_header(&CONTINUATION_SLOT), Ok(Status::NGX_ERROR));
+        assert_eq!(
+            continuation.call_next_header(&CONTINUATION_SLOT),
+            Err(RequestContinuationError::HeaderAlreadyContinued)
+        );
+        assert_eq!(continuation.call_next_body(&CONTINUATION_SLOT, chain), Ok(Status::NGX_ERROR));
+        assert_eq!(
+            continuation.call_next_body(&CONTINUATION_SLOT, chain),
+            Err(RequestContinuationError::BodyAlreadyContinued)
+        );
+        assert_eq!(FAILING_HEADER_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(FAILING_BODY_CALLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn terminal_continuation_propagates_missing_saved_filters() {
+        let mut connection = unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() };
+        let mut raw = request();
+        raw.main = &raw mut raw;
+        raw.parent = &raw mut raw;
+        raw.connection = &raw mut connection;
+        raw.set_count(1);
+        let mut hold = None;
+        let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
+        request.hold(&mut hold).unwrap();
+        let mut continuation = RequestHold::take(&mut hold, request).unwrap();
+        let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
+
+        assert_eq!(
+            continuation.call_next_header(&MISSING_NEXT_SLOT),
+            Err(RequestContinuationError::Filter(HttpFilterError::MissingHeaderNext))
+        );
+        assert_eq!(
+            continuation.call_next_body(&MISSING_NEXT_SLOT, chain),
+            Err(RequestContinuationError::Filter(HttpFilterError::MissingBodyNext))
+        );
+    }
+
+    #[test]
+    fn terminal_continuation_rejects_invalid_request_before_saved_filter_call() {
+        let _globals = FilterGlobals::new();
+        let mut cycle = unsafe { MaybeUninit::<ngx_cycle_t>::zeroed().assume_init() };
+        let mut configuration = configuration(&mut cycle);
+        NEXT_HEADER_CALLS.store(0, Ordering::Relaxed);
+        NEXT_BODY_CALLS.store(0, Ordering::Relaxed);
+        assert_eq!(
+            unsafe { filter_postconfiguration::<ContinuationFilter>(&raw mut configuration) },
+            Status::NGX_OK.0
+        );
+
+        let mut raw = request();
+        raw.main = &raw mut raw;
+        raw.parent = &raw mut raw;
+        raw.set_count(1);
+        let mut hold = None;
+        let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
+        request.hold(&mut hold).unwrap();
+        let mut continuation = RequestHold::take(&mut hold, request).unwrap();
+        let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
+
+        assert_eq!(
+            continuation.call_next_header(&CONTINUATION_SLOT),
+            Err(RequestContinuationError::Request(RequestError::Connection(
+                ConnectionError::NullConnection
+            )))
+        );
+        assert_eq!(NEXT_HEADER_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            continuation.call_next_body(&CONTINUATION_SLOT, chain),
+            Err(RequestContinuationError::Request(RequestError::Connection(
+                ConnectionError::NullConnection
+            )))
+        );
+        assert_eq!(NEXT_BODY_CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn checked_request_output_calls_current_filters_and_preserves_statuses() {
+        let globals = FilterGlobals::new();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut connection = unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() };
+        connection.log = &raw mut log;
+        let mut raw = request();
+        raw.main = &raw mut raw;
+        raw.connection = &raw mut connection;
+        let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
+        {
+            let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
+
+            NEXT_HEADER_CALLS.store(0, Ordering::Relaxed);
+            NEXT_BODY_CALLS.store(0, Ordering::Relaxed);
+            assert_eq!(request.send_header(), Ok(Status::NGX_DECLINED));
+            assert_eq!(request.output_filter(chain), Ok(Status::NGX_DECLINED));
+            assert_eq!(NEXT_HEADER_CALLS.load(Ordering::Relaxed), 1);
+            assert_eq!(NEXT_BODY_CALLS.load(Ordering::Relaxed), 1);
+
+            globals.set(Some(failing_header), Some(failing_body));
+            assert_eq!(request.send_header(), Ok(Status::NGX_ERROR));
+            assert_eq!(request.output_filter(chain), Ok(Status::NGX_ERROR));
+        }
+        assert_eq!(connection.error(), 1);
+    }
+
+    #[test]
+    fn terminal_continuation_sends_output_without_consuming_its_hold() {
+        let _globals = FilterGlobals::new();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut connection = unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() };
+        connection.log = &raw mut log;
+        let mut raw = request();
+        raw.main = &raw mut raw;
+        raw.connection = &raw mut connection;
+        raw.set_count(1);
+        let mut hold = None;
+        let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
+        let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
+        request.hold(&mut hold).unwrap();
+        let mut continuation = RequestHold::take(&mut hold, request).unwrap();
+
+        NEXT_HEADER_CALLS.store(0, Ordering::Relaxed);
+        NEXT_BODY_CALLS.store(0, Ordering::Relaxed);
+        assert_eq!(continuation.send_header(), Ok(Status::NGX_DECLINED));
+        assert_eq!(continuation.output_filter(chain), Ok(Status::NGX_DECLINED));
+        assert_eq!(NEXT_HEADER_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(NEXT_BODY_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(continuation.cancel(), Ok(()));
     }
 
     #[test]
