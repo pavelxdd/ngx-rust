@@ -3172,7 +3172,7 @@ mod tests {
         let mut r: ngx_http_request_t = unsafe { MaybeUninit::zeroed().assume_init() };
         // SAFETY: `r` outlives `req`, and the test reads only
         // `upstream_states`, which it sets up below.
-        let req = unsafe { Request::from_ngx_http_request(&raw mut r) };
+        let req = request_from(&mut r);
         // No upstream contacted: the array is null.
         assert!(req.upstream_states().is_empty());
 
@@ -3190,7 +3190,7 @@ mod tests {
         r.upstream_states = &raw mut arr;
 
         // SAFETY: as above; `states` and `arr` also outlive `req`.
-        let req = unsafe { Request::from_ngx_http_request(&raw mut r) };
+        let req = request_from(&mut r);
         let statuses: Vec<_> = req.upstream_states().iter().map(|s| s.status).collect();
         assert_eq!(statuses, [502, 200]);
     }
