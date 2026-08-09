@@ -7,7 +7,7 @@ use super::{ConfiguredUpstreamUrl, UpstreamPort, UpstreamUrlParseError, Upstream
 use crate::core::{SocketAddressError, SocketPort};
 use crate::ffi::{ngx_addr_t, ngx_str_t, ngx_url_t};
 
-fn raw_url<'pool>(raw: &'pool mut ngx_url_t) -> ConfiguredUpstreamUrl<'pool> {
+fn raw_url(raw: &mut ngx_url_t) -> ConfiguredUpstreamUrl<'_> {
     ConfiguredUpstreamUrl {
         raw: NonNull::from(raw),
         _pool: PhantomData,
@@ -31,6 +31,11 @@ fn configured_url_keeps_copied_input_and_default_port() {
     let address = address.socket_address().unwrap();
     assert_eq!(address.ipv4_octets(), Some([127, 0, 0, 1]));
     assert_eq!(address.port(), Some(SocketPort::from_host_order(8080)));
+
+    let addresses = url.addresses().unwrap();
+    let selected = addresses.get(0).unwrap();
+    let address = selected.event_peer_address().unwrap();
+    assert_eq!(address.name().unwrap().as_bytes(), b"127.0.0.1:8080");
 }
 
 #[test]

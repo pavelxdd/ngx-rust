@@ -18,6 +18,9 @@ use crate::ffi::{
 };
 use crate::ngx_container_of;
 
+mod peer;
+pub use peer::*;
+
 /// Failure returned while validating a native nginx event pointer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventError {
