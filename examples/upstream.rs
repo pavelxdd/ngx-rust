@@ -19,7 +19,7 @@ use ngx::ffi::{
     ngx_http_upstream_srv_conf_t, ngx_http_upstream_t, ngx_int_t, ngx_module_t,
     ngx_peer_connection_t, ngx_str_t, ngx_uint_t,
 };
-use ngx::http::{HttpModule, Merge, MergeConfigError, Request};
+use ngx::http::{HttpModule, Merge, MergeConfigError, RequestRefMut};
 use ngx::http::{HttpModuleServerConf, NgxHttpUpstreamModule};
 use ngx::{
     http_upstream_init_peer_pt, ngx_conf_log_error, ngx_log_debug_http, ngx_log_debug_mask,
@@ -114,10 +114,13 @@ pub static mut ngx_http_upstream_custom_module: ngx_module_t = ngx_module_t {
 // are saved into peer data and replaced with this module's custom callbacks.
 http_upstream_init_peer_pt!(
     http_upstream_init_custom_peer,
-    |request: &mut Request, us: *mut ngx_http_upstream_srv_conf_t| {
+    |request: &mut RequestRefMut<'_>, us: *mut ngx_http_upstream_srv_conf_t| {
         ngx_log_debug_http!(request, "CUSTOM UPSTREAM request peer init");
 
-        let hcpd = request.pool().alloc_type::<UpstreamPeerData>();
+        let hcpd = match request.pool() {
+            Ok(pool) => pool.alloc_type::<UpstreamPeerData>(),
+            Err(_) => return Status::NGX_ERROR,
+        };
         if hcpd.is_null() {
             return Status::NGX_ERROR;
         }
@@ -132,7 +135,8 @@ http_upstream_init_peer_pt!(
             Ok(None) | Err(_) => return Status::NGX_ERROR,
         };
 
-        if unsafe { original_init_peer(request.into(), us) != Status::NGX_OK.into() } {
+        let raw_request = unsafe { request.as_ptr() };
+        if unsafe { original_init_peer(raw_request, us) != Status::NGX_OK.into() } {
             return Status::NGX_ERROR;
         }
 
@@ -141,17 +145,20 @@ http_upstream_init_peer_pt!(
             Ok(None) | Err(_) => return Status::NGX_ERROR,
         };
 
-        let maybe_upstream = request.upstream();
-        if maybe_upstream.is_none() {
+        let Some(upstream) = (unsafe { request.upstream() }) else {
+            return Status::NGX_ERROR;
+        };
+        let upstream_ptr = upstream.as_ptr();
+        if request.connection().is_err() {
             return Status::NGX_ERROR;
         }
-        let upstream_ptr = maybe_upstream.unwrap();
+        let client_connection = unsafe { (*request.as_ptr()).connection };
 
         unsafe {
             (*hcpd).conf = Some(hccf);
-            (*hcpd).upstream = maybe_upstream;
+            (*hcpd).upstream = Some(upstream_ptr);
             (*hcpd).data = (*upstream_ptr).peer.data;
-            (*hcpd).client_connection = Some(request.connection());
+            (*hcpd).client_connection = Some(client_connection);
             (*hcpd).original_get_peer = (*upstream_ptr).peer.get;
             (*hcpd).original_free_peer = (*upstream_ptr).peer.free;
 

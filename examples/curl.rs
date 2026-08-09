@@ -79,7 +79,7 @@ impl HttpRequestHandler for CurlRequestHandler {
     const PHASE: HttpPhase = HttpPhase::Access;
     type Output = Status;
 
-    fn handler(request: &mut Request) -> Self::Output {
+    fn handler(request: &mut RequestRefMut<'_>) -> Self::Output {
         let Ok(Some(co)) = Module::location_conf(request) else {
             return Status::NGX_ERROR;
         };
@@ -87,7 +87,7 @@ impl HttpRequestHandler for CurlRequestHandler {
         ngx_log_debug_http!(request, "curl module enabled: {}", co.enable.unwrap_or(false));
 
         if co.enable.unwrap_or(false)
-            && request.user_agent().is_some_and(|ua| ua.as_bytes().starts_with(b"curl"))
+            && matches!(request.user_agent(), Ok(Some(ua)) if ua.as_bytes().starts_with(b"curl"))
         {
             HTTPStatus::FORBIDDEN.into()
         } else {

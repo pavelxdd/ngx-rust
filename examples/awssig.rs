@@ -249,7 +249,7 @@ impl HttpRequestHandler for AwsSigV4HeaderHandler {
     const PHASE: HttpPhase = HttpPhase::PreContent;
     type Output = Status;
 
-    fn handler(request: &mut Request) -> Self::Output {
+    fn handler(request: &mut RequestRefMut<'_>) -> Self::Output {
         // get Module Config from request
         let Ok(Some(conf)) = Module::location_conf(request) else {
             return Status::NGX_ERROR;
@@ -268,8 +268,11 @@ impl HttpRequestHandler for AwsSigV4HeaderHandler {
         }
 
         let datetime = chrono::Utc::now();
-        let uri = match request.unparsed_uri().to_str() {
-            Ok(v) => format!("https://{}.{}{}", conf.s3_bucket, conf.s3_endpoint, v),
+        let uri = match request.unparsed_uri() {
+            Ok(uri) => match uri.to_str() {
+                Ok(uri) => format!("https://{}.{}{}", conf.s3_bucket, conf.s3_endpoint, uri),
+                Err(_) => return Status::NGX_DECLINED,
+            },
             Err(_) => return Status::NGX_DECLINED,
         };
 
@@ -314,8 +317,8 @@ impl HttpRequestHandler for AwsSigV4HeaderHandler {
             s.sign()
         };
 
-        if request.add_header_in("authorization", signature.as_str()).is_none()
-            || request.add_header_in("X-Amz-Date", datetime_now.as_str()).is_none()
+        if request.add_header_in("authorization", signature.as_str()).is_err()
+            || request.add_header_in("X-Amz-Date", datetime_now.as_str()).is_err()
         {
             return Status::NGX_ERROR;
         }

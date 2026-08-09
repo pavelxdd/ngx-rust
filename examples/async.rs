@@ -177,7 +177,7 @@ impl AsyncHttpRequestHandler for AsyncAccessHandler {
     type Result = Status;
 
     fn start(
-        request: &mut http::Request,
+        request: &mut http::RequestRefMut<'_>,
     ) -> impl core::future::Future<Output = Self::Output> + 'static {
         let enabled = Module::location_conf(request)
             .map_err(|_| SubRequestError::Create(Status::NGX_ERROR.into()))
@@ -222,7 +222,7 @@ impl AsyncHttpRequestHandler for AsyncAccessHandler {
         }
     }
 
-    fn finish(request: &mut http::Request, output: Self::Output) -> Self::Result {
+    fn finish(request: &mut http::RequestRefMut<'_>, output: Self::Output) -> Self::Result {
         let output = match output {
             Ok(Some(output)) => output,
             Ok(None) => return Status::NGX_DECLINED,
@@ -233,16 +233,16 @@ impl AsyncHttpRequestHandler for AsyncAccessHandler {
         };
 
         let elapsed = output.elapsed.to_string();
-        if request.add_header_out("X-Async-Time", &elapsed).is_none() {
+        if request.add_header_out("X-Async-Time", &elapsed).is_err() {
             return Status::NGX_ERROR;
         }
         let subrequest_status = subrequest_status.0.to_string();
-        if request.add_header_out("X-Async-Subrequest-Status", &subrequest_status).is_none() {
+        if request.add_header_out("X-Async-Subrequest-Status", &subrequest_status).is_err() {
             return Status::NGX_ERROR;
         }
         #[cfg(not(windows))]
         {
-            if request.add_header_out("X-Async-Thread-Wake", "1").is_none() {
+            if request.add_header_out("X-Async-Thread-Wake", "1").is_err() {
                 return Status::NGX_ERROR;
             }
         }

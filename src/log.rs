@@ -157,15 +157,16 @@ macro_rules! ngx_log_debug {
 #[macro_export]
 macro_rules! ngx_log_debug_http {
     ( $request:expr, $($arg:tt)+ ) => {
-        let log = $request.log();
-        $crate::ngx_log_debug!(mask: $crate::log::DebugMask::Http, log, $($arg)+);
+        if let Ok(Some(log)) = $request.log() {
+            $crate::ngx_log_debug!(mask: $crate::log::DebugMask::Http, log.as_ptr(), $($arg)+);
+        }
     }
 }
 
 /// Log with requested debug mask.
 ///
 /// **NOTE:** This macro supports [`DebugMask::Http`] (`NGX_LOG_DEBUG_HTTP`), however, if you have
-/// access to a Request object via an http handler it can be more convenient and readable to use
+/// access to a checked HTTP request view via an HTTP handler it can be more convenient to use
 /// the [`ngx_log_debug_http`] macro instead.
 ///
 /// See <https://nginx.org/en/docs/dev/development_guide.html#logging> for details and available

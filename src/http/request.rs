@@ -1,35 +1,40 @@
 use core::error;
 use core::ffi::c_void;
 use core::fmt;
-use core::ptr::NonNull;
+use core::marker::PhantomData;
+use core::ptr::{self, NonNull};
 use core::slice;
 use core::str::FromStr;
 
-use crate::allocator::AllocError;
+#[cfg(feature = "std")]
+use core::panic::AssertUnwindSafe;
+#[cfg(feature = "std")]
+use std::panic::catch_unwind;
+
 use crate::collections::{NgxList, list::NgxListIter};
 use crate::core::*;
 use crate::ffi::*;
 use crate::http::status::*;
-use crate::http::upstream::UpstreamState;
-use crate::http::{HttpModuleRequestContext, HttpPhase};
+use crate::http::{HttpConfigError, HttpModuleRequestContext, HttpPhase, conf};
 
 /// Define a static request handler.
 ///
-/// Handlers are expected to take a single [`Request`] argument and return a [`Status`].
+/// Handlers are expected to take a single [`RequestRefMut`] argument and return a [`Status`].
 #[macro_export]
 macro_rules! http_request_handler {
     ( $name: ident, $handler: expr ) => {
-        extern "C" fn $name(r: *mut $crate::ffi::ngx_http_request_t) -> $crate::ffi::ngx_int_t {
-            let request = unsafe { $crate::http::Request::from_ngx_http_request(r) };
-            let status: $crate::core::Status = $handler(request);
-            status.0
+        unsafe extern "C" fn $name(
+            r: *mut $crate::ffi::ngx_http_request_t,
+        ) -> $crate::ffi::ngx_int_t {
+            let handler: for<'scope> fn(&mut $crate::http::RequestRefMut<'scope>) -> _ = $handler;
+            unsafe { $crate::http::request_callback_status(r, |request| handler(request)) }
         }
     };
 }
 
 /// Define a static post subrequest handler.
 ///
-/// Handlers are expected to take a single [`Request`] argument and return a [`Status`].
+/// Handlers are expected to take a single [`RequestRefMut`] argument and return a [`Status`].
 #[macro_export]
 macro_rules! http_subrequest_handler {
     ( $name: ident, $handler: expr ) => {
@@ -38,7 +43,14 @@ macro_rules! http_subrequest_handler {
             data: *mut ::core::ffi::c_void,
             rc: $crate::ffi::ngx_int_t,
         ) -> $crate::ffi::ngx_int_t {
-            $handler(r, data, rc)
+            let handler: for<'scope> fn(
+                &mut $crate::http::RequestRefMut<'scope>,
+                *mut ::core::ffi::c_void,
+                $crate::ffi::ngx_int_t,
+            ) -> _ = $handler;
+            unsafe {
+                $crate::http::request_callback_status(r, |request| handler(request, data, rc))
+            }
         }
     };
 }
@@ -46,7 +58,7 @@ macro_rules! http_subrequest_handler {
 /// Define a static variable setter.
 ///
 /// The set handler allows setting the property referenced by the variable.
-/// The set handler expects a [`Request`], [`mut ngx_variable_value_t`], and a [`usize`].
+/// The set handler expects a [`RequestRefMut`], [`mut ngx_variable_value_t`], and a [`usize`].
 /// Variables: <https://nginx.org/en/docs/dev/development_guide.html#http_variables>
 #[macro_export]
 macro_rules! http_variable_set {
@@ -56,8 +68,17 @@ macro_rules! http_variable_set {
             v: *mut $crate::ffi::ngx_variable_value_t,
             data: usize,
         ) {
-            let request = unsafe { $crate::http::Request::from_ngx_http_request(r) };
-            $handler(request, v, data);
+            let handler: for<'scope> fn(
+                &mut $crate::http::RequestRefMut<'scope>,
+                *mut $crate::ffi::ngx_variable_value_t,
+                usize,
+            ) -> _ = $handler;
+            let _ = unsafe {
+                $crate::http::request_callback_status(r, |request| {
+                    handler(request, v, data);
+                    $crate::core::Status::NGX_OK
+                })
+            };
         }
     };
 }
@@ -65,7 +86,7 @@ macro_rules! http_variable_set {
 /// Define a static variable evaluator.
 ///
 /// The get handler is responsible for evaluating a variable in the context of a specific request.
-/// Variable evaluators accept a [`Request`] input argument and two output
+/// Variable evaluators accept a [`RequestRefMut`] input argument and two output
 /// arguments: [`ngx_variable_value_t`] and [`usize`].
 /// Variables: <https://nginx.org/en/docs/dev/development_guide.html#http_variables>
 #[macro_export]
@@ -76,9 +97,12 @@ macro_rules! http_variable_get {
             v: *mut $crate::ffi::ngx_variable_value_t,
             data: usize,
         ) -> $crate::ffi::ngx_int_t {
-            let request = unsafe { $crate::http::Request::from_ngx_http_request(r) };
-            let status: $crate::core::Status = $handler(request, v, data);
-            status.0
+            let handler: for<'scope> fn(
+                &mut $crate::http::RequestRefMut<'scope>,
+                *mut $crate::ffi::ngx_variable_value_t,
+                usize,
+            ) -> _ = $handler;
+            unsafe { $crate::http::request_callback_status(r, |request| handler(request, v, data)) }
         }
     };
 }
@@ -95,7 +119,7 @@ where
     Self: Sized,
 {
     /// Convert the handler return type into an `ngx_int_t`.
-    fn into_handler_status(self, _r: &Request) -> ngx_int_t;
+    fn into_handler_status(self, _r: &RequestRef<'_>) -> ngx_int_t;
 }
 
 impl<T> IntoHandlerStatus for Option<T>
@@ -103,7 +127,7 @@ where
     T: IntoHandlerStatus,
 {
     #[inline]
-    fn into_handler_status(self, r: &Request) -> ngx_int_t {
+    fn into_handler_status(self, r: &RequestRef<'_>) -> ngx_int_t {
         self.map(|val| val.into_handler_status(r)).unwrap_or(NGX_ERROR as _)
     }
 }
@@ -114,7 +138,7 @@ where
     E: IntoHandlerStatus,
 {
     #[inline]
-    fn into_handler_status(self, r: &Request) -> ngx_int_t {
+    fn into_handler_status(self, r: &RequestRef<'_>) -> ngx_int_t {
         match self {
             Ok(value) => value.into_handler_status(r),
             Err(error) => error.into_handler_status(r),
@@ -124,21 +148,21 @@ where
 
 impl IntoHandlerStatus for ngx_int_t {
     #[inline]
-    fn into_handler_status(self, _r: &Request) -> ngx_int_t {
+    fn into_handler_status(self, _r: &RequestRef<'_>) -> ngx_int_t {
         self
     }
 }
 
 impl IntoHandlerStatus for Status {
     #[inline]
-    fn into_handler_status(self, _r: &Request) -> ngx_int_t {
+    fn into_handler_status(self, _r: &RequestRef<'_>) -> ngx_int_t {
         self.0
     }
 }
 
 impl IntoHandlerStatus for HTTPStatus {
     #[inline]
-    fn into_handler_status(self, _r: &Request) -> ngx_int_t {
+    fn into_handler_status(self, _r: &RequestRef<'_>) -> ngx_int_t {
         self.0 as _
     }
 }
@@ -150,7 +174,7 @@ pub trait HttpRequestHandler {
     /// The return type of the handler.
     type Output: IntoHandlerStatus;
     /// The handler function.
-    fn handler(request: &mut Request) -> Self::Output;
+    fn handler(request: &mut RequestRefMut<'_>) -> Self::Output;
     /// Handler name for logging purposes.
     /// [`core::any::type_name`] is used by default.
     fn name() -> &'static str {
@@ -167,492 +191,958 @@ pub(crate) unsafe extern "C" fn raw_handler<H>(r: *mut ngx_http_request_t) -> ng
 where
     H: HttpRequestHandler,
 {
-    let r = unsafe { Request::from_ngx_http_request(r) };
-    H::handler(r).into_handler_status(r)
+    unsafe { request_callback_status(r, |request| H::handler(request)) }
 }
 
-/// Wrapper struct for an [`ngx_http_request_t`] pointer, providing methods for working with HTTP
-/// requests.
+/// Failure returned while creating or using a checked HTTP request view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestError {
+    /// The request pointer is null.
+    NullRequest,
+    /// The request pointer does not satisfy `ngx_http_request_t` alignment.
+    MisalignedRequest,
+    /// The pointed value is not an initialized HTTP request.
+    InvalidRequestSignature,
+    /// The request does not identify a main request.
+    MissingMain,
+    /// The main request pointer does not satisfy `ngx_http_request_t` alignment.
+    MisalignedMain,
+    /// The main request does not have a valid HTTP request signature.
+    InvalidMainSignature,
+    /// The main request is not the root of this request's parent chain.
+    ForeignMain,
+    /// The request has no pool.
+    MissingPool,
+    /// The request pool pointer does not satisfy `ngx_pool_t` alignment.
+    MisalignedPool,
+    /// The client connection is invalid.
+    Connection(ConnectionError),
+    /// A native request string has a nonzero length but no data pointer.
+    MissingStringData,
+    /// A native request timestamp cannot be represented as an unsigned value.
+    NegativeStartTime,
+    /// A native request counter cannot be represented as an unsigned value.
+    NegativeCounter,
+    /// A response content length cannot be represented by nginx's `off_t`.
+    ContentLengthTooLarge,
+    /// Nginx could not allocate request-pool storage.
+    Allocation,
+}
+
+impl From<ConnectionError> for RequestError {
+    fn from(error: ConnectionError) -> Self {
+        Self::Connection(error)
+    }
+}
+
+/// Failure returned while accessing a module request-context slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestContextError {
+    /// The module descriptor does not identify a usable HTTP context slot.
+    Configuration(HttpConfigError),
+    /// Nginx has not installed the request context-slot array.
+    MissingSlots,
+    /// The request context-slot array does not satisfy pointer alignment.
+    MisalignedSlots,
+    /// A non-null module context does not satisfy its Rust type's alignment.
+    MisalignedContext,
+    /// The request pool cannot be used for a context operation.
+    Request(RequestError),
+    /// Nginx could not allocate the context and its cleanup entry.
+    Allocation,
+    /// The context cleanup was missing when removal was requested.
+    MissingCleanup,
+}
+
+impl From<HttpConfigError> for RequestContextError {
+    fn from(error: HttpConfigError) -> Self {
+        Self::Configuration(error)
+    }
+}
+
+impl From<RequestError> for RequestContextError {
+    fn from(error: RequestError) -> Self {
+        Self::Request(error)
+    }
+}
+
+fn checked_request_ptr(
+    request: *mut ngx_http_request_t,
+) -> Result<NonNull<ngx_http_request_t>, RequestError> {
+    let request = NonNull::new(request).ok_or(RequestError::NullRequest)?;
+    if !request.as_ptr().is_aligned() {
+        return Err(RequestError::MisalignedRequest);
+    }
+    if unsafe { request.as_ref().signature } != NGX_HTTP_MODULE {
+        return Err(RequestError::InvalidRequestSignature);
+    }
+
+    Ok(request)
+}
+
+unsafe fn checked_ngx_str<'a>(value: ngx_str_t) -> Result<&'a NgxStr, RequestError> {
+    if value.len == 0 {
+        return Ok(NgxStr::from_bytes(&[]));
+    }
+
+    let data = NonNull::new(value.data).ok_or(RequestError::MissingStringData)?;
+    let bytes = unsafe { slice::from_raw_parts(data.as_ptr(), value.len) };
+    Ok(NgxStr::from_bytes(bytes))
+}
+
+const MAX_SUBREQUEST_DEPTH: usize = 50;
+
+/// Shared callback-scoped access to an nginx HTTP request.
 ///
-/// See <https://nginx.org/en/docs/dev/development_guide.html#http_request>
-#[repr(transparent)]
-pub struct Request(ngx_http_request_t);
-
-impl<'a> From<&'a Request> for *const ngx_http_request_t {
-    fn from(request: &'a Request) -> Self {
-        &raw const request.0
-    }
+/// ```compile_fail
+/// use ngx::ffi::ngx_http_request_t;
+/// use ngx::http::RequestRef;
+///
+/// unsafe fn escape(raw: *const ngx_http_request_t) -> RequestRef<'static> {
+///     unsafe { RequestRef::with_raw(raw, |request| request) }.unwrap()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_http_request_t;
+/// use ngx::http::RequestRef;
+///
+/// fn require_send<T: Send>(_: T) {}
+/// unsafe fn reject(raw: *const ngx_http_request_t) {
+///     let _ = unsafe { RequestRef::with_raw(raw, |request| require_send(request)) };
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_http_request_t;
+/// use ngx::http::RequestRef;
+///
+/// fn require_sync<T: Sync>(_: &T) {}
+/// unsafe fn reject(raw: *const ngx_http_request_t) {
+///     let _ = unsafe { RequestRef::with_raw(raw, |request| require_sync(&request)) };
+/// }
+/// ```
+#[derive(Clone, Copy)]
+pub struct RequestRef<'callback> {
+    raw: NonNull<ngx_http_request_t>,
+    _callback: PhantomData<&'callback ngx_http_request_t>,
+    _not_thread_safe: PhantomData<*mut ()>,
 }
 
-impl<'a> From<&'a mut Request> for *mut ngx_http_request_t {
-    fn from(request: &'a mut Request) -> Self {
-        &raw mut request.0
-    }
-}
-
-impl AsRef<ngx_http_request_t> for Request {
-    fn as_ref(&self) -> &ngx_http_request_t {
-        &self.0
-    }
-}
-
-impl AsMut<ngx_http_request_t> for Request {
-    fn as_mut(&mut self) -> &mut ngx_http_request_t {
-        &mut self.0
-    }
-}
-
-impl Request {
-    /// Create a [`Request`] from an [`ngx_http_request_t`].
+impl RequestRef<'_> {
+    /// Creates a checked shared request view from an nginx callback pointer.
     ///
     /// # Safety
     ///
-    /// The caller has provided a valid non-null pointer to a valid `ngx_http_request_t`
-    /// which shares the same representation as `Request`.
-    pub unsafe fn from_ngx_http_request<'a>(r: *mut ngx_http_request_t) -> &'a mut Request {
-        unsafe { &mut *r.cast::<Request>() }
+    /// `request` must point to a live initialized nginx request for `'callback`. Nginx must not
+    /// mutate it while this shared view exists, and the view must remain on its owning event-loop
+    /// thread.
+    pub unsafe fn from_raw(request: *const ngx_http_request_t) -> Result<Self, RequestError> {
+        let raw = checked_request_ptr(request.cast_mut())?;
+        Ok(Self { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
     }
 
-    /// Create a shared [`Request`] from an [`ngx_http_request_t`] pointer.
+    /// Invokes a closure with a request view that cannot escape the nginx callback through a safe
+    /// value.
     ///
     /// # Safety
     ///
-    /// The caller must provide a valid non-null request pointer and ensure that no mutable
-    /// reference to the request is live for the returned lifetime.
-    pub unsafe fn from_const_ngx_http_request<'a>(r: *const ngx_http_request_t) -> &'a Request {
-        unsafe { &*r.cast::<Request>() }
+    /// The same requirements as [`from_raw`](Self::from_raw) apply for the closure call.
+    pub unsafe fn with_raw<R>(
+        request: *const ngx_http_request_t,
+        f: impl for<'scope> FnOnce(RequestRef<'scope>) -> R,
+    ) -> Result<R, RequestError> {
+        let request = unsafe { Self::from_raw(request) }?;
+        Ok(f(request))
     }
 
-    /// Is this the main request (as opposed to a subrequest)?
-    pub fn is_main(&self) -> bool {
-        let main = self.0.main.cast();
-        core::ptr::eq(self, main)
+    /// Returns the native request pointer for an explicit nginx FFI operation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the target nginx API's aliasing and callback-lifetime requirements.
+    pub unsafe fn as_ptr(&self) -> *const ngx_http_request_t {
+        self.raw.as_ptr()
+    }
+
+    fn main_raw(&self) -> Result<NonNull<ngx_http_request_t>, RequestError> {
+        let main =
+            NonNull::new(unsafe { self.raw.as_ref().main }).ok_or(RequestError::MissingMain)?;
+        if !main.as_ptr().is_aligned() {
+            return Err(RequestError::MisalignedMain);
+        }
+        if unsafe { main.as_ref().signature } != NGX_HTTP_MODULE {
+            return Err(RequestError::InvalidMainSignature);
+        }
+        if !ptr::eq(unsafe { main.as_ref().main }, main.as_ptr()) {
+            return Err(RequestError::ForeignMain);
+        }
+        if ptr::eq(main.as_ptr(), self.raw.as_ptr()) {
+            return Ok(main);
+        }
+
+        let mut request = self.raw;
+        for _ in 0..MAX_SUBREQUEST_DEPTH {
+            let parent = NonNull::new(unsafe { request.as_ref().parent })
+                .ok_or(RequestError::ForeignMain)?;
+            if !parent.as_ptr().is_aligned()
+                || unsafe { parent.as_ref().signature } != NGX_HTTP_MODULE
+                || !ptr::eq(unsafe { parent.as_ref().main }, main.as_ptr())
+            {
+                return Err(RequestError::ForeignMain);
+            }
+            if ptr::eq(parent.as_ptr(), request.as_ptr()) {
+                return Err(RequestError::ForeignMain);
+            }
+            if ptr::eq(parent.as_ptr(), main.as_ptr()) {
+                return Ok(main);
+            }
+            request = parent;
+        }
+
+        Err(RequestError::ForeignMain)
+    }
+
+    /// Returns whether this is the main request.
+    pub fn is_main(&self) -> Result<bool, RequestError> {
+        Ok(ptr::eq(self.main_raw()?.as_ptr(), self.raw.as_ptr()))
     }
 
     /// Whether nginx marked this request as internal.
     pub fn is_internal(&self) -> bool {
-        self.0.internal() != 0
+        unsafe { self.raw.as_ref().internal() != 0 }
     }
 
     /// Number of additional nested subrequests nginx permits from this request.
     pub fn subrequests_available(&self) -> u32 {
-        self.0.subrequests().saturating_sub(1)
+        unsafe { self.raw.as_ref().subrequests().saturating_sub(1) }
     }
 
-    /// Main request associated with this request.
-    pub fn main(&self) -> &Request {
-        if self.is_main() {
-            self
-        } else {
-            unsafe { Request::from_const_ngx_http_request(self.0.main) }
-        }
-    }
-
-    /// Mutable main request associated with this request.
-    ///
-    /// Nginx processes a request and its subrequests sequentially, so the active request borrow
-    /// has exclusive access to their shared main-request state.
-    pub fn main_mut(&mut self) -> &mut Request {
-        if self.is_main() { self } else { unsafe { Request::from_ngx_http_request(self.0.main) } }
+    /// Shared access to the root main request.
+    pub fn main(&self) -> Result<RequestRef<'_>, RequestError> {
+        Ok(RequestRef {
+            raw: self.main_raw()?,
+            _callback: PhantomData,
+            _not_thread_safe: PhantomData,
+        })
     }
 
     /// Request pool.
-    pub fn pool(&self) -> Pool<'_> {
-        // SAFETY: This request is allocated from `pool`, thus must be a valid pool.
-        unsafe { Pool::from_raw(self.0.pool).unwrap_unchecked() }
+    pub fn pool(&self) -> Result<Pool<'_>, RequestError> {
+        let pool = unsafe { self.raw.as_ref().pool };
+        if pool.is_null() {
+            return Err(RequestError::MissingPool);
+        }
+        unsafe { Pool::from_raw(pool) }.ok_or(RequestError::MisalignedPool)
     }
 
-    /// Returns the result as an `Option` if it exists, otherwise `None`.
-    ///
-    /// The option wraps an ngx_http_upstream_t instance, it will be none when the underlying NGINX
-    /// request does not have a pointer to a [`ngx_http_upstream_t`] upstream structure.
-    ///
-    /// [`ngx_http_upstream_t`] is best described in
-    /// <https://nginx.org/en/docs/dev/development_guide.html#http_load_balancing>
-    pub fn upstream(&self) -> Option<*mut ngx_http_upstream_t> {
-        if self.0.upstream.is_null() {
-            return None;
-        }
-        Some(self.0.upstream)
+    /// Client connection associated with this request.
+    pub fn connection(&self) -> Result<ConnectionRef<'_>, RequestError> {
+        unsafe { ConnectionRef::from_raw(self.raw.as_ref().connection) }.map_err(Into::into)
     }
 
-    /// Upstream attempts recorded for this request, in chronological order.
-    ///
-    /// The slice is empty before nginx creates an upstream or when the request is served without
-    /// contacting one. Retries add one state for each attempted peer.
-    pub fn upstream_states(&self) -> &[UpstreamState] {
-        if self.0.upstream_states.is_null() {
-            return &[];
-        }
-
-        let states = unsafe { &*self.0.upstream_states };
-        if states.nelts == 0 {
-            return &[];
-        }
-
-        // SAFETY: nginx creates this array with ngx_http_upstream_state_t elements in the request
-        // pool. UpstreamState is a transparent wrapper and the request borrow bounds the slice.
-        unsafe { slice::from_raw_parts(states.elts.cast(), states.nelts) }
+    /// Logger associated with the client connection, when nginx configured one.
+    pub fn log(&self) -> Result<Option<NonNull<ngx_log_t>>, RequestError> {
+        self.connection()?.log().map_err(Into::into)
     }
 
     /// Seconds since the Unix epoch when nginx created the request.
-    pub fn start_sec(&self) -> time_t {
-        self.0.start_sec
+    pub fn start_sec(&self) -> Result<u64, RequestError> {
+        u64::try_from(unsafe { self.raw.as_ref().start_sec })
+            .map_err(|_| RequestError::NegativeStartTime)
     }
 
     /// Millisecond component of the request creation time.
-    pub fn start_msec(&self) -> ngx_msec_t {
-        self.0.start_msec
+    pub fn start_msec(&self) -> u64 {
+        unsafe { self.raw.as_ref().start_msec as u64 }
     }
 
     /// Bytes received for the request line, headers, and body parsed so far.
-    pub fn request_length(&self) -> off_t {
-        self.0.request_length
+    pub fn request_length(&self) -> Result<u64, RequestError> {
+        u64::try_from(unsafe { self.raw.as_ref().request_length })
+            .map_err(|_| RequestError::NegativeCounter)
     }
 
     /// Current value of the client connection's sent-byte counter.
-    pub fn bytes_sent(&self) -> off_t {
-        // SAFETY: nginx assigns a connection before creating a valid HTTP request.
-        unsafe { (*self.0.connection).sent }
-    }
-
-    /// Pointer to a [`ngx_connection_t`] client connection object.
-    ///
-    /// [`ngx_connection_t`]: https://nginx.org/en/docs/dev/development_guide.html#connection
-    pub fn connection(&self) -> *mut ngx_connection_t {
-        self.0.connection
-    }
-
-    /// Pointer to a [`ngx_log_t`].
-    ///
-    /// [`ngx_log_t`]: https://nginx.org/en/docs/dev/development_guide.html#logging
-    pub fn log(&self) -> *mut ngx_log_t {
-        unsafe { (*self.connection()).log }
-    }
-
-    /// Get Module context pointer
-    fn get_module_ctx_ptr(&self, module: &ngx_module_t) -> *mut c_void {
-        unsafe { *self.0.ctx.add(module.ctx_index) }
-    }
-
-    /// Context associated with module `M` for this request.
-    pub fn module_context<M>(&self) -> Option<&M::RequestContext>
-    where
-        M: HttpModuleRequestContext,
-    {
-        let context = self.get_module_ctx_ptr(M::module()).cast::<M::RequestContext>();
-        unsafe { context.as_ref() }
-    }
-
-    /// Mutable context associated with module `M` for this request.
-    pub fn module_context_mut<M>(&mut self) -> Option<&mut M::RequestContext>
-    where
-        M: HttpModuleRequestContext,
-    {
-        let context = self.get_module_ctx_ptr(M::module()).cast::<M::RequestContext>();
-        unsafe { context.as_mut() }
-    }
-
-    /// Returns the module context, inserting a pool-owned value when absent.
-    pub fn get_or_insert_module_context_with<M>(
-        &mut self,
-        constructor: impl FnOnce() -> M::RequestContext,
-    ) -> Result<&mut M::RequestContext, AllocError>
-    where
-        M: HttpModuleRequestContext,
-    {
-        let context = self.get_module_ctx_ptr(M::module()).cast::<M::RequestContext>();
-        if let Some(mut context) = NonNull::new(context) {
-            return Ok(unsafe { context.as_mut() });
-        }
-
-        let mut context = self.pool().allocate_with_cleanup(constructor)?.into_non_null();
-        self.set_module_ctx_ptr(context.as_ptr().cast(), M::module());
-        Ok(unsafe { context.as_mut() })
-    }
-
-    /// Drops and removes the module context when present.
-    pub fn remove_module_context<M>(&mut self) -> Option<()>
-    where
-        M: HttpModuleRequestContext,
-    {
-        let context =
-            NonNull::new(self.get_module_ctx_ptr(M::module()).cast::<M::RequestContext>())?;
-        self.set_module_ctx_ptr(core::ptr::null_mut(), M::module());
-
-        let pool = self.pool();
-        if unsafe { pool.remove_cleanup(context) } {
-            Some(())
-        } else {
-            self.set_module_ctx_ptr(context.as_ptr().cast(), M::module());
-            None
-        }
-    }
-
-    fn set_module_ctx_ptr(&mut self, value: *mut c_void, module: &ngx_module_t) {
-        unsafe {
-            *self.0.ctx.add(module.ctx_index) = value;
-        };
-    }
-
-    /// Get the value of a [complex value].
-    ///
-    /// [complex value]: https://nginx.org/en/docs/dev/development_guide.html#http_complex_values
-    ///
-    /// ```compile_fail
-    /// # use ngx::ffi::ngx_http_complex_value_t;
-    /// # use ngx::http::Request;
-    /// # fn evaluate(request: &Request, value: &ngx_http_complex_value_t) {
-    /// let _ = request.get_complex_value(value);
-    /// # }
-    /// ```
-    pub fn get_complex_value(&mut self, cv: &ngx_http_complex_value_t) -> Option<&NgxStr> {
-        let r = (&raw mut self.0).cast();
-        let val = cv as *const ngx_http_complex_value_t as *mut ngx_http_complex_value_t;
-        // SAFETY: `r` is exclusively borrowed, `val` remains valid for the call, and nginx stores
-        // a valid pool-owned string in `value` when the call succeeds.
-        unsafe {
-            let mut value = ngx_str_t::default();
-            Status(ngx_http_complex_value(r, val, &raw mut value)).into_result().ok()?;
-            Some(NgxStr::from_ngx_str(value))
-        }
-    }
-
-    /// Discard (read and ignore) the [request body].
-    ///
-    /// [request body]: https://nginx.org/en/docs/dev/development_guide.html#http_request_body
-    pub fn discard_request_body(&mut self) -> Status {
-        unsafe { Status(ngx_http_discard_request_body(&raw mut self.0)) }
-    }
-
-    /// Client HTTP [User-Agent].
-    ///
-    /// [User-Agent]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/User-Agent
-    pub fn user_agent(&self) -> Option<&NgxStr> {
-        if !self.0.headers_in.user_agent.is_null() {
-            unsafe { Some(NgxStr::from_ngx_str((*self.0.headers_in.user_agent).value)) }
-        } else {
-            None
-        }
+    pub fn bytes_sent(&self) -> Result<u64, RequestError> {
+        self.connection()?.bytes_sent().map_err(Into::into)
     }
 
     /// HTTP response status set by nginx.
     ///
     /// Returns `None` while the status is unset or outside the valid HTTP range.
     pub fn status(&self) -> Option<HTTPStatus> {
-        HTTPStatus::try_from(self.0.headers_out.status).ok()
+        HTTPStatus::try_from(unsafe { self.raw.as_ref().headers_out.status }).ok()
     }
 
-    /// Set HTTP status of response.
-    pub fn set_status(&mut self, status: HTTPStatus) {
-        self.0.headers_out.status = status.into();
+    /// Request method verb.
+    pub fn method(&self) -> Method {
+        Method::from_ngx(unsafe { self.raw.as_ref().method })
     }
 
-    /// Add header to the `headers_in` object.
+    /// Path part of the request URI.
+    pub fn path(&self) -> Result<&NgxStr, RequestError> {
+        unsafe { checked_ngx_str(self.raw.as_ref().uri) }
+    }
+
+    /// Full request URI including query arguments.
+    pub fn unparsed_uri(&self) -> Result<&NgxStr, RequestError> {
+        unsafe { checked_ngx_str(self.raw.as_ref().unparsed_uri) }
+    }
+
+    fn module_context_slot(
+        &self,
+        module: &ngx_module_t,
+    ) -> Result<NonNull<*mut c_void>, RequestContextError> {
+        let index = conf::request_context_index(module)?;
+        let slots = NonNull::new(unsafe { self.raw.as_ref().ctx })
+            .ok_or(RequestContextError::MissingSlots)?;
+        if !slots.as_ptr().is_aligned() {
+            return Err(RequestContextError::MisalignedSlots);
+        }
+
+        Ok(unsafe { NonNull::new_unchecked(slots.as_ptr().add(index)) })
+    }
+
+    fn context_from_slot<T>(
+        slot: NonNull<*mut c_void>,
+    ) -> Result<Option<NonNull<T>>, RequestContextError> {
+        let Some(context) = NonNull::new(unsafe { (*slot.as_ptr()).cast::<T>() }) else {
+            return Ok(None);
+        };
+        if !context.as_ptr().is_aligned() {
+            return Err(RequestContextError::MisalignedContext);
+        }
+
+        Ok(Some(context))
+    }
+
+    /// Shared context associated with module `M` for this request.
+    pub fn module_context<M>(&self) -> Result<Option<&M::RequestContext>, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+    {
+        let slot = self.module_context_slot(M::module())?;
+        Ok(Self::context_from_slot::<M::RequestContext>(slot)?
+            .map(|context| unsafe { context.as_ref() }))
+    }
+
+    /// Client HTTP User-Agent, when nginx parsed one.
+    pub fn user_agent(&self) -> Result<Option<&NgxStr>, RequestError> {
+        let header = unsafe { self.raw.as_ref().headers_in.user_agent };
+        if header.is_null() {
+            return Ok(None);
+        }
+
+        unsafe { checked_ngx_str((*header).value) }.map(Some)
+    }
+
+    /// Whether nginx marked the response as header-only.
+    pub fn header_only(&self) -> bool {
+        unsafe { self.raw.as_ref().header_only() != 0 }
+    }
+
+    /// Returns the active upstream pointer for an explicit nginx FFI operation.
     ///
-    /// See <https://nginx.org/en/docs/dev/development_guide.html#http_request>
-    pub fn add_header_in(&mut self, key: &str, value: &str) -> Option<()> {
-        let table: *mut ngx_table_elt_t =
-            unsafe { ngx_list_push(&raw mut self.0.headers_in.headers).cast() };
-        unsafe { add_to_ngx_table(table, self.0.pool, key, value) }
+    /// # Safety
+    ///
+    /// The caller must uphold the upstream object's aliasing and request-lifetime requirements.
+    pub unsafe fn upstream(&self) -> Option<NonNull<ngx_http_upstream_t>> {
+        NonNull::new(unsafe { self.raw.as_ref().upstream })
+    }
+
+    /// Iterates over input headers.
+    ///
+    /// Header structural validation and byte-oriented APIs are provided separately.
+    pub fn headers_in_iterator(&self) -> NgxListIterator<'_> {
+        unsafe { list_iterator(&self.raw.as_ref().headers_in.headers) }
+    }
+
+    /// Iterates over output headers.
+    ///
+    /// Header structural validation and byte-oriented APIs are provided separately.
+    pub fn headers_out_iterator(&self) -> NgxListIterator<'_> {
+        unsafe { list_iterator(&self.raw.as_ref().headers_out.headers) }
+    }
+}
+
+impl fmt::Debug for RequestRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestRef").field("raw", &self.raw).finish()
+    }
+}
+
+/// Exclusive callback-scoped access to an nginx HTTP request.
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_http_request_t;
+/// use ngx::http::RequestRefMut;
+///
+/// unsafe fn escape(raw: *mut ngx_http_request_t) -> RequestRefMut<'static> {
+///     unsafe { RequestRefMut::with_raw(raw, |request| request) }.unwrap()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_http_request_t;
+/// use ngx::http::RequestRefMut;
+///
+/// fn aliases(mut request: RequestRefMut<'_>) {
+///     let main = request.main_mut().unwrap();
+///     let _another = request.main_mut().unwrap();
+///     drop(main);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_http_request_t;
+/// use ngx::http::RequestRefMut;
+///
+/// fn retain_in_future(raw: *mut ngx_http_request_t) {
+///     let _future = unsafe {
+///         RequestRefMut::with_raw(raw, |request| async move {
+///             let _request = request;
+///         })
+///     };
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_http_request_t;
+/// use ngx::http::RequestRefMut;
+///
+/// fn require_send<T: Send>(_: T) {}
+/// unsafe fn reject(raw: *mut ngx_http_request_t) {
+///     let _ = unsafe { RequestRefMut::with_raw(raw, |request| require_send(request)) };
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_http_request_t;
+/// use ngx::http::RequestRefMut;
+///
+/// fn require_sync<T: Sync>(_: &T) {}
+/// unsafe fn reject(raw: *mut ngx_http_request_t) {
+///     let _ = unsafe { RequestRefMut::with_raw(raw, |request| require_sync(&request)) };
+/// }
+/// ```
+pub struct RequestRefMut<'callback> {
+    raw: NonNull<ngx_http_request_t>,
+    _callback: PhantomData<&'callback mut ngx_http_request_t>,
+    _not_thread_safe: PhantomData<*mut ()>,
+}
+
+impl RequestRefMut<'_> {
+    /// Creates a checked exclusive request view from an nginx callback pointer.
+    ///
+    /// # Safety
+    ///
+    /// `request` must point to a live initialized nginx request for `'callback`. Nginx must make
+    /// it exclusively available for that lifetime, and the view must remain on its owning
+    /// event-loop thread.
+    pub unsafe fn from_raw(request: *mut ngx_http_request_t) -> Result<Self, RequestError> {
+        let raw = checked_request_ptr(request)?;
+        Ok(Self { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
+    }
+
+    /// Invokes a closure with a request view that cannot escape the nginx callback through a safe
+    /// value.
+    ///
+    /// # Safety
+    ///
+    /// The same requirements as [`from_raw`](Self::from_raw) apply for the closure call.
+    pub unsafe fn with_raw<R>(
+        request: *mut ngx_http_request_t,
+        f: impl for<'scope> FnOnce(RequestRefMut<'scope>) -> R,
+    ) -> Result<R, RequestError> {
+        let request = unsafe { Self::from_raw(request) }?;
+        Ok(f(request))
+    }
+
+    /// Returns a shared reborrow of this request.
+    pub fn view(&self) -> RequestRef<'_> {
+        RequestRef { raw: self.raw, _callback: PhantomData, _not_thread_safe: PhantomData }
+    }
+
+    /// Returns whether this is the main request.
+    pub fn is_main(&self) -> Result<bool, RequestError> {
+        self.view().is_main()
+    }
+
+    /// Whether nginx marked this request as internal.
+    pub fn is_internal(&self) -> bool {
+        self.view().is_internal()
+    }
+
+    /// Number of additional nested subrequests nginx permits from this request.
+    pub fn subrequests_available(&self) -> u32 {
+        self.view().subrequests_available()
+    }
+
+    /// Shared access to the root main request.
+    pub fn main(&self) -> Result<RequestRef<'_>, RequestError> {
+        let raw =
+            RequestRef { raw: self.raw, _callback: PhantomData, _not_thread_safe: PhantomData }
+                .main_raw()?;
+        Ok(RequestRef { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
+    }
+
+    /// Request pool.
+    pub fn pool(&self) -> Result<Pool<'_>, RequestError> {
+        let pool = unsafe { self.raw.as_ref().pool };
+        if pool.is_null() {
+            return Err(RequestError::MissingPool);
+        }
+        unsafe { Pool::from_raw(pool) }.ok_or(RequestError::MisalignedPool)
+    }
+
+    /// Client connection associated with this request.
+    pub fn connection(&self) -> Result<ConnectionRef<'_>, RequestError> {
+        unsafe { ConnectionRef::from_raw(self.raw.as_ref().connection) }.map_err(Into::into)
+    }
+
+    /// Logger associated with the client connection, when nginx configured one.
+    pub fn log(&self) -> Result<Option<NonNull<ngx_log_t>>, RequestError> {
+        self.view().log()
+    }
+
+    /// Seconds since the Unix epoch when nginx created the request.
+    pub fn start_sec(&self) -> Result<u64, RequestError> {
+        self.view().start_sec()
+    }
+
+    /// Millisecond component of the request creation time.
+    pub fn start_msec(&self) -> u64 {
+        self.view().start_msec()
+    }
+
+    /// Bytes received for the request line, headers, and body parsed so far.
+    pub fn request_length(&self) -> Result<u64, RequestError> {
+        self.view().request_length()
+    }
+
+    /// Current value of the client connection's sent-byte counter.
+    pub fn bytes_sent(&self) -> Result<u64, RequestError> {
+        self.view().bytes_sent()
+    }
+
+    /// HTTP response status set by nginx.
+    pub fn status(&self) -> Option<HTTPStatus> {
+        self.view().status()
+    }
+
+    /// Request method verb.
+    pub fn method(&self) -> Method {
+        self.view().method()
+    }
+
+    /// Path part of the request URI.
+    pub fn path(&self) -> Result<&NgxStr, RequestError> {
+        unsafe { checked_ngx_str(self.raw.as_ref().uri) }
+    }
+
+    /// Full request URI including query arguments.
+    pub fn unparsed_uri(&self) -> Result<&NgxStr, RequestError> {
+        unsafe { checked_ngx_str(self.raw.as_ref().unparsed_uri) }
+    }
+
+    /// Shared context associated with module `M` for this request.
+    pub fn module_context<M>(&self) -> Result<Option<&M::RequestContext>, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+    {
+        let slot =
+            RequestRef { raw: self.raw, _callback: PhantomData, _not_thread_safe: PhantomData }
+                .module_context_slot(M::module())?;
+        Ok(RequestRef::context_from_slot::<M::RequestContext>(slot)?
+            .map(|context| unsafe { context.as_ref() }))
+    }
+
+    /// Exclusive context associated with module `M` for this request.
+    pub fn module_context_mut<M>(
+        &mut self,
+    ) -> Result<Option<&mut M::RequestContext>, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+    {
+        let slot = self.view().module_context_slot(M::module())?;
+        Ok(RequestRef::context_from_slot::<M::RequestContext>(slot)?
+            .map(|mut context| unsafe { context.as_mut() }))
+    }
+
+    /// Returns the module context, inserting a pool-owned value when absent.
+    pub fn get_or_insert_module_context_with<M>(
+        &mut self,
+        constructor: impl FnOnce() -> M::RequestContext,
+    ) -> Result<&mut M::RequestContext, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+    {
+        let slot = self.view().module_context_slot(M::module())?;
+        if let Some(mut context) = RequestRef::context_from_slot::<M::RequestContext>(slot)? {
+            return Ok(unsafe { context.as_mut() });
+        }
+
+        let mut context = self
+            .pool()?
+            .allocate_with_cleanup(constructor)
+            .map_err(|_| RequestContextError::Allocation)?
+            .into_non_null();
+        unsafe { *slot.as_ptr() = context.as_ptr().cast() };
+        Ok(unsafe { context.as_mut() })
+    }
+
+    /// Drops and removes the module context when present.
+    ///
+    /// Returns `Ok(false)` when the slot is empty. A missing cleanup restores the original slot
+    /// and returns [`RequestContextError::MissingCleanup`].
+    pub fn remove_module_context<M>(&mut self) -> Result<bool, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+    {
+        let pool = self.pool()?;
+        let slot = self.view().module_context_slot(M::module())?;
+        let Some(context) = RequestRef::context_from_slot::<M::RequestContext>(slot)? else {
+            return Ok(false);
+        };
+
+        unsafe { *slot.as_ptr() = ptr::null_mut() };
+        if unsafe { pool.remove_cleanup(context) } {
+            Ok(true)
+        } else {
+            unsafe { *slot.as_ptr() = context.as_ptr().cast() };
+            Err(RequestContextError::MissingCleanup)
+        }
+    }
+
+    /// Client HTTP User-Agent, when nginx parsed one.
+    pub fn user_agent(&self) -> Result<Option<&NgxStr>, RequestError> {
+        let header = unsafe { self.raw.as_ref().headers_in.user_agent };
+        if header.is_null() {
+            return Ok(None);
+        }
+
+        unsafe { checked_ngx_str((*header).value) }.map(Some)
+    }
+
+    /// Whether nginx marked the response as header-only.
+    pub fn header_only(&self) -> bool {
+        self.view().header_only()
+    }
+
+    /// Returns the active upstream pointer for an explicit nginx FFI operation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the upstream object's aliasing and request-lifetime requirements.
+    pub unsafe fn upstream(&self) -> Option<NonNull<ngx_http_upstream_t>> {
+        unsafe { self.view().upstream() }
+    }
+
+    /// Iterates over input headers.
+    pub fn headers_in_iterator(&self) -> NgxListIterator<'_> {
+        unsafe { list_iterator(&self.raw.as_ref().headers_in.headers) }
+    }
+
+    /// Iterates over output headers.
+    pub fn headers_out_iterator(&self) -> NgxListIterator<'_> {
+        unsafe { list_iterator(&self.raw.as_ref().headers_out.headers) }
+    }
+
+    /// Returns the native request pointer for an explicit nginx FFI operation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the target nginx API's aliasing and callback-lifetime requirements.
+    pub unsafe fn as_ptr(&self) -> *mut ngx_http_request_t {
+        self.raw.as_ptr()
+    }
+
+    /// Exclusive reborrow of the root main request.
+    pub fn main_mut(&mut self) -> Result<RequestRefMut<'_>, RequestError> {
+        let raw =
+            RequestRef { raw: self.raw, _callback: PhantomData, _not_thread_safe: PhantomData }
+                .main_raw()?;
+        Ok(RequestRefMut { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
+    }
+
+    /// Consumes this view and returns exclusive access to the root main request.
+    pub fn into_main(self) -> Result<Self, RequestError> {
+        let raw =
+            RequestRef { raw: self.raw, _callback: PhantomData, _not_thread_safe: PhantomData }
+                .main_raw()?;
+        Ok(Self { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
+    }
+
+    /// Exclusive access to the client connection associated with this request.
+    pub fn connection_mut(&mut self) -> Result<ConnectionRefMut<'_>, RequestError> {
+        unsafe { ConnectionRefMut::from_raw(self.raw.as_ref().connection) }.map_err(Into::into)
+    }
+
+    /// Sets the HTTP response status.
+    pub fn set_status(&mut self, status: HTTPStatus) {
+        unsafe { self.raw.as_mut().headers_out.status = status.into() };
+    }
+
+    /// Gets the value of a complex value.
+    pub fn get_complex_value(
+        &mut self,
+        value: &ngx_http_complex_value_t,
+    ) -> Result<Option<&NgxStr>, RequestError> {
+        let mut output = ngx_str_t::default();
+        let status = unsafe {
+            ngx_http_complex_value(
+                self.raw.as_ptr(),
+                ptr::from_ref(value).cast_mut(),
+                &raw mut output,
+            )
+        };
+        if Status(status).into_result().is_err() {
+            return Ok(None);
+        }
+
+        unsafe { checked_ngx_str(output) }.map(Some)
+    }
+
+    /// Discards the request body.
+    pub fn discard_request_body(&mut self) -> Status {
+        Status(unsafe { ngx_http_discard_request_body(self.raw.as_ptr()) })
+    }
+
+    /// Adds an input header allocated from the request pool.
+    pub fn add_header_in(&mut self, key: &str, value: &str) -> Result<(), RequestError> {
+        let pool = self.pool()?.as_ptr();
+        let table = unsafe { ngx_list_push(&raw mut self.raw.as_mut().headers_in.headers).cast() };
+        unsafe { add_to_ngx_table(table, pool, key, value) }.ok_or(RequestError::Allocation)
     }
 
     pub(crate) fn reset_headers_in(&mut self, headers: ngx_list_t) {
-        self.0.headers_in = unsafe { core::mem::zeroed() };
-        self.0.headers_in.headers = headers;
-        // ngx_list_init makes `last` point into the initialized list, so repair it after the move.
-        self.0.headers_in.headers.last = &raw mut self.0.headers_in.headers.part;
-        self.0.headers_in.content_length_n = -1;
-        self.0.headers_in.keep_alive_n = -1;
+        let request = unsafe { self.raw.as_mut() };
+        request.headers_in = unsafe { core::mem::zeroed() };
+        request.headers_in.headers = headers;
+        request.headers_in.headers.last = &raw mut request.headers_in.headers.part;
+        request.headers_in.content_length_n = -1;
+        request.headers_in.keep_alive_n = -1;
     }
 
-    /// Add header to the `headers_out` object.
-    ///
-    /// See <https://nginx.org/en/docs/dev/development_guide.html#http_request>
-    pub fn add_header_out(&mut self, key: &str, value: &str) -> Option<()> {
-        let table: *mut ngx_table_elt_t =
-            unsafe { ngx_list_push(&raw mut self.0.headers_out.headers).cast() };
-        unsafe { add_to_ngx_table(table, self.0.pool, key, value) }
+    /// Adds an output header allocated from the request pool.
+    pub fn add_header_out(&mut self, key: &str, value: &str) -> Result<(), RequestError> {
+        let pool = self.pool()?.as_ptr();
+        let table = unsafe { ngx_list_push(&raw mut self.raw.as_mut().headers_out.headers).cast() };
+        unsafe { add_to_ngx_table(table, pool, key, value) }.ok_or(RequestError::Allocation)
     }
 
-    /// Set response body [Content-Length].
-    ///
-    /// [Content-Length]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Length
-    pub fn set_content_length_n(&mut self, n: usize) {
-        self.0.headers_out.content_length_n = n as off_t;
+    /// Sets the response Content-Length.
+    pub fn set_content_length_n(&mut self, length: usize) -> Result<(), RequestError> {
+        let length = off_t::try_from(length).map_err(|_| RequestError::ContentLengthTooLarge)?;
+        unsafe { self.raw.as_mut().headers_out.content_length_n = length };
+        Ok(())
     }
 
-    /// Send the output header.
-    ///
-    /// Do not call this function until all output headers are set.
+    /// Sends the output header.
     pub fn send_header(&mut self) -> Status {
-        unsafe { Status(ngx_http_send_header(&raw mut self.0)) }
+        Status(unsafe { ngx_http_send_header(self.raw.as_ptr()) })
     }
 
-    /// Flag indicating that the output does not require a body.
-    ///
-    /// For example, this flag is used by `HTTP HEAD` requests.
-    pub fn header_only(&self) -> bool {
-        self.0.header_only() != 0
-    }
-
-    /// request method
-    pub fn method(&self) -> Method {
-        Method::from_ngx(self.0.method)
-    }
-
-    /// path part of request only
-    pub fn path(&self) -> &NgxStr {
-        unsafe { NgxStr::from_ngx_str(self.0.uri) }
-    }
-
-    /// full uri - containing path and args
-    pub fn unparsed_uri(&self) -> &NgxStr {
-        unsafe { NgxStr::from_ngx_str(self.0.unparsed_uri) }
-    }
-
-    /// Send the [response body].
-    ///
-    /// This function can be called multiple times.
-    /// Set the `last_buf` flag in the last body buffer.
-    ///
-    /// [response body]: https://nginx.org/en/docs/dev/development_guide.html#http_request_body
+    /// Sends a response body through nginx's current output filter.
     pub fn output_filter(&mut self, body: &mut ngx_chain_t) -> Status {
-        unsafe { Status(ngx_http_output_filter(&raw mut self.0, body)) }
+        Status(unsafe { ngx_http_output_filter(self.raw.as_ptr(), body) })
     }
 
-    /// Perform internal redirect to a location.
-    ///
-    /// ```compile_fail
-    /// # use ngx::http::Request;
-    /// # fn redirect(request: &Request) {
-    /// let _ = request.internal_redirect("/next");
-    /// # }
-    /// ```
-    pub fn internal_redirect(&mut self, location: &str) -> Status {
-        assert!(!location.is_empty(), "uri location is empty");
-        let Some(mut uri) = (unsafe { ngx_str_t::from_str(self.0.pool, location) }) else {
-            return Status::NGX_ERROR;
+    /// Performs an internal redirect to a location.
+    pub fn internal_redirect(&mut self, location: &str) -> Result<Status, RequestError> {
+        if location.is_empty() {
+            return Ok(Status::NGX_ERROR);
+        }
+        let Some(mut uri) = (unsafe { ngx_str_t::from_str(self.pool()?.as_ptr(), location) })
+        else {
+            return Err(RequestError::Allocation);
         };
 
         let status = if location.starts_with('@') {
-            unsafe { ngx_http_named_location(&raw mut self.0, &raw mut uri) }
+            unsafe { ngx_http_named_location(self.raw.as_ptr(), &raw mut uri) }
         } else {
-            unsafe {
-                ngx_http_internal_redirect(&raw mut self.0, &raw mut uri, core::ptr::null_mut())
-            }
+            unsafe { ngx_http_internal_redirect(self.raw.as_ptr(), &raw mut uri, ptr::null_mut()) }
         };
-        Status(status)
-    }
-
-    /// Iterate over headers_in
-    /// each header item is (&str, &str) (borrowed)
-    pub fn headers_in_iterator(&self) -> NgxListIterator<'_> {
-        unsafe { list_iterator(&self.0.headers_in.headers) }
-    }
-
-    /// Iterate over headers_out
-    /// each header item is (&str, &str) (borrowed)
-    pub fn headers_out_iterator(&self) -> NgxListIterator<'_> {
-        unsafe { list_iterator(&self.0.headers_out.headers) }
+        Ok(Status(status))
     }
 }
 
-impl crate::http::conf::sealed::MainConfSource for Request {}
-impl crate::http::conf::sealed::MainConfSourceMut for Request {}
-impl crate::http::conf::sealed::ServerConfSource for Request {}
-impl crate::http::conf::sealed::ServerConfSourceMut for Request {}
-impl crate::http::conf::sealed::LocationConfSource for Request {}
-impl crate::http::conf::sealed::LocationConfSourceMut for Request {}
+impl fmt::Debug for RequestRefMut<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.view().fmt(f)
+    }
+}
 
-impl crate::http::HttpModuleMainConfExt for Request {
+/// Runs one HTTP callback with a checked exclusive request view and converts its result to an
+/// nginx status. Panics from Rust callbacks never unwind through nginx's C ABI.
+#[doc(hidden)]
+pub unsafe fn request_callback_status<R>(
+    request: *mut ngx_http_request_t,
+    callback: impl for<'scope> FnOnce(&mut RequestRefMut<'scope>) -> R,
+) -> ngx_int_t
+where
+    R: IntoHandlerStatus,
+{
+    #[cfg(feature = "std")]
+    {
+        match catch_unwind(AssertUnwindSafe(|| unsafe {
+            RequestRefMut::with_raw(request, |mut request| {
+                let result = callback(&mut request);
+                result.into_handler_status(&request.view())
+            })
+        })) {
+            Ok(Ok(status)) => status,
+            Ok(Err(_)) | Err(_) => NGX_ERROR as _,
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        unsafe {
+            RequestRefMut::with_raw(request, |mut request| {
+                let result = callback(&mut request);
+                result.into_handler_status(&request.view())
+            })
+        }
+        .unwrap_or(NGX_ERROR as _)
+    }
+}
+
+impl conf::sealed::MainConfSource for RequestRef<'_> {}
+impl conf::sealed::ServerConfSource for RequestRef<'_> {}
+impl conf::sealed::LocationConfSource for RequestRef<'_> {}
+
+impl crate::http::HttpModuleMainConfExt for RequestRef<'_> {
     unsafe fn http_main_conf<T>(
         &self,
         module: &ngx_module_t,
-    ) -> Result<Option<&T>, crate::http::HttpConfigError> {
+    ) -> Result<Option<&T>, HttpConfigError> {
         unsafe {
             <ngx_http_request_t as crate::http::HttpModuleMainConfExt>::http_main_conf(
-                &self.0, module,
-            )
-        }
-    }
-}
-
-impl crate::http::HttpModuleMainConfMutExt for Request {
-    unsafe fn http_main_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, crate::http::HttpConfigError> {
-        unsafe {
-            <ngx_http_request_t as crate::http::HttpModuleMainConfMutExt>::http_main_conf_mut(
-                &mut self.0,
+                self.raw.as_ref(),
                 module,
             )
         }
     }
 }
 
-impl crate::http::HttpModuleServerConfExt for Request {
+impl crate::http::HttpModuleServerConfExt for RequestRef<'_> {
     unsafe fn http_server_conf<T>(
         &self,
         module: &ngx_module_t,
-    ) -> Result<Option<&T>, crate::http::HttpConfigError> {
+    ) -> Result<Option<&T>, HttpConfigError> {
         unsafe {
             <ngx_http_request_t as crate::http::HttpModuleServerConfExt>::http_server_conf(
-                &self.0, module,
-            )
-        }
-    }
-}
-
-impl crate::http::HttpModuleServerConfMutExt for Request {
-    unsafe fn http_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, crate::http::HttpConfigError> {
-        unsafe {
-            <ngx_http_request_t as crate::http::HttpModuleServerConfMutExt>::http_server_conf_mut(
-                &mut self.0,
+                self.raw.as_ref(),
                 module,
             )
         }
     }
 }
 
-impl crate::http::HttpModuleLocationConfExt for Request {
+impl crate::http::HttpModuleLocationConfExt for RequestRef<'_> {
     unsafe fn http_location_conf<T>(
         &self,
         module: &ngx_module_t,
-    ) -> Result<Option<&T>, crate::http::HttpConfigError> {
+    ) -> Result<Option<&T>, HttpConfigError> {
         unsafe {
             <ngx_http_request_t as crate::http::HttpModuleLocationConfExt>::http_location_conf(
-                &self.0, module,
-            )
-        }
-    }
-}
-
-impl crate::http::HttpModuleLocationConfMutExt for Request {
-    unsafe fn http_location_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, crate::http::HttpConfigError> {
-        unsafe {
-            <ngx_http_request_t as crate::http::HttpModuleLocationConfMutExt>::http_location_conf_mut(
-                &mut self.0,
+                self.raw.as_ref(),
                 module,
             )
         }
     }
 }
 
-// trait OnSubRequestDone {
+impl conf::sealed::MainConfSource for RequestRefMut<'_> {}
+impl conf::sealed::MainConfSourceMut for RequestRefMut<'_> {}
+impl conf::sealed::ServerConfSource for RequestRefMut<'_> {}
+impl conf::sealed::ServerConfSourceMut for RequestRefMut<'_> {}
+impl conf::sealed::LocationConfSource for RequestRefMut<'_> {}
+impl conf::sealed::LocationConfSourceMut for RequestRefMut<'_> {}
 
-// }
+impl crate::http::HttpModuleMainConfExt for RequestRefMut<'_> {
+    unsafe fn http_main_conf<T>(
+        &self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&T>, HttpConfigError> {
+        unsafe {
+            <ngx_http_request_t as crate::http::HttpModuleMainConfExt>::http_main_conf(
+                self.raw.as_ref(),
+                module,
+            )
+        }
+    }
+}
 
-impl fmt::Debug for Request {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Request").field("request_", &self.0).finish()
+impl crate::http::HttpModuleMainConfMutExt for RequestRefMut<'_> {
+    unsafe fn http_main_conf_mut<T>(
+        &mut self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&mut T>, HttpConfigError> {
+        unsafe {
+            <ngx_http_request_t as crate::http::HttpModuleMainConfMutExt>::http_main_conf_mut(
+                self.raw.as_mut(),
+                module,
+            )
+        }
+    }
+}
+
+impl crate::http::HttpModuleServerConfExt for RequestRefMut<'_> {
+    unsafe fn http_server_conf<T>(
+        &self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&T>, HttpConfigError> {
+        unsafe {
+            <ngx_http_request_t as crate::http::HttpModuleServerConfExt>::http_server_conf(
+                self.raw.as_ref(),
+                module,
+            )
+        }
+    }
+}
+
+impl crate::http::HttpModuleServerConfMutExt for RequestRefMut<'_> {
+    unsafe fn http_server_conf_mut<T>(
+        &mut self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&mut T>, HttpConfigError> {
+        unsafe {
+            <ngx_http_request_t as crate::http::HttpModuleServerConfMutExt>::http_server_conf_mut(
+                self.raw.as_mut(),
+                module,
+            )
+        }
+    }
+}
+
+impl crate::http::HttpModuleLocationConfExt for RequestRefMut<'_> {
+    unsafe fn http_location_conf<T>(
+        &self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&T>, HttpConfigError> {
+        unsafe {
+            <ngx_http_request_t as crate::http::HttpModuleLocationConfExt>::http_location_conf(
+                self.raw.as_ref(),
+                module,
+            )
+        }
+    }
+}
+
+impl crate::http::HttpModuleLocationConfMutExt for RequestRefMut<'_> {
+    unsafe fn http_location_conf_mut<T>(
+        &mut self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&mut T>, HttpConfigError> {
+        unsafe {
+            <ngx_http_request_t as crate::http::HttpModuleLocationConfMutExt>::http_location_conf_mut(
+                self.raw.as_mut(),
+                module,
+            )
+        }
     }
 }
 
@@ -958,6 +1448,8 @@ mod tests {
 
     use alloc::{boxed::Box, vec::Vec};
     use core::mem::MaybeUninit;
+    #[cfg(feature = "test-link")]
+    use std::sync::MutexGuard;
 
     use super::*;
     use crate::http::{HttpModule, HttpModuleRequestContext};
@@ -966,9 +1458,12 @@ mod tests {
 
     unsafe impl HttpModule for TestContextModule {
         fn module() -> &'static ngx_module_t {
-            let mut module = ngx_module_t::default();
-            module.ctx_index = 0;
-            Box::leak(Box::new(module))
+            Box::leak(Box::new(ngx_module_t {
+                type_: NGX_HTTP_MODULE as _,
+                index: 0,
+                ctx_index: 0,
+                ..ngx_module_t::default()
+            }))
         }
     }
 
@@ -980,8 +1475,252 @@ mod tests {
         unsafe { MaybeUninit::zeroed().assume_init() }
     }
 
-    fn request_from(raw: &mut ngx_http_request_t) -> &mut Request {
-        unsafe { Request::from_ngx_http_request(raw) }
+    fn initialize_request(raw: &mut ngx_http_request_t) {
+        raw.signature = NGX_HTTP_MODULE as _;
+        if raw.main.is_null() {
+            raw.main = raw;
+        }
+    }
+
+    fn request_from(raw: &mut ngx_http_request_t) -> RequestRefMut<'_> {
+        initialize_request(raw);
+        unsafe { RequestRefMut::from_raw(raw).unwrap() }
+    }
+
+    http_request_handler!(callback_status_handler, |_: &mut RequestRefMut<'_>| {
+        Status::NGX_AGAIN
+    });
+    http_request_handler!(callback_inferred_request_handler, |request| {
+        let _ = request.status();
+        Status::NGX_OK
+    });
+    http_subrequest_handler!(
+        callback_status_subrequest_handler,
+        |_: &mut RequestRefMut<'_>, _: *mut c_void, _: ngx_int_t| HTTPStatus::NO_CONTENT
+    );
+    http_variable_get!(
+        callback_status_variable_handler,
+        |_: &mut RequestRefMut<'_>, _: *mut ngx_variable_value_t, _: usize| Status::NGX_DONE
+    );
+
+    #[cfg(feature = "test-link")]
+    struct RequestGlobals {
+        _guard: MutexGuard<'static, ()>,
+        max_module: ngx_uint_t,
+        http_max_module: ngx_uint_t,
+    }
+
+    #[cfg(feature = "test-link")]
+    impl RequestGlobals {
+        fn new(module_slots: ngx_uint_t, http_slots: ngx_uint_t) -> Self {
+            let guard = crate::TEST_NGINX_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
+            let (max_module, http_max_module) =
+                unsafe { (nginx_sys::ngx_max_module, nginx_sys::ngx_http_max_module) };
+            unsafe {
+                nginx_sys::ngx_max_module = module_slots;
+                nginx_sys::ngx_http_max_module = http_slots;
+            }
+            Self { _guard: guard, max_module, http_max_module }
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    impl Drop for RequestGlobals {
+        fn drop(&mut self) {
+            unsafe {
+                nginx_sys::ngx_max_module = self.max_module;
+                nginx_sys::ngx_http_max_module = self.http_max_module;
+            }
+        }
+    }
+
+    #[test]
+    fn callback_scoped_request_rejects_null_and_misaligned_raw_pointers() {
+        assert!(matches!(
+            unsafe { RequestRefMut::from_raw(core::ptr::null_mut()) },
+            Err(RequestError::NullRequest)
+        ));
+
+        let misaligned = core::ptr::without_provenance_mut::<ngx_http_request_t>(1);
+        assert!(matches!(
+            unsafe { RequestRefMut::from_raw(misaligned) },
+            Err(RequestError::MisalignedRequest)
+        ));
+
+        let mut raw = zeroed_request();
+        assert!(matches!(
+            unsafe { RequestRefMut::from_raw(&raw mut raw) },
+            Err(RequestError::InvalidRequestSignature)
+        ));
+    }
+
+    #[test]
+    fn main_request_validation_rejects_missing_invalid_and_foreign_links() {
+        let mut missing = zeroed_request();
+        missing.signature = NGX_HTTP_MODULE as _;
+        let missing = unsafe { RequestRefMut::from_raw(&raw mut missing).unwrap() };
+        assert!(matches!(missing.main(), Err(RequestError::MissingMain)));
+
+        let mut misaligned = zeroed_request();
+        misaligned.signature = NGX_HTTP_MODULE as _;
+        misaligned.main = core::ptr::without_provenance_mut(1);
+        let misaligned = unsafe { RequestRefMut::from_raw(&raw mut misaligned).unwrap() };
+        assert!(matches!(misaligned.main(), Err(RequestError::MisalignedMain)));
+
+        let mut invalid_main = zeroed_request();
+        let mut invalid = zeroed_request();
+        invalid.signature = NGX_HTTP_MODULE as _;
+        invalid.main = &raw mut invalid_main;
+        let invalid = unsafe { RequestRefMut::from_raw(&raw mut invalid).unwrap() };
+        assert!(matches!(invalid.main(), Err(RequestError::InvalidMainSignature)));
+
+        let mut main = zeroed_request();
+        initialize_request(&mut main);
+        let mut foreign = zeroed_request();
+        foreign.signature = NGX_HTTP_MODULE as _;
+        foreign.main = &raw mut main;
+        let foreign = unsafe { RequestRefMut::from_raw(&raw mut foreign).unwrap() };
+        assert!(matches!(foreign.main(), Err(RequestError::ForeignMain)));
+
+        let mut parent = zeroed_request();
+        initialize_request(&mut parent);
+        parent.parent = &raw mut main;
+        let mut child = zeroed_request();
+        child.signature = NGX_HTTP_MODULE as _;
+        child.main = &raw mut main;
+        child.parent = &raw mut parent;
+        let child = unsafe { RequestRefMut::from_raw(&raw mut child).unwrap() };
+        assert!(matches!(child.main(), Err(RequestError::ForeignMain)));
+    }
+
+    #[test]
+    fn request_views_validate_pool_connection_and_logger_pointers() {
+        let mut missing_pool = zeroed_request();
+        assert!(matches!(request_from(&mut missing_pool).pool(), Err(RequestError::MissingPool)));
+
+        let mut misaligned_pool = zeroed_request();
+        misaligned_pool.pool = core::ptr::without_provenance_mut(1);
+        assert!(matches!(
+            request_from(&mut misaligned_pool).pool(),
+            Err(RequestError::MisalignedPool)
+        ));
+
+        let mut missing_connection = zeroed_request();
+        assert_eq!(
+            request_from(&mut missing_connection).connection(),
+            Err(RequestError::Connection(ConnectionError::NullConnection))
+        );
+
+        let mut misaligned_connection = zeroed_request();
+        misaligned_connection.connection = core::ptr::without_provenance_mut(1);
+        assert_eq!(
+            request_from(&mut misaligned_connection).connection(),
+            Err(RequestError::Connection(ConnectionError::MisalignedConnection))
+        );
+
+        let mut connection: ngx_connection_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut missing_log = zeroed_request();
+        missing_log.connection = &raw mut connection;
+        assert_eq!(request_from(&mut missing_log).log(), Ok(None));
+
+        connection.log = core::ptr::without_provenance_mut(1);
+        let mut invalid_log = zeroed_request();
+        invalid_log.connection = &raw mut connection;
+        assert_eq!(
+            request_from(&mut invalid_log).log(),
+            Err(RequestError::Connection(ConnectionError::MisalignedLog))
+        );
+    }
+
+    #[test]
+    fn request_fields_return_checked_strings_counters_and_status() {
+        let path = b"/path";
+        let uri = b"/path?query=1";
+        let agent = b"curl/8";
+        let mut user_agent: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        user_agent.value = ngx_str_t { len: agent.len(), data: agent.as_ptr().cast_mut() };
+
+        let mut raw = zeroed_request();
+        raw.uri = ngx_str_t { len: path.len(), data: path.as_ptr().cast_mut() };
+        raw.unparsed_uri = ngx_str_t { len: uri.len(), data: uri.as_ptr().cast_mut() };
+        raw.headers_in.user_agent = &raw mut user_agent;
+        raw.method = NGX_HTTP_GET as _;
+        raw.headers_out.status = HTTPStatus::NO_CONTENT.into();
+        raw.start_sec = 1_700_000_000;
+        raw.start_msec = 250;
+        raw.request_length = 4096;
+
+        let request = request_from(&mut raw);
+        assert_eq!(request.path().unwrap().as_bytes(), path);
+        assert_eq!(request.unparsed_uri().unwrap().as_bytes(), uri);
+        assert_eq!(request.user_agent().unwrap().unwrap().as_bytes(), agent);
+        assert_eq!(request.method(), Method::GET);
+        assert_eq!(request.status(), Some(HTTPStatus::NO_CONTENT));
+        assert_eq!(request.start_sec(), Ok(1_700_000_000));
+        assert_eq!(request.start_msec(), 250);
+        assert_eq!(request.request_length(), Ok(4096));
+
+        let mut malformed = zeroed_request();
+        malformed.uri.len = 1;
+        assert_eq!(request_from(&mut malformed).path(), Err(RequestError::MissingStringData));
+
+        let mut negative = zeroed_request();
+        negative.start_sec = -1;
+        negative.request_length = -1;
+        let negative = request_from(&mut negative);
+        assert_eq!(negative.start_sec(), Err(RequestError::NegativeStartTime));
+        assert_eq!(negative.request_length(), Err(RequestError::NegativeCounter));
+    }
+
+    #[test]
+    fn request_fields_accept_empty_uri_parts_and_method_variants() {
+        let mut empty = zeroed_request();
+        let empty = request_from(&mut empty);
+        assert_eq!(empty.path().unwrap().as_bytes(), b"");
+        assert_eq!(empty.unparsed_uri().unwrap().as_bytes(), b"");
+
+        let mut post = zeroed_request();
+        post.method = NGX_HTTP_POST as _;
+        assert_eq!(request_from(&mut post).method(), Method::POST);
+
+        let mut patch = zeroed_request();
+        patch.method = NGX_HTTP_PATCH as _;
+        assert_eq!(request_from(&mut patch).method(), Method::PATCH);
+    }
+
+    #[test]
+    fn callback_boundaries_convert_statuses_and_reject_invalid_requests() {
+        let mut raw = zeroed_request();
+        initialize_request(&mut raw);
+
+        assert_eq!(unsafe { callback_status_handler(&raw mut raw) }, NGX_AGAIN as _);
+        assert_eq!(unsafe { callback_inferred_request_handler(&raw mut raw) }, NGX_OK as _);
+        assert_eq!(
+            unsafe { callback_status_subrequest_handler(&raw mut raw, core::ptr::null_mut(), 0) },
+            HTTPStatus::NO_CONTENT.0 as _
+        );
+        assert_eq!(
+            unsafe { callback_status_variable_handler(&raw mut raw, core::ptr::null_mut(), 0) },
+            NGX_DONE as _
+        );
+        assert_eq!(
+            unsafe { request_callback_status(core::ptr::null_mut(), |_| Status::NGX_OK) },
+            NGX_ERROR as _
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn callback_boundary_catches_panics() {
+        let mut raw = zeroed_request();
+        initialize_request(&mut raw);
+
+        assert_eq!(
+            unsafe {
+                request_callback_status(&raw mut raw, |_| -> Status { panic!("callback panic") })
+            },
+            NGX_ERROR as _
+        );
     }
 
     #[test]
@@ -1013,46 +1752,6 @@ mod tests {
     }
 
     #[test]
-    fn upstream_states_is_empty_without_an_array() {
-        let mut raw = zeroed_request();
-
-        assert!(request_from(&mut raw).upstream_states().is_empty());
-    }
-
-    #[test]
-    fn upstream_states_is_empty_without_elements() {
-        let mut states: ngx_array_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        states.elts = (&raw mut states).cast();
-
-        let mut raw = zeroed_request();
-        raw.upstream_states = &raw mut states;
-
-        assert!(request_from(&mut raw).upstream_states().is_empty());
-    }
-
-    #[test]
-    fn upstream_states_preserves_attempt_order() {
-        let mut values: [ngx_http_upstream_state_t; 2] =
-            unsafe { MaybeUninit::zeroed().assume_init() };
-        values[0].status = 502;
-        values[0].response_time = 3;
-        values[1].status = 200;
-        values[1].response_time = 12;
-
-        let mut states: ngx_array_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        states.elts = values.as_mut_ptr().cast();
-        states.nelts = values.len();
-
-        let mut raw = zeroed_request();
-        raw.upstream_states = &raw mut states;
-
-        let attempts = request_from(&mut raw).upstream_states();
-        assert_eq!(attempts.len(), 2);
-        assert_eq!((attempts[0].status(), attempts[0].response_time()), (502, 3));
-        assert_eq!((attempts[1].status(), attempts[1].response_time()), (200, 12));
-    }
-
-    #[test]
     fn request_metrics_read_nginx_fields() {
         let mut raw = zeroed_request();
         raw.start_sec = 1_700_000_000;
@@ -1060,9 +1759,9 @@ mod tests {
         raw.request_length = 4096;
 
         let request = request_from(&mut raw);
-        assert_eq!(request.start_sec(), 1_700_000_000);
+        assert_eq!(request.start_sec(), Ok(1_700_000_000));
         assert_eq!(request.start_msec(), 250);
-        assert_eq!(request.request_length(), 4096);
+        assert_eq!(request.request_length(), Ok(4096));
     }
 
     #[test]
@@ -1073,7 +1772,20 @@ mod tests {
         let mut raw = zeroed_request();
         raw.connection = &raw mut connection;
 
-        assert_eq!(request_from(&mut raw).bytes_sent(), 8192);
+        assert_eq!(request_from(&mut raw).bytes_sent(), Ok(8192));
+    }
+
+    #[test]
+    fn bytes_sent_rejects_a_negative_client_counter() {
+        let mut connection: ngx_connection_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        connection.sent = -1;
+        let mut raw = zeroed_request();
+        raw.connection = &raw mut connection;
+
+        assert_eq!(
+            request_from(&mut raw).bytes_sent(),
+            Err(RequestError::Connection(ConnectionError::NegativeBytesSent))
+        );
     }
 
     #[test]
@@ -1107,61 +1819,146 @@ mod tests {
         let success: Result<Status, HTTPStatus> = Ok(Status::NGX_AGAIN);
         let error: Result<Status, HTTPStatus> = Err(HTTPStatus::BAD_REQUEST);
 
-        assert_eq!(success.into_handler_status(request), Status::NGX_AGAIN.0);
-        assert_eq!(error.into_handler_status(request), 400);
+        assert_eq!(success.into_handler_status(&request.view()), Status::NGX_AGAIN.0);
+        assert_eq!(error.into_handler_status(&request.view()), 400);
     }
 
     #[test]
     fn main_returns_the_same_main_request() {
         let mut raw = zeroed_request();
-        raw.main = &raw mut raw;
         let request = request_from(&mut raw);
 
-        assert!(core::ptr::eq(request.main(), request));
+        assert!(request.is_main().unwrap());
+        let first = request.view();
+        let second = request.view();
+        assert_eq!(unsafe { first.as_ptr() }, unsafe { second.as_ptr() });
+        assert_eq!(unsafe { request.main().unwrap().as_ptr() }, unsafe { request.as_ptr() });
     }
 
     #[test]
     fn main_returns_the_parent_of_a_subrequest() {
         let mut raw_main = zeroed_request();
-        raw_main.main = &raw mut raw_main;
+        initialize_request(&mut raw_main);
         let mut raw_subrequest = zeroed_request();
+        initialize_request(&mut raw_subrequest);
         raw_subrequest.main = &raw mut raw_main;
+        raw_subrequest.parent = &raw mut raw_main;
 
-        let main: *const ngx_http_request_t = request_from(&mut raw_subrequest).main().into();
+        let request = request_from(&mut raw_subrequest);
+        let main = unsafe { request.main().unwrap().as_ptr() };
 
         assert_eq!(main, &raw const raw_main);
     }
 
     #[test]
+    fn main_returns_the_root_of_nested_subrequests() {
+        let mut raw_main = zeroed_request();
+        initialize_request(&mut raw_main);
+        let mut raw_parent = zeroed_request();
+        initialize_request(&mut raw_parent);
+        raw_parent.main = &raw mut raw_main;
+        raw_parent.parent = &raw mut raw_main;
+        let mut raw_child = zeroed_request();
+        initialize_request(&mut raw_child);
+        raw_child.main = &raw mut raw_main;
+        raw_child.parent = &raw mut raw_parent;
+
+        let request = request_from(&mut raw_child);
+
+        assert_eq!(unsafe { request.main().unwrap().as_ptr() }, &raw const raw_main);
+    }
+
+    #[test]
     fn main_mut_updates_the_parent_of_a_subrequest() {
         let mut raw_main = zeroed_request();
-        raw_main.main = &raw mut raw_main;
+        initialize_request(&mut raw_main);
         let mut raw_subrequest = zeroed_request();
+        initialize_request(&mut raw_subrequest);
         raw_subrequest.main = &raw mut raw_main;
+        raw_subrequest.parent = &raw mut raw_main;
 
-        request_from(&mut raw_subrequest).main_mut().0.request_length = 4096;
+        let mut request = request_from(&mut raw_subrequest);
+        let main = request.main_mut().unwrap();
+        unsafe { (*main.as_ptr()).request_length = 4096 };
 
         assert_eq!(raw_main.request_length, 4096);
     }
 
     #[test]
-    fn module_context_reads_the_associated_context_type() {
-        let mut context = 41u32;
-        let mut contexts = [(&raw mut context).cast()];
-        let mut raw = zeroed_request();
-        raw.ctx = contexts.as_mut_ptr();
+    fn into_main_consumes_a_subrequest_view() {
+        let mut raw_main = zeroed_request();
+        initialize_request(&mut raw_main);
+        let mut raw_subrequest = zeroed_request();
+        initialize_request(&mut raw_subrequest);
+        raw_subrequest.main = &raw mut raw_main;
+        raw_subrequest.parent = &raw mut raw_main;
 
-        assert_eq!(request_from(&mut raw).module_context::<TestContextModule>(), Some(&41));
+        let main = request_from(&mut raw_subrequest).into_main().unwrap();
+
+        assert_eq!(unsafe { main.as_ptr() }, &raw mut raw_main);
     }
 
+    #[cfg(feature = "test-link")]
     #[test]
-    fn module_context_mut_updates_the_associated_context_type() {
+    fn request_context_slots_validate_missing_and_misaligned_storage() {
+        let _globals = RequestGlobals::new(1, 1);
+
+        let mut missing = zeroed_request();
+        assert_eq!(
+            request_from(&mut missing).module_context::<TestContextModule>(),
+            Err(RequestContextError::MissingSlots)
+        );
+
+        let mut misaligned_slots = zeroed_request();
+        misaligned_slots.ctx = core::ptr::without_provenance_mut(1);
+        assert_eq!(
+            request_from(&mut misaligned_slots).module_context::<TestContextModule>(),
+            Err(RequestContextError::MisalignedSlots)
+        );
+
+        let mut slots = [core::ptr::without_provenance_mut::<c_void>(1)];
+        let mut misaligned_context = zeroed_request();
+        misaligned_context.ctx = slots.as_mut_ptr();
+        assert_eq!(
+            request_from(&mut misaligned_context).module_context::<TestContextModule>(),
+            Err(RequestContextError::MisalignedContext)
+        );
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn request_context_slots_reject_unavailable_module_indexes() {
+        let _globals = RequestGlobals::new(0, 0);
+        let mut raw = zeroed_request();
+
+        assert_eq!(
+            request_from(&mut raw).module_context::<TestContextModule>(),
+            Err(RequestContextError::Configuration(HttpConfigError::ModuleIndexOutOfBounds))
+        );
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn module_context_reads_the_associated_context_type() {
+        let _globals = RequestGlobals::new(1, 1);
         let mut context = 41u32;
         let mut contexts = [(&raw mut context).cast()];
         let mut raw = zeroed_request();
         raw.ctx = contexts.as_mut_ptr();
 
-        *request_from(&mut raw).module_context_mut::<TestContextModule>().unwrap() = 42;
+        assert_eq!(request_from(&mut raw).module_context::<TestContextModule>(), Ok(Some(&41)));
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn module_context_mut_updates_the_associated_context_type() {
+        let _globals = RequestGlobals::new(1, 1);
+        let mut context = 41u32;
+        let mut contexts = [(&raw mut context).cast()];
+        let mut raw = zeroed_request();
+        raw.ctx = contexts.as_mut_ptr();
+
+        *request_from(&mut raw).module_context_mut::<TestContextModule>().unwrap().unwrap() = 42;
 
         assert_eq!(context, 42);
     }

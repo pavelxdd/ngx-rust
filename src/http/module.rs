@@ -4,7 +4,9 @@ use core::fmt;
 use core::ptr::{self, NonNull};
 
 #[cfg(feature = "std")]
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use core::panic::AssertUnwindSafe;
+#[cfg(feature = "std")]
+use std::panic::catch_unwind;
 
 use crate::core::{NGX_CONF_ERROR, Pool, Status};
 use crate::ffi::{NGX_LOG_EMERG, ngx_conf_t, ngx_int_t, ngx_module_t};
@@ -101,12 +103,12 @@ where
 
     #[cfg(feature = "std")]
     {
-        return match pool.try_allocate_with_cleanup(|| {
+        match pool.try_allocate_with_cleanup(|| -> Result<T, ()> {
             catch_unwind(AssertUnwindSafe(T::default)).map_err(|_| ())
         }) {
             Ok(value) => value.into_non_null().as_ptr().cast(),
             Err(_) => ptr::null_mut(),
-        };
+        }
     }
 
     #[cfg(not(feature = "std"))]
@@ -141,11 +143,11 @@ where
 
     #[cfg(feature = "std")]
     {
-        return match catch_unwind(AssertUnwindSafe(|| conf.init_main_conf())) {
+        match catch_unwind(AssertUnwindSafe(|| conf.init_main_conf())) {
             Ok(Ok(())) => ptr::null_mut(),
             Ok(Err(error)) => error.as_conf_result(),
             Err(_) => NGX_CONF_ERROR,
-        };
+        }
     }
 
     #[cfg(not(feature = "std"))]
