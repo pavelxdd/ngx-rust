@@ -1,6 +1,7 @@
 use core::error;
 use core::ffi::{CStr, c_char, c_void};
 use core::fmt;
+use core::marker::PhantomData;
 use core::ptr::{self, NonNull};
 
 #[cfg(feature = "std")]
@@ -9,8 +10,10 @@ use core::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 
 use crate::core::{NGX_CONF_ERROR, Pool, Status};
-use crate::ffi::{NGX_LOG_EMERG, ngx_conf_t, ngx_int_t, ngx_module_t};
-use crate::http::{HttpModuleLocationConf, HttpModuleMainConf, HttpModuleServerConf};
+use crate::ffi::{NGX_LOG_EMERG, ngx_conf_t, ngx_cycle_t, ngx_int_t, ngx_module_t};
+use crate::http::{
+    HttpConfigError, HttpModuleLocationConf, HttpModuleMainConf, HttpModuleServerConf,
+};
 
 /// Error returned when child configuration cannot be merged with its parent.
 #[derive(Debug)]
@@ -86,6 +89,150 @@ unsafe fn checked_mut<'a, T>(pointer: *mut T) -> Option<&'a mut T> {
     Some(unsafe { pointer.as_mut() })
 }
 
+/// Failure returned while creating a process-callback cycle view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessCycleError {
+    /// The process callback did not receive a cycle.
+    NullCycle,
+    /// The process callback cycle does not satisfy nginx alignment.
+    MisalignedCycle,
+}
+
+/// Checked callback-scoped access to an nginx process cycle.
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_cycle_t;
+/// use ngx::http::ProcessCycle;
+///
+/// unsafe fn escape(raw: *mut ngx_cycle_t) -> ProcessCycle<'static> {
+///     unsafe { ProcessCycle::with_raw(raw, |cycle| cycle) }.unwrap()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_cycle_t;
+/// use ngx::http::ProcessCycle;
+///
+/// fn require_send<T: Send>(_: T) {}
+/// unsafe fn reject(raw: *mut ngx_cycle_t) {
+///     let _ = unsafe { ProcessCycle::with_raw(raw, |cycle| require_send(cycle)) };
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_cycle_t;
+/// use ngx::http::ProcessCycle;
+///
+/// fn require_sync<T: Sync>(_: &T) {}
+/// unsafe fn reject(raw: *mut ngx_cycle_t) {
+///     let _ = unsafe { ProcessCycle::with_raw(raw, |cycle| require_sync(&cycle)) };
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_cycle_t;
+/// use ngx::http::{HttpModuleMainConf, ProcessCycle};
+///
+/// unsafe fn escape<M: HttpModuleMainConf>(raw: *mut ngx_cycle_t) -> &'static M::MainConf {
+///     unsafe { ProcessCycle::with_raw(raw, |cycle| cycle.main_conf::<M>().unwrap().unwrap()) }
+///         .unwrap()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessCycle<'callback> {
+    raw: NonNull<ngx_cycle_t>,
+    _callback: PhantomData<&'callback ngx_cycle_t>,
+    _not_thread_safe: PhantomData<*mut ()>,
+}
+
+impl ProcessCycle<'_> {
+    /// Creates a checked process-cycle view from an nginx callback pointer.
+    ///
+    /// # Safety
+    ///
+    /// `cycle` must point to a live initialized nginx process cycle for `'callback`. The view must
+    /// remain on its owning worker thread and not outlive the callback that supplied it.
+    pub unsafe fn from_raw(cycle: *mut ngx_cycle_t) -> Result<Self, ProcessCycleError> {
+        let raw = NonNull::new(cycle).ok_or(ProcessCycleError::NullCycle)?;
+        if !raw.as_ptr().is_aligned() {
+            return Err(ProcessCycleError::MisalignedCycle);
+        }
+
+        Ok(Self { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
+    }
+
+    /// Invokes a closure with a process-cycle view that cannot escape the nginx callback through a
+    /// safe value.
+    ///
+    /// # Safety
+    ///
+    /// The same requirements as [`from_raw`](Self::from_raw) apply for the closure call.
+    pub unsafe fn with_raw<R>(
+        cycle: *mut ngx_cycle_t,
+        f: impl for<'scope> FnOnce(ProcessCycle<'scope>) -> R,
+    ) -> Result<R, ProcessCycleError> {
+        let cycle = unsafe { Self::from_raw(cycle) }?;
+        Ok(f(cycle))
+    }
+
+    /// Returns the native cycle pointer for an explicit nginx FFI operation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must uphold the target nginx API's aliasing and callback-lifetime requirements.
+    pub unsafe fn as_ptr(&self) -> *mut ngx_cycle_t {
+        self.raw.as_ptr()
+    }
+
+    pub(crate) fn raw(&self) -> &ngx_cycle_t {
+        unsafe { self.raw.as_ref() }
+    }
+
+    /// Shared main configuration for module `M` from this process callback's cycle.
+    pub fn main_conf<M>(&self) -> Result<Option<&M::MainConf>, HttpConfigError>
+    where
+        M: HttpModuleMainConf,
+    {
+        M::main_conf(self)
+    }
+}
+
+fn process_callback_status(
+    cycle: *mut ngx_cycle_t,
+    callback: impl for<'scope> FnOnce(ProcessCycle<'scope>) -> ngx_int_t,
+) -> ngx_int_t {
+    #[cfg(feature = "std")]
+    {
+        match catch_unwind(AssertUnwindSafe(|| unsafe { ProcessCycle::with_raw(cycle, callback) }))
+        {
+            Ok(Ok(status)) => status,
+            Ok(Err(_)) | Err(_) => Status::NGX_ERROR.0,
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        unsafe { ProcessCycle::with_raw(cycle, callback) }.unwrap_or(Status::NGX_ERROR.0)
+    }
+}
+
+fn process_exit_callback(
+    cycle: *mut ngx_cycle_t,
+    callback: impl for<'scope> FnOnce(ProcessCycle<'scope>),
+) {
+    #[cfg(feature = "std")]
+    {
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+            let _ = ProcessCycle::with_raw(cycle, callback);
+        }));
+    }
+
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = unsafe { ProcessCycle::with_raw(cycle, callback) };
+    }
+}
+
 pub(crate) fn configuration_callback_status(
     cf: *mut ngx_conf_t,
     callback: impl FnOnce(&mut ngx_conf_t) -> ngx_int_t,
@@ -131,6 +278,33 @@ where
     M: HttpModule,
 {
     configuration_callback_status(cf, M::postconfigure)
+}
+
+/// C-compatible adapter for an HTTP module worker-start callback.
+///
+/// # Safety
+///
+/// `cycle` must point to the live nginx cycle supplied for this process callback. Null and
+/// misaligned pointers return `NGX_ERROR`; Rust panics return `NGX_ERROR` instead of unwinding
+/// through nginx.
+pub unsafe extern "C" fn init_process<M>(cycle: *mut ngx_cycle_t) -> ngx_int_t
+where
+    M: HttpModule,
+{
+    process_callback_status(cycle, M::init_process)
+}
+
+/// C-compatible adapter for an HTTP module worker-stop callback.
+///
+/// # Safety
+///
+/// `cycle` must point to the live nginx cycle supplied for this process callback. Null,
+/// misaligned pointers, and Rust panics do not cross nginx's void callback boundary.
+pub unsafe extern "C" fn exit_process<M>(cycle: *mut ngx_cycle_t)
+where
+    M: HttpModule,
+{
+    process_exit_callback(cycle, M::exit_process)
 }
 
 /// C-compatible postconfiguration callback that registers one typed HTTP phase handler.
@@ -278,6 +452,20 @@ pub unsafe trait HttpModule {
         Status::NGX_OK.0
     }
 
+    /// Runs after nginx starts this worker process.
+    ///
+    /// The module descriptor must use [`init_process`] as its FFI callback. Return `NGX_ERROR` to
+    /// reject worker startup.
+    fn init_process(_cycle: ProcessCycle<'_>) -> ngx_int_t {
+        Status::NGX_OK.0
+    }
+
+    /// Runs before nginx stops this worker process.
+    ///
+    /// The module descriptor must use [`exit_process`] as its FFI callback. Implementations must
+    /// tolerate repeated calls because nginx can stop an already-drained worker during reload.
+    fn exit_process(_cycle: ProcessCycle<'_>) {}
+
     /// Allocates the module's main configuration in nginx's configuration pool.
     ///
     /// # Safety
@@ -383,14 +571,14 @@ mod tests {
     use core::ffi::c_void;
     use core::mem;
     use core::ptr;
-    #[cfg(feature = "test-link")]
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        HttpModule, InitMainConf, Merge, MergeConfigError, postconfiguration, preconfiguration,
+        HttpModule, InitMainConf, Merge, MergeConfigError, ProcessCycle, exit_process,
+        init_process, postconfiguration, preconfiguration,
     };
     use crate::core::{NGX_CONF_ERROR, Status};
-    use crate::ffi::{ngx_conf_t, ngx_int_t, ngx_module_t};
+    use crate::ffi::{ngx_conf_t, ngx_cycle_t, ngx_int_t, ngx_module_t};
     #[cfg(feature = "test-link")]
     use crate::ffi::{ngx_create_pool, ngx_destroy_pool, ngx_log_t, ngx_pool_t, ngx_uint_t};
     use crate::http::{HttpModuleLocationConf, HttpModuleMainConf, HttpModuleServerConf};
@@ -458,6 +646,56 @@ mod tests {
         }
     }
 
+    static PROCESS_STARTS: AtomicUsize = AtomicUsize::new(0);
+    static PROCESS_STOPS: AtomicUsize = AtomicUsize::new(0);
+
+    struct ProcessModule;
+
+    unsafe impl HttpModule for ProcessModule {
+        fn module() -> &'static ngx_module_t {
+            test_module()
+        }
+
+        fn init_process(_cycle: ProcessCycle<'_>) -> ngx_int_t {
+            PROCESS_STARTS.fetch_add(1, Ordering::Relaxed);
+            Status::NGX_OK.0
+        }
+
+        fn exit_process(_cycle: ProcessCycle<'_>) {
+            PROCESS_STOPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct FailingProcessModule;
+
+    unsafe impl HttpModule for FailingProcessModule {
+        fn module() -> &'static ngx_module_t {
+            test_module()
+        }
+
+        fn init_process(_cycle: ProcessCycle<'_>) -> ngx_int_t {
+            Status::NGX_ERROR.0
+        }
+    }
+
+    #[cfg(feature = "std")]
+    struct PanicProcessModule;
+
+    #[cfg(feature = "std")]
+    unsafe impl HttpModule for PanicProcessModule {
+        fn module() -> &'static ngx_module_t {
+            test_module()
+        }
+
+        fn init_process(_cycle: ProcessCycle<'_>) -> ngx_int_t {
+            panic!("process startup panic");
+        }
+
+        fn exit_process(_cycle: ProcessCycle<'_>) {
+            panic!("process shutdown panic");
+        }
+    }
+
     unsafe impl HttpModuleMainConf for TestHttpModule {
         type MainConf = MainConf;
     }
@@ -468,6 +706,46 @@ mod tests {
 
     unsafe impl HttpModuleLocationConf for TestHttpModule {
         type LocationConf = LocationConf;
+    }
+
+    #[test]
+    fn process_callbacks_reject_invalid_cycles_and_preserve_ffi_statuses() {
+        PROCESS_STARTS.store(0, Ordering::Relaxed);
+        PROCESS_STOPS.store(0, Ordering::Relaxed);
+
+        assert_eq!(unsafe { init_process::<ProcessModule>(ptr::null_mut()) }, Status::NGX_ERROR.0);
+        unsafe { exit_process::<ProcessModule>(ptr::null_mut()) };
+        assert_eq!(PROCESS_STARTS.load(Ordering::Relaxed), 0);
+        assert_eq!(PROCESS_STOPS.load(Ordering::Relaxed), 0);
+
+        let misaligned = ptr::without_provenance_mut::<ngx_cycle_t>(1);
+        assert_eq!(unsafe { init_process::<ProcessModule>(misaligned) }, Status::NGX_ERROR.0);
+        unsafe { exit_process::<ProcessModule>(misaligned) };
+        assert_eq!(PROCESS_STARTS.load(Ordering::Relaxed), 0);
+        assert_eq!(PROCESS_STOPS.load(Ordering::Relaxed), 0);
+
+        let mut cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+        assert_eq!(unsafe { init_process::<ProcessModule>(&raw mut cycle) }, Status::NGX_OK.0);
+        assert_eq!(
+            unsafe { init_process::<FailingProcessModule>(&raw mut cycle) },
+            Status::NGX_ERROR.0
+        );
+        unsafe { exit_process::<ProcessModule>(&raw mut cycle) };
+        unsafe { exit_process::<ProcessModule>(&raw mut cycle) };
+        assert_eq!(PROCESS_STARTS.load(Ordering::Relaxed), 1);
+        assert_eq!(PROCESS_STOPS.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn process_callbacks_catch_panics_before_crossing_nginx() {
+        let mut cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+
+        assert_eq!(
+            unsafe { init_process::<PanicProcessModule>(&raw mut cycle) },
+            Status::NGX_ERROR.0
+        );
+        unsafe { exit_process::<PanicProcessModule>(&raw mut cycle) };
     }
 
     #[test]
