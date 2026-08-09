@@ -17,9 +17,9 @@ pub use crate::http::{
     HttpVariableIndexError, HttpVariableLookupError, HttpVariablePoolBytes,
     HttpVariableRegistrationError, HttpVariableSetter, HttpVariableValue, HttpVariableValueError,
     HttpVariableValueReadError, HttpVariableValueRef, IntoHandlerStatus, Merge, MergeConfigError,
-    ProcessCycle, ProcessCycleError, RequestContextError, RequestError, RequestRef, RequestRefMut,
-    add_phase_handler, add_variable, add_variable_with_setter, exit_process,
-    filter_postconfiguration, get_variable_index, init_process, phase_handler_postconfiguration,
-    postconfiguration, preconfiguration,
+    ProcessCycle, ProcessCycleError, RequestContextCreateError, RequestContextError, RequestError,
+    RequestRef, RequestRefMut, add_phase_handler, add_variable, add_variable_with_setter,
+    exit_process, filter_postconfiguration, get_variable_index, init_process,
+    phase_handler_postconfiguration, postconfiguration, preconfiguration,
 };
 pub use crate::ngx_log_debug_http;

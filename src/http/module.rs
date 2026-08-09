@@ -2,6 +2,7 @@ use core::error;
 use core::ffi::{CStr, c_char, c_void};
 use core::fmt;
 use core::marker::PhantomData;
+use core::pin::Pin;
 use core::ptr::{self, NonNull};
 
 #[cfg(feature = "std")]
@@ -561,6 +562,13 @@ pub unsafe trait HttpModule {
 pub unsafe trait HttpModuleRequestContext: HttpModule {
     /// Value stored in the module's per-request context slot.
     type RequestContext: 'static;
+
+    /// Cancels context-owned work before the request pool drops the context.
+    ///
+    /// The request context slot is already empty when this hook runs, so it cannot obtain a new
+    /// request borrow. The default is sufficient when the context's owned values clean themselves
+    /// up in [`Drop`].
+    fn cleanup(_context: Pin<&mut Self::RequestContext>) {}
 }
 
 #[cfg(test)]

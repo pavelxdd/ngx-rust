@@ -22,7 +22,10 @@ pub trait AsyncHttpRequestHandler: Sized + 'static {
     /// The HTTP module whose request-context slot owns the pending task.
     type Module: HttpModuleRequestContext<RequestContext = AsyncHandlerContext<Self>>;
     /// The value produced without holding a request reference.
-    type Output: 'static;
+    ///
+    /// It is moved out of pinned request state before [`finish`](Self::finish), so it must be
+    /// [`Unpin`].
+    type Output: 'static + Unpin;
     /// The final phase-handler result.
     type Result: IntoHandlerStatus;
 
@@ -77,9 +80,10 @@ where
         };
         if has_context {
             let output = {
-                let Ok(Some(context)) = request.module_context_mut::<H::Module>() else {
+                let Ok(Some(mut context)) = request.pinned_module_context_mut::<H::Module>() else {
                     return NGX_ERROR as ngx_int_t;
                 };
+                let context = context.as_mut().get_mut();
                 let Some(output) = context.output.take() else {
                     ngx_log_debug_http!(request, "async handler {} pending", H::name());
                     return NGX_AGAIN as ngx_int_t;
@@ -111,8 +115,8 @@ where
             },
             Err(_) => return NGX_ERROR as ngx_int_t,
         };
-        let context = match request
-            .get_or_insert_module_context_with::<H::Module>(AsyncHandlerContext::new)
+        let mut context = match request
+            .get_or_insert_pinned_module_context_with::<H::Module>(AsyncHandlerContext::new)
         {
             Ok(context) => context,
             Err(_) => {
@@ -127,6 +131,7 @@ where
                 return NGX_ERROR as ngx_int_t;
             }
         };
+        let context = context.as_mut().get_mut();
         let context_ptr = NonNull::from(&mut *context);
         context.task = Some(spawn(handler_future(future, context_ptr, write_event)));
 
