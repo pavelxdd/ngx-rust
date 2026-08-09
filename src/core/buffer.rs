@@ -645,6 +645,10 @@ impl<'chain> ChainRef<'chain> {
     pub fn is_empty(self) -> Result<bool, ChainError> {
         self.len().map(|len| len == 0)
     }
+
+    pub(crate) fn as_ptr(self) -> *mut ngx_chain_t {
+        self.head
+    }
 }
 
 /// Exclusive callback-scoped access to a nullable nginx chain.
