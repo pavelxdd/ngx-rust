@@ -1,16 +1,18 @@
 use core::ffi::c_int;
 use core::mem;
-use core::ptr::{self, NonNull};
+use core::ptr;
 
 use libc::sockaddr_storage;
-use ngx::core::{Pool, SocketType, Status};
+use ngx::core::{NgxStr, Pool, SocketType, Status};
 use ngx::ffi::{
-    NGX_HTTP_MODULE, in_port_t, ngx_conf_t, ngx_http_add_variable, ngx_http_module_t,
-    ngx_http_variable_t, ngx_inet_get_port, ngx_int_t, ngx_module_t, ngx_sock_ntop, ngx_str_t,
-    ngx_variable_value_t, sockaddr,
+    NGX_HTTP_MODULE, in_port_t, ngx_conf_t, ngx_http_module_t, ngx_inet_get_port, ngx_int_t,
+    ngx_module_t, ngx_sock_ntop, ngx_str_t, sockaddr,
 };
-use ngx::http::{self, HttpModule, HttpModuleRequestContext};
-use ngx::{http_variable_get, ngx_log_debug_http, ngx_string};
+use ngx::http::{
+    self, HttpModule, HttpModuleRequestContext, HttpVariableFlags, HttpVariableHandler,
+    HttpVariableValue, add_variable,
+};
+use ngx::ngx_log_debug_http;
 
 const IPV4_STRLEN: usize = b"255.255.255.255\0".len();
 
@@ -38,34 +40,37 @@ impl NgxHttpOrigDstCtx {
         Status::NGX_OK
     }
 
-    pub unsafe fn bind_addr(&self, v: *mut ngx_variable_value_t) {
-        let mut v = NonNull::new(v).unwrap();
-        let v = unsafe { v.as_mut() };
-        if self.orig_dst_addr.len == 0 {
-            v.set_not_found(1);
-            return;
-        }
-
-        v.set_valid(1);
-        v.set_no_cacheable(0);
-        v.set_not_found(0);
-        v.set_len(self.orig_dst_addr.len as u32);
-        v.data = self.orig_dst_addr.data;
+    fn bind_addr(
+        &self,
+        request: &http::RequestRefMut<'_>,
+        output: &mut HttpVariableValue<'_>,
+    ) -> Status {
+        Self::bind(self.orig_dst_addr, request, output)
     }
 
-    pub unsafe fn bind_port(&self, v: *mut ngx_variable_value_t) {
-        let mut v = NonNull::new(v).unwrap();
-        let v = unsafe { v.as_mut() };
-        if self.orig_dst_port.len == 0 {
-            v.set_not_found(1);
-            return;
+    fn bind_port(
+        &self,
+        request: &http::RequestRefMut<'_>,
+        output: &mut HttpVariableValue<'_>,
+    ) -> Status {
+        Self::bind(self.orig_dst_port, request, output)
+    }
+
+    fn bind(
+        value: ngx_str_t,
+        request: &http::RequestRefMut<'_>,
+        output: &mut HttpVariableValue<'_>,
+    ) -> Status {
+        if value.len == 0 {
+            output.set_not_found();
+            return Status::NGX_OK;
         }
 
-        v.set_valid(1);
-        v.set_no_cacheable(0);
-        v.set_not_found(0);
-        v.set_len(self.orig_dst_port.len as u32);
-        v.data = self.orig_dst_port.data;
+        let value = unsafe { NgxStr::from_ngx_str(value) };
+        output
+            .copy_from_request(request, value.as_bytes())
+            .map(|()| Status::NGX_OK)
+            .unwrap_or(Status::NGX_ERROR)
     }
 }
 
@@ -94,31 +99,6 @@ pub static mut ngx_http_orig_dst_module: ngx_module_t = ngx_module_t {
     type_: NGX_HTTP_MODULE as _,
     ..ngx_module_t::default()
 };
-
-static mut NGX_HTTP_ORIG_DST_VARS: [ngx_http_variable_t; 2] = [
-    // ngx_str_t name
-    // ngx_http_set_variable_pt set_handler
-    // ngx_http_get_variable_pt get_handler
-    // uintptr_t data
-    // ngx_uint_t flags
-    // ngx_uint_t index
-    ngx_http_variable_t {
-        name: ngx_string!("server_orig_addr"),
-        set_handler: None,
-        get_handler: Some(ngx_http_orig_dst_addr_variable),
-        data: 0,
-        flags: 0,
-        index: 0,
-    },
-    ngx_http_variable_t {
-        name: ngx_string!("server_orig_port"),
-        set_handler: None,
-        get_handler: Some(ngx_http_orig_dst_port_variable),
-        data: 0,
-        flags: 0,
-        index: 0,
-    },
-];
 
 fn ngx_get_origdst(request: &mut http::RequestRefMut<'_>) -> Result<(String, in_port_t), Status> {
     {
@@ -178,17 +158,23 @@ fn ngx_get_origdst(request: &mut http::RequestRefMut<'_>) -> Result<(String, in_
     Ok((String::from_utf8(ip).unwrap(), port))
 }
 
-http_variable_get!(
-    ngx_http_orig_dst_addr_variable,
-    |request: &mut http::RequestRefMut<'_>, v: *mut ngx_variable_value_t, _: usize| {
+struct OrigDstAddrVariable;
+
+impl HttpVariableHandler for OrigDstAddrVariable {
+    type Output = Status;
+
+    fn get(
+        request: &mut http::RequestRefMut<'_>,
+        value: &mut HttpVariableValue<'_>,
+        _: usize,
+    ) -> Self::Output {
         let ctx = match request.module_context::<Module>() {
             Ok(ctx) => ctx,
             Err(_) => return Status::NGX_ERROR,
         };
         if let Some(obj) = ctx {
             ngx_log_debug_http!(request, "httporigdst: found context and binding variable",);
-            unsafe { obj.bind_addr(v) };
-            return Status::NGX_OK;
+            return obj.bind_addr(request, value);
         }
         // lazy initialization:
         //   get original dest information
@@ -209,36 +195,44 @@ http_variable_get!(
                     Ok(pool) => pool.as_ptr(),
                     Err(_) => return Status::NGX_ERROR,
                 };
-                let Ok(new_ctx) =
-                    request.get_or_insert_module_context_with::<Module>(NgxHttpOrigDstCtx::default)
-                else {
-                    return Status::NGX_ERROR;
+                let address = {
+                    let Ok(new_ctx) = request
+                        .get_or_insert_module_context_with::<Module>(NgxHttpOrigDstCtx::default)
+                    else {
+                        return Status::NGX_ERROR;
+                    };
+                    // SAFETY: the request and its pool remain live for this variable callback.
+                    let status =
+                        unsafe { Pool::with_raw(raw_pool, |pool| new_ctx.save(&ip, port, &pool)) }
+                            .unwrap_or(Status::NGX_ERROR);
+                    if let Err(status) = status.into_result() {
+                        return status;
+                    }
+                    new_ctx.orig_dst_addr
                 };
-                // SAFETY: the request and its pool remain live for this variable callback.
-                let status =
-                    unsafe { Pool::with_raw(raw_pool, |pool| new_ctx.save(&ip, port, &pool)) }
-                        .unwrap_or(Status::NGX_ERROR);
-                if let Err(status) = status.into_result() {
-                    return status;
-                }
-                unsafe { new_ctx.bind_addr(v) };
+                return NgxHttpOrigDstCtx::bind(address, request, value);
             }
         }
-        Status::NGX_OK
     }
-);
+}
 
-http_variable_get!(
-    ngx_http_orig_dst_port_variable,
-    |request: &mut http::RequestRefMut<'_>, v: *mut ngx_variable_value_t, _: usize| {
+struct OrigDstPortVariable;
+
+impl HttpVariableHandler for OrigDstPortVariable {
+    type Output = Status;
+
+    fn get(
+        request: &mut http::RequestRefMut<'_>,
+        value: &mut HttpVariableValue<'_>,
+        _: usize,
+    ) -> Self::Output {
         let ctx = match request.module_context::<Module>() {
             Ok(ctx) => ctx,
             Err(_) => return Status::NGX_ERROR,
         };
         if let Some(obj) = ctx {
             ngx_log_debug_http!(request, "httporigdst: found context and binding variable",);
-            unsafe { obj.bind_port(v) };
-            return Status::NGX_OK;
+            return obj.bind_port(request, value);
         }
         // lazy initialization:
         //   get original dest information
@@ -259,24 +253,26 @@ http_variable_get!(
                     Ok(pool) => pool.as_ptr(),
                     Err(_) => return Status::NGX_ERROR,
                 };
-                let Ok(new_ctx) =
-                    request.get_or_insert_module_context_with::<Module>(NgxHttpOrigDstCtx::default)
-                else {
-                    return Status::NGX_ERROR;
+                let port = {
+                    let Ok(new_ctx) = request
+                        .get_or_insert_module_context_with::<Module>(NgxHttpOrigDstCtx::default)
+                    else {
+                        return Status::NGX_ERROR;
+                    };
+                    // SAFETY: the request and its pool remain live for this variable callback.
+                    let status =
+                        unsafe { Pool::with_raw(raw_pool, |pool| new_ctx.save(&ip, port, &pool)) }
+                            .unwrap_or(Status::NGX_ERROR);
+                    if let Err(status) = status.into_result() {
+                        return status;
+                    }
+                    new_ctx.orig_dst_port
                 };
-                // SAFETY: the request and its pool remain live for this variable callback.
-                let status =
-                    unsafe { Pool::with_raw(raw_pool, |pool| new_ctx.save(&ip, port, &pool)) }
-                        .unwrap_or(Status::NGX_ERROR);
-                if let Err(status) = status.into_result() {
-                    return status;
-                }
-                unsafe { new_ctx.bind_port(v) };
+                return NgxHttpOrigDstCtx::bind(port, request, value);
             }
         }
-        Status::NGX_OK
     }
-);
+}
 
 struct Module;
 
@@ -286,15 +282,25 @@ unsafe impl HttpModule for Module {
     }
 
     fn preconfigure(cf: &mut ngx_conf_t) -> ngx_int_t {
-        for mut v in unsafe { NGX_HTTP_ORIG_DST_VARS } {
-            let Some(mut var) =
-                NonNull::new(unsafe { ngx_http_add_variable(cf, &raw mut v.name, v.flags) })
-            else {
-                return Status::NGX_ERROR.0;
-            };
-            let var = unsafe { var.as_mut() };
-            var.get_handler = v.get_handler;
-            var.data = v.data;
+        if add_variable::<OrigDstAddrVariable>(
+            cf,
+            NgxStr::from_bytes(b"server_orig_addr"),
+            HttpVariableFlags::empty(),
+            0,
+        )
+        .is_err()
+        {
+            return Status::NGX_ERROR.0;
+        }
+        if add_variable::<OrigDstPortVariable>(
+            cf,
+            NgxStr::from_bytes(b"server_orig_port"),
+            HttpVariableFlags::empty(),
+            0,
+        )
+        .is_err()
+        {
+            return Status::NGX_ERROR.0;
         }
         Status::NGX_OK.0
     }
