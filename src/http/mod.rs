@@ -10,6 +10,7 @@ mod status;
 /// HTTP subrequest support.
 pub mod subrequest;
 mod upstream;
+mod variable;
 
 #[cfg(feature = "async")]
 pub use async_request::*;
@@ -19,3 +20,4 @@ pub use module::*;
 pub use request::*;
 pub use status::*;
 pub use upstream::*;
+pub use variable::*;
