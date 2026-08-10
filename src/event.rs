@@ -20,6 +20,10 @@ use crate::ngx_container_of;
 
 mod peer;
 pub use peer::*;
+#[cfg(feature = "async")]
+mod readiness;
+#[cfg(feature = "async")]
+pub use readiness::{EventReadiness, Readiness, ReadinessError};
 
 /// Failure returned while validating a native nginx event pointer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
