@@ -15,6 +15,8 @@ use std::panic::catch_unwind;
 
 use crate::collections::{NgxList, list::NgxListIter};
 use crate::core::*;
+#[cfg(feature = "async")]
+use crate::event::PostedQueue;
 use crate::ffi::*;
 use crate::http::status::*;
 use crate::http::{
@@ -348,6 +350,8 @@ pub enum RequestContinuationError {
     Filter(HttpFilterError),
     /// Phase resumption could not prepare a valid nginx request state.
     Phase(RequestPhaseResumeError),
+    /// The delayed request hold could not create its terminal continuation.
+    Hold(RequestHoldError),
     /// The continuation has already completed or been cancelled.
     Consumed,
     /// The saved header filter has already been called for this continuation.
@@ -371,6 +375,12 @@ impl From<HttpFilterError> for RequestContinuationError {
 impl From<RequestPhaseResumeError> for RequestContinuationError {
     fn from(error: RequestPhaseResumeError) -> Self {
         Self::Phase(error)
+    }
+}
+
+impl From<RequestHoldError> for RequestContinuationError {
+    fn from(error: RequestHoldError) -> Self {
+        Self::Hold(error)
     }
 }
 
@@ -2458,7 +2468,7 @@ impl RequestHold {
         if current.request != request.raw || current.main != main {
             return Err(RequestHoldError::ForeignRequest);
         }
-        if unsafe { main.as_ref().count() } == 0 {
+        if unsafe { main.as_ref().count() } <= 1 {
             return Err(RequestHoldError::InactiveMain);
         }
 
@@ -2478,6 +2488,13 @@ impl RequestHold {
     pub fn cancel(hold: &mut Option<Self>) -> bool {
         hold.take().is_some()
     }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn resume_phase(hold: &mut Option<Self>) -> Result<(), RequestContinuationError> {
+        let request = hold.as_ref().ok_or(RequestHoldError::Missing)?.request;
+        let request = unsafe { RequestRefMut::from_raw(request.as_ptr()) }?;
+        Self::take(hold, request)?.resume_phase()
+    }
 }
 
 impl RequestContinuation<'_> {
@@ -2487,6 +2504,21 @@ impl RequestContinuation<'_> {
         }
 
         Ok(())
+    }
+
+    fn ensure_releasable_hold(&self) -> Result<(), RequestHoldError> {
+        if unsafe { self._hold.main.as_ref().count() } <= 1 {
+            return Err(RequestHoldError::InactiveMain);
+        }
+
+        Ok(())
+    }
+
+    fn release_hold(hold: &mut RequestHold) {
+        let mut main = hold.main;
+        let count = unsafe { main.as_ref().count() };
+        debug_assert!(count > 1);
+        unsafe { main.as_mut().set_count(count - 1) };
     }
 
     /// Cancels this terminal owner after request cleanup made continuation impossible.
@@ -2567,7 +2599,9 @@ impl RequestContinuation<'_> {
     /// ```
     pub fn finalize(mut self, status: impl Into<Status>) -> Result<(), RequestContinuationError> {
         self.ensure_active()?;
+        self.ensure_releasable_hold()?;
         self.request.validate_terminal_operation()?;
+        Self::release_hold(&mut self._hold);
         self.consumed = true;
         let status = status.into();
         unsafe { ngx_http_finalize_request(self.request.raw.as_ptr(), status.0) };
@@ -2577,9 +2611,47 @@ impl RequestContinuation<'_> {
     /// Resumes PREACCESS processing and consumes this terminal continuation before entering nginx.
     pub fn resume_preaccess(mut self) -> Result<(), RequestContinuationError> {
         self.ensure_active()?;
+        self.ensure_releasable_hold()?;
         self.request.prepare_preaccess_resume()?;
+        Self::release_hold(&mut self._hold);
         self.consumed = true;
         unsafe { ngx_http_core_run_phases(self.request.raw.as_ptr()) };
+        Ok(())
+    }
+
+    #[cfg(feature = "async")]
+    fn resume_phase(mut self) -> Result<(), RequestContinuationError> {
+        self.ensure_active()?;
+        self.ensure_releasable_hold()?;
+        {
+            let (request, hold) = (&mut self.request, &mut self._hold);
+            request.validate_terminal_operation()?;
+            let original_handler = unsafe { request.raw.as_ref().write_event_handler };
+            unsafe { request.raw.as_mut().write_event_handler = Some(ngx_http_core_run_phases) };
+            let request_raw = request.raw.as_ptr();
+            let request_is_current = unsafe {
+                let connection = request.raw.as_ref().connection;
+                (*connection).data == request_raw.cast()
+            };
+            let posted: Result<(), RequestError> = (|| {
+                let mut connection = request.connection_mut()?;
+                let mut event = connection.write_event()?;
+                if !request_is_current
+                    && unsafe { ngx_http_post_request(request_raw, ptr::null_mut()) } != NGX_OK as _
+                {
+                    return Err(RequestError::Allocation);
+                }
+
+                Self::release_hold(hold);
+                event.post(PostedQueue::Next);
+                Ok(())
+            })();
+            if let Err(error) = posted {
+                unsafe { request.raw.as_mut().write_event_handler = original_handler };
+                return Err(error.into());
+            }
+        }
+        self.consumed = true;
         Ok(())
     }
 }
@@ -4907,8 +4979,16 @@ mod tests {
             let mut request = request_from(&mut raw);
             request.hold(&mut hold).unwrap();
         }
-        main.set_count(0);
+        main.set_count(1);
 
+        let request = request_from(&mut raw);
+        assert!(matches!(
+            RequestHold::take(&mut hold, request),
+            Err(RequestHoldError::InactiveMain)
+        ));
+        assert!(hold.is_some());
+
+        main.set_count(0);
         let request = request_from(&mut raw);
         assert!(matches!(
             RequestHold::take(&mut hold, request),

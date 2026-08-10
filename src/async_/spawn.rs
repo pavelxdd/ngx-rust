@@ -23,7 +23,7 @@ use crate::ffi::{ngx_event_t, ngx_log_t};
 static ACTIVE_SCHEDULER: OnceLock<Mutex<Option<Arc<Scheduler>>>> = OnceLock::new();
 
 #[cfg(test)]
-static SCHEDULER_TESTS: Mutex<()> = Mutex::new(());
+pub(crate) static SCHEDULER_TESTS: Mutex<()> = Mutex::new(());
 
 std::thread_local! {
     static WORKER_SCHEDULER: RefCell<Option<WorkerScheduler>> = const { RefCell::new(None) };
