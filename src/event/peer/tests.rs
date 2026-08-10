@@ -1019,3 +1019,7 @@ fn native_connect_decline_closes_connection() {
     assert!(result.into_peer().raw.connection.is_null());
     assert_eq!(globals.free_connection_n(), 1);
 }
+
+#[cfg(feature = "async")]
+#[path = "readiness_tests.rs"]
+mod readiness_tests;

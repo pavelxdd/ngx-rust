@@ -1009,6 +1009,22 @@ impl<'address> EventPeerConnection<'address> {
         self.state
     }
 
+    #[cfg(feature = "async")]
+    pub(crate) fn readiness_parts(
+        &self,
+        write: bool,
+    ) -> Result<(NonNull<ngx_connection_t>, NonNull<ngx_event_t>), EventPeerConnectionError> {
+        let connection = self.peer.connection()?;
+        let (read, write_event) = checked_event_peer_events(connection)?;
+        Ok((connection, if write { write_event } else { read }))
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn readiness_log(&self) -> NonNull<ngx_log_t> {
+        // EventPeerBuilder validates the logger before constructing this owner.
+        unsafe { NonNull::new_unchecked(self.peer.raw.log) }
+    }
+
     /// Checks `SO_ERROR` after nginx reports readiness for a pending connect.
     ///
     /// Call this from the connection's read or write handler. Checking before readiness can
