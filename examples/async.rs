@@ -2,7 +2,7 @@ extern crate alloc;
 
 use alloc::string::ToString;
 use core::ffi::{c_char, c_void};
-use core::ptr;
+use core::ptr::{self, NonNull};
 use core::time::Duration;
 use std::time::Instant;
 
@@ -30,13 +30,25 @@ unsafe impl http::HttpModule for Module {
             .map_or(Status::NGX_ERROR.0, |_| Status::NGX_OK.0)
     }
 
-    fn init_process(_cycle: http::ProcessCycle<'_>) -> ngx_int_t {
+    fn init_process(cycle: http::ProcessCycle<'_>) -> ngx_int_t {
         if ngx::log::interop::init().is_err() {
+            return Status::NGX_ERROR.0;
+        }
+
+        let log = unsafe { NonNull::new((*cycle.as_ptr()).log) };
+        let Some(log) = log else {
+            return Status::NGX_ERROR.0;
+        };
+        if ngx_async::init_worker(log).is_err() {
             return Status::NGX_ERROR.0;
         }
 
         log::info!("async log facade initialized");
         Status::NGX_OK.0
+    }
+
+    fn exit_process(_cycle: http::ProcessCycle<'_>) {
+        let _ = ngx_async::shutdown_worker();
     }
 }
 
