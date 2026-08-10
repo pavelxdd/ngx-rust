@@ -1,27 +1,42 @@
+use core::cell::RefCell;
 use core::future::Future;
-use core::marker::PhantomPinned;
 use core::mem;
 use core::pin::Pin;
 use core::ptr::NonNull;
-use core::task::{self, Poll};
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
-use nginx_sys::{ngx_add_timer, ngx_del_timer, ngx_event_t, ngx_log_t, ngx_msec_int_t, ngx_msec_t};
+use nginx_sys::{ngx_log_t, ngx_msec_int_t, ngx_msec_t};
 use pin_project_lite::pin_project;
 
-use crate::{ngx_container_of, ngx_log_debug};
+use crate::event::{Timer, TimerCallback};
+use crate::ngx_log_debug;
 
-/// Maximum duration that can be achieved using [ngx_add_timer].
-const NGX_TIMER_DURATION_MAX: Duration = Duration::from_millis(ngx_msec_int_t::MAX as _);
+const MILLISECONDS_PER_SECOND: u128 = 1_000;
+const NANOSECONDS_PER_MILLISECOND: u32 = 1_000_000;
+const TIMER_DURATION_MAX_MILLISECONDS: u128 = ngx_msec_int_t::MAX as u128;
 
-#[cfg(any(test, target_pointer_width = "32"))]
-fn advance_timer(remaining: &mut Duration, elapsed: Duration) -> Option<ngx_msec_t> {
-    if *remaining <= elapsed {
-        return None;
+fn duration_to_milliseconds_ceil(duration: Duration) -> u128 {
+    let milliseconds = u128::from(duration.as_secs()) * MILLISECONDS_PER_SECOND
+        + u128::from(duration.subsec_millis());
+
+    if duration.subsec_nanos() % NANOSECONDS_PER_MILLISECOND == 0 {
+        milliseconds
+    } else {
+        milliseconds + 1
     }
+}
 
-    *remaining = remaining.saturating_sub(elapsed);
-    Some((*remaining).min(NGX_TIMER_DURATION_MAX).as_millis() as ngx_msec_t)
+fn bounded_milliseconds(remaining: u128, maximum: u128) -> Option<u128> {
+    (remaining != 0).then(|| remaining.min(maximum))
+}
+
+fn timer_step(remaining: u128) -> Option<(u128, ngx_msec_t)> {
+    let milliseconds = bounded_milliseconds(remaining, TIMER_DURATION_MAX_MILLISECONDS)?;
+    let timeout =
+        ngx_msec_t::try_from(milliseconds).expect("signed nginx timer bound must fit ngx_msec_t");
+
+    Some((milliseconds, timeout))
 }
 
 /// Puts the current task to sleep for at least the specified amount of time.
@@ -48,132 +63,406 @@ pin_project! {
 /// ```
 pub struct Sleep {
     #[pin]
-    timer: TimerEvent,
-    duration: Duration,
+    timer: Timer<SleepTimerState, SleepTimerCallback>,
+    remaining_milliseconds: u128,
+    armed_milliseconds: u128,
 }
+}
+
+struct SleepTimerState {
+    waker: RefCell<Option<Waker>>,
+}
+
+impl SleepTimerState {
+    fn new() -> Self {
+        Self { waker: RefCell::new(None) }
+    }
+
+    fn replace_waker(&self, waker: &Waker) {
+        let mut current = self.waker.borrow_mut();
+        match current.as_mut() {
+            Some(current) => current.clone_from(waker),
+            None => *current = Some(waker.clone()),
+        }
+    }
+
+    fn take_waker(&self) -> Option<Waker> {
+        self.waker.borrow_mut().take()
+    }
+}
+
+type SleepTimerCallback = for<'callback> fn(TimerCallback<'callback, SleepTimerState>);
+
+fn sleep_timer_callback(timer: TimerCallback<'_, SleepTimerState>) {
+    if let Some(waker) = timer.state().take_waker() {
+        waker.wake();
+    }
 }
 
 impl Sleep {
     /// Creates a new Sleep with the specified duration and logger for debug messages.
     pub fn new(duration: Duration, log: NonNull<ngx_log_t>) -> Self {
-        let timer = TimerEvent::new(log);
-        ngx_log_debug!(timer.event.log, "async: sleep for {duration:?}");
-        Sleep { timer, duration }
+        ngx_log_debug!(log.as_ptr(), "async: sleep for {duration:?}");
+
+        Sleep {
+            timer: Timer::new(
+                log,
+                SleepTimerState::new(),
+                sleep_timer_callback as SleepTimerCallback,
+            ),
+            remaining_milliseconds: duration_to_milliseconds_ceil(duration),
+            armed_milliseconds: 0,
+        }
     }
 }
 
 impl Future for Sleep {
     type Output = ();
 
-    #[cfg(not(target_pointer_width = "32"))]
-    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-        let msec = self.duration.min(NGX_TIMER_DURATION_MAX).as_millis() as ngx_msec_t;
-        let this = self.project();
-        this.timer.poll_sleep(msec, cx)
-    }
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
 
-    #[cfg(target_pointer_width = "32")]
-    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
-        if self.duration.is_zero() {
+        if *this.remaining_milliseconds == 0 {
             return Poll::Ready(());
         }
-        let step = self.duration.min(NGX_TIMER_DURATION_MAX);
 
-        let mut this = self.project();
-        // Handle ngx_msec_t overflow on 32-bit platforms.
-        match this.timer.as_mut().poll_sleep(step.as_millis() as _, cx) {
-            Poll::Ready(()) => match advance_timer(this.duration, step) {
-                None => Poll::Ready(()),
-                Some(next) => {
-                    this.timer.as_mut().rearm();
-                    this.timer.as_mut().poll_sleep(next, cx)
-                }
-            },
-            x => x,
-        }
-    }
-}
+        if this.timer.as_mut().take_timeout() {
+            let elapsed = mem::take(this.armed_milliseconds);
+            *this.remaining_milliseconds = this
+                .remaining_milliseconds
+                .checked_sub(elapsed)
+                .expect("timer expiry must match the armed sleep step");
 
-struct TimerEvent {
-    event: ngx_event_t,
-    waker: Option<task::Waker>,
-    _pin: PhantomPinned,
-}
-
-impl TimerEvent {
-    pub fn new(log: NonNull<ngx_log_t>) -> Self {
-        static IDENT: [usize; 4] = [
-            0, 0, 0, 0x4153594e, // ASYN
-        ];
-
-        let mut ev: ngx_event_t = unsafe { mem::zeroed() };
-        // The data is only used for `ngx_event_ident` and will not be mutated.
-        ev.data = (&raw const IDENT).cast_mut().cast();
-        ev.handler = Some(Self::timer_handler);
-        ev.log = log.as_ptr();
-        ev.set_cancelable(1);
-
-        Self { event: ev, waker: None, _pin: PhantomPinned }
-    }
-
-    pub fn poll_sleep(
-        mut self: Pin<&mut Self>,
-        duration: ngx_msec_t,
-        context: &mut task::Context<'_>,
-    ) -> Poll<()> {
-        // SAFETY: no field is moved; the pinned address is the one stored in nginx's timer tree.
-        let this = unsafe { self.as_mut().get_unchecked_mut() };
-
-        if this.event.timedout() != 0 {
-            Poll::Ready(())
-        } else if this.event.timer_set() != 0 {
-            if let Some(waker) = this.waker.as_mut() {
-                waker.clone_from(context.waker());
-            } else {
-                this.waker = Some(context.waker().clone());
+            if *this.remaining_milliseconds == 0 {
+                return Poll::Ready(());
             }
-            Poll::Pending
-        } else {
-            unsafe { ngx_add_timer(&raw mut this.event, duration) };
-            this.waker = Some(context.waker().clone());
-            Poll::Pending
         }
-    }
 
-    #[cfg(target_pointer_width = "32")]
-    fn rearm(mut self: Pin<&mut Self>) {
-        // SAFETY: clearing a flag does not move any field of the pinned timer.
-        unsafe { self.as_mut().get_unchecked_mut().event.set_timedout(0) };
-    }
-
-    unsafe extern "C" fn timer_handler(ev: *mut ngx_event_t) {
-        let timer = ngx_container_of!(ev, Self, event);
-
-        if let Some(waker) = unsafe { (*timer).waker.take() } {
-            waker.wake();
+        if this.timer.as_ref().get_ref().is_armed() {
+            this.timer.as_ref().get_ref().state().replace_waker(cx.waker());
+            return Poll::Pending;
         }
-    }
-}
 
-impl Drop for TimerEvent {
-    fn drop(&mut self) {
-        if self.event.timer_set() != 0 {
-            unsafe { ngx_del_timer(&raw mut self.event) };
-        }
+        let Some((milliseconds, timeout)) = timer_step(*this.remaining_milliseconds) else {
+            return Poll::Ready(());
+        };
+        this.timer.as_ref().get_ref().state().replace_waker(cx.waker());
+        this.timer.as_mut().set_cancelable(true);
+        this.timer.as_mut().arm(timeout).expect("timer was checked unarmed before arming sleep");
+        *this.armed_milliseconds = milliseconds;
+
+        Poll::Pending
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod conversion_tests {
     use super::*;
 
     #[test]
-    fn timer_remainder_uses_shorter_final_step() {
-        let mut remaining = NGX_TIMER_DURATION_MAX + Duration::from_millis(1);
+    fn duration_conversion_uses_ceiling_milliseconds() {
+        assert_eq!(duration_to_milliseconds_ceil(Duration::ZERO), 0);
+        assert_eq!(duration_to_milliseconds_ceil(Duration::from_nanos(1)), 1);
+        assert_eq!(duration_to_milliseconds_ceil(Duration::from_micros(1)), 1);
+        assert_eq!(duration_to_milliseconds_ceil(Duration::from_micros(999)), 1);
+        assert_eq!(duration_to_milliseconds_ceil(Duration::from_millis(1)), 1);
+        assert_eq!(
+            duration_to_milliseconds_ceil(Duration::from_millis(1) + Duration::from_nanos(1)),
+            2,
+        );
+        assert_eq!(
+            duration_to_milliseconds_ceil(
+                Duration::from_millis(TIMER_DURATION_MAX_MILLISECONDS as u64)
+                    + Duration::from_nanos(1),
+            ),
+            TIMER_DURATION_MAX_MILLISECONDS + 1,
+        );
+    }
 
-        let next = advance_timer(&mut remaining, NGX_TIMER_DURATION_MAX);
+    #[test]
+    fn bounded_steps_cover_32_and_64_bit_timer_ranges() {
+        for maximum in [i32::MAX as u128, i64::MAX as u128] {
+            assert_eq!(bounded_milliseconds(0, maximum), None);
+            assert_eq!(bounded_milliseconds(maximum, maximum), Some(maximum));
+            assert_eq!(
+                bounded_milliseconds(maximum.checked_add(1).unwrap(), maximum),
+                Some(maximum),
+            );
+            assert_eq!(
+                bounded_milliseconds(maximum.checked_mul(2).unwrap(), maximum),
+                Some(maximum),
+            );
+        }
+    }
+}
 
-        assert_eq!(remaining, Duration::from_millis(1));
-        assert_eq!(next, Some(1));
+#[cfg(all(test, feature = "test-link"))]
+mod tests {
+    extern crate alloc;
+
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::mem::MaybeUninit;
+    use core::pin::Pin;
+    use core::ptr;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::{Context, Poll, Waker};
+    use core::time::Duration;
+    use std::sync::MutexGuard;
+
+    use super::Sleep;
+    use crate::ffi::{
+        ngx_current_msec, ngx_event_expire_timers, ngx_event_no_timers_left, ngx_event_timer_init,
+        ngx_log_t, ngx_msec_int_t, ngx_msec_t,
+    };
+
+    struct TimerGlobals {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl TimerGlobals {
+        fn new() -> Self {
+            let guard = crate::TEST_NGINX_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
+            reset_timer_tree();
+            Self { _guard: guard }
+        }
+    }
+
+    impl Drop for TimerGlobals {
+        fn drop(&mut self) {
+            reset_timer_tree();
+        }
+    }
+
+    fn reset_timer_tree() {
+        unsafe {
+            assert_eq!(ngx_event_timer_init(ptr::null_mut()), 0);
+            ngx_current_msec = 0;
+        }
+    }
+
+    fn advance_to(msec: ngx_msec_t) {
+        unsafe {
+            ngx_current_msec = msec;
+            ngx_event_expire_timers();
+        }
+    }
+
+    fn poll_sleep(sleep: Pin<&mut Sleep>, waker: &Waker) -> Poll<()> {
+        let mut context = Context::from_waker(waker);
+        sleep.poll(&mut context)
+    }
+
+    #[derive(Default)]
+    struct WakeState {
+        wakes: AtomicUsize,
+        drops: AtomicUsize,
+    }
+
+    struct RecordingWake {
+        state: Arc<WakeState>,
+    }
+
+    impl Wake for RecordingWake {
+        fn wake(self: Arc<Self>) {
+            self.state.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.state.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Drop for RecordingWake {
+        fn drop(&mut self) {
+            self.state.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn recording_waker() -> (Waker, Arc<WakeState>) {
+        let state = Arc::new(WakeState::default());
+        let waker = Waker::from(Arc::new(RecordingWake { state: Arc::clone(&state) }));
+        (waker, state)
+    }
+
+    fn maximum_timer_step() -> u64 {
+        ngx_msec_int_t::MAX as u64
+    }
+
+    #[test]
+    fn zero_duration_is_ready_without_arming_a_timer() {
+        let _globals = TimerGlobals::new();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut sleep = Box::pin(Sleep::new(Duration::ZERO, (&mut log).into()));
+        let (waker, state) = recording_waker();
+
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Ready(()));
+        advance_to(0);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn positive_submillisecond_duration_rounds_up_to_one_millisecond() {
+        let _globals = TimerGlobals::new();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut sleep = Box::pin(Sleep::new(Duration::from_nanos(1), (&mut log).into()));
+        let (waker, state) = recording_waker();
+
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
+        advance_to(0);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 0);
+        advance_to(1);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Ready(()));
+    }
+
+    #[test]
+    fn one_millisecond_duration_waits_for_one_millisecond() {
+        let _globals = TimerGlobals::new();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), (&mut log).into()));
+        let (waker, state) = recording_waker();
+
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
+        advance_to(0);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 0);
+        advance_to(1);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Ready(()));
+    }
+
+    #[test]
+    fn maximum_timer_step_completes_on_its_expiry() {
+        let _globals = TimerGlobals::new();
+        let maximum = maximum_timer_step();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(maximum), (&mut log).into()));
+        let (waker, state) = recording_waker();
+
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
+        advance_to((maximum - 1) as ngx_msec_t);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 0);
+        advance_to(maximum as ngx_msec_t);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Ready(()));
+    }
+
+    #[test]
+    fn duration_larger_than_one_timer_step_rearms_for_the_remainder() {
+        let _globals = TimerGlobals::new();
+        let maximum = maximum_timer_step();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut sleep = Box::pin(Sleep::new(
+            Duration::from_millis(maximum.checked_add(1).unwrap()),
+            (&mut log).into(),
+        ));
+        let (waker, state) = recording_waker();
+
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
+        advance_to(maximum as ngx_msec_t);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
+        advance_to(maximum.checked_add(1).unwrap() as ngx_msec_t);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 2);
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Ready(()));
+    }
+
+    #[test]
+    fn duration_spanning_multiple_timer_steps_never_finishes_early() {
+        let _globals = TimerGlobals::new();
+        let maximum = maximum_timer_step();
+        let second = maximum.checked_mul(2).unwrap();
+        let total = second.checked_add(1).unwrap();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(total), (&mut log).into()));
+        let (waker, state) = recording_waker();
+
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
+        advance_to(maximum as ngx_msec_t);
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
+        advance_to(second as ngx_msec_t);
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
+        advance_to(total as ngx_msec_t);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 3);
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Ready(()));
+    }
+
+    #[test]
+    fn repeated_poll_replaces_the_pending_waker() {
+        let _globals = TimerGlobals::new();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), (&mut log).into()));
+        let (first, first_state) = recording_waker();
+        let (second, second_state) = recording_waker();
+
+        assert_eq!(poll_sleep(sleep.as_mut(), &first), Poll::Pending);
+        assert_eq!(poll_sleep(sleep.as_mut(), &second), Poll::Pending);
+        advance_to(1);
+
+        assert_eq!(first_state.wakes.load(Ordering::Relaxed), 0);
+        assert_eq!(second_state.wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(poll_sleep(sleep.as_mut(), &second), Poll::Ready(()));
+    }
+
+    #[test]
+    fn expiry_wakes_once_until_the_executor_repolls() {
+        let _globals = TimerGlobals::new();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), (&mut log).into()));
+        let (waker, state) = recording_waker();
+        let mut polls = 0;
+
+        polls += 1;
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
+        advance_to(1);
+
+        assert_eq!(polls, 1);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
+        polls += 1;
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Ready(()));
+        assert_eq!(polls, 2);
+    }
+
+    #[test]
+    fn dropping_pending_sleep_cancels_the_timer_before_waker_state_is_destroyed() {
+        let _globals = TimerGlobals::new();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), (&mut log).into()));
+        let (waker, state) = recording_waker();
+
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
+        drop(waker);
+        drop(sleep);
+
+        assert_eq!(state.drops.load(Ordering::Relaxed), 1);
+        advance_to(1);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dropping_sleep_after_expiry_leaves_no_timer_callback() {
+        let _globals = TimerGlobals::new();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), (&mut log).into()));
+        let (waker, state) = recording_waker();
+
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
+        advance_to(1);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
+        drop(sleep);
+        advance_to(2);
+        assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn sleep_timer_is_cancelable_during_worker_shutdown() {
+        let _globals = TimerGlobals::new();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), (&mut log).into()));
+        let (waker, _) = recording_waker();
+
+        assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
+        assert_eq!(unsafe { ngx_event_no_timers_left() }, 0);
     }
 }
