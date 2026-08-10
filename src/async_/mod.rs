@@ -5,6 +5,7 @@ pub use self::spawn::{
     CancellationHandle, LocalTask, SchedulerInitError, SchedulerShutdownError, SpawnError,
     TaskError, init_worker, shutdown_worker, spawn,
 };
+pub use crate::event::{EventReadiness, Readiness, ReadinessError};
 
 pub mod resolver;
 
