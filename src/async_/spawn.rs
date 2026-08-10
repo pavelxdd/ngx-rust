@@ -1,16 +1,21 @@
 use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
-use alloc::sync::Arc;
-use core::cell::RefCell;
+use alloc::rc::Rc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
+use core::cell::{Cell, RefCell};
 use core::future::Future;
 use core::mem;
+use core::panic::AssertUnwindSafe;
 use core::pin::Pin;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU8, Ordering};
+use core::task::{Context, Poll, Waker};
+use std::panic::catch_unwind;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread::{self, ThreadId};
 
-pub use async_task::Task;
-use async_task::{Runnable, ScheduleInfo, WithInfo};
+use async_task::{Runnable, ScheduleInfo, Task as RawTask, WithInfo};
 
 use crate::event::{NotifyError, PostedEvent, PostedEventCallback, PostedQueue, notify};
 use crate::ffi::{ngx_event_t, ngx_log_t};
@@ -53,12 +58,291 @@ pub enum SchedulerShutdownError {
     Processing,
 }
 
+/// Terminal failure returned by a [`LocalTask`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskError {
+    /// The task's owner canceled it before it produced an output.
+    Canceled,
+    /// The task's future panicked while being polled.
+    Panicked,
+    /// The worker scheduler could no longer deliver task wakeups.
+    SchedulerFailed,
+    /// The task output was already consumed by an earlier poll.
+    OutputTaken,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TaskStatus {
+    Active,
+    CancelRequested,
+    Ready,
+    Canceled,
+    Panicked,
+    SchedulerFailed,
+}
+
+impl TaskStatus {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Active,
+            1 => Self::CancelRequested,
+            2 => Self::Ready,
+            3 => Self::Canceled,
+            4 => Self::Panicked,
+            _ => Self::SchedulerFailed,
+        }
+    }
+
+    fn error(self) -> Option<TaskError> {
+        match self {
+            Self::Canceled => Some(TaskError::Canceled),
+            Self::Panicked => Some(TaskError::Panicked),
+            Self::SchedulerFailed => Some(TaskError::SchedulerFailed),
+            Self::Active | Self::CancelRequested | Self::Ready => None,
+        }
+    }
+}
+
+struct TaskControl {
+    scheduler: Weak<Scheduler>,
+    status: AtomicU8,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl TaskControl {
+    fn new(scheduler: &Arc<Scheduler>) -> Arc<Self> {
+        Arc::new(Self {
+            scheduler: Arc::downgrade(scheduler),
+            status: AtomicU8::new(TaskStatus::Active as u8),
+            waker: Mutex::new(None),
+        })
+    }
+
+    fn status(&self) -> TaskStatus {
+        TaskStatus::from_raw(self.status.load(Ordering::Acquire))
+    }
+
+    fn set_waker(&self, waker: &Waker) {
+        *self.waker.lock().unwrap_or_else(|error| error.into_inner()) = Some(waker.clone());
+    }
+
+    fn wake(&self) {
+        let waker = self.waker.lock().unwrap_or_else(|error| error.into_inner()).take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn request_cancel(control: &Arc<Self>) {
+        let mut status = control.status();
+
+        loop {
+            match status {
+                TaskStatus::Active => match control.status.compare_exchange_weak(
+                    TaskStatus::Active as u8,
+                    TaskStatus::CancelRequested as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        if let Some(scheduler) = control.scheduler.upgrade() {
+                            scheduler.request_cancel(Arc::clone(control));
+                        } else {
+                            control.finish(TaskStatus::SchedulerFailed);
+                        }
+                        return;
+                    }
+                    Err(next) => status = TaskStatus::from_raw(next),
+                },
+                TaskStatus::CancelRequested
+                | TaskStatus::Ready
+                | TaskStatus::Canceled
+                | TaskStatus::Panicked
+                | TaskStatus::SchedulerFailed => return,
+            }
+        }
+    }
+
+    fn fail_scheduler(&self) {
+        let mut status = self.status();
+
+        loop {
+            match status {
+                TaskStatus::Active | TaskStatus::CancelRequested => {
+                    match self.status.compare_exchange_weak(
+                        status as u8,
+                        TaskStatus::SchedulerFailed as u8,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => {
+                            self.wake();
+                            return;
+                        }
+                        Err(next) => status = TaskStatus::from_raw(next),
+                    }
+                }
+                TaskStatus::Ready
+                | TaskStatus::Canceled
+                | TaskStatus::Panicked
+                | TaskStatus::SchedulerFailed => return,
+            }
+        }
+    }
+
+    fn finish(&self, desired: TaskStatus) -> TaskStatus {
+        let mut status = self.status();
+
+        loop {
+            let next = match status {
+                TaskStatus::Active => desired,
+                TaskStatus::CancelRequested => TaskStatus::Canceled,
+                TaskStatus::Ready
+                | TaskStatus::Canceled
+                | TaskStatus::Panicked
+                | TaskStatus::SchedulerFailed => return status,
+            };
+
+            match self.status.compare_exchange_weak(
+                status as u8,
+                next as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if next.error().is_some() {
+                        self.wake();
+                    }
+                    return next;
+                }
+                Err(current) => status = TaskStatus::from_raw(current),
+            }
+        }
+    }
+}
+
+struct TaskState<T> {
+    result: Cell<Option<Result<T, TaskError>>>,
+}
+
+impl<T> TaskState<T> {
+    fn new() -> Rc<Self> {
+        Rc::new(Self { result: Cell::new(None) })
+    }
+
+    fn resolve(&self, result: Result<T, TaskError>) {
+        if let Some(existing) = self.result.take() {
+            self.result.set(Some(existing));
+            return;
+        }
+
+        self.result.set(Some(result));
+    }
+}
+
+/// A worker-local handle for a spawned async task.
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<ngx::async_::LocalTask<()>>();
+/// ```
+#[must_use = "dropping an attached task requests cancellation"]
+pub struct LocalTask<T> {
+    control: Arc<TaskControl>,
+    state: Rc<TaskState<T>>,
+    attached: bool,
+    completed: bool,
+}
+
+impl<T> LocalTask<T> {
+    /// Returns a handle that can request cancellation from any thread.
+    pub fn cancellation_handle(&self) -> CancellationHandle {
+        CancellationHandle { control: Arc::clone(&self.control) }
+    }
+
+    /// Requests cancellation of this task on its owning worker.
+    pub fn cancel(&self) {
+        TaskControl::request_cancel(&self.control);
+    }
+
+    /// Transfers task ownership to the worker scheduler and returns a cancellation handle.
+    pub fn detach(mut self) -> CancellationHandle {
+        self.attached = false;
+        self.cancellation_handle()
+    }
+
+    pub(crate) fn into_attached(self) -> AttachedTask<T> {
+        AttachedTask { _task: self }
+    }
+}
+
+impl<T> Drop for LocalTask<T> {
+    fn drop(&mut self) {
+        if self.attached && !self.completed {
+            TaskControl::request_cancel(&self.control);
+        }
+    }
+}
+
+impl<T> Future for LocalTask<T> {
+    type Output = Result<T, TaskError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+        if this.completed {
+            return Poll::Ready(Err(TaskError::OutputTaken));
+        }
+
+        if let Some(result) = this.state.result.take() {
+            this.completed = true;
+            return Poll::Ready(result);
+        }
+
+        if let Some(error) = this.control.status().error() {
+            this.completed = true;
+            return Poll::Ready(Err(error));
+        }
+
+        this.control.set_waker(context.waker());
+        if let Some(error) = this.control.status().error() {
+            this.completed = true;
+            return Poll::Ready(Err(error));
+        }
+        Poll::Pending
+    }
+}
+
+/// A cancellation handle that never polls or drops a worker-local future.
+#[derive(Clone)]
+pub struct CancellationHandle {
+    control: Arc<TaskControl>,
+}
+
+impl CancellationHandle {
+    /// Requests cancellation on the task's owning worker.
+    pub fn cancel(&self) {
+        TaskControl::request_cancel(&self.control);
+    }
+}
+
+pub(crate) struct AttachedTask<T> {
+    _task: LocalTask<T>,
+}
+
 type SchedulerPostedCallback = for<'callback> fn(PostedEventCallback<'callback, Arc<Scheduler>>);
 type SchedulerPostedEvent = PostedEvent<Arc<Scheduler>, SchedulerPostedCallback>;
+
+struct RegisteredTask {
+    control: Arc<TaskControl>,
+    _task: RawTask<()>,
+}
 
 struct WorkerScheduler {
     scheduler: Arc<Scheduler>,
     posted: Pin<Box<SchedulerPostedEvent>>,
+    tasks: Vec<RegisteredTask>,
+    completed: Vec<Arc<TaskControl>>,
 }
 
 impl WorkerScheduler {
@@ -70,6 +354,8 @@ impl WorkerScheduler {
                 posted_scheduler_handler as SchedulerPostedCallback,
             )),
             scheduler,
+            tasks: Vec::new(),
+            completed: Vec::new(),
         }
     }
 
@@ -80,16 +366,51 @@ impl WorkerScheduler {
     fn shutdown(&mut self) {
         self.posted.as_mut().shutdown();
     }
+
+    fn register_task(&mut self, control: Arc<TaskControl>, task: RawTask<()>) {
+        self.tasks.push(RegisteredTask { control, _task: task });
+    }
+
+    fn take_task(&mut self, control: &Arc<TaskControl>) -> Option<RegisteredTask> {
+        let position = self.tasks.iter().position(|task| Arc::ptr_eq(&task.control, control))?;
+        Some(self.tasks.swap_remove(position))
+    }
+
+    fn task_completed(&mut self, control: Arc<TaskControl>) {
+        if !self.completed.iter().any(|completed| Arc::ptr_eq(completed, &control)) {
+            self.completed.push(control);
+        }
+    }
+
+    fn take_completed(&mut self) -> Vec<RegisteredTask> {
+        let completed = mem::take(&mut self.completed);
+        let mut tasks = Vec::new();
+
+        for control in completed {
+            if let Some(task) = self.take_task(&control) {
+                tasks.push(task);
+            }
+        }
+
+        tasks
+    }
+
+    fn take_all_tasks(&mut self) -> Vec<RegisteredTask> {
+        self.completed.clear();
+        mem::take(&mut self.tasks)
+    }
 }
 
 struct Scheduler {
     owner: ThreadId,
     inner: Mutex<SchedulerInner>,
+    controls: Mutex<Vec<Weak<TaskControl>>>,
 }
 
 struct SchedulerInner {
     phase: SchedulerPhase,
     queue: VecDeque<Runnable>,
+    cancellations: VecDeque<Arc<TaskControl>>,
     // A local runnable may only be destroyed by its owner thread.
     quarantined: VecDeque<Runnable>,
     processing: bool,
@@ -109,6 +430,13 @@ enum ScheduleAction {
     RejectedLocal(Runnable),
 }
 
+enum WakeAction {
+    Deferred,
+    Foreign,
+    Local,
+    Rejected,
+}
+
 impl Scheduler {
     fn new(worker: ThreadId) -> Self {
         Self {
@@ -116,9 +444,11 @@ impl Scheduler {
             inner: Mutex::new(SchedulerInner {
                 phase: SchedulerPhase::Running,
                 queue: VecDeque::new(),
+                cancellations: VecDeque::new(),
                 quarantined: VecDeque::new(),
                 processing: false,
             }),
+            controls: Mutex::new(Vec::new()),
         }
     }
 
@@ -135,6 +465,153 @@ impl Scheduler {
             SchedulerPhase::Running => Err(SpawnError::WrongWorker),
             SchedulerPhase::Stopping | SchedulerPhase::Stopped => Err(SpawnError::ShuttingDown),
         }
+    }
+
+    fn register_task(
+        &self,
+        control: Arc<TaskControl>,
+        task: RawTask<()>,
+    ) -> Result<(), SpawnError> {
+        let task = WORKER_SCHEDULER.with(|worker| {
+            let mut worker = worker.borrow_mut();
+            let Some(worker) = worker.as_mut() else {
+                return Err(task);
+            };
+            if !core::ptr::eq(Arc::as_ptr(&worker.scheduler), self) {
+                return Err(task);
+            }
+            worker.register_task(Arc::clone(&control), task);
+            Ok(())
+        });
+        if let Err(task) = task {
+            drop(task);
+            return Err(SpawnError::WrongWorker);
+        }
+
+        let mut controls = self.controls.lock().unwrap_or_else(|error| error.into_inner());
+        controls.retain(|candidate| candidate.strong_count() != 0);
+        controls.push(Arc::downgrade(&control));
+        Ok(())
+    }
+
+    fn untrack_task(&self, control: &Arc<TaskControl>) {
+        self.controls.lock().unwrap_or_else(|error| error.into_inner()).retain(|candidate| {
+            candidate.upgrade().is_some_and(|candidate| !Arc::ptr_eq(&candidate, control))
+        });
+    }
+
+    fn fail_live_tasks(&self) {
+        let controls = {
+            let mut controls = self.controls.lock().unwrap_or_else(|error| error.into_inner());
+            controls.retain(|candidate| candidate.strong_count() != 0);
+            controls.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+        };
+
+        for control in controls {
+            control.fail_scheduler();
+        }
+    }
+
+    fn request_cancel(self: &Arc<Self>, control: Arc<TaskControl>) {
+        let current = thread::current().id();
+        let action = {
+            let mut inner = self.lock();
+            match inner.phase {
+                SchedulerPhase::Running => {
+                    inner.cancellations.push_back(control);
+                    if inner.processing {
+                        WakeAction::Deferred
+                    } else if self.owner == current {
+                        WakeAction::Local
+                    } else {
+                        WakeAction::Foreign
+                    }
+                }
+                SchedulerPhase::Stopping | SchedulerPhase::Stopped => WakeAction::Rejected,
+            }
+        };
+
+        match action {
+            WakeAction::Deferred | WakeAction::Rejected => {}
+            WakeAction::Local => {
+                if !self.post_current() {
+                    self.stop_and_drop();
+                }
+            }
+            WakeAction::Foreign => {
+                if unsafe { notify(notification_handler) }.is_err() {
+                    self.fail_from_foreign_thread();
+                }
+            }
+        }
+    }
+
+    fn take_registered_tasks(&self, controls: Vec<Arc<TaskControl>>) -> Vec<RegisteredTask> {
+        WORKER_SCHEDULER.with(|worker| {
+            let mut worker = worker.borrow_mut();
+            let Some(worker) = worker.as_mut() else {
+                return Vec::new();
+            };
+            if !core::ptr::eq(Arc::as_ptr(&worker.scheduler), self) {
+                return Vec::new();
+            }
+
+            controls.iter().filter_map(|control| worker.take_task(control)).collect()
+        })
+    }
+
+    fn drop_registered_tasks(&self, tasks: Vec<RegisteredTask>) {
+        for task in &tasks {
+            self.untrack_task(&task.control);
+        }
+        drop(tasks);
+    }
+
+    fn cancel_registered_tasks(&self, controls: Vec<Arc<TaskControl>>) {
+        self.drop_registered_tasks(self.take_registered_tasks(controls));
+    }
+
+    fn reap_completed_tasks(&self) {
+        let tasks = WORKER_SCHEDULER.with(|worker| {
+            let mut worker = worker.borrow_mut();
+            let Some(worker) = worker.as_mut() else {
+                return Vec::new();
+            };
+            if !core::ptr::eq(Arc::as_ptr(&worker.scheduler), self) {
+                return Vec::new();
+            }
+            worker.take_completed()
+        });
+        self.drop_registered_tasks(tasks);
+    }
+
+    fn cancel_all_registered_tasks(&self) {
+        let tasks = WORKER_SCHEDULER.with(|worker| {
+            let mut worker = worker.borrow_mut();
+            let Some(worker) = worker.as_mut() else {
+                return Vec::new();
+            };
+            if !core::ptr::eq(Arc::as_ptr(&worker.scheduler), self) {
+                return Vec::new();
+            }
+            worker.take_all_tasks()
+        });
+        for task in &tasks {
+            task.control.finish(TaskStatus::Canceled);
+        }
+        self.drop_registered_tasks(tasks);
+    }
+
+    fn task_completed(&self, control: Arc<TaskControl>) {
+        WORKER_SCHEDULER.with(|worker| {
+            let mut worker = worker.borrow_mut();
+            let Some(worker) = worker.as_mut() else {
+                return;
+            };
+            if core::ptr::eq(Arc::as_ptr(&worker.scheduler), self) {
+                worker.task_completed(control);
+            }
+        });
     }
 
     fn queue(&self, runnable: Runnable) -> ScheduleAction {
@@ -225,21 +702,30 @@ impl Scheduler {
 
     fn process(&self) -> bool {
         let current = thread::current().id();
-        let runnables = {
+        let (cancellations, mut runnables) = {
             let mut inner = self.lock();
             match &inner.phase {
                 SchedulerPhase::Running if self.owner == current && !inner.processing => {
                     inner.processing = true;
-                    mem::take(&mut inner.queue)
+                    (mem::take(&mut inner.cancellations), mem::take(&mut inner.queue))
                 }
                 _ => return false,
             }
         };
         let processing = ProcessingGuard { scheduler: self };
 
-        for runnable in runnables {
+        self.cancel_registered_tasks(cancellations.into_iter().collect());
+
+        while let Some(runnable) = runnables.pop_front() {
             runnable.run();
+            self.reap_completed_tasks();
+            if !self.is_running_on_current_worker() {
+                drop(runnables);
+                self.cancel_all_registered_tasks();
+                break;
+            }
         }
+        self.reap_completed_tasks();
 
         processing.finish()
     }
@@ -250,7 +736,12 @@ impl Scheduler {
         inner.processing = false;
 
         matches!(&inner.phase, SchedulerPhase::Running if self.owner == current)
-            && !inner.queue.is_empty()
+            && (!inner.queue.is_empty() || !inner.cancellations.is_empty())
+    }
+
+    fn is_running_on_current_worker(&self) -> bool {
+        let inner = self.lock();
+        self.owner == thread::current().id() && matches!(inner.phase, SchedulerPhase::Running)
     }
 
     fn processing_on_current_worker(&self) -> bool {
@@ -263,12 +754,15 @@ impl Scheduler {
     }
 
     fn fail_from_foreign_thread(&self) {
-        let mut inner = self.lock();
-        if matches!(&inner.phase, SchedulerPhase::Running) {
-            inner.phase = SchedulerPhase::Stopping;
+        {
+            let mut inner = self.lock();
+            if matches!(&inner.phase, SchedulerPhase::Running) {
+                inner.phase = SchedulerPhase::Stopping;
+            }
+            let mut queued = mem::take(&mut inner.queue);
+            inner.quarantined.append(&mut queued);
         }
-        let mut queued = mem::take(&mut inner.queue);
-        inner.quarantined.append(&mut queued);
+        self.fail_live_tasks();
     }
 
     fn quarantine(&self, runnable: Runnable) {
@@ -280,13 +774,23 @@ impl Scheduler {
         if matches!(&inner.phase, SchedulerPhase::Running) {
             inner.phase = SchedulerPhase::Stopping;
         }
+        inner.cancellations.clear();
         let mut queued = mem::take(&mut inner.queue);
         queued.append(&mut inner.quarantined);
         queued
     }
 
     fn stop_and_drop(&self) {
-        drop(self.drain_for_shutdown());
+        self.fail_live_tasks();
+        let queued = self.drain_for_shutdown();
+        let processing = self.processing_on_current_worker();
+        if !processing {
+            self.cancel_all_registered_tasks();
+        }
+        drop(queued);
+        if !processing {
+            self.reap_completed_tasks();
+        }
     }
 
     fn finish_shutdown(&self) {
@@ -317,6 +821,68 @@ impl ProcessingGuard<'_> {
 impl Drop for ProcessingGuard<'_> {
     fn drop(&mut self) {
         self.scheduler.finish_processing();
+    }
+}
+
+struct TaskRunner<F, T> {
+    future: Pin<Box<F>>,
+    control: Arc<TaskControl>,
+    state: Rc<TaskState<T>>,
+    scheduler: Arc<Scheduler>,
+}
+
+impl<F, T> TaskRunner<F, T> {
+    fn finish_ready(&self, output: T) {
+        match self.control.finish(TaskStatus::Ready) {
+            TaskStatus::Ready => {
+                self.state.resolve(Ok(output));
+                self.control.wake();
+            }
+            TaskStatus::Canceled | TaskStatus::Panicked | TaskStatus::SchedulerFailed => {
+                drop(output);
+                if let Some(error) = self.control.status().error() {
+                    self.state.resolve(Err(error));
+                }
+            }
+            TaskStatus::Active | TaskStatus::CancelRequested => {}
+        }
+        self.scheduler.task_completed(Arc::clone(&self.control));
+    }
+
+    fn finish_error(&self, desired: TaskStatus) {
+        let status = self.control.finish(desired);
+        if let Some(error) = status.error() {
+            self.state.resolve(Err(error));
+        }
+        self.scheduler.task_completed(Arc::clone(&self.control));
+    }
+}
+
+impl<F, T> Future for TaskRunner<F, T>
+where
+    F: Future<Output = T>,
+{
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+        match catch_unwind(AssertUnwindSafe(|| this.future.as_mut().poll(context))) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(output)) => {
+                this.finish_ready(output);
+                Poll::Ready(())
+            }
+            Err(_) => {
+                this.finish_error(TaskStatus::Panicked);
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
+impl<F, T> Drop for TaskRunner<F, T> {
+    fn drop(&mut self) {
+        self.finish_error(TaskStatus::Canceled);
     }
 }
 
@@ -371,11 +937,19 @@ pub fn init_worker(log: NonNull<ngx_log_t>) -> Result<(), SchedulerInitError> {
         Some(_) => Err(SchedulerInitError::AlreadyInitialized),
     })?;
     if stopped {
-        let worker = WORKER_SCHEDULER
+        let mut worker = WORKER_SCHEDULER
             .with(|worker| worker.borrow_mut().take())
             .ok_or(SchedulerInitError::AlreadyInitialized)?;
-        drop(worker.scheduler.drain_for_shutdown());
+        let scheduler = Arc::clone(&worker.scheduler);
+        let queued = scheduler.drain_for_shutdown();
+        worker.shutdown();
+        let tasks = worker.take_all_tasks();
+        for task in &tasks {
+            task.control.finish(TaskStatus::Canceled);
+        }
         drop(worker);
+        scheduler.drop_registered_tasks(tasks);
+        drop(queued);
     }
 
     let scheduler = Arc::new(Scheduler::new(thread::current().id()));
@@ -425,7 +999,7 @@ pub fn shutdown_worker() -> Result<bool, SchedulerShutdownError> {
     };
     let was_stopped = scheduler.is_stopped();
     let queued = scheduler.drain_for_shutdown();
-    WORKER_SCHEDULER.with(|worker| {
+    let tasks = WORKER_SCHEDULER.with(|worker| {
         let mut worker = worker.borrow_mut();
         let Some(worker) = worker.as_mut() else {
             return Err(SchedulerShutdownError::WrongWorker);
@@ -434,11 +1008,16 @@ pub fn shutdown_worker() -> Result<bool, SchedulerShutdownError> {
             return Err(SchedulerShutdownError::WrongWorker);
         }
         worker.shutdown();
-        Ok(())
+        Ok(worker.take_all_tasks())
     })?;
     scheduler.finish_shutdown();
-    clear_active_scheduler(&scheduler);
+    for task in &tasks {
+        task.control.finish(TaskStatus::Canceled);
+    }
+    scheduler.drop_registered_tasks(tasks);
     drop(queued);
+    scheduler.reap_completed_tasks();
+    clear_active_scheduler(&scheduler);
 
     Ok(!was_stopped)
 }
@@ -447,22 +1026,37 @@ pub fn shutdown_worker() -> Result<bool, SchedulerShutdownError> {
 ///
 /// This function must be called after [`init_worker`] on the owning nginx worker thread. The task
 /// is always polled on that thread even when its waker is invoked from another thread.
-pub fn spawn<F, T>(future: F) -> Result<Task<T>, SpawnError>
+pub fn spawn<F, T>(future: F) -> Result<LocalTask<T>, SpawnError>
 where
     F: Future<Output = T> + 'static,
     T: 'static,
 {
     let scheduler = current_scheduler()?;
+    let control = TaskControl::new(&scheduler);
+    let state = TaskState::new();
     let task_scheduler = Arc::clone(&scheduler);
     let task_scheduler = WithInfo(move |runnable, info| task_scheduler.schedule(runnable, info));
-    let (runnable, task) = async_task::spawn_local(future, task_scheduler);
+    let (runnable, task) = async_task::spawn_local(
+        TaskRunner {
+            future: Box::pin(future),
+            control: Arc::clone(&control),
+            state: Rc::clone(&state),
+            scheduler: Arc::clone(&scheduler),
+        },
+        task_scheduler,
+    );
 
-    if let Err(error) = scheduler.schedule_initial(runnable) {
-        drop(task);
+    if let Err(error) = scheduler.register_task(Arc::clone(&control), task) {
+        drop(runnable);
         return Err(error);
     }
 
-    Ok(task)
+    if let Err(error) = scheduler.schedule_initial(runnable) {
+        scheduler.cancel_registered_tasks(Vec::from([Arc::clone(&control)]));
+        return Err(error);
+    }
+
+    Ok(LocalTask { control, state, attached: true, completed: false })
 }
 
 #[cfg(test)]
@@ -488,6 +1082,7 @@ mod worker_tests {
     use alloc::boxed::Box;
     use alloc::rc::Rc;
     use alloc::sync::Arc;
+    use alloc::task::Wake;
     use alloc::vec::Vec;
     use core::future::{Future, poll_fn};
     use core::mem::MaybeUninit;
@@ -591,6 +1186,14 @@ mod worker_tests {
                     && ngx_queue_empty(&raw const ngx_posted_next_events)
             }
         }
+
+        fn task_registry_is_empty(&self) -> bool {
+            WORKER_SCHEDULER.with(|scheduler| {
+                scheduler.borrow().as_ref().is_none_or(|scheduler| {
+                    scheduler.tasks.is_empty() && scheduler.completed.is_empty()
+                })
+            })
+        }
     }
 
     impl Drop for TestWorker {
@@ -628,6 +1231,396 @@ mod worker_tests {
     }
 
     #[test]
+    fn local_task_returns_its_output_once() {
+        let mut worker = TestWorker::new();
+        worker.init().unwrap();
+
+        let task = spawn(async { 7 }).unwrap();
+        worker.process_posted();
+
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Ok(7)));
+        assert!(matches!(
+            task.as_mut().poll(&mut context),
+            Poll::Ready(Err(TaskError::OutputTaken))
+        ));
+    }
+
+    struct PendingDropFuture {
+        polls: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+        waker: Option<mpsc::Sender<Waker>>,
+    }
+
+    impl Future for PendingDropFuture {
+        type Output = ();
+
+        fn poll(self: core::pin::Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            this.polls.fetch_add(1, Ordering::Relaxed);
+            if let Some(waker) = this.waker.take() {
+                waker.send(context.waker().clone()).unwrap();
+            }
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDropFuture {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct SelfCancelFuture {
+        cancellation: Arc<Mutex<Option<CancellationHandle>>>,
+        polls: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Future for SelfCancelFuture {
+        type Output = ();
+
+        fn poll(self: core::pin::Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = self.get_mut();
+            this.polls.fetch_add(1, Ordering::Relaxed);
+            if let Some(cancellation) =
+                this.cancellation.lock().unwrap_or_else(|error| error.into_inner()).as_ref()
+            {
+                cancellation.cancel();
+            }
+            Poll::Pending
+        }
+    }
+
+    impl Drop for SelfCancelFuture {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct CountedOutput(Arc<AtomicUsize>);
+
+    impl Drop for CountedOutput {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct CountWaker(Arc<AtomicUsize>);
+
+    impl Wake for CountWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn cancellation_handle_is_send_and_sync() {
+        fn require_send_sync<T: Send + Sync>() {}
+
+        require_send_sync::<CancellationHandle>();
+    }
+
+    #[test]
+    fn task_output_is_destroyed_once_after_consumption() {
+        let mut worker = TestWorker::new();
+        worker.init().unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let output_dropped = Arc::clone(&dropped);
+
+        let task = spawn(async move { CountedOutput(output_dropped) }).unwrap();
+        worker.process_posted();
+
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(Waker::noop());
+        let output = match task.as_mut().poll(&mut context) {
+            Poll::Ready(Ok(output)) => output,
+            Poll::Ready(Err(error)) => panic!("unexpected task error: {error:?}"),
+            Poll::Pending => panic!("task output is still pending"),
+        };
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        drop(output);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            task.as_mut().poll(&mut context),
+            Poll::Ready(Err(TaskError::OutputTaken))
+        ));
+    }
+
+    #[test]
+    fn cancellation_before_first_poll_drops_the_future_without_polling() {
+        let mut worker = TestWorker::new();
+        worker.init().unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+
+        let task = spawn(PendingDropFuture {
+            polls: Arc::clone(&polls),
+            dropped: Arc::clone(&dropped),
+            waker: None,
+        })
+        .unwrap();
+        task.cancel();
+        worker.process_posted();
+
+        assert_eq!(polls.load(Ordering::Relaxed), 0);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::Canceled)));
+        assert!(worker.queues_are_empty());
+    }
+
+    #[test]
+    fn cancellation_during_poll_runs_the_destructor_once_after_the_callback() {
+        let mut worker = TestWorker::new();
+        worker.init().unwrap();
+        let cancellation = Arc::new(Mutex::new(None));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+
+        let task = spawn(SelfCancelFuture {
+            cancellation: Arc::clone(&cancellation),
+            polls: Arc::clone(&polls),
+            dropped: Arc::clone(&dropped),
+        })
+        .unwrap();
+        *cancellation.lock().unwrap_or_else(|error| error.into_inner()) =
+            Some(task.cancellation_handle());
+
+        worker.process_posted();
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        worker.process_posted();
+        worker.process_posted();
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert!(worker.queues_are_empty());
+
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::Canceled)));
+    }
+
+    #[test]
+    fn cancellation_after_ready_keeps_the_output_available() {
+        let mut worker = TestWorker::new();
+        worker.init().unwrap();
+
+        let task = spawn(async { 7 }).unwrap();
+        let cancellation = task.cancellation_handle();
+        worker.process_posted();
+        cancellation.cancel();
+
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Ok(7)));
+    }
+
+    #[test]
+    fn cancellation_wakes_an_awaiting_local_task() {
+        let mut worker = TestWorker::new();
+        worker.init().unwrap();
+        let (waker_tx, waker_rx) = mpsc::channel();
+
+        let task = spawn(PendingDropFuture {
+            polls: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicUsize::new(0)),
+            waker: Some(waker_tx),
+        })
+        .unwrap();
+        worker.process_posted();
+        let _future_waker = waker_rx.recv().unwrap();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let task_waker = Waker::from(Arc::new(CountWaker(Arc::clone(&wakes))));
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(&task_waker);
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Pending);
+
+        task.as_ref().get_ref().cancel();
+        worker.process_posted();
+        worker.process_posted();
+
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::Canceled)));
+    }
+
+    #[test]
+    fn foreign_cancellation_drops_once_and_ignores_a_late_wake() {
+        let mut worker = TestWorker::new();
+        worker.init().unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (waker_tx, waker_rx) = mpsc::channel();
+
+        let task = spawn(PendingDropFuture {
+            polls: Arc::clone(&polls),
+            dropped: Arc::clone(&dropped),
+            waker: Some(waker_tx),
+        })
+        .unwrap();
+        let cancellation = task.cancellation_handle();
+        worker.process_posted();
+        let waker = waker_rx.recv().unwrap();
+
+        thread::spawn(move || {
+            cancellation.cancel();
+            cancellation.cancel();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 2);
+
+        worker.deliver_notification();
+        worker.process_posted();
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+
+        thread::spawn(move || waker.wake()).join().unwrap();
+        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 2);
+        assert!(worker.queues_are_empty());
+
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::Canceled)));
+    }
+
+    #[test]
+    fn attached_owner_drop_requests_cancellation() {
+        let mut worker = TestWorker::new();
+        worker.init().unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+
+        let task = spawn(PendingDropFuture {
+            polls: Arc::clone(&polls),
+            dropped: Arc::clone(&dropped),
+            waker: None,
+        })
+        .unwrap();
+        worker.process_posted();
+        drop(task);
+        worker.process_posted();
+        worker.process_posted();
+
+        assert_eq!(polls.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert!(worker.queues_are_empty());
+    }
+
+    #[test]
+    fn detach_keeps_the_task_registered_until_worker_shutdown() {
+        let mut worker = TestWorker::new();
+        worker.init().unwrap();
+        let attached_dropped = Arc::new(AtomicUsize::new(0));
+        let detached_dropped = Arc::new(AtomicUsize::new(0));
+
+        let attached = spawn(PendingDropFuture {
+            polls: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::clone(&attached_dropped),
+            waker: None,
+        })
+        .unwrap();
+        let detached = spawn(PendingDropFuture {
+            polls: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::clone(&detached_dropped),
+            waker: None,
+        })
+        .unwrap();
+        let cancellation = detached.detach();
+        worker.process_posted();
+
+        assert_eq!(attached_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(detached_dropped.load(Ordering::Relaxed), 0);
+        assert!(!worker.task_registry_is_empty());
+        assert_eq!(shutdown_worker(), Ok(true));
+        assert_eq!(attached_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(detached_dropped.load(Ordering::Relaxed), 1);
+        cancellation.cancel();
+        assert!(worker.queues_are_empty());
+        assert!(worker.task_registry_is_empty());
+
+        let mut attached = core::pin::pin!(attached);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(attached.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::Canceled)));
+    }
+
+    #[test]
+    fn notification_failure_is_a_task_terminal_state() {
+        let mut worker = TestWorker::new();
+        worker.init().unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let (waker_tx, waker_rx) = mpsc::channel();
+
+        let task = spawn(PendingDropFuture {
+            polls: Arc::clone(&polls),
+            dropped: Arc::clone(&dropped),
+            waker: Some(waker_tx),
+        })
+        .unwrap();
+        worker.process_posted();
+        let waker = waker_rx.recv().unwrap();
+
+        NOTIFY_SUCCEEDS.store(false, Ordering::Relaxed);
+        thread::spawn(move || waker.wake()).join().unwrap();
+
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::SchedulerFailed)));
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(shutdown_worker(), Ok(true));
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn scheduler_failure_wakes_an_awaiting_local_task() {
+        let mut worker = TestWorker::new();
+        worker.init().unwrap();
+        let (waker_tx, waker_rx) = mpsc::channel();
+
+        let task = spawn(PendingDropFuture {
+            polls: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicUsize::new(0)),
+            waker: Some(waker_tx),
+        })
+        .unwrap();
+        worker.process_posted();
+        let future_waker = waker_rx.recv().unwrap();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let task_waker = Waker::from(Arc::new(CountWaker(Arc::clone(&wakes))));
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(&task_waker);
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Pending);
+
+        NOTIFY_SUCCEEDS.store(false, Ordering::Relaxed);
+        thread::spawn(move || future_waker.wake()).join().unwrap();
+
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::SchedulerFailed)));
+    }
+
+    #[test]
+    fn task_panic_is_reported_without_crossing_the_scheduler_callback() {
+        let mut worker = TestWorker::new();
+        worker.init().unwrap();
+
+        let task = spawn(async {
+            panic!("task panic");
+        })
+        .unwrap();
+        worker.process_posted();
+
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::Panicked)));
+    }
+
+    #[test]
     fn local_tasks_are_posted_and_worker_can_reinitialize() {
         let mut worker = TestWorker::new();
         worker.init().unwrap();
@@ -654,8 +1647,8 @@ mod worker_tests {
         let mut first = core::pin::pin!(first);
         let mut second = core::pin::pin!(second);
         let mut context = Context::from_waker(Waker::noop());
-        assert_eq!(first.as_mut().poll(&mut context), Poll::Ready(1));
-        assert_eq!(second.as_mut().poll(&mut context), Poll::Ready(2));
+        assert_eq!(first.as_mut().poll(&mut context), Poll::Ready(Ok(1)));
+        assert_eq!(second.as_mut().poll(&mut context), Poll::Ready(Ok(2)));
 
         assert_eq!(shutdown_worker(), Ok(true));
         assert!(worker.queues_are_empty());
@@ -665,7 +1658,7 @@ mod worker_tests {
         let task = spawn(async { 3 }).unwrap();
         worker.process_posted();
         let mut task = core::pin::pin!(task);
-        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(3));
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Ok(3)));
     }
 
     #[test]
@@ -727,7 +1720,7 @@ mod worker_tests {
 
         let mut task = core::pin::pin!(task);
         let mut context = Context::from_waker(Waker::noop());
-        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(7));
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Ok(7)));
     }
 
     #[test]
@@ -755,7 +1748,7 @@ mod worker_tests {
 
         let mut task = core::pin::pin!(task);
         let mut context = Context::from_waker(Waker::noop());
-        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(()));
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Ok(())));
     }
 
     #[test]
@@ -803,7 +1796,7 @@ mod worker_tests {
     }
 
     #[test]
-    fn late_foreign_wake_is_quarantined_until_its_owner_reinitializes() {
+    fn late_foreign_wake_after_shutdown_does_not_enqueue_a_runnable() {
         let mut worker = TestWorker::new();
         worker.init().unwrap();
         let scheduler = current_scheduler().unwrap();
@@ -822,12 +1815,15 @@ mod worker_tests {
         assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 1);
         let inner = scheduler.lock();
         assert!(inner.queue.is_empty());
-        assert_eq!(inner.quarantined.len(), 1);
+        assert!(inner.quarantined.is_empty());
         drop(inner);
+
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::Canceled)));
 
         worker.init().unwrap();
         assert!(scheduler.lock().quarantined.is_empty());
-        drop(task);
     }
 
     struct DropFuture {
@@ -889,7 +1885,7 @@ mod worker_tests {
         worker.process_posted();
         let mut task = core::pin::pin!(task);
         let mut context = Context::from_waker(Waker::noop());
-        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(9));
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Ok(9)));
     }
 
     #[test]

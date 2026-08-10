@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 use crate::allocator::AllocError;
-use crate::async_::{Task, spawn};
+use crate::async_::{AttachedTask, spawn};
 use crate::ffi::{NGX_AGAIN, NGX_ERROR, ngx_event_t, ngx_int_t, ngx_post_event, ngx_posted_events};
 use crate::http::{
     HttpModuleRequestContext, HttpPhase, HttpRequestHandler, IntoHandlerStatus, RequestRefMut,
@@ -49,7 +49,7 @@ pub struct AsyncHandlerContext<H>
 where
     H: AsyncHttpRequestHandler,
 {
-    task: Option<Task<()>>,
+    task: Option<AttachedTask<()>>,
     output: Option<H::Output>,
     handler: PhantomData<fn() -> H>,
 }
@@ -139,7 +139,7 @@ where
 
             match spawn(handler_future(future, context_ptr, write_event)) {
                 Ok(task) => {
-                    context.as_mut().get_mut().task = Some(task);
+                    context.as_mut().get_mut().task = Some(task.into_attached());
                     false
                 }
                 Err(_) => true,
@@ -182,8 +182,9 @@ async fn handler_future<H>(
     let output = future.await;
 
     // The request context owns this task. nginx runs phase handlers, task polls, and pool
-    // cleanup sequentially on the worker event loop. If cleanup wins, dropping Task cancels
-    // this future before the context storage is released.
+    // cleanup sequentially on the worker event loop. If cleanup wins, dropping LocalTask requests
+    // cancellation before the context storage is released, and the scheduler cancels it before
+    // any later runnable can poll this future.
     unsafe {
         debug_assert!((*context.as_ptr()).output.is_none());
         (*context.as_ptr()).output = Some(output);
