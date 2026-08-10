@@ -409,6 +409,50 @@ ngx_rs_test_free(void *ptr)
     .expect("NGINX allocation test wrapper");
     sources.push(alloc_wrapper);
 
+    let resolver_source = dunce::canonicalize(nginx.source_dir.join("src/core/ngx_resolver.c"))
+        .expect("configured nginx resolver source");
+    let source_count = sources.len();
+    sources.retain(|source| source != &resolver_source);
+    assert_eq!(
+        sources.len(),
+        source_count - 1,
+        "configured nginx resolver source appears exactly once"
+    );
+
+    let resolver_wrapper = out_dir.join("nginx_test_resolver.c");
+    let mut file = File::create(&resolver_wrapper).expect("NGINX resolver test wrapper");
+    file.write_all(
+        br"#define ngx_resolve_name_done ngx_rs_test_real_resolve_name_done
+#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_resolver.c>
+#undef ngx_resolve_name_done
+
+static ngx_uint_t ngx_rs_test_resolve_name_done_calls;
+
+void
+ngx_resolve_name_done(ngx_resolver_ctx_t *ctx)
+{
+    ngx_rs_test_resolve_name_done_calls++;
+    ngx_rs_test_real_resolve_name_done(ctx);
+}
+
+void
+ngx_rs_test_reset_resolve_name_done_count(void)
+{
+    ngx_rs_test_resolve_name_done_calls = 0;
+}
+
+ngx_uint_t
+ngx_rs_test_resolve_name_done_count(void)
+{
+    return ngx_rs_test_resolve_name_done_calls;
+}
+",
+    )
+    .expect("NGINX resolver test wrapper");
+    sources.push(resolver_wrapper);
+
     #[cfg(feature = "stream")]
     {
         let stream_variables =
