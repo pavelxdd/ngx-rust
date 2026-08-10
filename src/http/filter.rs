@@ -519,6 +519,62 @@ mod tests {
         }
     }
 
+    struct FailingContinuationFilter;
+
+    static FAILING_CONTINUATION_SLOT: HttpFilterSlot<FailingContinuationFilter> =
+        HttpFilterSlot::new();
+
+    unsafe impl HttpModule for FailingContinuationFilter {
+        fn module() -> &'static ngx_module_t {
+            module()
+        }
+    }
+
+    unsafe impl HttpFilter for FailingContinuationFilter {
+        type HeaderOutput = Status;
+        type BodyOutput = Status;
+
+        fn filter_slot() -> &'static HttpFilterSlot<Self> {
+            &FAILING_CONTINUATION_SLOT
+        }
+
+        fn header_filter(_request: &mut RequestRefMut<'_>) -> Self::HeaderOutput {
+            Status::NGX_DONE
+        }
+
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
+            Status::NGX_DONE
+        }
+    }
+
+    struct InvalidContinuationFilter;
+
+    static INVALID_CONTINUATION_SLOT: HttpFilterSlot<InvalidContinuationFilter> =
+        HttpFilterSlot::new();
+
+    unsafe impl HttpModule for InvalidContinuationFilter {
+        fn module() -> &'static ngx_module_t {
+            module()
+        }
+    }
+
+    unsafe impl HttpFilter for InvalidContinuationFilter {
+        type HeaderOutput = Status;
+        type BodyOutput = Status;
+
+        fn filter_slot() -> &'static HttpFilterSlot<Self> {
+            &INVALID_CONTINUATION_SLOT
+        }
+
+        fn header_filter(_request: &mut RequestRefMut<'_>) -> Self::HeaderOutput {
+            Status::NGX_DONE
+        }
+
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
+            Status::NGX_DONE
+        }
+    }
+
     static HEADER_ORDER: AtomicUsize = AtomicUsize::new(0);
     static BODY_ORDER: AtomicUsize = AtomicUsize::new(0);
 
@@ -1051,7 +1107,9 @@ mod tests {
         FAILING_HEADER_CALLS.store(0, Ordering::Relaxed);
         FAILING_BODY_CALLS.store(0, Ordering::Relaxed);
         assert_eq!(
-            unsafe { filter_postconfiguration::<ContinuationFilter>(&raw mut configuration) },
+            unsafe {
+                filter_postconfiguration::<FailingContinuationFilter>(&raw mut configuration)
+            },
             Status::NGX_OK.0
         );
 
@@ -1067,14 +1125,20 @@ mod tests {
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
         let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
 
-        assert_eq!(continuation.call_next_header(&CONTINUATION_SLOT), Ok(Status::NGX_ERROR));
         assert_eq!(
-            continuation.call_next_header(&CONTINUATION_SLOT),
+            continuation.call_next_header(&FAILING_CONTINUATION_SLOT),
+            Ok(Status::NGX_ERROR)
+        );
+        assert_eq!(
+            continuation.call_next_header(&FAILING_CONTINUATION_SLOT),
             Err(RequestContinuationError::HeaderAlreadyContinued)
         );
-        assert_eq!(continuation.call_next_body(&CONTINUATION_SLOT, chain), Ok(Status::NGX_ERROR));
         assert_eq!(
-            continuation.call_next_body(&CONTINUATION_SLOT, chain),
+            continuation.call_next_body(&FAILING_CONTINUATION_SLOT, chain),
+            Ok(Status::NGX_ERROR)
+        );
+        assert_eq!(
+            continuation.call_next_body(&FAILING_CONTINUATION_SLOT, chain),
             Err(RequestContinuationError::BodyAlreadyContinued)
         );
         assert_eq!(FAILING_HEADER_CALLS.load(Ordering::Relaxed), 1);
@@ -1113,7 +1177,9 @@ mod tests {
         NEXT_HEADER_CALLS.store(0, Ordering::Relaxed);
         NEXT_BODY_CALLS.store(0, Ordering::Relaxed);
         assert_eq!(
-            unsafe { filter_postconfiguration::<ContinuationFilter>(&raw mut configuration) },
+            unsafe {
+                filter_postconfiguration::<InvalidContinuationFilter>(&raw mut configuration)
+            },
             Status::NGX_OK.0
         );
 
@@ -1128,14 +1194,14 @@ mod tests {
         let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
 
         assert_eq!(
-            continuation.call_next_header(&CONTINUATION_SLOT),
+            continuation.call_next_header(&INVALID_CONTINUATION_SLOT),
             Err(RequestContinuationError::Request(RequestError::Connection(
                 ConnectionError::NullConnection
             )))
         );
         assert_eq!(NEXT_HEADER_CALLS.load(Ordering::Relaxed), 0);
         assert_eq!(
-            continuation.call_next_body(&CONTINUATION_SLOT, chain),
+            continuation.call_next_body(&INVALID_CONTINUATION_SLOT, chain),
             Err(RequestContinuationError::Request(RequestError::Connection(
                 ConnectionError::NullConnection
             )))
