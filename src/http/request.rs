@@ -4634,7 +4634,7 @@ mod tests {
             let advanced_offset = offset + 2;
             unsafe {
                 temp.as_mut().file.offset = advanced_offset;
-                temp.as_mut().file.fd = 0;
+                temp.as_mut().file.fd = NGX_INVALID_FILE as ngx_fd_t - 1;
             }
 
             assert!(matches!(
