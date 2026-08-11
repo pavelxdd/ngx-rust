@@ -126,8 +126,13 @@ fn configured_url_validates_selected_address_storage() {
 
     let mut sockaddr = unsafe { MaybeUninit::<libc::sockaddr_in>::zeroed().assume_init() };
     sockaddr.sin_family = libc::AF_INET as _;
-    address.sockaddr = (&raw mut sockaddr).cast();
-    address.socklen = 1;
+    let mut address =
+        ngx_addr_t { sockaddr: (&raw mut sockaddr).cast(), socklen: 1, name: ngx_str_t::empty() };
+    let mut raw = unsafe { MaybeUninit::<ngx_url_t>::zeroed().assume_init() };
+    raw.naddrs = 1;
+    raw.addrs = &raw mut address;
+    let url = raw_url(&mut raw);
+    let selected = url.addresses().unwrap().get(0).unwrap();
     assert!(matches!(
         selected.socket_address(),
         Err(UpstreamUrlViewError::SocketAddress(SocketAddressError::TruncatedAddress))

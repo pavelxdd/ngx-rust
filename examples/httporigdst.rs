@@ -184,9 +184,7 @@ impl HttpVariableHandler for OrigDstAddrVariable {
         ngx_log_debug_http!(request, "httporigdst: context not found, getting address");
         let r = ngx_get_origdst(request);
         match r {
-            Err(e) => {
-                return e;
-            }
+            Err(e) => e,
             Ok((ip, port)) => {
                 // create context,
                 // set context
@@ -210,7 +208,7 @@ impl HttpVariableHandler for OrigDstAddrVariable {
                     }
                     new_ctx.orig_dst_addr
                 };
-                return NgxHttpOrigDstCtx::bind(address, request, value);
+                NgxHttpOrigDstCtx::bind(address, request, value)
             }
         }
     }
@@ -242,9 +240,7 @@ impl HttpVariableHandler for OrigDstPortVariable {
         ngx_log_debug_http!(request, "httporigdst: context not found, getting address");
         let r = ngx_get_origdst(request);
         match r {
-            Err(e) => {
-                return e;
-            }
+            Err(e) => e,
             Ok((ip, port)) => {
                 // create context,
                 // set context
@@ -268,7 +264,7 @@ impl HttpVariableHandler for OrigDstPortVariable {
                     }
                     new_ctx.orig_dst_port
                 };
-                return NgxHttpOrigDstCtx::bind(port, request, value);
+                NgxHttpOrigDstCtx::bind(port, request, value)
             }
         }
     }

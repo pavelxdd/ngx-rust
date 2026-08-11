@@ -1258,38 +1258,68 @@ mod tests {
         let owner = TestPool::new();
         let pool = owner.handle();
         let raw_pool = NonNull::new(pool.as_ptr()).unwrap();
-        let mut context = unsafe { MaybeUninit::<ngx_resolver_ctx_t>::zeroed().assume_init() };
-        let mut address = unsafe { MaybeUninit::<ngx_resolver_addr_t>::zeroed().assume_init() };
-        let mut oversized = [0_u8; mem::size_of::<libc::sockaddr_storage>() + 1];
 
+        let mut context = unsafe { MaybeUninit::<ngx_resolver_ctx_t>::zeroed().assume_init() };
         context.state = NGX_OK as _;
         context.naddrs = 1;
         context.addrs = ptr::null_mut();
         assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));
 
+        let mut address = unsafe { MaybeUninit::<ngx_resolver_addr_t>::zeroed().assume_init() };
+        let mut context = unsafe { MaybeUninit::<ngx_resolver_ctx_t>::zeroed().assume_init() };
+        context.state = NGX_OK as _;
+        context.naddrs = 1;
         context.addrs = core::ptr::from_mut(&mut address);
-        address.socklen = 0;
         assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));
 
-        address.sockaddr = oversized.as_mut_ptr().cast();
-        address.socklen = oversized.len() as _;
+        let mut oversized = [0_u8; mem::size_of::<libc::sockaddr_storage>() + 1];
+        let address = ngx_resolver_addr_t {
+            sockaddr: oversized.as_mut_ptr().cast(),
+            socklen: oversized.len() as _,
+            name: ngx_str_t::empty(),
+            priority: 0,
+            weight: 0,
+        };
+        let mut context = unsafe { MaybeUninit::<ngx_resolver_ctx_t>::zeroed().assume_init() };
+        context.state = NGX_OK as _;
+        context.naddrs = 1;
+        context.addrs = core::ptr::from_ref(&address).cast_mut();
         assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));
 
-        address.sockaddr = ptr::null_mut();
-        address.socklen = mem::size_of::<libc::sockaddr_in>() as _;
+        let address = ngx_resolver_addr_t {
+            sockaddr: ptr::null_mut(),
+            socklen: mem::size_of::<libc::sockaddr_in>() as _,
+            name: ngx_str_t::empty(),
+            priority: 0,
+            weight: 0,
+        };
+        let mut context = unsafe { MaybeUninit::<ngx_resolver_ctx_t>::zeroed().assume_init() };
+        context.state = NGX_OK as _;
+        context.naddrs = 1;
+        context.addrs = core::ptr::from_ref(&address).cast_mut();
         assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));
 
-        address.sockaddr = oversized.as_mut_ptr().cast();
-        address.name = ngx_str_t { data: ptr::null_mut(), len: 1 };
+        let mut sockaddr = unsafe { MaybeUninit::<libc::sockaddr_in>::zeroed().assume_init() };
+        let address = ngx_resolver_addr_t {
+            sockaddr: core::ptr::from_mut(&mut sockaddr).cast(),
+            socklen: mem::size_of::<libc::sockaddr_in>() as _,
+            name: ngx_str_t { data: ptr::null_mut(), len: 1 },
+            priority: 0,
+            weight: 0,
+        };
+        let mut context = unsafe { MaybeUninit::<ngx_resolver_ctx_t>::zeroed().assume_init() };
+        context.state = NGX_OK as _;
+        context.naddrs = 1;
+        context.addrs = core::ptr::from_ref(&address).cast_mut();
         assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));
 
+        let mut context = unsafe { MaybeUninit::<ngx_resolver_ctx_t>::zeroed().assume_init() };
         context.state = NGX_RESOLVE_NXDOMAIN as _;
-        context.naddrs = 0;
         context.name = ngx_str_t { data: ptr::null_mut(), len: 1 };
         assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));
 
+        let mut context = unsafe { MaybeUninit::<ngx_resolver_ctx_t>::zeroed().assume_init() };
         context.state = NGX_OK as _;
-        context.name = ngx_str_t::empty();
         context.naddrs = usize::MAX as ngx_uint_t;
         context.addrs = NonNull::<ngx_resolver_addr_t>::dangling().as_ptr();
         assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));

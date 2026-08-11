@@ -337,8 +337,12 @@ fn proxy_protocol_view_rejects_invalid_metadata_discriminants() {
     let connection = unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
     assert_eq!(connection.proxy_protocol(), Err(ProxyProtocolError::UnsupportedFamily(-1)));
 
+    let mut metadata: ngx_proxy_protocol_t = unsafe { mem::zeroed() };
     metadata.family = libc::AF_INET;
     metadata.transport = -1;
+    let mut connection = zeroed_connection();
+    connection.proxy_protocol = &raw mut metadata;
+    let connection = unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
     assert_eq!(connection.proxy_protocol(), Err(ProxyProtocolError::UnsupportedTransport(-1)));
 }
 
@@ -354,7 +358,13 @@ fn proxy_protocol_view_rejects_unbacked_and_oversized_metadata_bytes() {
 
     assert_eq!(connection.proxy_protocol(), Err(ProxyProtocolError::MissingData));
 
+    let mut metadata: ngx_proxy_protocol_t = unsafe { mem::zeroed() };
+    metadata.family = libc::AF_INET;
+    metadata.transport = libc::SOCK_STREAM;
     metadata.src_addr.len = isize::MAX as usize + 1;
+    let mut connection = zeroed_connection();
+    connection.proxy_protocol = &raw mut metadata;
+    let connection = unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
     assert_eq!(connection.proxy_protocol(), Err(ProxyProtocolError::DataTooLong));
 }
 
@@ -526,29 +536,43 @@ fn address_views_reject_truncated_wrong_and_missing_addresses() {
 #[test]
 fn input_buffer_views_distinguish_absent_invalid_and_control_buffers() {
     let mut connection = zeroed_connection();
-    let connection_view =
-        unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
-    assert!(connection_view.buffer().unwrap().is_none());
+    assert!(
+        unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .is_none()
+    );
 
     let bytes = *b"abc";
     let mut invalid = memory_buffer(&bytes);
     invalid.pos = unsafe { invalid.pos.add(2) };
     invalid.last = bytes.as_ptr().cast_mut();
     connection.buffer = &raw mut invalid;
-    let buffer = connection_view.buffer().unwrap().unwrap();
-    assert_eq!(buffer.bytes(), Err(BufferError::InvalidMemoryRange));
+    {
+        let connection_view =
+            unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
+        let buffer = connection_view.buffer().unwrap().unwrap();
+        assert_eq!(buffer.bytes(), Err(BufferError::InvalidMemoryRange));
+    }
 
     let mut control: ngx_buf_t = unsafe { mem::zeroed() };
     control.set_flush(1);
     connection.buffer = &raw mut control;
-    let buffer = connection_view.buffer().unwrap().unwrap();
-    assert_eq!(buffer.bytes(), Ok(None));
-    assert_eq!(buffer.has_space(), Ok(false));
+    {
+        let connection_view =
+            unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
+        let buffer = connection_view.buffer().unwrap().unwrap();
+        assert_eq!(buffer.bytes(), Ok(None));
+        assert_eq!(buffer.has_space(), Ok(false));
+    }
 
     let mut reversed_end = memory_buffer(&bytes);
     reversed_end.last = unsafe { reversed_end.pos.add(2) };
     reversed_end.end = unsafe { reversed_end.pos.add(1) };
     connection.buffer = &raw mut reversed_end;
+    let connection_view =
+        unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
     let buffer = connection_view.buffer().unwrap().unwrap();
     assert_eq!(buffer.has_space(), Err(BufferError::InvalidMemoryRange));
 }
@@ -575,25 +599,41 @@ fn buffer_swap_rejects_invalid_scratch_without_changing_the_connection() {
 
 #[test]
 fn listener_and_socket_type_views_reject_missing_and_unknown_values() {
-    let mut listener: ngx_listening_t = unsafe { mem::zeroed() };
-    listener.type_ = libc::SOCK_STREAM;
+    let mut stream_listener: ngx_listening_t = unsafe { mem::zeroed() };
+    stream_listener.type_ = libc::SOCK_STREAM;
     let mut connection = zeroed_connection();
     connection.type_ = libc::SOCK_STREAM;
-    connection.listening = &raw mut listener;
+    connection.listening = &raw mut stream_listener;
+    {
+        let connection_view =
+            unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
+        assert_eq!(connection_view.socket_type(), Ok(SocketType::Stream));
+        assert_eq!(connection_view.listener().unwrap().socket_type(), Ok(SocketType::Stream));
+    }
+
+    let mut datagram_listener: ngx_listening_t = unsafe { mem::zeroed() };
+    datagram_listener.type_ = libc::SOCK_DGRAM;
+    let mut connection = zeroed_connection();
+    connection.type_ = libc::SOCK_DGRAM;
+    connection.listening = &raw mut datagram_listener;
+    {
+        let connection_view =
+            unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
+        assert_eq!(connection_view.socket_type(), Ok(SocketType::Datagram));
+        assert_eq!(connection_view.listener().unwrap().socket_type(), Ok(SocketType::Datagram));
+    }
+
+    let mut connection = zeroed_connection();
+    connection.type_ = -1;
+    {
+        let connection_view =
+            unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
+        assert_eq!(connection_view.socket_type(), Err(ConnectionError::UnsupportedSocketType(-1)));
+    }
+
+    let mut connection = zeroed_connection();
     let connection_view =
         unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
-
-    assert_eq!(connection_view.socket_type(), Ok(SocketType::Stream));
-    assert_eq!(connection_view.listener().unwrap().socket_type(), Ok(SocketType::Stream));
-
-    connection.type_ = libc::SOCK_DGRAM;
-    listener.type_ = libc::SOCK_DGRAM;
-    assert_eq!(connection_view.socket_type(), Ok(SocketType::Datagram));
-    assert_eq!(connection_view.listener().unwrap().socket_type(), Ok(SocketType::Datagram));
-
-    connection.type_ = -1;
-    assert_eq!(connection_view.socket_type(), Err(ConnectionError::UnsupportedSocketType(-1)));
-    connection.listening = ptr::null_mut();
     assert_eq!(connection_view.listener(), Err(ConnectionError::MissingListener));
 }
 
@@ -615,7 +655,10 @@ fn read_and_write_event_views_are_checked_and_exclusive() {
         let event = connection_view.write_event().unwrap();
         assert_eq!(event.as_ptr(), &raw mut write);
     }
-    connection.read = ptr::null_mut();
+
+    let mut connection = zeroed_connection();
+    let mut connection_view =
+        unsafe { ConnectionRefMut::from_raw(raw_connection(&mut connection)) }.unwrap();
     assert!(matches!(
         connection_view.read_event(),
         Err(ConnectionError::Event(crate::event::EventError::NullEvent))
@@ -905,23 +948,24 @@ fn proxy_protocol_tlv_lookup_rejects_missing_or_misaligned_connection_logs() {
     let mut connection = zeroed_connection();
     connection.pool = owner.raw;
     connection.type_ = libc::SOCK_STREAM;
-    let mut connection_view =
-        unsafe { ConnectionRefMut::from_raw(raw_connection(&mut connection)) }.unwrap();
-    connection_view
-        .attach_proxy_protocol(
-            ProxyProtocolBuilder::new(source, destination, SocketType::Stream)
-                .unwrap()
-                .tlvs(&tlvs)
-                .unwrap(),
-        )
-        .unwrap();
-
     {
+        let mut connection_view =
+            unsafe { ConnectionRefMut::from_raw(raw_connection(&mut connection)) }.unwrap();
+        connection_view
+            .attach_proxy_protocol(
+                ProxyProtocolBuilder::new(source, destination, SocketType::Stream)
+                    .unwrap()
+                    .tlvs(&tlvs)
+                    .unwrap(),
+            )
+            .unwrap();
         let metadata = connection_view.proxy_protocol().unwrap().unwrap();
         assert_eq!(metadata.lookup_tlv(0x05), Err(ProxyProtocolError::MissingConnectionLog));
     }
 
     connection.log = ptr::without_provenance_mut::<ngx_log_t>(1);
+    let connection_view =
+        unsafe { ConnectionRefMut::from_raw(raw_connection(&mut connection)) }.unwrap();
     let metadata = connection_view.proxy_protocol().unwrap().unwrap();
     assert_eq!(
         metadata.lookup_tlv(0x05),
@@ -1116,8 +1160,8 @@ fn synchronous_buffer_swap_restores_the_original_on_success_error_and_unwind() {
     let mut scratch: ngx_buf_t = unsafe { mem::zeroed() };
     let scratch_ptr = &raw mut scratch;
     let mut connection = zeroed_connection();
-    let connection_ptr = raw_connection(&mut connection);
     connection.buffer = original_ptr;
+    let connection_ptr = raw_connection(&mut connection);
     let mut connection_view = unsafe { ConnectionRefMut::from_raw(connection_ptr) }.unwrap();
 
     {
@@ -1147,9 +1191,9 @@ fn buffer_swap_can_copy_a_pool_owned_final_descriptor_before_restoring() {
     let original_ptr = &raw mut original;
     let mut scratch: ngx_buf_t = unsafe { mem::zeroed() };
     let mut connection = zeroed_connection();
-    let connection_ptr = raw_connection(&mut connection);
     connection.pool = owner.raw;
     connection.buffer = original_ptr;
+    let connection_ptr = raw_connection(&mut connection);
     let mut connection_view = unsafe { ConnectionRefMut::from_raw(connection_ptr) }.unwrap();
     let replacement =
         connection_view.pool().unwrap().copy_buffer(b"final", BufferFlags::default()).unwrap();

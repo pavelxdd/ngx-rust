@@ -3947,9 +3947,9 @@ mod tests {
 
         let mut empty_headers: [ngx_table_elt_t; 1] =
             unsafe { MaybeUninit::zeroed().assume_init() };
-        let disabled_key = [b'X', b'-', b'D', b'i', b's', b'a', b'b', b'l', b'e', b'd'];
+        let disabled_key = *b"X-Disabled";
         let disabled_value = [0xff, b'!'];
-        let disabled_lowcase = [b'x', b'-', b'd', b'i', b's', b'a', b'b', b'l', b'e', b'd'];
+        let disabled_lowcase = *b"x-disabled";
         let mut disabled_headers: [ngx_table_elt_t; 1] =
             unsafe { MaybeUninit::zeroed().assume_init() };
         disabled_headers[0].hash = 0;
@@ -4045,40 +4045,121 @@ mod tests {
         assert!(matches!(request_from(&mut raw).headers_in(), Err(HeaderListError::InvalidList)));
 
         let mut header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        raw.headers_in.headers.part.elts = &raw mut header as *mut _ as *mut _;
-        raw.headers_in.headers.part.nelts = 2;
+        let mut raw = zeroed_request();
+        raw.headers_in.headers = ngx_list_t {
+            last: &raw mut raw.headers_in.headers.part,
+            part: ngx_list_part_t {
+                elts: (&raw mut header).cast(),
+                nelts: 2,
+                next: core::ptr::null_mut(),
+            },
+            size: core::mem::size_of::<ngx_table_elt_t>(),
+            nalloc: 1,
+            pool: core::ptr::null_mut(),
+        };
         assert!(matches!(request_from(&mut raw).headers_in(), Err(HeaderListError::InvalidList)));
 
-        raw.headers_in.headers.part.nelts = 1;
-        raw.headers_in.headers.part.next = &raw mut raw.headers_in.headers.part;
+        let mut header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut raw = zeroed_request();
+        raw.headers_in.headers = ngx_list_t {
+            last: &raw mut raw.headers_in.headers.part,
+            part: ngx_list_part_t {
+                elts: (&raw mut header).cast(),
+                nelts: 1,
+                next: &raw mut raw.headers_in.headers.part,
+            },
+            size: core::mem::size_of::<ngx_table_elt_t>(),
+            nalloc: 1,
+            pool: core::ptr::null_mut(),
+        };
         assert!(matches!(request_from(&mut raw).headers_in(), Err(HeaderListError::InvalidList)));
 
-        raw.headers_in.headers.part.next = core::ptr::null_mut();
+        let mut header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
         header.key.len = 1;
+        let mut raw = zeroed_request();
+        raw.headers_in.headers = ngx_list_t {
+            last: &raw mut raw.headers_in.headers.part,
+            part: ngx_list_part_t {
+                elts: (&raw mut header).cast(),
+                nelts: 1,
+                next: core::ptr::null_mut(),
+            },
+            size: core::mem::size_of::<ngx_table_elt_t>(),
+            nalloc: 1,
+            pool: core::ptr::null_mut(),
+        };
         assert!(matches!(
             request_from(&mut raw).headers_in(),
             Err(HeaderListError::MissingKeyData)
         ));
 
-        let key = [b'X'];
-        header.key.data = key.as_ptr().cast_mut();
+        let key = *b"X";
+        let mut header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        header.key = ngx_str_t { len: key.len(), data: key.as_ptr().cast_mut() };
         header.value.len = 1;
+        let mut raw = zeroed_request();
+        raw.headers_in.headers = ngx_list_t {
+            last: &raw mut raw.headers_in.headers.part,
+            part: ngx_list_part_t {
+                elts: (&raw mut header).cast(),
+                nelts: 1,
+                next: core::ptr::null_mut(),
+            },
+            size: core::mem::size_of::<ngx_table_elt_t>(),
+            nalloc: 1,
+            pool: core::ptr::null_mut(),
+        };
         assert!(matches!(
             request_from(&mut raw).headers_in(),
             Err(HeaderListError::MissingValueData)
         ));
 
-        header.value.data = key.as_ptr().cast_mut();
+        let mut header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
         header.key.len = isize::MAX as usize + 1;
+        let mut raw = zeroed_request();
+        raw.headers_in.headers = ngx_list_t {
+            last: &raw mut raw.headers_in.headers.part,
+            part: ngx_list_part_t {
+                elts: (&raw mut header).cast(),
+                nelts: 1,
+                next: core::ptr::null_mut(),
+            },
+            size: core::mem::size_of::<ngx_table_elt_t>(),
+            nalloc: 1,
+            pool: core::ptr::null_mut(),
+        };
         assert!(matches!(request_from(&mut raw).headers_in(), Err(HeaderListError::KeyTooLong)));
 
-        header.key.len = 1;
+        let mut header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        header.key = ngx_str_t { len: key.len(), data: key.as_ptr().cast_mut() };
         header.value.len = isize::MAX as usize + 1;
+        let mut raw = zeroed_request();
+        raw.headers_in.headers = ngx_list_t {
+            last: &raw mut raw.headers_in.headers.part,
+            part: ngx_list_part_t {
+                elts: (&raw mut header).cast(),
+                nelts: 1,
+                next: core::ptr::null_mut(),
+            },
+            size: core::mem::size_of::<ngx_table_elt_t>(),
+            nalloc: 1,
+            pool: core::ptr::null_mut(),
+        };
         assert!(matches!(request_from(&mut raw).headers_in(), Err(HeaderListError::ValueTooLong)));
 
-        raw.headers_out.headers = raw.headers_in.headers;
-        raw.headers_out.headers.last = &raw mut raw.headers_out.headers.part;
-        raw.headers_out.headers.part.next = &raw mut raw.headers_out.headers.part;
+        let mut header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut raw = zeroed_request();
+        raw.headers_out.headers = ngx_list_t {
+            last: &raw mut raw.headers_out.headers.part,
+            part: ngx_list_part_t {
+                elts: (&raw mut header).cast(),
+                nelts: 1,
+                next: &raw mut raw.headers_out.headers.part,
+            },
+            size: core::mem::size_of::<ngx_table_elt_t>(),
+            nalloc: 1,
+            pool: core::ptr::null_mut(),
+        };
         assert!(matches!(request_from(&mut raw).headers_out(), Err(HeaderListError::InvalidList)));
     }
 
@@ -5064,19 +5145,20 @@ mod tests {
         assert!(request_from(&mut raw).request_body().unwrap().is_none());
 
         let mut empty: ngx_http_request_body_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut raw = zeroed_request();
         raw.request_body = &raw mut empty;
-        {
-            let request = request_from(&mut raw);
-            let body = request.request_body().unwrap().unwrap();
-            assert!(body.chain().unwrap().iter().next().is_none());
-            assert_eq!(body.size().unwrap(), RequestBodySize { bytes: 0, saturated: false });
-        }
+        let request = request_from(&mut raw);
+        let body = request.request_body().unwrap().unwrap();
+        assert!(body.chain().unwrap().iter().next().is_none());
+        assert_eq!(body.size().unwrap(), RequestBodySize { bytes: 0, saturated: false });
 
         let mut control: ngx_buf_t = unsafe { MaybeUninit::zeroed().assume_init() };
         control.set_flush(1);
-        let mut link: ngx_chain_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        link.buf = &raw mut control;
-        empty.bufs = &raw mut link;
+        let mut link = ngx_chain_t { buf: &raw mut control, next: core::ptr::null_mut() };
+        let mut body: ngx_http_request_body_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        body.bufs = &raw mut link;
+        let mut raw = zeroed_request();
+        raw.request_body = &raw mut body;
 
         let request = request_from(&mut raw);
         let body = request.request_body().unwrap().unwrap();
@@ -5107,14 +5189,9 @@ mod tests {
 
         let mut control: ngx_buf_t = unsafe { MaybeUninit::zeroed().assume_init() };
         control.set_sync(1);
-        let mut memory_link: ngx_chain_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        let mut file_link: ngx_chain_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        let mut control_link: ngx_chain_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        memory_link.buf = &raw mut memory_buffer;
-        memory_link.next = &raw mut file_link;
-        file_link.buf = &raw mut file_buffer;
-        file_link.next = &raw mut control_link;
-        control_link.buf = &raw mut control;
+        let mut control_link = ngx_chain_t { buf: &raw mut control, next: core::ptr::null_mut() };
+        let mut file_link = ngx_chain_t { buf: &raw mut file_buffer, next: &raw mut control_link };
+        let mut memory_link = ngx_chain_t { buf: &raw mut memory_buffer, next: &raw mut file_link };
 
         let mut body: ngx_http_request_body_t = unsafe { MaybeUninit::zeroed().assume_init() };
         body.bufs = &raw mut memory_link;
@@ -5139,10 +5216,10 @@ mod tests {
 
     #[test]
     fn request_body_size_rejects_invalid_chains_and_saturates() {
-        let mut raw = zeroed_request();
+        let mut null_buffer_link = ngx_chain_t { buf: ptr::null_mut(), next: ptr::null_mut() };
         let mut body: ngx_http_request_body_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        let mut null_buffer_link: ngx_chain_t = unsafe { MaybeUninit::zeroed().assume_init() };
         body.bufs = &raw mut null_buffer_link;
+        let mut raw = zeroed_request();
         raw.request_body = &raw mut body;
         assert!(matches!(
             request_from(&mut raw).request_body().unwrap().unwrap().size(),
@@ -5155,7 +5232,12 @@ mod tests {
         invalid_file.file_pos = -1;
         invalid_file.file_last = 0;
         invalid_file.set_in_file(1);
-        null_buffer_link.buf = &raw mut invalid_file;
+        let mut invalid_file_link =
+            ngx_chain_t { buf: &raw mut invalid_file, next: ptr::null_mut() };
+        let mut body: ngx_http_request_body_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        body.bufs = &raw mut invalid_file_link;
+        let mut raw = zeroed_request();
+        raw.request_body = &raw mut body;
         assert!(matches!(
             request_from(&mut raw).request_body().unwrap().unwrap().size(),
             Err(RequestBodyError::Chain(ChainError::Buffer(BufferError::InvalidFileRange)))
@@ -5166,12 +5248,18 @@ mod tests {
         invalid_memory.pos = unsafe { memory.as_mut_ptr().add(memory.len()) };
         invalid_memory.last = memory.as_mut_ptr();
         invalid_memory.set_memory(1);
-        null_buffer_link.buf = &raw mut invalid_memory;
+        let mut invalid_memory_link =
+            ngx_chain_t { buf: &raw mut invalid_memory, next: ptr::null_mut() };
+        let mut body: ngx_http_request_body_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        body.bufs = &raw mut invalid_memory_link;
+        let mut raw = zeroed_request();
+        raw.request_body = &raw mut body;
         assert!(matches!(
             request_from(&mut raw).request_body().unwrap().unwrap().size(),
             Err(RequestBodyError::Chain(ChainError::Buffer(BufferError::InvalidMemoryRange)))
         ));
 
+        let mut file: ngx_file_t = unsafe { MaybeUninit::zeroed().assume_init() };
         let mut first: ngx_buf_t = unsafe { MaybeUninit::zeroed().assume_init() };
         let mut second: ngx_buf_t = unsafe { MaybeUninit::zeroed().assume_init() };
         let mut third: ngx_buf_t = unsafe { MaybeUninit::zeroed().assume_init() };
@@ -5181,21 +5269,36 @@ mod tests {
             buffer.file_last = off_t::MAX;
             buffer.set_in_file(1);
         }
-        let mut first_link: ngx_chain_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        let mut second_link: ngx_chain_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        let mut third_link: ngx_chain_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        first_link.buf = &raw mut first;
-        first_link.next = &raw mut second_link;
-        second_link.buf = &raw mut second;
-        second_link.next = &raw mut third_link;
-        third_link.buf = &raw mut third;
+        let mut third_link = ngx_chain_t { buf: &raw mut third, next: ptr::null_mut() };
+        let mut second_link = ngx_chain_t { buf: &raw mut second, next: &raw mut third_link };
+        let mut first_link = ngx_chain_t { buf: &raw mut first, next: &raw mut second_link };
+        let mut body: ngx_http_request_body_t = unsafe { MaybeUninit::zeroed().assume_init() };
         body.bufs = &raw mut first_link;
+        let mut raw = zeroed_request();
+        raw.request_body = &raw mut body;
         assert_eq!(
             request_from(&mut raw).request_body().unwrap().unwrap().size(),
             Ok(RequestBodySize { bytes: usize::MAX, saturated: true })
         );
-        third_link.next = &raw mut null_buffer_link;
-        null_buffer_link.buf = ptr::null_mut();
+
+        let mut file: ngx_file_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut first: ngx_buf_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut second: ngx_buf_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut third: ngx_buf_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        for buffer in [&mut first, &mut second, &mut third] {
+            buffer.file = &raw mut file;
+            buffer.file_pos = 0;
+            buffer.file_last = off_t::MAX;
+            buffer.set_in_file(1);
+        }
+        let mut null_buffer_link = ngx_chain_t { buf: ptr::null_mut(), next: ptr::null_mut() };
+        let mut third_link = ngx_chain_t { buf: &raw mut third, next: &raw mut null_buffer_link };
+        let mut second_link = ngx_chain_t { buf: &raw mut second, next: &raw mut third_link };
+        let mut first_link = ngx_chain_t { buf: &raw mut first, next: &raw mut second_link };
+        let mut body: ngx_http_request_body_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        body.bufs = &raw mut first_link;
+        let mut raw = zeroed_request();
+        raw.request_body = &raw mut body;
         assert!(matches!(
             request_from(&mut raw).request_body().unwrap().unwrap().size(),
             Err(RequestBodyError::Chain(ChainError::NullBuffer))
@@ -5204,6 +5307,7 @@ mod tests {
         let mut storage = [0_u8;
             core::mem::size_of::<ngx_http_request_body_t>()
                 + core::mem::align_of::<ngx_http_request_body_t>()];
+        let mut raw = zeroed_request();
         raw.request_body = unsafe { storage.as_mut_ptr().add(1).cast() };
         assert_eq!(request_from(&mut raw).request_body(), Err(RequestBodyError::MisalignedBody));
     }
@@ -5922,8 +6026,8 @@ mod tests {
             let mut request = request_from(&mut raw);
             let mut headers = request.headers_in_builder(1).unwrap();
             {
-                let mut key = [b'X', b'-', b'I', b'n'];
-                let mut value = [b'i', b'n', b'p', b'u', b't'];
+                let mut key = *b"X-In";
+                let mut value = *b"input";
                 headers.add(&key, &value).unwrap();
                 key.fill(b'!');
                 value.fill(b'!');
@@ -5935,7 +6039,7 @@ mod tests {
             let mut request = request_from(&mut raw);
             let mut headers = request.headers_out_builder(1).unwrap();
             {
-                let mut value = [b't', b'e', b'x', b't', b'/', b'p', b'l', b'a', b'i', b'n'];
+                let mut value = *b"text/plain";
                 headers.add(b"Content-Type", &value).unwrap();
                 value.fill(b'!');
             }

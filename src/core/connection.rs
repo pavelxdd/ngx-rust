@@ -523,9 +523,9 @@ impl<'callback> ProxyProtocolRef<'callback> {
         let status = unsafe {
             ngx_proxy_protocol_lookup_tlv(
                 self.connection.as_ptr(),
-                &mut tlvs,
+                &raw mut tlvs,
                 type_.into(),
-                &mut value,
+                &raw mut value,
             )
         };
 
