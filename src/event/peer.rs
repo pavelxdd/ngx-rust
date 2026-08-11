@@ -642,6 +642,7 @@ impl<'address> EventPeer<'address> {
     ///
     /// `NGX_ERROR` is returned as [`EventPeerConnectResult::Error`]. `Err` is reserved for an
     /// invalid native status or ownership transition.
+    #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub fn connect(
         mut self,
     ) -> Result<EventPeerConnectResult<'address>, EventPeerConnectError<'address>> {
@@ -652,6 +653,7 @@ impl<'address> EventPeer<'address> {
         self.classify_connect(status)
     }
 
+    #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     fn classify_connect(
         mut self,
         status: ngx_int_t,
@@ -704,6 +706,7 @@ impl<'address> EventPeer<'address> {
     }
 
     /// Transfers a connected or pending socket into its explicit connection owner.
+    #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub fn into_connection(
         self,
     ) -> Result<EventPeerConnection<'address>, EventPeerIntoConnectionError<'address>> {
@@ -727,6 +730,7 @@ impl<'address> EventPeer<'address> {
     ///
     /// `connection` must be a live nginx connection with initialized read and write events. On
     /// success this owner becomes solely responsible for closing its socket and optional pool.
+    #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub unsafe fn attach_keepalive(
         mut self,
         connection: *mut ngx_connection_t,
@@ -1075,6 +1079,7 @@ impl<'address> EventPeerConnection<'address> {
     }
 
     /// Clears active handlers, timers, and connection data before keepalive transfer.
+    #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub fn into_keepalive(
         mut self,
     ) -> Result<EventPeerKeepalive<'address>, EventPeerKeepaliveTransferError<'address>> {
@@ -1190,6 +1195,7 @@ impl<'address> EventPeerKeepalive<'address> {
     }
 
     /// Clears idle state and transfers the socket back without allocating a new socket.
+    #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub fn into_connection(
         mut self,
     ) -> Result<EventPeerConnection<'address>, EventPeerKeepaliveIntoConnectionError<'address>>

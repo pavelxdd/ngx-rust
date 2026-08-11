@@ -595,8 +595,6 @@ fn peer_callback_adapters_reject_mismatched_or_misaligned_typed_data() {
     unsafe {
         raw_free_peer::<MissingOriginalPeer>(&raw mut request_upstream.peer, invalid_data, 0)
     };
-
-    request_upstream.peer.data = typed_data;
 }
 
 #[cfg(feature = "std")]

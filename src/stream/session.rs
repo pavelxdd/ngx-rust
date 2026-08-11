@@ -1078,7 +1078,6 @@ mod tests {
         unsafe {
             (*cleanup).handler = None;
             core::ptr::drop_in_place(context.cast::<TestContext>());
-            contexts[0] = ptr::null_mut();
         }
         assert_eq!(CONTEXT_DROPS.load(Ordering::Relaxed), 1);
 
