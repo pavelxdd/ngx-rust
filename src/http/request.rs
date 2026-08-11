@@ -866,6 +866,38 @@ impl<'request, 'callback> HttpHeadersInBuilder<'request, 'callback> {
         Ok(())
     }
 
+    /// Starts constructing a request-pool body candidate for this replacement-header set.
+    pub fn request_body_candidate(
+        &self,
+    ) -> Result<RequestBodyCandidate<'callback>, RequestBodyBuildError> {
+        let pool = unsafe { Pool::from_raw(self.pool) }.ok_or(RequestError::MisalignedPool)?;
+        Ok(RequestBodyCandidate::new(pool))
+    }
+
+    /// Publishes the replacement headers, body, and authoritative body framing together.
+    pub fn commit_with_body(
+        self,
+        body: RequestBodyCandidate<'callback>,
+    ) -> Result<(), RequestBodyBuildError> {
+        let Self { request, pool, mut headers } = self;
+        if pool != body.pool.as_ptr() {
+            return Err(RequestBodyBuildError::Buffer(BufferError::ForeignPool));
+        }
+
+        replace_request_body_framing(&mut headers, pool, body.length)?;
+        let body = body.into_raw()?;
+        publish_request_body(request, headers, body.as_ptr());
+        Ok(())
+    }
+
+    /// Publishes the replacement headers with a null body and a zero Content-Length.
+    pub fn commit_without_body(self) -> Result<(), RequestBodyBuildError> {
+        let Self { request, pool, mut headers } = self;
+        replace_request_body_framing(&mut headers, pool, 0)?;
+        publish_request_body(request, headers, ptr::null_mut());
+        Ok(())
+    }
+
     /// Publishes the complete input-header candidate to the request.
     pub fn commit(self) {
         let request = unsafe { self.request.raw.as_mut() };
@@ -926,22 +958,17 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
     }
 }
 
-/// Request-pool builder for atomically replacing an HTTP request body and its framing.
-pub struct RequestBodyBuilder<'request, 'callback> {
-    request: &'request mut RequestRefMut<'callback>,
+/// Request-pool candidate for a non-null HTTP request body.
+pub struct RequestBodyCandidate<'callback> {
     pool: Pool<'callback>,
     chain: PoolChain<'callback>,
     length: usize,
 }
 
-impl<'request, 'callback> RequestBodyBuilder<'request, 'callback> {
-    fn new(request: &'request mut RequestRefMut<'callback>) -> Result<Self, RequestBodyBuildError> {
-        let raw_pool = request.pool()?.as_ptr();
-        // The checked request view owns the callback lifetime that keeps its pool alive.
-        let pool = unsafe { Pool::from_raw(raw_pool) }.ok_or(RequestError::MisalignedPool)?;
+impl<'callback> RequestBodyCandidate<'callback> {
+    fn new(pool: Pool<'callback>) -> Self {
         let chain = pool.chain();
-
-        Ok(Self { request, pool, chain, length: 0 })
+        Self { pool, chain, length: 0 }
     }
 
     /// Copies memory bytes into the request-pool body candidate.
@@ -969,20 +996,53 @@ impl<'request, 'callback> RequestBodyBuilder<'request, 'callback> {
         self.append(buffer)
     }
 
-    /// Publishes the complete non-null request-body candidate and matching framing headers.
-    pub fn commit(self) -> Result<(), RequestBodyBuildError> {
-        let Self { request, pool, chain, length } = self;
-        let headers = request_body_headers_candidate(request, pool.as_ptr(), length)?;
+    fn into_raw(self) -> Result<NonNull<ngx_http_request_body_t>, RequestBodyBuildError> {
+        let Self { pool, chain, length: _ } = self;
         let body = NonNull::new(pool.calloc_type::<ngx_http_request_body_t>())
             .ok_or(RequestBodyBuildError::Allocation)?;
         let mut candidate: ngx_http_request_body_t = unsafe { core::mem::zeroed() };
         candidate.bufs = chain.into_raw();
         unsafe { body.as_ptr().write(candidate) };
+        Ok(body)
+    }
+}
 
-        let request = unsafe { request.raw.as_mut() };
-        request.headers_in = headers;
-        request.request_body = body.as_ptr();
-        repair_header_list_last(&mut request.headers_in.headers);
+/// Request-pool builder for atomically replacing an HTTP request body and its framing.
+pub struct RequestBodyBuilder<'request, 'callback> {
+    request: &'request mut RequestRefMut<'callback>,
+    body: RequestBodyCandidate<'callback>,
+}
+
+impl<'request, 'callback> RequestBodyBuilder<'request, 'callback> {
+    fn new(request: &'request mut RequestRefMut<'callback>) -> Result<Self, RequestBodyBuildError> {
+        let raw_pool = request.pool()?.as_ptr();
+        // The checked request view owns the callback lifetime that keeps its pool alive.
+        let pool = unsafe { Pool::from_raw(raw_pool) }.ok_or(RequestError::MisalignedPool)?;
+
+        Ok(Self { request, body: RequestBodyCandidate::new(pool) })
+    }
+
+    /// Copies memory bytes into the request-pool body candidate.
+    pub fn append_copy(&mut self, bytes: &[u8]) -> Result<(), RequestBodyBuildError> {
+        self.body.append_copy(bytes)
+    }
+
+    /// Appends one request-pool-owned buffer to the body candidate.
+    pub fn append(&mut self, buffer: PoolBuffer<'callback>) -> Result<(), RequestBodyBuildError> {
+        self.body.append(buffer)
+    }
+
+    /// Appends a zero-size control buffer to the body candidate.
+    pub fn append_control(&mut self, flags: BufferFlags) -> Result<(), RequestBodyBuildError> {
+        self.body.append_control(flags)
+    }
+
+    /// Publishes the complete non-null request-body candidate and matching framing headers.
+    pub fn commit(self) -> Result<(), RequestBodyBuildError> {
+        let Self { request, body } = self;
+        let headers = request_body_headers_candidate(request, body.pool.as_ptr(), body.length)?;
+        let body = body.into_raw()?;
+        publish_request_body(request, headers, body.as_ptr());
         Ok(())
     }
 }
@@ -1408,8 +1468,6 @@ fn request_body_headers_candidate(
     pool: *mut ngx_pool_t,
     length: usize,
 ) -> Result<ngx_http_headers_in_t, RequestBodyBuildError> {
-    let content_length =
-        off_t::try_from(length).map_err(|_| RequestBodyBuildError::ContentLengthTooLarge)?;
     let headers = request.headers_in()?;
     let capacity = headers.len().checked_add(1).ok_or(HeaderBuildError::CountOverflow)?;
     let mut candidate = unsafe { request.raw.as_ref().headers_in };
@@ -1422,29 +1480,57 @@ fn request_body_headers_candidate(
         let count = candidate.count.checked_add(1).ok_or(HeaderBuildError::CountOverflow)?;
         let copied =
             append_pool_header(&mut candidate.headers, pool, header.key(), header.value())?;
-        unsafe {
-            (*copied.as_ptr()).hash = if header.key().eq_ignore_ascii_case(b"Content-Length")
-                || header.key().eq_ignore_ascii_case(b"Transfer-Encoding")
-            {
-                0
-            } else {
-                header.hash()
-            };
-        }
+        unsafe { (*copied.as_ptr()).hash = header.hash() };
         candidate.count = count;
     }
 
+    replace_request_body_framing(&mut candidate, pool, length)?;
+    Ok(candidate)
+}
+
+fn replace_request_body_framing(
+    headers: &mut ngx_http_headers_in_t,
+    pool: *mut ngx_pool_t,
+    length: usize,
+) -> Result<(), RequestBodyBuildError> {
+    let content_length =
+        off_t::try_from(length).map_err(|_| RequestBodyBuildError::ContentLengthTooLarge)?;
+    repair_header_list_last(&mut headers.headers);
+    let list = unsafe { NgxList::<ngx_table_elt_t>::from_ngx_list_mut(&mut headers.headers) }
+        .ok_or(HeaderListError::InvalidList)?;
+    for header in list.iter_mut() {
+        let key = unsafe { header_bytes_unchecked(header.key) };
+        if key.eq_ignore_ascii_case(b"Content-Length")
+            || key.eq_ignore_ascii_case(b"Transfer-Encoding")
+        {
+            header.hash = 0;
+        }
+    }
+
+    headers.content_length = ptr::null_mut();
+    headers.transfer_encoding = ptr::null_mut();
     let mut decimal = [0_u8; core::mem::size_of::<usize>() * 3];
     let value = decimal_bytes(length, &mut decimal);
-    let count = candidate.count.checked_add(1).ok_or(HeaderBuildError::CountOverflow)?;
+    let count = headers.count.checked_add(1).ok_or(HeaderBuildError::CountOverflow)?;
     let content_length_header =
-        append_pool_header(&mut candidate.headers, pool, b"Content-Length", value)?;
-    candidate.count = count;
-    candidate.content_length = content_length_header.as_ptr();
-    candidate.content_length_n = content_length;
-    candidate.transfer_encoding = ptr::null_mut();
-    candidate.set_chunked(0);
-    Ok(candidate)
+        append_pool_header(&mut headers.headers, pool, b"Content-Length", value)?;
+    headers.count = count;
+    unsafe { bind_headers_in(headers, content_length_header.as_ptr()) };
+    headers.content_length_n = content_length;
+    headers.transfer_encoding = ptr::null_mut();
+    headers.set_chunked(0);
+    Ok(())
+}
+
+fn publish_request_body(
+    request: &mut RequestRefMut<'_>,
+    headers: ngx_http_headers_in_t,
+    body: *mut ngx_http_request_body_t,
+) {
+    let request = unsafe { request.raw.as_mut() };
+    request.headers_in = headers;
+    request.request_body = body;
+    repair_header_list_last(&mut request.headers_in.headers);
 }
 
 fn decimal_bytes(mut value: usize, buffer: &mut [u8]) -> &[u8] {
@@ -3134,7 +3220,7 @@ enum MethodInner {
 mod tests {
     extern crate alloc;
 
-    use alloc::{boxed::Box, vec::Vec};
+    use alloc::{boxed::Box, vec, vec::Vec};
     #[cfg(all(feature = "test-link", unix))]
     use core::ffi::c_int;
     #[cfg(all(feature = "test-link", unix))]
@@ -4343,6 +4429,256 @@ mod tests {
         assert_eq!(content_length_count, 1);
         assert_eq!(disabled_content_length_count, 1);
         assert_eq!(disabled_transfer_encoding_count, 1);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn input_header_builder_publishes_replacement_body_and_framing_together() {
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        let mut previous_body: ngx_http_request_body_t =
+            unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut previous_temp_file: ngx_temp_file_t =
+            unsafe { MaybeUninit::zeroed().assume_init() };
+        previous_body.temp_file = &raw mut previous_temp_file;
+        raw.request_body = &raw mut previous_body;
+
+        {
+            let mut request = request_from(&mut raw);
+            let mut headers = request.headers_in_builder(1).unwrap();
+            headers.add(b"Host", b"example.test").unwrap();
+            headers.add(b"X-Keep", b"kept").unwrap();
+            headers.add(b"Content-Length", b"99").unwrap();
+            headers.add(b"Transfer-Encoding", b"chunked").unwrap();
+            let mut body = headers.request_body_candidate().unwrap();
+            body.append_copy(b"replacement").unwrap();
+            headers.commit_with_body(body).unwrap();
+        }
+
+        assert!(!raw.request_body.is_null());
+        assert!(!ptr::eq(raw.request_body, &raw mut previous_body));
+        assert!(unsafe { (*raw.request_body).temp_file }.is_null());
+        assert_eq!(raw.headers_in.count, 5);
+        assert_eq!(raw.headers_in.content_length_n, 11);
+        assert_eq!(raw.headers_in.chunked(), 0);
+        assert!(raw.headers_in.transfer_encoding.is_null());
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_in.content_length).value) }.unwrap().as_bytes(),
+            b"11"
+        );
+
+        let request = request_from(&mut raw);
+        let body = request.request_body().unwrap().unwrap();
+        assert_eq!(body.size().unwrap().bytes(), 11);
+        assert_eq!(
+            body.chain().unwrap().iter().next().unwrap().unwrap().bytes(),
+            Ok(Some(b"replacement".as_slice()))
+        );
+        let headers = request.headers_in().unwrap();
+        let fields = headers
+            .iter()
+            .map(|header| (header.key().to_vec(), header.value().to_vec(), header.is_enabled()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fields,
+            vec![
+                (b"Host".to_vec(), b"example.test".to_vec(), true),
+                (b"X-Keep".to_vec(), b"kept".to_vec(), true),
+                (b"Content-Length".to_vec(), b"99".to_vec(), false),
+                (b"Transfer-Encoding".to_vec(), b"chunked".to_vec(), false),
+                (b"Content-Length".to_vec(), b"11".to_vec(), true),
+            ]
+        );
+        let content_length = headers
+            .iter()
+            .find(|header| header.is_enabled() && header.key() == b"Content-Length")
+            .unwrap();
+        assert_eq!(content_length.lowercase_key(), Some(b"content-length".as_slice()));
+        assert_ne!(content_length.hash(), 0);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn input_header_builder_clears_body_and_replaces_framing_together() {
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        let mut previous_temp_file: ngx_temp_file_t =
+            unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut previous_buffer: ngx_buf_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        let mut previous_chain: ngx_chain_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        previous_chain.buf = &raw mut previous_buffer;
+        let mut previous_body: ngx_http_request_body_t =
+            unsafe { MaybeUninit::zeroed().assume_init() };
+        previous_body.temp_file = &raw mut previous_temp_file;
+        previous_body.bufs = &raw mut previous_chain;
+        raw.request_body = &raw mut previous_body;
+
+        {
+            let mut request = request_from(&mut raw);
+            let mut headers = request.headers_in_builder(1).unwrap();
+            headers.add(b"Host", b"example.test").unwrap();
+            headers.add(b"X-Keep", b"kept").unwrap();
+            headers.add(b"Content-Length", b"99").unwrap();
+            headers.add(b"Transfer-Encoding", b"chunked").unwrap();
+            headers.commit_without_body().unwrap();
+        }
+
+        assert!(raw.request_body.is_null());
+        assert_eq!(raw.headers_in.count, 5);
+        assert_eq!(raw.headers_in.content_length_n, 0);
+        assert_eq!(raw.headers_in.chunked(), 0);
+        assert!(raw.headers_in.transfer_encoding.is_null());
+
+        let request = request_from(&mut raw);
+        let headers = request.headers_in().unwrap();
+        let fields = headers
+            .iter()
+            .map(|header| (header.key().to_vec(), header.value().to_vec(), header.is_enabled()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fields,
+            vec![
+                (b"Host".to_vec(), b"example.test".to_vec(), true),
+                (b"X-Keep".to_vec(), b"kept".to_vec(), true),
+                (b"Content-Length".to_vec(), b"99".to_vec(), false),
+                (b"Transfer-Encoding".to_vec(), b"chunked".to_vec(), false),
+                (b"Content-Length".to_vec(), b"0".to_vec(), true),
+            ]
+        );
+        let content_length = headers
+            .iter()
+            .find(|header| header.is_enabled() && header.key() == b"Content-Length")
+            .unwrap();
+        assert_eq!(content_length.lowercase_key(), Some(b"content-length".as_slice()));
+        assert_ne!(content_length.hash(), 0);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn input_header_builder_publishes_body_with_an_empty_header_list() {
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+
+        {
+            let mut request = request_from(&mut raw);
+            let headers = request.headers_in_builder(1).unwrap();
+            let mut body = headers.request_body_candidate().unwrap();
+            body.append_copy(b"body").unwrap();
+            headers.commit_with_body(body).unwrap();
+        }
+
+        assert_eq!(raw.headers_in.count, 1);
+        assert_eq!(raw.headers_in.content_length_n, 4);
+        assert_eq!(raw.headers_in.chunked(), 0);
+        assert!(raw.headers_in.transfer_encoding.is_null());
+        let request = request_from(&mut raw);
+        let headers = request.headers_in().unwrap();
+        let content_length = headers.iter().next().unwrap();
+        assert_eq!(content_length.key(), b"Content-Length");
+        assert_eq!(content_length.value(), b"4");
+        assert_eq!(content_length.lowercase_key(), Some(b"content-length".as_slice()));
+        assert_ne!(content_length.hash(), 0);
+        let body = request.request_body().unwrap().unwrap();
+        assert_eq!(body.size().unwrap().bytes(), 4);
+        assert_eq!(
+            body.chain().unwrap().iter().next().unwrap().unwrap().bytes(),
+            Ok(Some(b"body".as_slice()))
+        );
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn input_header_builder_keeps_live_request_when_combined_body_allocation_fails() {
+        let mut reached_success = false;
+
+        for successes in 0..64 {
+            let owner = TestPool::new();
+            let mut raw = zeroed_request();
+            raw.pool = owner.raw;
+            {
+                let mut request = request_from(&mut raw);
+                let mut headers = request.headers_in_builder(1).unwrap();
+                headers.add(b"Host", b"example.test").unwrap();
+                headers.add(b"Content-Length", b"7").unwrap();
+                headers.add(b"Transfer-Encoding", b"chunked").unwrap();
+                headers.commit();
+            }
+            raw.headers_in.content_length_n = 7;
+            raw.headers_in.set_chunked(1);
+            let mut previous_temp_file: ngx_temp_file_t =
+                unsafe { MaybeUninit::zeroed().assume_init() };
+            let mut previous_body: ngx_http_request_body_t =
+                unsafe { MaybeUninit::zeroed().assume_init() };
+            previous_body.temp_file = &raw mut previous_temp_file;
+            raw.request_body = &raw mut previous_body;
+            let original = (
+                raw.request_body,
+                raw.headers_in.headers.part.elts,
+                raw.headers_in.headers.part.nelts,
+                raw.headers_in.headers.part.next,
+                raw.headers_in.headers.last,
+                raw.headers_in.headers.size,
+                raw.headers_in.headers.nalloc,
+                raw.headers_in.headers.pool,
+                raw.headers_in.content_length,
+                raw.headers_in.transfer_encoding,
+                raw.headers_in.count,
+                raw.headers_in.content_length_n,
+            );
+            let original_host = raw.headers_in.host;
+            let original_chunked = raw.headers_in.chunked();
+
+            unsafe {
+                (*owner.raw).max = 0;
+                ngx_rs_test_fail_allocations_after(successes);
+            }
+            let result = (|| -> Result<(), RequestBodyBuildError> {
+                let mut request = request_from(&mut raw);
+                let mut headers = request.headers_in_builder(1)?;
+                headers.add(b"Host", b"replacement.test")?;
+                headers.add(b"X-Replaced", b"yes")?;
+                let mut body = headers.request_body_candidate()?;
+                body.append_copy(b"replacement")?;
+                headers.commit_with_body(body)
+            })();
+            unsafe { ngx_rs_test_reset_allocation_failures() };
+
+            if result.is_ok() {
+                reached_success = true;
+                break;
+            }
+            assert!(matches!(
+                result,
+                Err(RequestBodyBuildError::HeaderBuild(HeaderBuildError::Allocation)
+                    | RequestBodyBuildError::Buffer(BufferError::Allocation)
+                    | RequestBodyBuildError::Chain(ChainError::Allocation)
+                    | RequestBodyBuildError::Allocation)
+            ));
+            assert_eq!(
+                (
+                    raw.request_body,
+                    raw.headers_in.headers.part.elts,
+                    raw.headers_in.headers.part.nelts,
+                    raw.headers_in.headers.part.next,
+                    raw.headers_in.headers.last,
+                    raw.headers_in.headers.size,
+                    raw.headers_in.headers.nalloc,
+                    raw.headers_in.headers.pool,
+                    raw.headers_in.content_length,
+                    raw.headers_in.transfer_encoding,
+                    raw.headers_in.count,
+                    raw.headers_in.content_length_n,
+                ),
+                original
+            );
+            assert_eq!(raw.headers_in.host, original_host);
+            assert_eq!(raw.headers_in.chunked(), original_chunked);
+        }
+
+        assert!(reached_success);
     }
 
     #[cfg(feature = "test-link")]
