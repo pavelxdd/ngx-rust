@@ -83,6 +83,13 @@ pub enum SocketType {
     Datagram,
 }
 
+impl SocketType {
+    /// Parses an nginx native socket type.
+    pub fn from_raw(raw: c_int) -> Result<Self, ConnectionError> {
+        socket_type(raw)
+    }
+}
+
 /// The family represented by a checked socket address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketAddressFamily {
@@ -1223,7 +1230,7 @@ fn socket_type(raw: c_int) -> Result<SocketType, ConnectionError> {
 ///
 /// `address` must point to a live native socket address for `'callback`. The address must not be
 /// mutated while the returned view exists.
-pub(crate) unsafe fn parse_socket_address<'callback>(
+pub unsafe fn parse_socket_address<'callback>(
     address: *const sockaddr,
     socklen: socklen_t,
 ) -> Result<SocketAddress<'callback>, SocketAddressError> {
