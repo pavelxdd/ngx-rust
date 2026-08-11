@@ -138,7 +138,7 @@ impl TestAddress {
     }
 
     fn peer_address(&self) -> EventPeerAddress<'_> {
-        unsafe { EventPeerAddress::from_raw(&self.raw) }.unwrap()
+        unsafe { EventPeerAddress::from_raw(&raw const self.raw) }.unwrap()
     }
 }
 
@@ -169,7 +169,7 @@ impl TestUnixAddress {
     }
 
     fn peer_address(&self) -> EventPeerAddress<'_> {
-        unsafe { EventPeerAddress::from_raw(&self.raw) }.unwrap()
+        unsafe { EventPeerAddress::from_raw(&raw const self.raw) }.unwrap()
     }
 }
 
@@ -287,7 +287,7 @@ fn builder_requires_valid_address_log_and_get_callback() {
         socklen: size_of::<sockaddr_in>() as _,
         name: ngx_str_t { len: 4, data: c"peer".as_ptr().cast_mut() },
     };
-    let address = unsafe { EventPeerAddress::from_raw(&address) }.unwrap();
+    let address = unsafe { EventPeerAddress::from_raw(&raw const address) }.unwrap();
     let log: ngx_log_t = unsafe { mem::zeroed() };
 
     assert!(matches!(EventPeerBuilder::new(address).build(), Err(EventPeerBuildError::MissingLog)));
@@ -321,7 +321,7 @@ fn peer_address_rejects_invalid_native_storage() {
 
     let mut address: ngx_addr_t = unsafe { mem::zeroed() };
     assert_eq!(
-        unsafe { EventPeerAddress::from_raw(&address) },
+        unsafe { EventPeerAddress::from_raw(&raw const address) },
         Err(EventPeerAddressError::SocketAddress(SocketAddressError::NullAddress))
     );
 
@@ -331,13 +331,13 @@ fn peer_address_rejects_invalid_native_storage() {
     address.socklen = size_of::<sockaddr_in>() as _;
     address.name = ngx_str_t { len: 1, data: ptr::null_mut() };
     assert_eq!(
-        unsafe { EventPeerAddress::from_raw(&address) },
+        unsafe { EventPeerAddress::from_raw(&raw const address) },
         Err(EventPeerAddressError::MissingName)
     );
 
     address.name.len = isize::MAX as usize + 1;
     assert_eq!(
-        unsafe { EventPeerAddress::from_raw(&address) },
+        unsafe { EventPeerAddress::from_raw(&raw const address) },
         Err(EventPeerAddressError::NameTooLong)
     );
 }
@@ -446,7 +446,7 @@ fn peer_address_accepts_ipv4_ipv6_and_unix_storage() {
         socklen: size_of::<sockaddr_in6>() as _,
         name: ngx_str_t { len: name.len(), data: name.as_mut_ptr() },
     };
-    let peer_address = unsafe { EventPeerAddress::from_raw(&ipv6) }.unwrap();
+    let peer_address = unsafe { EventPeerAddress::from_raw(&raw const ipv6) }.unwrap();
     let address = peer_address.socket_address().unwrap();
     assert_eq!(
         address.ipv6_octets(),
@@ -469,7 +469,11 @@ fn peer_address_accepts_ipv4_ipv6_and_unix_storage() {
         name: ngx_str_t { len: 0, data: ptr::null_mut() },
     };
     assert_eq!(
-        unsafe { EventPeerAddress::from_raw(&empty_name) }.unwrap().name().unwrap().as_bytes(),
+        unsafe { EventPeerAddress::from_raw(&raw const empty_name) }
+            .unwrap()
+            .name()
+            .unwrap()
+            .as_bytes(),
         b""
     );
 }
@@ -484,7 +488,7 @@ fn peer_address_rejects_socket_length_and_family_mismatches() {
         name: ngx_str_t { len: 4, data: c"peer".as_ptr().cast_mut() },
     };
     assert_eq!(
-        unsafe { EventPeerAddress::from_raw(&address) },
+        unsafe { EventPeerAddress::from_raw(&raw const address) },
         Err(EventPeerAddressError::SocketAddress(SocketAddressError::InvalidLength))
     );
 
@@ -496,7 +500,7 @@ fn peer_address_rejects_socket_length_and_family_mismatches() {
         name: ngx_str_t { len: 4, data: c"peer".as_ptr().cast_mut() },
     };
     assert_eq!(
-        unsafe { EventPeerAddress::from_raw(&address) },
+        unsafe { EventPeerAddress::from_raw(&raw const address) },
         Err(EventPeerAddressError::SocketAddress(SocketAddressError::InvalidLength))
     );
 }

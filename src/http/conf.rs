@@ -1681,46 +1681,67 @@ mod tests {
         );
         globals.set_http_module_index(0);
 
-        contexts[0] = ptr::null_mut();
+        let mut missing_context_cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+        let mut missing_contexts: [*mut *mut *mut c_void; 2] = [ptr::null_mut(), ptr::null_mut()];
+        missing_context_cycle.conf_ctx = missing_contexts.as_mut_ptr();
         assert_eq!(
             unsafe {
-                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                ProcessCycle::with_raw(&raw mut missing_context_cycle, |cycle| {
                     cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
                 })
             },
             Ok(Ok(None))
         );
-        contexts[0] = ptr::without_provenance_mut(1);
-        assert_eq!(
-            unsafe {
-                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
-                    cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
-                })
-            },
-            Ok(Ok(None))
-        );
-        contexts[0] = (&raw mut context).cast();
 
-        context.main_conf = ptr::null_mut();
+        let mut misaligned_context_cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+        let mut misaligned_contexts: [*mut *mut *mut c_void; 2] =
+            [ptr::without_provenance_mut(1), ptr::null_mut()];
+        misaligned_context_cycle.conf_ctx = misaligned_contexts.as_mut_ptr();
         assert_eq!(
             unsafe {
-                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                ProcessCycle::with_raw(&raw mut misaligned_context_cycle, |cycle| {
                     cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
                 })
             },
             Ok(Ok(None))
         );
-        context.main_conf = slots.as_mut_ptr();
-        slots[0] = ptr::null_mut();
+
+        let mut missing_main_context = ngx_http_conf_ctx_t {
+            main_conf: ptr::null_mut(),
+            srv_conf: ptr::null_mut(),
+            loc_conf: ptr::null_mut(),
+        };
+        let mut missing_main_contexts: [*mut *mut *mut c_void; 2] =
+            [(&raw mut missing_main_context).cast(), ptr::null_mut()];
+        let mut missing_main_cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+        missing_main_cycle.conf_ctx = missing_main_contexts.as_mut_ptr();
         assert_eq!(
             unsafe {
-                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                ProcessCycle::with_raw(&raw mut missing_main_cycle, |cycle| {
                     cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
                 })
             },
             Ok(Ok(None))
         );
-        slots[0] = (&raw mut value).cast();
+
+        let mut missing_slot: [*mut c_void; 1] = [ptr::null_mut()];
+        let mut missing_slot_context = ngx_http_conf_ctx_t {
+            main_conf: missing_slot.as_mut_ptr(),
+            srv_conf: ptr::null_mut(),
+            loc_conf: ptr::null_mut(),
+        };
+        let mut missing_slot_contexts: [*mut *mut *mut c_void; 2] =
+            [(&raw mut missing_slot_context).cast(), ptr::null_mut()];
+        let mut missing_slot_cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+        missing_slot_cycle.conf_ctx = missing_slot_contexts.as_mut_ptr();
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut missing_slot_cycle, |cycle| {
+                    cycle.main_conf::<TestHttpModule>().map(|value| value.copied())
+                })
+            },
+            Ok(Ok(None))
+        );
 
         assert_eq!(
             unsafe {
