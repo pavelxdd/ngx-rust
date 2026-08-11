@@ -4,11 +4,12 @@ extern crate std;
 use alloc::boxed::Box;
 #[cfg(feature = "test-link")]
 use alloc::vec;
-#[cfg(feature = "test-link")]
+#[cfg(all(feature = "test-link", feature = "stream", ngx_feature = "stream"))]
 use alloc::vec::Vec;
 use core::mem::{self, size_of};
 use core::panic::AssertUnwindSafe;
 use core::ptr;
+#[cfg(all(feature = "test-link", feature = "stream", ngx_feature = "stream"))]
 use core::slice;
 #[cfg(all(feature = "test-link", unix))]
 use std::net::{TcpListener, TcpStream};
@@ -16,21 +17,22 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 
 use super::{
-    ConnectionError, ConnectionRef, ConnectionRefMut, ProxyProtocolAddress, ProxyProtocolBuilder,
-    ProxyProtocolError, ProxyProtocolTlvLookup, SocketAddressError, SocketPort, SocketType,
+    ConnectionError, ConnectionIoError, ConnectionReadResult, ConnectionRef, ConnectionRefMut,
+    ConnectionWriteResult, ProxyProtocolAddress, ProxyProtocolBuilder, ProxyProtocolError,
+    ProxyProtocolTlvLookup, SocketAddressError, SocketPort, SocketType,
 };
 use crate::core::{BufferError, BufferFlags, Pool};
 #[cfg(feature = "test-link")]
 use crate::ffi::ngx_proxy_protocol_read;
 #[cfg(unix)]
 use crate::ffi::sockaddr_un;
+use crate::ffi::{
+    NGX_AGAIN, NGX_ERROR, in6_addr__bindgen_ty_1, ngx_buf_t, ngx_connection_t, ngx_create_pool,
+    ngx_destroy_pool, ngx_event_t, ngx_listening_t, ngx_log_t, ngx_pool_t, ngx_proxy_protocol_t,
+    ngx_str_t, ngx_uint_t, sockaddr, sockaddr_in, sockaddr_in6,
+};
 #[cfg(all(feature = "test-link", feature = "stream", ngx_feature = "stream"))]
 use crate::ffi::{NGX_OK, ngx_int_t, ngx_stream_session_t, ngx_stream_variable_value_t};
-use crate::ffi::{
-    in6_addr__bindgen_ty_1, ngx_buf_t, ngx_connection_t, ngx_create_pool, ngx_destroy_pool,
-    ngx_event_t, ngx_listening_t, ngx_log_t, ngx_pool_t, ngx_proxy_protocol_t, ngx_str_t,
-    ngx_uint_t, sockaddr, sockaddr_in, sockaddr_in6,
-};
 
 #[cfg(feature = "test-link")]
 unsafe extern "C" {
@@ -63,6 +65,71 @@ fn memory_buffer(bytes: &[u8]) -> ngx_buf_t {
     buffer.end = buffer.last;
     buffer.set_memory(1);
     buffer
+}
+
+unsafe extern "C" fn receive_three(
+    _connection: *mut ngx_connection_t,
+    output: *mut u8,
+    size: usize,
+) -> isize {
+    if size < 3 {
+        return NGX_ERROR as _;
+    }
+
+    unsafe { ptr::copy_nonoverlapping(b"abc".as_ptr(), output, 3) };
+    3
+}
+
+unsafe extern "C" fn receive_again(
+    _connection: *mut ngx_connection_t,
+    _output: *mut u8,
+    _size: usize,
+) -> isize {
+    NGX_AGAIN as _
+}
+
+unsafe extern "C" fn send_two(
+    _connection: *mut ngx_connection_t,
+    input: *mut u8,
+    size: usize,
+) -> isize {
+    if size != 3 || unsafe { *input } != b'x' {
+        return NGX_ERROR as _;
+    }
+
+    2
+}
+
+unsafe extern "C" fn send_again(
+    _connection: *mut ngx_connection_t,
+    _input: *mut u8,
+    _size: usize,
+) -> isize {
+    NGX_AGAIN as _
+}
+
+unsafe extern "C" fn io_end_of_file(
+    _connection: *mut ngx_connection_t,
+    _buffer: *mut u8,
+    _size: usize,
+) -> isize {
+    0
+}
+
+unsafe extern "C" fn io_error(
+    _connection: *mut ngx_connection_t,
+    _buffer: *mut u8,
+    _size: usize,
+) -> isize {
+    NGX_ERROR as _
+}
+
+unsafe extern "C" fn io_too_large(
+    _connection: *mut ngx_connection_t,
+    _buffer: *mut u8,
+    _size: usize,
+) -> isize {
+    5
 }
 
 #[cfg(feature = "test-link")]
@@ -159,6 +226,58 @@ fn raw_connection_construction_rejects_null_inputs() {
         unsafe { ConnectionRefMut::from_raw(misaligned) },
         Err(ConnectionError::MisalignedConnection)
     ));
+}
+
+#[test]
+fn connection_io_preserves_partial_and_would_block_results() {
+    let mut raw = zeroed_connection();
+    raw.recv = Some(receive_three);
+    raw.send = Some(send_two);
+    let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
+    let mut output = [0; 4];
+
+    assert_eq!(connection.receive(&mut output), Ok(ConnectionReadResult::Data(3)));
+    assert_eq!(&output[..3], b"abc");
+    assert_eq!(connection.send(b"xyz"), Ok(ConnectionWriteResult::Written(2)));
+
+    let mut raw = zeroed_connection();
+    raw.recv = Some(receive_again);
+    raw.send = Some(send_again);
+    let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
+
+    assert_eq!(connection.receive(&mut output), Ok(ConnectionReadResult::Again));
+    assert_eq!(connection.send(b"xyz"), Ok(ConnectionWriteResult::Again));
+
+    let mut raw = zeroed_connection();
+    let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
+    assert_eq!(connection.receive(&mut output), Err(ConnectionIoError::MissingReceive));
+    assert_eq!(connection.send(b"xyz"), Err(ConnectionIoError::MissingSend));
+}
+
+#[test]
+fn connection_io_maps_eof_failures_and_invalid_counts() {
+    let mut output = [0; 4];
+
+    let mut raw = zeroed_connection();
+    raw.recv = Some(io_end_of_file);
+    raw.send = Some(io_end_of_file);
+    let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
+    assert_eq!(connection.receive(&mut output), Ok(ConnectionReadResult::EndOfFile));
+    assert_eq!(connection.send(b"xyz"), Ok(ConnectionWriteResult::Written(0)));
+
+    let mut raw = zeroed_connection();
+    raw.recv = Some(io_error);
+    raw.send = Some(io_error);
+    let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
+    assert_eq!(connection.receive(&mut output), Err(ConnectionIoError::ReceiveFailed));
+    assert_eq!(connection.send(b"xyz"), Err(ConnectionIoError::SendFailed));
+
+    let mut raw = zeroed_connection();
+    raw.recv = Some(io_too_large);
+    raw.send = Some(io_too_large);
+    let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
+    assert_eq!(connection.receive(&mut output), Err(ConnectionIoError::ReceiveTooLarge));
+    assert_eq!(connection.send(b"xyz"), Err(ConnectionIoError::SendTooLarge));
 }
 
 #[test]

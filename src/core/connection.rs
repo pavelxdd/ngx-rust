@@ -9,7 +9,7 @@ use crate::event::{EventError, EventRef};
 #[cfg(unix)]
 use crate::ffi::sockaddr_un;
 use crate::ffi::{
-    NGX_DECLINED, NGX_ERROR, NGX_OK, NGX_PROXY_PROTOCOL_MAX_HEADER, in_addr, in6_addr,
+    NGX_AGAIN, NGX_DECLINED, NGX_ERROR, NGX_OK, NGX_PROXY_PROTOCOL_MAX_HEADER, in_addr, in6_addr,
     in6_addr__bindgen_ty_1, ngx_buf_t, ngx_connection_local_sockaddr, ngx_connection_t, ngx_int_t,
     ngx_listening_t, ngx_log_t, ngx_proxy_protocol_lookup_tlv, ngx_proxy_protocol_t,
     ngx_sin_addr_t, ngx_sock_ntop, ngx_str_t, sa_family_t, sockaddr, sockaddr_in, sockaddr_in6,
@@ -60,6 +60,43 @@ pub enum ConnectionError {
     Event(EventError),
     /// A replacement buffer belongs to a different nginx pool.
     ForeignPool,
+}
+
+/// Result of one native connection receive operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionReadResult {
+    /// The connection received this many bytes.
+    Data(usize),
+    /// The connection reached end of file.
+    EndOfFile,
+    /// The native connection would block before receiving data.
+    Again,
+}
+
+/// Result of one native connection send operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionWriteResult {
+    /// The connection sent this many bytes.
+    Written(usize),
+    /// The native connection would block before sending data.
+    Again,
+}
+
+/// Failure returned by one native connection I/O operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionIoError {
+    /// The connection has no receive callback.
+    MissingReceive,
+    /// The connection has no send callback.
+    MissingSend,
+    /// The native receive callback failed.
+    ReceiveFailed,
+    /// The native send callback failed.
+    SendFailed,
+    /// The native receive callback reported more bytes than fit in the supplied output.
+    ReceiveTooLarge,
+    /// The native send callback reported more bytes than the supplied input.
+    SendTooLarge,
 }
 
 impl From<BufferError> for ConnectionError {
@@ -716,6 +753,54 @@ impl<'callback> ConnectionRefMut<'callback> {
     /// Returns the client connection's sent-byte counter.
     pub fn bytes_sent(&self) -> Result<u64, ConnectionError> {
         self.view().bytes_sent()
+    }
+
+    /// Receives bytes through nginx's configured connection callback.
+    pub fn receive(
+        &mut self,
+        output: &mut [u8],
+    ) -> Result<ConnectionReadResult, ConnectionIoError> {
+        if output.is_empty() {
+            return Ok(ConnectionReadResult::Data(0));
+        }
+
+        let receive = unsafe { self.raw.as_ref().recv }.ok_or(ConnectionIoError::MissingReceive)?;
+        let result = unsafe { receive(self.raw.as_ptr(), output.as_mut_ptr(), output.len()) };
+        if result > 0 {
+            let received = result as usize;
+            return (received <= output.len())
+                .then_some(ConnectionReadResult::Data(received))
+                .ok_or(ConnectionIoError::ReceiveTooLarge);
+        }
+        if result == 0 {
+            return Ok(ConnectionReadResult::EndOfFile);
+        }
+        if result == NGX_AGAIN as _ {
+            return Ok(ConnectionReadResult::Again);
+        }
+
+        Err(ConnectionIoError::ReceiveFailed)
+    }
+
+    /// Sends bytes through nginx's configured connection callback.
+    pub fn send(&mut self, input: &[u8]) -> Result<ConnectionWriteResult, ConnectionIoError> {
+        if input.is_empty() {
+            return Ok(ConnectionWriteResult::Written(0));
+        }
+
+        let send = unsafe { self.raw.as_ref().send }.ok_or(ConnectionIoError::MissingSend)?;
+        let result = unsafe { send(self.raw.as_ptr(), input.as_ptr().cast_mut(), input.len()) };
+        if result >= 0 {
+            let written = result as usize;
+            return (written <= input.len())
+                .then_some(ConnectionWriteResult::Written(written))
+                .ok_or(ConnectionIoError::SendTooLarge);
+        }
+        if result == NGX_AGAIN as _ {
+            return Ok(ConnectionWriteResult::Again);
+        }
+
+        Err(ConnectionIoError::SendFailed)
     }
 
     /// Returns the configured socket type.
