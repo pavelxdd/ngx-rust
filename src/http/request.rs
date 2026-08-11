@@ -955,6 +955,7 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
         let request = unsafe { self.request.raw.as_mut() };
         request.headers_out = self.headers;
         repair_header_list_last(&mut request.headers_out.headers);
+        repair_header_list_last(&mut request.headers_out.trailers);
     }
 }
 
@@ -1461,6 +1462,21 @@ fn clear_headers_out_slots(headers: &mut ngx_http_headers_out_t) {
     headers.charset = ngx_str_t::empty();
     headers.content_type_lowcase = ptr::null_mut();
     headers.content_type_hash = 0;
+}
+
+fn clear_headers_out_metadata(headers: &mut ngx_http_headers_out_t) {
+    headers.status = 0;
+    headers.status_line = ngx_str_t::empty();
+    clear_headers_out_slots(headers);
+    headers.override_charset = ptr::null_mut();
+    headers.content_length_n = -1;
+    headers.content_offset = 0;
+    headers.date_time = 0;
+    headers.last_modified_time = -1;
+
+    headers.trailers.part.nelts = 0;
+    headers.trailers.part.next = ptr::null_mut();
+    headers.trailers.last = &raw mut headers.trailers.part;
 }
 
 fn request_body_headers_candidate(
@@ -2349,6 +2365,19 @@ impl<'callback> RequestRefMut<'callback> {
         capacity: usize,
     ) -> Result<HttpHeadersOutBuilder<'_, 'callback>, HeaderBuildError> {
         HttpHeadersOutBuilder::new(self, capacity)
+    }
+
+    /// Starts constructing a complete output-header candidate with fresh response metadata.
+    ///
+    /// Unlike [`headers_out_builder`](Self::headers_out_builder), this clears the status,
+    /// trailers, and scalar output metadata inherited from the current response.
+    pub fn clean_headers_out_builder(
+        &mut self,
+        capacity: usize,
+    ) -> Result<HttpHeadersOutBuilder<'_, 'callback>, HeaderBuildError> {
+        let mut builder = HttpHeadersOutBuilder::new(self, capacity)?;
+        clear_headers_out_metadata(&mut builder.headers);
+        Ok(builder)
     }
 
     /// Returns the active upstream pointer for an explicit nginx FFI operation.
@@ -4438,6 +4467,52 @@ mod tests {
             0
         );
         assert_eq!(headers.iter().filter(|header| header.key() == b"X-Duplicate").count(), 2);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn output_header_builder_resets_response_metadata_on_request() {
+        let owner = TestPool::new();
+        let status_line = b"201 Created";
+        let mut override_charset = ngx_str_t::empty();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        raw.headers_out.status = 201;
+        raw.headers_out.status_line =
+            ngx_str_t { len: status_line.len(), data: status_line.as_ptr().cast_mut() };
+        raw.headers_out.override_charset = &raw mut override_charset;
+        raw.headers_out.content_length_n = 91;
+        raw.headers_out.content_offset = 7;
+        raw.headers_out.date_time = 11;
+        raw.headers_out.last_modified_time = 13;
+
+        {
+            let mut request = request_from(&mut raw);
+            let mut headers = request.clean_headers_out_builder(1).unwrap();
+            headers.add(b"Content-Type", b"text/plain").unwrap();
+            headers.add(b"Location", b"/next").unwrap();
+            headers.commit();
+        }
+
+        assert_eq!(raw.headers_out.status, 0);
+        assert!(raw.headers_out.status_line.data.is_null());
+        assert_eq!(raw.headers_out.status_line.len, 0);
+        assert!(raw.headers_out.override_charset.is_null());
+        assert_eq!(raw.headers_out.content_length_n, -1);
+        assert_eq!(raw.headers_out.content_offset, 0);
+        assert_eq!(raw.headers_out.date_time, 0);
+        assert_eq!(raw.headers_out.last_modified_time, -1);
+        assert_eq!(raw.headers_out.trailers.part.nelts, 0);
+        assert!(raw.headers_out.trailers.part.next.is_null());
+        assert_eq!(raw.headers_out.trailers.last, &raw mut raw.headers_out.trailers.part);
+        assert_eq!(
+            unsafe { checked_ngx_str(raw.headers_out.content_type) }.unwrap().as_bytes(),
+            b"text/plain"
+        );
+        assert_eq!(
+            unsafe { checked_ngx_str((*raw.headers_out.location).value) }.unwrap().as_bytes(),
+            b"/next"
+        );
     }
 
     #[cfg(feature = "test-link")]
