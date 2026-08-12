@@ -30,6 +30,11 @@ const char *NGX_RS_MODULE_SIGNATURE = NGX_MODULE_SIGNATURE;
 // latter being unsupported by bindgen.
 const size_t NGX_RS_ALIGNMENT = NGX_ALIGNMENT;
 
+enum {
+    NGX_RS_READ_EVENT = NGX_READ_EVENT,
+    NGX_RS_WRITE_EVENT = NGX_WRITE_EVENT,
+};
+
 // `--prefix=` results in not emitting the declaration
 #ifndef NGX_PREFIX
 #define NGX_PREFIX ""
