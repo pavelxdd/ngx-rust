@@ -500,7 +500,7 @@ impl<'pool> Pool<'pool> {
     /// File slices duplicate only the native file descriptor and adjust its offsets.
     pub fn buffer_slice(
         &self,
-        source: BufferRef<'_>,
+        source: BufferRef<'pool>,
         range: Range<usize>,
         flags: BufferFlags,
     ) -> Result<PoolBuffer<'pool>, BufferError> {
