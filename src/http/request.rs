@@ -2720,7 +2720,7 @@ impl RequestContinuation<'_> {
     pub fn call_next_body<M: HttpFilter>(
         &mut self,
         filters: &HttpFilterSlot<M>,
-        chain: ChainRef<'_>,
+        chain: ChainMut<'_>,
     ) -> Result<Status, RequestContinuationError> {
         self.ensure_active()?;
         if self.body_continued {
