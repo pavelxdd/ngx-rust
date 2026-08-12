@@ -720,6 +720,11 @@ impl<'chain> ChainMut<'chain> {
         Ok(f(chain))
     }
 
+    /// Iterates over shared checked buffer views without consuming this exclusive chain handle.
+    pub fn iter(&self) -> ChainIter<'_> {
+        ChainIter { next: self.head, _lifetime: PhantomData }
+    }
+
     /// Iterates over exclusive checked buffer views in order.
     pub fn into_iter_mut(self) -> ChainIterMut<'chain> {
         ChainIterMut { next: self.head, _lifetime: PhantomData }

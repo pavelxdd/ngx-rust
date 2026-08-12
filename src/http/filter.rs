@@ -2,7 +2,7 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ptr;
 
-use crate::core::{ChainRef, Status};
+use crate::core::{ChainMut, Status};
 use crate::ffi::{ngx_conf_t, ngx_cycle_t, ngx_http_request_t, ngx_int_t};
 use crate::http::{HttpModule, IntoHandlerStatus, RequestRefMut};
 
@@ -107,7 +107,7 @@ where
     pub fn call_next_body(
         &self,
         request: &mut RequestRefMut<'_>,
-        chain: ChainRef<'_>,
+        chain: ChainMut<'_>,
     ) -> Result<ngx_int_t, HttpFilterError> {
         let next = unsafe { (*self.state.get()).body }.ok_or(HttpFilterError::MissingBodyNext)?;
         if ptr::fn_addr_eq(next, body_trampoline::<M>()) {
@@ -187,13 +187,13 @@ pub unsafe trait HttpFilter: HttpModule + Sized + 'static {
     /// ```
     ///
     /// ```compile_fail
-    /// use ngx::core::ChainRef;
+    /// use ngx::core::ChainMut;
     ///
-    /// fn escape_chain<'callback>(chain: ChainRef<'callback>) -> ChainRef<'static> {
+    /// fn escape_chain<'callback>(chain: ChainMut<'callback>) -> ChainMut<'static> {
     ///     chain
     /// }
     /// ```
-    fn body_filter(request: &mut RequestRefMut<'_>, chain: ChainRef<'_>) -> Self::BodyOutput;
+    fn body_filter(request: &mut RequestRefMut<'_>, chain: ChainMut<'_>) -> Self::BodyOutput;
 }
 
 /// C-compatible HTTP header-filter trampoline for one [`HttpFilter`] module.
@@ -221,7 +221,7 @@ where
 {
     unsafe {
         crate::http::request_callback_status(request, |request| {
-            let Ok(chain) = ChainRef::from_raw(chain) else {
+            let Ok(chain) = ChainMut::from_raw(chain) else {
                 return Status::NGX_ERROR.0;
             };
             M::body_filter(request, chain).into_handler_status(&request.view())
@@ -275,7 +275,7 @@ mod tests {
         BodyFilter, HeaderFilter, HttpFilter, HttpFilterError, HttpFilterSlot, body_filter,
         filter_postconfiguration, header_filter,
     };
-    use crate::core::{ChainRef, ConnectionError, Status};
+    use crate::core::{ChainMut, ChainRef, ConnectionError, Status};
     use crate::ffi::{
         NGX_HTTP_MODULE, ngx_buf_t, ngx_chain_t, ngx_conf_t, ngx_connection_t, ngx_cycle_t,
         ngx_http_output_body_filter_pt, ngx_http_output_header_filter_pt, ngx_http_request_t,
@@ -409,12 +409,51 @@ mod tests {
             PASS_THROUGH_SLOT.call_next_header(request).map(Status).unwrap_or(Status::NGX_ERROR)
         }
 
-        fn body_filter(request: &mut RequestRefMut<'_>, chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(request: &mut RequestRefMut<'_>, chain: ChainMut<'_>) -> Self::BodyOutput {
             BODY_FILTER_CALLS.fetch_add(1, Ordering::Relaxed);
             PASS_THROUGH_SLOT
                 .call_next_body(request, chain)
                 .map(Status)
                 .unwrap_or(Status::NGX_ERROR)
+        }
+    }
+
+    struct ConsumingFilter;
+
+    static CONSUMING_SLOT: HttpFilterSlot<ConsumingFilter> = HttpFilterSlot::new();
+
+    unsafe impl HttpModule for ConsumingFilter {
+        fn module() -> &'static ngx_module_t {
+            module()
+        }
+    }
+
+    unsafe impl HttpFilter for ConsumingFilter {
+        type HeaderOutput = Status;
+        type BodyOutput = Status;
+
+        fn filter_slot() -> &'static HttpFilterSlot<Self> {
+            &CONSUMING_SLOT
+        }
+
+        fn header_filter(_request: &mut RequestRefMut<'_>) -> Self::HeaderOutput {
+            Status::NGX_OK
+        }
+
+        fn body_filter(_request: &mut RequestRefMut<'_>, chain: ChainMut<'_>) -> Self::BodyOutput {
+            let expected = chain
+                .iter()
+                .map(|buffer| buffer.expect("input buffer").len().expect("input length"))
+                .sum::<usize>();
+            let mut consumed = 0;
+            for buffer in chain.into_iter_mut() {
+                let mut buffer = buffer.expect("input buffer");
+                let length = buffer.len().expect("input length");
+                buffer.consume(length).expect("consume input");
+                consumed += length;
+            }
+            assert_eq!(consumed, expected);
+            Status::NGX_DONE
         }
     }
 
@@ -445,17 +484,31 @@ mod tests {
             Status::NGX_DONE
         }
 
-        fn body_filter(_request: &mut RequestRefMut<'_>, chain: ChainRef<'_>) -> Self::BodyOutput {
-            match chain.is_empty() {
-                Ok(true) => {
-                    NULL_CHAIN_BODY_EMPTY_CALLS.fetch_add(1, Ordering::Relaxed);
-                    Status::NGX_DONE
+        fn body_filter(_request: &mut RequestRefMut<'_>, chain: ChainMut<'_>) -> Self::BodyOutput {
+            let mut has_data = false;
+            for buffer in chain.iter() {
+                let buffer = match buffer {
+                    Ok(buffer) => buffer,
+                    Err(_) => {
+                        NULL_CHAIN_BODY_MALFORMED_CALLS.fetch_add(1, Ordering::Relaxed);
+                        return Status::NGX_ABORT;
+                    }
+                };
+                match buffer.is_empty() {
+                    Ok(true) => {}
+                    Ok(false) => has_data = true,
+                    Err(_) => {
+                        NULL_CHAIN_BODY_MALFORMED_CALLS.fetch_add(1, Ordering::Relaxed);
+                        return Status::NGX_ABORT;
+                    }
                 }
-                Err(_) => {
-                    NULL_CHAIN_BODY_MALFORMED_CALLS.fetch_add(1, Ordering::Relaxed);
-                    Status::NGX_ABORT
-                }
-                Ok(false) => Status::NGX_ERROR,
+            }
+
+            if has_data {
+                Status::NGX_ERROR
+            } else {
+                NULL_CHAIN_BODY_EMPTY_CALLS.fetch_add(1, Ordering::Relaxed);
+                Status::NGX_DONE
             }
         }
     }
@@ -486,7 +539,7 @@ mod tests {
             Status::NGX_DONE
         }
 
-        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainMut<'_>) -> Self::BodyOutput {
             DELAYED_BODY_CALLS.fetch_add(1, Ordering::Relaxed);
             Status::NGX_DONE
         }
@@ -514,7 +567,7 @@ mod tests {
             Status::NGX_DONE
         }
 
-        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainMut<'_>) -> Self::BodyOutput {
             Status::NGX_DONE
         }
     }
@@ -542,7 +595,7 @@ mod tests {
             Status::NGX_DONE
         }
 
-        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainMut<'_>) -> Self::BodyOutput {
             Status::NGX_DONE
         }
     }
@@ -570,7 +623,7 @@ mod tests {
             Status::NGX_DONE
         }
 
-        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainMut<'_>) -> Self::BodyOutput {
             Status::NGX_DONE
         }
     }
@@ -622,7 +675,7 @@ mod tests {
             FIRST_SLOT.call_next_header(request).map(Status).unwrap_or(Status::NGX_ERROR)
         }
 
-        fn body_filter(request: &mut RequestRefMut<'_>, chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(request: &mut RequestRefMut<'_>, chain: ChainMut<'_>) -> Self::BodyOutput {
             record(&BODY_ORDER, 2);
             FIRST_SLOT.call_next_body(request, chain).map(Status).unwrap_or(Status::NGX_ERROR)
         }
@@ -651,7 +704,7 @@ mod tests {
             SECOND_SLOT.call_next_header(request).map(Status).unwrap_or(Status::NGX_ERROR)
         }
 
-        fn body_filter(request: &mut RequestRefMut<'_>, chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(request: &mut RequestRefMut<'_>, chain: ChainMut<'_>) -> Self::BodyOutput {
             record(&BODY_ORDER, 3);
             SECOND_SLOT.call_next_body(request, chain).map(Status).unwrap_or(Status::NGX_ERROR)
         }
@@ -679,7 +732,7 @@ mod tests {
             REPEATED_SLOT.call_next_header(request).map(Status).unwrap_or(Status::NGX_ERROR)
         }
 
-        fn body_filter(request: &mut RequestRefMut<'_>, chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(request: &mut RequestRefMut<'_>, chain: ChainMut<'_>) -> Self::BodyOutput {
             REPEATED_SLOT.call_next_body(request, chain).map(Status).unwrap_or(Status::NGX_ERROR)
         }
     }
@@ -706,7 +759,7 @@ mod tests {
             Status::NGX_OK
         }
 
-        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainMut<'_>) -> Self::BodyOutput {
             Status::NGX_OK
         }
     }
@@ -733,7 +786,7 @@ mod tests {
             Status::NGX_OK
         }
 
-        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainMut<'_>) -> Self::BodyOutput {
             Status::NGX_OK
         }
     }
@@ -760,7 +813,7 @@ mod tests {
             Status::NGX_OK
         }
 
-        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainMut<'_>) -> Self::BodyOutput {
             Status::NGX_OK
         }
     }
@@ -795,7 +848,7 @@ mod tests {
             Status::NGX_OK
         }
 
-        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainMut<'_>) -> Self::BodyOutput {
             Status::NGX_OK
         }
     }
@@ -835,7 +888,7 @@ mod tests {
             Status::NGX_OK
         }
 
-        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainMut<'_>) -> Self::BodyOutput {
             Status::NGX_OK
         }
     }
@@ -866,7 +919,7 @@ mod tests {
             panic!("header filter panic");
         }
 
-        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainMut<'_>) -> Self::BodyOutput {
             panic!("body filter panic");
         }
     }
@@ -893,7 +946,7 @@ mod tests {
             RELOAD_SLOT.call_next_header(request).map(Status).unwrap_or(Status::NGX_ERROR)
         }
 
-        fn body_filter(request: &mut RequestRefMut<'_>, chain: ChainRef<'_>) -> Self::BodyOutput {
+        fn body_filter(request: &mut RequestRefMut<'_>, chain: ChainMut<'_>) -> Self::BodyOutput {
             RELOAD_SLOT.call_next_body(request, chain).map(Status).unwrap_or(Status::NGX_ERROR)
         }
     }
@@ -943,6 +996,28 @@ mod tests {
         assert_eq!(BODY_FILTER_CALLS.load(Ordering::Relaxed), 1);
         assert_eq!(NEXT_HEADER_CALLS.load(Ordering::Relaxed), 1);
         assert_eq!(NEXT_BODY_CALLS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn body_filter_receives_an_exclusive_chain_it_can_consume() {
+        let _globals = FilterGlobals::new();
+        let mut cycle = unsafe { MaybeUninit::<ngx_cycle_t>::zeroed().assume_init() };
+        let mut configuration = configuration(&mut cycle);
+        assert_eq!(
+            unsafe { filter_postconfiguration::<ConsumingFilter>(&raw mut configuration) },
+            Status::NGX_OK.0
+        );
+
+        let mut request = request();
+        let mut bytes = *b"body";
+        let mut buffer = unsafe { MaybeUninit::<ngx_buf_t>::zeroed().assume_init() };
+        buffer.pos = bytes.as_mut_ptr();
+        buffer.last = unsafe { bytes.as_mut_ptr().add(bytes.len()) };
+        buffer.set_memory(1);
+        let mut chain = ngx_chain_t { buf: &raw mut buffer, next: ptr::null_mut() };
+
+        assert_eq!(top_body(&mut request, &raw mut chain), Status::NGX_DONE.0);
+        assert_eq!(buffer.pos, buffer.last);
     }
 
     #[test]
@@ -1043,7 +1118,7 @@ mod tests {
         .unwrap();
         let body_status = unsafe {
             RequestRefMut::with_raw(&raw mut request, |mut request| {
-                let chain = ChainRef::from_raw(&raw mut chain).unwrap();
+                let chain = ChainMut::from_raw(&raw mut chain).unwrap();
                 DELAYED_SLOT.call_next_body(&mut request, chain)
             })
         }
@@ -1079,7 +1154,7 @@ mod tests {
         let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
         request.hold(&mut hold).unwrap();
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
-        let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
+        let chain = unsafe { ChainMut::from_raw(ptr::null_mut()).unwrap() };
 
         assert_eq!(continuation.call_next_header(&CONTINUATION_SLOT), Ok(Status::NGX_DECLINED));
         assert_eq!(
@@ -1090,6 +1165,7 @@ mod tests {
             continuation.call_next_body(&CONTINUATION_SLOT, chain),
             Ok(Status::NGX_DECLINED)
         );
+        let chain = unsafe { ChainMut::from_raw(ptr::null_mut()).unwrap() };
         assert_eq!(
             continuation.call_next_body(&CONTINUATION_SLOT, chain),
             Err(RequestContinuationError::BodyAlreadyContinued)
@@ -1123,7 +1199,7 @@ mod tests {
         let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
         request.hold(&mut hold).unwrap();
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
-        let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
+        let chain = unsafe { ChainMut::from_raw(ptr::null_mut()).unwrap() };
 
         assert_eq!(
             continuation.call_next_header(&FAILING_CONTINUATION_SLOT),
@@ -1137,6 +1213,7 @@ mod tests {
             continuation.call_next_body(&FAILING_CONTINUATION_SLOT, chain),
             Ok(Status::NGX_ERROR)
         );
+        let chain = unsafe { ChainMut::from_raw(ptr::null_mut()).unwrap() };
         assert_eq!(
             continuation.call_next_body(&FAILING_CONTINUATION_SLOT, chain),
             Err(RequestContinuationError::BodyAlreadyContinued)
@@ -1157,7 +1234,7 @@ mod tests {
         let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
         request.hold(&mut hold).unwrap();
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
-        let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
+        let chain = unsafe { ChainMut::from_raw(ptr::null_mut()).unwrap() };
 
         assert_eq!(
             continuation.call_next_header(&MISSING_NEXT_SLOT),
@@ -1191,7 +1268,7 @@ mod tests {
         let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
         request.hold(&mut hold).unwrap();
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
-        let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
+        let chain = unsafe { ChainMut::from_raw(ptr::null_mut()).unwrap() };
 
         assert_eq!(
             continuation.call_next_header(&INVALID_CONTINUATION_SLOT),
@@ -1268,7 +1345,7 @@ mod tests {
         let (header, body) = unsafe {
             RequestRefMut::with_raw(&raw mut request, |mut request| {
                 let header = MISSING_NEXT_SLOT.call_next_header(&mut request);
-                let chain = ChainRef::from_raw(&raw mut chain).unwrap();
+                let chain = ChainMut::from_raw(&raw mut chain).unwrap();
                 let body = MISSING_NEXT_SLOT.call_next_body(&mut request, chain);
                 (header, body)
             })
