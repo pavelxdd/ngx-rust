@@ -224,13 +224,18 @@ impl<'buffer> BufferRef<'buffer> {
 
     /// Returns a nonempty file range when nginx marks the buffer as file-backed.
     pub fn file(self) -> Result<Option<FileView<'buffer>>, BufferError> {
-        let Some(file) = file_range(unsafe { self.raw.as_ref() })? else {
+        let Some(file) = self.file_range()? else {
             return Ok(None);
         };
         if file.len == 0 {
             return Ok(None);
         }
         Ok(Some(file))
+    }
+
+    /// Returns the checked file range, including a valid empty range.
+    pub fn file_range(self) -> Result<Option<FileView<'buffer>>, BufferError> {
+        file_range(unsafe { self.raw.as_ref() })
     }
 
     /// Returns the checked nginx-visible byte count.
@@ -1263,6 +1268,21 @@ mod tests {
         let file_view = sliced_file.view().file().unwrap().unwrap();
         assert_ne!(file_view.file_ptr(), &raw mut file);
         assert_eq!((file_view.start(), file_view.end()), (102, 107));
+    }
+
+    #[test]
+    fn file_range_keeps_a_checked_empty_file_visible() {
+        let mut file: ngx_file_t = unsafe { mem::zeroed() };
+        let mut raw: ngx_buf_t = unsafe { mem::zeroed() };
+        raw.file = &raw mut file;
+        raw.file_pos = 9;
+        raw.file_last = 9;
+        raw.set_in_file(1);
+
+        let view = unsafe { BufferRef::from_raw(&raw const raw) }.expect("file buffer");
+        assert_eq!(view.file(), Ok(None));
+        let range = view.file_range().expect("checked file range").expect("present file range");
+        assert_eq!((range.start(), range.end(), range.len()), (9, 9, 0));
     }
 
     #[cfg(feature = "test-link")]
