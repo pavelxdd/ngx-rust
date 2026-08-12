@@ -666,6 +666,30 @@ impl<'pool> PoolChain<'pool> {
         self.append_raw(raw)
     }
 
+    /// Appends every fully prepared link from `candidate` and leaves it empty.
+    ///
+    /// The candidate remains unchanged when it belongs to a different pool.
+    pub fn append_chain(&mut self, candidate: &mut PoolChain<'pool>) -> Result<(), ChainError> {
+        if !ptr::eq(self.pool.as_ptr(), candidate.pool.as_ptr()) {
+            return Err(ChainError::Buffer(BufferError::ForeignPool));
+        }
+
+        debug_assert_eq!(candidate.head.is_some(), candidate.tail.is_some());
+        let Some((head, tail)) = candidate.head.zip(candidate.tail) else {
+            return Ok(());
+        };
+
+        if let Some(mut output_tail) = self.tail {
+            unsafe { output_tail.as_mut().next = head.as_ptr() };
+        } else {
+            self.head = Some(head);
+        }
+        self.tail = Some(tail);
+        candidate.head = None;
+        candidate.tail = None;
+        Ok(())
+    }
+
     /// Iterates over the current chain in append order.
     pub fn iter(&self) -> ChainIter<'_> {
         ChainIter { next: self.head_ptr(), _lifetime: PhantomData }
@@ -819,6 +843,29 @@ mod tests {
         let view = sliced.as_ngx_buf().file().unwrap().unwrap();
         assert_ne!(view.file_ptr(), &raw mut file);
         assert_eq!((view.start(), view.end()), (102, 107));
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn pool_chain_appends_a_completed_candidate_without_partial_publication() {
+        let owner = TestPool::new();
+        let pool = owner.handle();
+        let mut output = pool.chain();
+        unsafe { output.append(pool.copy_buffer(b"head", BufferFlags::default()).unwrap()) }.unwrap();
+        let mut candidate = pool.chain();
+        unsafe { candidate.append(pool.copy_buffer(b"body", BufferFlags::default()).unwrap()) }.unwrap();
+        output.append_chain(&mut candidate).unwrap();
+        assert!(candidate.iter().next().is_none());
+        let values: alloc::vec::Vec<_> = output.iter().map(|b| b.unwrap().as_bytes()).collect();
+        assert_eq!(values, [b"head".as_slice(), b"body".as_slice()]);
+
+        let foreign_owner = TestPool::new();
+        let foreign_pool = foreign_owner.handle();
+        let mut foreign = foreign_pool.chain();
+        unsafe { foreign.append(foreign_pool.copy_buffer(b"foreign", BufferFlags::default()).unwrap()) }.unwrap();
+        assert_eq!(output.append_chain(&mut foreign), Err(ChainError::Buffer(BufferError::ForeignPool)));
+        assert_eq!(foreign.iter().count(), 1);
+        assert_eq!(output.iter().count(), 2);
     }
 
     #[test]
