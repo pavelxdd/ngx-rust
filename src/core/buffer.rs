@@ -852,6 +852,14 @@ impl<'pool> PoolChain<'pool> {
         self.head_ptr()
     }
 
+    /// Transfers the nullable chain endpoints while the pool retains all storage.
+    ///
+    /// A request-pool context can retain the endpoints and append another fully prepared chain
+    /// without walking raw links again.
+    pub fn into_raw_parts(self) -> (*mut ngx_chain_t, *mut ngx_chain_t) {
+        (self.head_ptr(), self.tail.map_or(ptr::null_mut(), NonNull::as_ptr))
+    }
+
     fn append_raw(&mut self, buffer: NonNull<ngx_buf_t>) -> Result<(), ChainError> {
         let mut link = NonNull::new(unsafe { ngx_alloc_chain_link(self.pool.as_ptr()) })
             .ok_or(ChainError::Allocation)?;
@@ -1330,6 +1338,22 @@ mod tests {
             .map(|buffer| buffer.unwrap().bytes().unwrap().unwrap())
             .collect::<alloc::vec::Vec<_>>();
         assert_eq!(values, [b"head".as_slice(), b"body".as_slice()]);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn pool_chain_transfers_matching_raw_endpoints() {
+        let owner = TestPool::new();
+        let pool = owner.handle();
+        let mut chain = pool.chain();
+        chain.append(pool.copy_buffer(b"one", BufferFlags::default()).unwrap()).unwrap();
+        chain.append(pool.copy_buffer(b"two", BufferFlags::default()).unwrap()).unwrap();
+
+        let (head, tail) = chain.into_raw_parts();
+        assert!(!head.is_null());
+        assert!(!tail.is_null());
+        assert_ne!(head, tail);
+        assert_eq!(unsafe { (*tail).next }, ptr::null_mut());
     }
 
     #[cfg(target_pointer_width = "64")]
