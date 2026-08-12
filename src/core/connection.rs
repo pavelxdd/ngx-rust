@@ -4,16 +4,18 @@ use core::mem::{offset_of, size_of};
 use core::ptr::{self, NonNull};
 use core::slice;
 
-use crate::core::{BufferError, BufferMut, BufferRef, Pool, PoolBuffer, Status};
+use crate::core::{
+    BufferError, BufferMut, BufferRef, ChainError, ChainMut, Pool, PoolBuffer, Status,
+};
 use crate::event::{EventError, EventRef};
 #[cfg(unix)]
 use crate::ffi::sockaddr_un;
 use crate::ffi::{
     NGX_AGAIN, NGX_DECLINED, NGX_ERROR, NGX_OK, NGX_PROXY_PROTOCOL_MAX_HEADER, in_addr, in6_addr,
-    in6_addr__bindgen_ty_1, ngx_buf_t, ngx_connection_local_sockaddr, ngx_connection_t, ngx_int_t,
-    ngx_listening_t, ngx_log_t, ngx_proxy_protocol_lookup_tlv, ngx_proxy_protocol_t,
-    ngx_sin_addr_t, ngx_sock_ntop, ngx_str_t, sa_family_t, sockaddr, sockaddr_in, sockaddr_in6,
-    socklen_t,
+    in6_addr__bindgen_ty_1, ngx_buf_t, ngx_chain_t, ngx_connection_local_sockaddr,
+    ngx_connection_t, ngx_int_t, ngx_listening_t, ngx_log_t, ngx_proxy_protocol_lookup_tlv,
+    ngx_proxy_protocol_t, ngx_sin_addr_t, ngx_sock_ntop, ngx_str_t, off_t, sa_family_t, sockaddr,
+    sockaddr_in, sockaddr_in6, socklen_t,
 };
 
 /// Failure returned while validating a native socket address.
@@ -82,6 +84,38 @@ pub enum ConnectionWriteResult {
     Again,
 }
 
+/// Result of one native chain send operation.
+#[derive(Debug)]
+pub enum ConnectionChainWriteResult<'chain> {
+    /// Nginx consumed the complete input chain.
+    Complete,
+    /// Nginx left this tail unsent for a later writable event.
+    Pending(ChainMut<'chain>),
+}
+
+impl ConnectionChainWriteResult<'_> {
+    /// Transfers the nullable unsent native chain head to its pool-owning caller.
+    pub fn into_raw(self) -> *mut ngx_chain_t {
+        match self {
+            Self::Complete => ptr::null_mut(),
+            Self::Pending(chain) => chain.as_ptr(),
+        }
+    }
+}
+
+/// Failure returned by one native chain send operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionChainWriteError {
+    /// The connection has no chain-send callback.
+    MissingSendChain,
+    /// Nginx returned its chain error sentinel.
+    SendChainFailed,
+    /// Nginx returned a tail that does not belong to the input chain.
+    UnexpectedTail,
+    /// Nginx returned an invalid unsent chain tail.
+    Chain(ChainError),
+}
+
 /// Failure returned by one native connection I/O operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionIoError {
@@ -102,6 +136,12 @@ pub enum ConnectionIoError {
 impl From<BufferError> for ConnectionError {
     fn from(error: BufferError) -> Self {
         Self::Buffer(error)
+    }
+}
+
+impl From<ChainError> for ConnectionChainWriteError {
+    fn from(error: ChainError) -> Self {
+        Self::Chain(error)
     }
 }
 
@@ -801,6 +841,31 @@ impl<'callback> ConnectionRefMut<'callback> {
         }
 
         Err(ConnectionIoError::SendFailed)
+    }
+
+    /// Sends a chain through nginx and returns the unconsumed tail, if any.
+    ///
+    /// Nginx may advance the chain's buffer cursors, so the input is exclusive.
+    pub fn send_chain<'chain>(
+        &mut self,
+        input: ChainMut<'chain>,
+        limit: off_t,
+    ) -> Result<ConnectionChainWriteResult<'chain>, ConnectionChainWriteError> {
+        let send_chain = unsafe { self.raw.as_ref().send_chain }
+            .ok_or(ConnectionChainWriteError::MissingSendChain)?;
+        let tail = unsafe { send_chain(self.raw.as_ptr(), input.as_ptr(), limit) };
+        if tail == ptr::without_provenance_mut(NGX_ERROR as usize) {
+            return Err(ConnectionChainWriteError::SendChainFailed);
+        }
+        if tail.is_null() {
+            return Ok(ConnectionChainWriteResult::Complete);
+        }
+        if !input.contains_link(tail) {
+            return Err(ConnectionChainWriteError::UnexpectedTail);
+        }
+
+        let tail = unsafe { ChainMut::from_raw(tail) }?;
+        Ok(ConnectionChainWriteResult::Pending(tail))
     }
 
     /// Returns the configured socket type.

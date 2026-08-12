@@ -17,19 +17,20 @@ use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 
 use super::{
-    ConnectionError, ConnectionIoError, ConnectionReadResult, ConnectionRef, ConnectionRefMut,
-    ConnectionWriteResult, ProxyProtocolAddress, ProxyProtocolBuilder, ProxyProtocolError,
-    ProxyProtocolTlvLookup, SocketAddressError, SocketPort, SocketType,
+    ConnectionChainWriteError, ConnectionChainWriteResult, ConnectionError, ConnectionIoError,
+    ConnectionReadResult, ConnectionRef, ConnectionRefMut, ConnectionWriteResult,
+    ProxyProtocolAddress, ProxyProtocolBuilder, ProxyProtocolError, ProxyProtocolTlvLookup,
+    SocketAddressError, SocketPort, SocketType,
 };
-use crate::core::{BufferError, BufferFlags, Pool};
+use crate::core::{BufferError, BufferFlags, ChainMut, Pool};
 #[cfg(feature = "test-link")]
 use crate::ffi::ngx_proxy_protocol_read;
 #[cfg(unix)]
 use crate::ffi::sockaddr_un;
 use crate::ffi::{
-    NGX_AGAIN, NGX_ERROR, in6_addr__bindgen_ty_1, ngx_buf_t, ngx_connection_t, ngx_create_pool,
-    ngx_destroy_pool, ngx_event_t, ngx_listening_t, ngx_log_t, ngx_pool_t, ngx_proxy_protocol_t,
-    ngx_str_t, ngx_uint_t, sockaddr, sockaddr_in, sockaddr_in6,
+    NGX_AGAIN, NGX_ERROR, in6_addr__bindgen_ty_1, ngx_buf_t, ngx_chain_t, ngx_connection_t,
+    ngx_create_pool, ngx_destroy_pool, ngx_event_t, ngx_listening_t, ngx_log_t, ngx_pool_t,
+    ngx_proxy_protocol_t, ngx_str_t, ngx_uint_t, off_t, sockaddr, sockaddr_in, sockaddr_in6,
 };
 #[cfg(all(feature = "test-link", feature = "stream", ngx_feature = "stream"))]
 use crate::ffi::{NGX_OK, ngx_int_t, ngx_stream_session_t, ngx_stream_variable_value_t};
@@ -130,6 +131,40 @@ unsafe extern "C" fn io_too_large(
     _size: usize,
 ) -> isize {
     5
+}
+
+unsafe extern "C" fn send_chain_tail(
+    _connection: *mut ngx_connection_t,
+    input: *mut ngx_chain_t,
+    limit: off_t,
+) -> *mut ngx_chain_t {
+    assert_eq!(limit, 0);
+    assert!(!input.is_null());
+    unsafe { (*input).next }
+}
+
+unsafe extern "C" fn send_chain_complete(
+    _connection: *mut ngx_connection_t,
+    _input: *mut ngx_chain_t,
+    _limit: off_t,
+) -> *mut ngx_chain_t {
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn send_chain_error(
+    _connection: *mut ngx_connection_t,
+    _input: *mut ngx_chain_t,
+    _limit: off_t,
+) -> *mut ngx_chain_t {
+    ptr::without_provenance_mut(NGX_ERROR as usize)
+}
+
+unsafe extern "C" fn send_chain_foreign_tail(
+    _connection: *mut ngx_connection_t,
+    _input: *mut ngx_chain_t,
+    _limit: off_t,
+) -> *mut ngx_chain_t {
+    ptr::without_provenance_mut(core::mem::align_of::<ngx_chain_t>())
 }
 
 #[cfg(feature = "test-link")]
@@ -278,6 +313,50 @@ fn connection_io_maps_eof_failures_and_invalid_counts() {
     let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
     assert_eq!(connection.receive(&mut output), Err(ConnectionIoError::ReceiveTooLarge));
     assert_eq!(connection.send(b"xyz"), Err(ConnectionIoError::SendTooLarge));
+}
+
+#[test]
+fn connection_chain_send_preserves_the_unsent_tail_and_maps_terminal_results() {
+    let first = b"first";
+    let second = b"second";
+    let mut first_buffer = memory_buffer(first);
+    let mut second_buffer = memory_buffer(second);
+    let mut tail = ngx_chain_t { buf: &raw mut second_buffer, next: ptr::null_mut() };
+    let mut head = ngx_chain_t { buf: &raw mut first_buffer, next: &raw mut tail };
+    let mut raw = zeroed_connection();
+    raw.send_chain = Some(send_chain_tail);
+    let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
+    let input = unsafe { ChainMut::from_raw(&raw mut head) }.unwrap();
+    assert_eq!(connection.send_chain(input, 0).unwrap().into_raw(), &raw mut tail,);
+
+    raw.send_chain = Some(send_chain_complete);
+    let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
+    let input = unsafe { ChainMut::from_raw(&raw mut head) }.unwrap();
+    assert!(matches!(connection.send_chain(input, 0), Ok(ConnectionChainWriteResult::Complete)));
+
+    raw.send_chain = Some(send_chain_error);
+    let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
+    let input = unsafe { ChainMut::from_raw(&raw mut head) }.unwrap();
+    assert!(matches!(
+        connection.send_chain(input, 0),
+        Err(ConnectionChainWriteError::SendChainFailed)
+    ));
+
+    raw.send_chain = Some(send_chain_foreign_tail);
+    let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
+    let input = unsafe { ChainMut::from_raw(&raw mut head) }.unwrap();
+    assert!(matches!(
+        connection.send_chain(input, 0),
+        Err(ConnectionChainWriteError::UnexpectedTail)
+    ));
+
+    raw.send_chain = None;
+    let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
+    let input = unsafe { ChainMut::from_raw(&raw mut head) }.unwrap();
+    assert!(matches!(
+        connection.send_chain(input, 0),
+        Err(ConnectionChainWriteError::MissingSendChain)
+    ));
 }
 
 #[test]
