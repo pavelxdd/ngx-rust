@@ -512,6 +512,8 @@ pub enum RequestTempFileError {
         /// Number of bytes reported as written by nginx.
         written: usize,
     },
+    /// The state belongs to a different nginx request.
+    ForeignRequest,
 }
 
 impl From<RequestError> for RequestTempFileError {
@@ -538,21 +540,23 @@ impl From<BufferError> for RequestTempFileError {
     }
 }
 
-/// Request-pool owner for a lazily created nginx temporary file.
+/// Callback-scoped owner for a lazily created nginx temporary file.
 ///
 /// The temporary file uses the HTTP core `client_body_temp_path`, is removed by nginx pool
 /// cleanup, and creates its file descriptor only when a nonempty memory buffer is appended.
 /// File-backed input is copied into the returned request-pool chain without a second disk write.
-///
-/// ```compile_fail
-/// use ngx::http::{RequestRefMut, RequestTempFile};
-///
-/// fn escape(request: &RequestRefMut<'_>) -> RequestTempFile<'static> {
-///     request.temp_file().unwrap()
-/// }
-/// ```
 pub struct RequestTempFile<'callback> {
+    state: RequestTempFileState,
     pool: Pool<'callback>,
+}
+
+/// Request-pool state for a temporary file retained across HTTP callbacks.
+///
+/// Store this only in a request-pool context. Every append requires the same current request and
+/// returns callback-scoped output.
+pub struct RequestTempFileState {
+    request: NonNull<ngx_http_request_t>,
+    pool: *mut ngx_pool_t,
     path: NonNull<ngx_path_t>,
     log: NonNull<ngx_log_t>,
     temp_file: Option<NonNull<ngx_temp_file_t>>,
@@ -1052,8 +1056,27 @@ static REQUEST_TEMP_FILE_WARNING: &[u8] = b"an HTTP body is buffered to a tempor
 
 impl<'callback> RequestTempFile<'callback> {
     fn new(request: &RequestRefMut<'callback>) -> Result<Self, RequestTempFileError> {
-        let raw_pool = request.pool()?.as_ptr();
-        let pool = unsafe { Pool::from_raw(raw_pool) }.ok_or(RequestError::MisalignedPool)?;
+        let pool = request.pool()?;
+        let state = RequestTempFileState::new(request)?;
+        Ok(Self { state, pool })
+    }
+
+    /// Copies one checked nginx chain into request-pool owned output.
+    ///
+    /// Nonempty memory buffers are appended to this temporary file. File-backed buffers receive
+    /// request-pool file descriptors over their original ranges, and zero-size control buffers
+    /// retain their control flags without opening a temporary file.
+    pub fn append(
+        &mut self,
+        input: ChainRef<'callback>,
+    ) -> Result<PoolChain<'callback>, RequestTempFileError> {
+        self.state.append_with_pool(&self.pool, input)
+    }
+}
+
+impl RequestTempFileState {
+    fn new(request: &RequestRefMut<'_>) -> Result<Self, RequestTempFileError> {
+        let pool = request.pool()?;
         let location = NgxHttpCoreModule::location_conf(request)?
             .ok_or(RequestTempFileError::MissingCoreLocationConfiguration)?;
         let path = NonNull::new(location.client_body_temp_path)
@@ -1063,7 +1086,14 @@ impl<'callback> RequestTempFile<'callback> {
         }
         let log = request.log()?.ok_or(RequestTempFileError::MissingLog)?;
 
-        Ok(Self { pool, path, log, temp_file: None, _not_thread_safe: PhantomData })
+        Ok(Self {
+            request: request.raw,
+            pool: pool.as_ptr(),
+            path,
+            log,
+            temp_file: None,
+            _not_thread_safe: PhantomData,
+        })
     }
 
     /// Copies one checked nginx chain into request-pool owned output.
@@ -1072,47 +1102,76 @@ impl<'callback> RequestTempFile<'callback> {
     /// request-pool file descriptors over their original ranges, and zero-size control buffers
     /// retain their control flags without opening a temporary file.
     ///
-    /// ```compile_fail
-    /// use ngx::core::{ChainRef, PoolChain};
-    /// use ngx::http::RequestRefMut;
-    ///
-    /// fn escape<'scope>(
-    ///     request: &RequestRefMut<'scope>,
-    ///     chain: ChainRef<'scope>,
-    /// ) -> PoolChain<'static> {
-    ///     request.temp_file().unwrap().append(chain).unwrap()
-    /// }
-    /// ```
-    pub fn append(
+    pub fn append<'callback>(
         &mut self,
+        request: &RequestRefMut<'callback>,
+        input: ChainRef<'callback>,
+    ) -> Result<PoolChain<'callback>, RequestTempFileError> {
+        let pool = self.checked_pool(request)?;
+        self.append_with_pool(&pool, input)
+    }
+
+    fn append_with_pool<'callback>(
+        &mut self,
+        pool: &Pool<'callback>,
         input: ChainRef<'callback>,
     ) -> Result<PoolChain<'callback>, RequestTempFileError> {
         for buffer in input.iter() {
             buffer?.kind()?;
         }
 
-        let mut output = self.pool.chain();
+        let mut output = pool.chain();
         for buffer in input.iter() {
             let buffer = buffer?;
-            let flags = buffer.flags();
-
             match buffer.kind()? {
                 BufferView::Memory(bytes) => {
                     let (temp_file, start, end) =
                         self.append_memory(buffer.as_ptr(), bytes.len())?;
-                    self.append_temp_file_buffer(&mut output, temp_file, start, end, flags)?;
+                    self.append_temp_file_buffer(
+                        &mut output,
+                        pool,
+                        temp_file,
+                        start,
+                        end,
+                        buffer.flags(),
+                    )?;
                 }
                 BufferView::File(file) => {
-                    let buffer = self.pool.file_buffer_slice(buffer, 0..file.len(), flags)?;
-                    output.append(buffer)?;
+                    output.append(pool.file_buffer_slice(
+                        buffer,
+                        0..file.len(),
+                        buffer.flags(),
+                    )?)?;
                 }
-                BufferView::Control(_) => {
-                    let buffer = self.pool.control_buffer(flags)?;
-                    output.append(buffer)?;
-                }
+                BufferView::Control(_) => output.append(pool.control_buffer(buffer.flags())?)?,
             }
         }
 
+        Ok(output)
+    }
+
+    /// Appends one checked buffer into its request-pool-owned representation.
+    ///
+    /// Nonempty memory is written to the persistent temporary file. File and control buffers are
+    /// recreated in the request pool without opening a temporary file.
+    pub fn append_buffer<'callback>(
+        &mut self,
+        request: &RequestRefMut<'callback>,
+        input: BufferRef<'callback>,
+        flags: BufferFlags,
+    ) -> Result<PoolChain<'callback>, RequestTempFileError> {
+        let pool = self.checked_pool(request)?;
+        let mut output = pool.chain();
+        match input.kind()? {
+            BufferView::Memory(bytes) => {
+                let (temp_file, start, end) = self.append_memory(input.as_ptr(), bytes.len())?;
+                self.append_temp_file_buffer(&mut output, &pool, temp_file, start, end, flags)?;
+            }
+            BufferView::File(file) => {
+                output.append(pool.file_buffer_slice(input, 0..file.len(), flags)?)?;
+            }
+            BufferView::Control(_) => output.append(pool.control_buffer(flags)?)?,
+        }
         Ok(output)
     }
 
@@ -1140,19 +1199,20 @@ impl<'callback> RequestTempFile<'callback> {
         Ok((temp_file, start, end))
     }
 
-    fn append_temp_file_buffer(
+    fn append_temp_file_buffer<'callback>(
         &self,
         output: &mut PoolChain<'callback>,
+        pool: &Pool<'callback>,
         temp_file: NonNull<ngx_temp_file_t>,
         start: off_t,
         end: off_t,
         flags: BufferFlags,
     ) -> Result<(), RequestTempFileError> {
-        let file = NonNull::new(self.pool.calloc_type::<ngx_file_t>())
+        let file = NonNull::new(pool.calloc_type::<ngx_file_t>())
             .ok_or(RequestTempFileError::Allocation)?;
         unsafe { file.as_ptr().write(temp_file.as_ref().file) };
 
-        let mut buffer = NonNull::new(self.pool.calloc_type::<ngx_buf_t>())
+        let mut buffer = NonNull::new(pool.calloc_type::<ngx_buf_t>())
             .ok_or(RequestTempFileError::Allocation)?;
         unsafe {
             let buffer = buffer.as_mut();
@@ -1176,14 +1236,15 @@ impl<'callback> RequestTempFile<'callback> {
             return Ok(temp_file);
         }
 
-        let mut temp_file = NonNull::new(self.pool.calloc_type::<ngx_temp_file_t>())
+        let pool = unsafe { Pool::from_raw(self.pool) }.ok_or(RequestError::MisalignedPool)?;
+        let mut temp_file = NonNull::new(pool.calloc_type::<ngx_temp_file_t>())
             .ok_or(RequestTempFileError::Allocation)?;
         unsafe {
             let temp_file_ref = temp_file.as_mut();
             temp_file_ref.file.fd = NGX_INVALID_FILE as _;
             temp_file_ref.file.log = self.log.as_ptr();
             temp_file_ref.path = self.path.as_ptr();
-            temp_file_ref.pool = self.pool.as_ptr();
+            temp_file_ref.pool = self.pool;
             temp_file_ref.warn = REQUEST_TEMP_FILE_WARNING.as_ptr().cast_mut();
             temp_file_ref.access = 0o600;
             temp_file_ref.set_log_level(NGX_LOG_WARN as _);
@@ -1191,6 +1252,18 @@ impl<'callback> RequestTempFile<'callback> {
         }
         self.temp_file = Some(temp_file);
         Ok(temp_file)
+    }
+
+    fn checked_pool<'callback>(
+        &self,
+        request: &RequestRefMut<'callback>,
+    ) -> Result<Pool<'callback>, RequestTempFileError> {
+        let pool = request.pool()?;
+        if self.request != request.raw || self.pool != pool.as_ptr() {
+            return Err(RequestTempFileError::ForeignRequest);
+        }
+
+        Ok(pool)
     }
 }
 
@@ -2323,12 +2396,20 @@ impl<'callback> RequestRefMut<'callback> {
         unsafe { UpstreamStates::from_raw(self.raw.as_ref().upstream_states) }
     }
 
-    /// Creates a request-pool owner for the configured HTTP temporary-file path.
+    /// Creates request-pool state for the configured HTTP temporary-file path.
     ///
     /// The owner allocates its native state and opens its file only when a nonempty memory buffer
     /// is appended through [`RequestTempFile::append`].
     pub fn temp_file(&self) -> Result<RequestTempFile<'callback>, RequestTempFileError> {
         RequestTempFile::new(self)
+    }
+
+    /// Creates request-pool state for a temporary file retained by a module context.
+    ///
+    /// The state can be reused by later callbacks for this request; each append still requires a
+    /// current callback-scoped request view and returns callback-scoped output.
+    pub fn temp_file_state(&self) -> Result<RequestTempFileState, RequestTempFileError> {
+        RequestTempFileState::new(self)
     }
 
     /// Starts constructing a complete request-pool body and framing-header replacement.
@@ -4925,10 +5006,10 @@ mod tests {
                 input.append(pool.copy_buffer(b"body", flags).unwrap()).unwrap();
                 let mut writer = request.temp_file().unwrap();
 
-                assert!(writer.temp_file.is_none());
+                assert!(writer.state.temp_file.is_none());
 
                 let output = writer.append(chain_ref(input)).unwrap();
-                let temp = writer.temp_file.unwrap();
+                let temp = writer.state.temp_file.unwrap();
                 let native = unsafe { temp.as_ref() };
                 assert_ne!(native.file.fd, NGX_INVALID_FILE as _);
                 assert_eq!(native.offset, 4);
@@ -4986,14 +5067,14 @@ mod tests {
         let mut writer = request.temp_file().unwrap();
 
         let empty_output = writer.append(chain_ref(empty_input)).unwrap();
-        assert!(writer.temp_file.is_none());
+        assert!(writer.state.temp_file.is_none());
         let empty_output = empty_output.iter().next().unwrap().unwrap();
         assert_eq!(empty_output.flags(), zero_flags);
         assert!(matches!(empty_output.kind(), Ok(BufferView::Control(_))));
 
         let first_output = writer.append(chain_ref(first_input)).unwrap();
         let second_output = writer.append(chain_ref(second_input)).unwrap();
-        let temp = writer.temp_file.unwrap();
+        let temp = writer.state.temp_file.unwrap();
         let native = unsafe { temp.as_ref() };
         assert_eq!(native.offset, 6);
         assert_eq!(
@@ -5007,6 +5088,66 @@ mod tests {
         assert_eq!(second_output.flags(), second_flags);
         #[cfg(unix)]
         assert_eq!(temp_file_bytes(native), b"onetwo");
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn temp_file_state_reuses_one_file_across_callback_scopes() {
+        let mut fixture = TempFileFixture::new();
+        let mut state = request_from(&mut fixture.request).temp_file_state().unwrap();
+
+        let first = unsafe {
+            RequestRefMut::with_raw(&raw mut fixture.request, |request| {
+                let pool = request.pool().unwrap();
+                let input = pool.copy_buffer(b"one", BufferFlags::default()).unwrap();
+                let output =
+                    state.append_buffer(&request, input.view(), input.view().flags()).unwrap();
+                let file = output.iter().next().unwrap().unwrap().file().unwrap().unwrap();
+                (file.start(), file.end())
+            })
+        }
+        .unwrap();
+
+        let second = unsafe {
+            RequestRefMut::with_raw(&raw mut fixture.request, |request| {
+                let pool = request.pool().unwrap();
+                let input = pool.copy_buffer(b"two", BufferFlags::default()).unwrap();
+                let output =
+                    state.append_buffer(&request, input.view(), input.view().flags()).unwrap();
+                let file = output.iter().next().unwrap().unwrap().file().unwrap().unwrap();
+                (file.start(), file.end())
+            })
+        }
+        .unwrap();
+
+        let temp = state.temp_file.unwrap();
+        let native = unsafe { temp.as_ref() };
+        assert_eq!(first, (0, 3));
+        assert_eq!(second, (3, 6));
+        assert_eq!(native.offset, 6);
+        #[cfg(unix)]
+        assert_eq!(temp_file_bytes(native), b"onetwo");
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn temp_file_state_rejects_a_different_request() {
+        let mut fixture = TempFileFixture::new();
+        let mut state = request_from(&mut fixture.request).temp_file_state().unwrap();
+        let mut other = zeroed_request();
+        other.pool = fixture.pool.raw;
+        other.connection = &raw mut *fixture.connection;
+        other.loc_conf = fixture.request.loc_conf;
+        initialize_request(&mut other);
+        let request = request_from(&mut other);
+        let pool = request.pool().unwrap();
+        let input = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
+
+        assert!(matches!(
+            state.append_buffer(&request, input.view(), input.view().flags()),
+            Err(RequestTempFileError::ForeignRequest)
+        ));
+        assert!(state.temp_file.is_none());
     }
 
     #[cfg(feature = "test-link")]
@@ -5028,7 +5169,7 @@ mod tests {
         let mut writer = request.temp_file().unwrap();
 
         let output = writer.append(chain_ref(input)).unwrap();
-        let temp = writer.temp_file.unwrap();
+        let temp = writer.state.temp_file.unwrap();
         let native = unsafe { temp.as_ref() };
         assert_eq!(native.offset, 9);
         #[cfg(unix)]
@@ -5073,7 +5214,7 @@ mod tests {
         let mut writer = request.temp_file().unwrap();
 
         let output = writer.append(chain_ref(input)).unwrap();
-        assert!(writer.temp_file.is_none());
+        assert!(writer.state.temp_file.is_none());
         let output = output.iter().next().unwrap().unwrap();
         assert_eq!(output.flags(), flags);
         let file = output.file().unwrap().unwrap();
@@ -5098,7 +5239,7 @@ mod tests {
             writer.append(chain_ref(input)),
             Err(RequestTempFileError::Buffer(BufferError::InvalidFileRange))
         ));
-        assert!(writer.temp_file.is_none());
+        assert!(writer.state.temp_file.is_none());
     }
 
     #[cfg(feature = "test-link")]
@@ -5124,7 +5265,7 @@ mod tests {
 
             assert!(matches!(writer.append(chain_ref(input)), Err(RequestTempFileError::Write)));
             assert_eq!(
-                unsafe { writer.temp_file.unwrap().as_ref().file.fd },
+                unsafe { writer.state.temp_file.unwrap().as_ref().file.fd },
                 NGX_INVALID_FILE as _
             );
         }
@@ -5143,7 +5284,7 @@ mod tests {
                 .unwrap();
             let mut writer = request.temp_file().unwrap();
             writer.append(chain_ref(first_input)).unwrap();
-            let mut temp = writer.temp_file.unwrap();
+            let mut temp = writer.state.temp_file.unwrap();
             let offset = unsafe { temp.as_ref().offset };
             let advanced_offset = offset + 2;
             unsafe {
@@ -5216,7 +5357,7 @@ mod tests {
             let failed = writer.append(chain_ref(first_input));
             unsafe { ngx_rs_test_reset_allocation_failures() };
 
-            let Some(temp) = writer.temp_file else {
+            let Some(temp) = writer.state.temp_file else {
                 continue;
             };
             let start = unsafe { temp.as_ref().offset };
