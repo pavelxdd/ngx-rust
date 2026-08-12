@@ -71,8 +71,13 @@ pub trait Buffer {
         flags.write(unsafe { &mut *self.as_ngx_buf_mut() });
     }
 
-    /// Returns a validated file range when the buffer is file-backed.
+    /// Returns a nonempty file range when the buffer is file-backed.
     fn file(&self) -> Result<Option<FileView<'_>>, BufferError> {
+        Ok(self.file_range()?.filter(|file| !file.is_empty()))
+    }
+
+    /// Returns the file range, including a valid empty range.
+    fn file_range(&self) -> Result<Option<FileView<'_>>, BufferError> {
         file_range(unsafe { &*self.as_ngx_buf() })
     }
 
@@ -909,6 +914,19 @@ mod tests {
         assert!(!tail.is_null());
         assert_ne!(head, tail);
         assert_eq!(unsafe { (*tail).next }, ptr::null_mut());
+    }
+
+    #[test]
+    fn file_range_keeps_an_empty_file_visible() {
+        let mut file: ngx_file_t = unsafe { core::mem::zeroed() };
+        let mut raw: ngx_buf_t = unsafe { core::mem::zeroed() };
+        raw.file = &raw mut file;
+        raw.file_pos = 9;
+        raw.file_last = 9;
+        raw.set_in_file(1);
+        assert!(raw.file().unwrap().is_none());
+        let range = raw.file_range().unwrap().unwrap();
+        assert_eq!((range.start(), range.end(), range.len()), (9, 9, 0));
     }
 
     #[test]
