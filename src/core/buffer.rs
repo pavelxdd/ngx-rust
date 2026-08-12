@@ -494,6 +494,36 @@ impl<'pool> Pool<'pool> {
         self.copy_buffer(&bytes[range], flags)
     }
 
+    /// Builds a bounded slice from a checked memory or file buffer view.
+    ///
+    /// Full memory slices retain the source bytes, while partial memory slices are copied.
+    /// File slices duplicate only the native file descriptor and adjust its offsets.
+    pub fn buffer_slice(
+        &self,
+        source: BufferRef<'pool>,
+        range: Range<usize>,
+        flags: BufferFlags,
+    ) -> Result<PoolBuffer<'pool>, BufferError> {
+        let length = source.len()?;
+        if range.start > range.end || range.end > length {
+            return Err(BufferError::OutOfRange);
+        }
+
+        match source.kind()? {
+            BufferView::Memory(bytes) => {
+                if range.is_empty() {
+                    return self.control_buffer(flags);
+                }
+                if range.start == 0 && range.end == bytes.len() {
+                    return self.reference_memory(bytes.as_ptr(), bytes.len(), flags);
+                }
+                self.copy_buffer(&bytes[range], flags)
+            }
+            BufferView::File(_) => self.file_buffer_slice(source, range, flags),
+            BufferView::Control(_) => self.control_buffer(flags),
+        }
+    }
+
     /// Duplicates file metadata and builds a bounded file slice.
     pub fn file_buffer_slice(
         &self,
@@ -1131,6 +1161,56 @@ mod tests {
         assert!(matches!(control.view().kind(), Ok(BufferView::Control(_))));
         assert!(control.view().flags().sync);
         assert!(control.view().flags().last_buf);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn buffer_slice_references_full_memory_and_duplicates_file_metadata() {
+        static BORROWED: &[u8] = b"borrowed";
+
+        let owner = TestPool::new();
+        let pool = owner.handle();
+
+        let memory = memory_buffer(BORROWED);
+        let full = pool
+            .buffer_slice(
+                unsafe { BufferRef::from_raw(&raw const memory) }.unwrap(),
+                0..BORROWED.len(),
+                BufferFlags::default(),
+            )
+            .unwrap();
+        assert_eq!(full.view().bytes(), Ok(Some(BORROWED)));
+        assert_eq!(full.view().bytes().unwrap().unwrap().as_ptr(), BORROWED.as_ptr());
+
+        let partial = pool
+            .buffer_slice(
+                unsafe { BufferRef::from_raw(&raw const memory) }.unwrap(),
+                1..4,
+                BufferFlags::default(),
+            )
+            .unwrap();
+        assert_eq!(partial.view().bytes(), Ok(Some(b"orr".as_slice())));
+        assert_ne!(partial.view().bytes().unwrap().unwrap().as_ptr(), unsafe {
+            BORROWED.as_ptr().add(1)
+        });
+
+        let mut file: ngx_file_t = unsafe { mem::zeroed() };
+        file.fd = 23;
+        let mut raw_file: ngx_buf_t = unsafe { mem::zeroed() };
+        raw_file.file = &raw mut file;
+        raw_file.file_pos = 100;
+        raw_file.file_last = 110;
+        raw_file.set_in_file(1);
+        let sliced_file = pool
+            .buffer_slice(
+                unsafe { BufferRef::from_raw(&raw const raw_file) }.unwrap(),
+                2..7,
+                BufferFlags::default(),
+            )
+            .unwrap();
+        let file_view = sliced_file.view().file().unwrap().unwrap();
+        assert_ne!(file_view.file_ptr(), &raw mut file);
+        assert_eq!((file_view.start(), file_view.end()), (102, 107));
     }
 
     #[cfg(feature = "test-link")]
