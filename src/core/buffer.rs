@@ -724,6 +724,21 @@ impl<'chain> ChainMut<'chain> {
     pub fn into_iter_mut(self) -> ChainIterMut<'chain> {
         ChainIterMut { next: self.head, _lifetime: PhantomData }
     }
+
+    pub(crate) fn as_ptr(&self) -> *mut ngx_chain_t {
+        self.head
+    }
+
+    pub(crate) fn contains_link(&self, target: *mut ngx_chain_t) -> bool {
+        let mut link = self.head;
+        while !link.is_null() {
+            if ptr::eq(link, target) {
+                return true;
+            }
+            link = unsafe { (*link).next };
+        }
+        false
+    }
 }
 
 /// Checked shared nginx chain iterator.
