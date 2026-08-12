@@ -373,7 +373,7 @@ impl<'pool> Pool<'pool> {
     ///
     /// # Safety
     /// The source storage must remain valid for the destination pool lifetime.
-    pub unsafe fn slice_buffer(
+    pub unsafe fn buffer_slice(
         &self,
         source: &impl Buffer,
         range: Range<usize>,
@@ -766,6 +766,59 @@ mod tests {
         raw.last = raw.start;
         raw.end = unsafe { raw.start.add(storage.len()) };
         TemporaryBuffer::from_ngx_buf(raw)
+    }
+
+    #[cfg(feature = "test-link")]
+    struct TestPool {
+        raw: *mut nginx_sys::ngx_pool_t,
+        _log: alloc::boxed::Box<nginx_sys::ngx_log_t>,
+    }
+
+    #[cfg(feature = "test-link")]
+    impl TestPool {
+        fn new() -> Self {
+            let mut log = alloc::boxed::Box::new(unsafe { core::mem::zeroed() });
+            let raw = unsafe { nginx_sys::ngx_create_pool(4096, &raw mut *log) };
+            assert!(!raw.is_null());
+            Self { raw, _log: log }
+        }
+
+        fn handle(&self) -> Pool<'_> {
+            unsafe { Pool::from_raw(self.raw) }.unwrap()
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    impl Drop for TestPool {
+        fn drop(&mut self) {
+            unsafe { nginx_sys::ngx_destroy_pool(self.raw) };
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn buffer_slice_references_full_memory_and_copies_partial_ranges() {
+        let owner = TestPool::new();
+        let pool = owner.handle();
+        let source = pool.create_buffer_from_str("borrowed").unwrap();
+        let full = unsafe { pool.buffer_slice(&source, 0..8, BufferFlags::default()) }.unwrap();
+        assert_eq!(full.as_bytes(), b"borrowed");
+        assert_eq!(full.as_bytes().as_ptr(), source.as_bytes().as_ptr());
+        let partial = unsafe { pool.buffer_slice(&source, 1..4, BufferFlags::default()) }.unwrap();
+        assert_eq!(partial.as_bytes(), b"orr");
+        assert_ne!(partial.as_bytes().as_ptr(), unsafe { source.as_bytes().as_ptr().add(1) });
+
+        let mut file: ngx_file_t = unsafe { core::mem::zeroed() };
+        file.fd = 23;
+        let mut raw_file: ngx_buf_t = unsafe { core::mem::zeroed() };
+        raw_file.file = &raw mut file;
+        raw_file.file_pos = 100;
+        raw_file.file_last = 110;
+        raw_file.set_in_file(1);
+        let sliced = unsafe { pool.buffer_slice(&raw_file, 2..7, BufferFlags::default()) }.unwrap();
+        let view = sliced.as_ngx_buf().file().unwrap().unwrap();
+        assert_ne!(view.file_ptr(), &raw mut file);
+        assert_eq!((view.start(), view.end()), (102, 107));
     }
 
     #[test]
