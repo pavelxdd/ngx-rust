@@ -2,10 +2,16 @@
 use ::core::ptr;
 
 use crate::{
-    NGX_TIMER_LAZY_DELAY, ngx_current_msec, ngx_event_t, ngx_event_timer_rbtree, ngx_msec_int_t,
-    ngx_msec_t, ngx_queue_insert_before, ngx_queue_remove, ngx_queue_t, ngx_rbtree_delete,
-    ngx_rbtree_insert,
+    NGX_TIMER_LAZY_DELAY, bindings, ngx_current_msec, ngx_event_t, ngx_event_timer_rbtree,
+    ngx_int_t, ngx_msec_int_t, ngx_msec_t, ngx_queue_insert_before, ngx_queue_remove, ngx_queue_t,
+    ngx_rbtree_delete, ngx_rbtree_insert,
 };
+
+/// Native event type for read readiness.
+pub const NGX_READ_EVENT: ngx_int_t = bindings::NGX_RS_READ_EVENT as _;
+
+/// Native event type for write readiness.
+pub const NGX_WRITE_EVENT: ngx_int_t = bindings::NGX_RS_WRITE_EVENT as _;
 
 /// Sets a timeout for an event.
 ///
