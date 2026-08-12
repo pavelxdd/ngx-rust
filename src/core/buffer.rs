@@ -798,6 +798,30 @@ impl<'pool> PoolChain<'pool> {
         self.append_raw(buffer.raw)
     }
 
+    /// Appends every fully prepared link from `candidate` and leaves it empty.
+    ///
+    /// The candidate remains unchanged when it belongs to a different pool.
+    pub fn append_chain(&mut self, candidate: &mut PoolChain<'pool>) -> Result<(), ChainError> {
+        if !ptr::eq(self.pool.as_ptr(), candidate.pool.as_ptr()) {
+            return Err(ChainError::Buffer(BufferError::ForeignPool));
+        }
+
+        debug_assert_eq!(candidate.head.is_some(), candidate.tail.is_some());
+        let Some((head, tail)) = candidate.head.zip(candidate.tail) else {
+            return Ok(());
+        };
+
+        if let Some(mut output_tail) = self.tail {
+            unsafe { output_tail.as_mut().next = head.as_ptr() };
+        } else {
+            self.head = Some(head);
+        }
+        self.tail = Some(tail);
+        candidate.head = None;
+        candidate.tail = None;
+        Ok(())
+    }
+
     /// Iterates over the current chain in append order.
     pub fn iter(&self) -> ChainIter<'_> {
         ChainIter { next: self.head_ptr(), _lifetime: PhantomData }
@@ -1250,6 +1274,42 @@ mod tests {
         let mut iter = unsafe { ChainRef::from_raw(&raw mut invalid_next) }.unwrap().iter();
         assert!(iter.next().unwrap().is_ok());
         assert_eq!(iter.next().unwrap(), Err(ChainError::MisalignedLink));
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn pool_chain_appends_a_completed_candidate_without_partial_publication() {
+        let owner = TestPool::new();
+        let pool = owner.handle();
+        let mut output = pool.chain();
+        output.append(pool.copy_buffer(b"head", BufferFlags::default()).unwrap()).unwrap();
+
+        let mut candidate = pool.chain();
+        candidate.append(pool.copy_buffer(b"body", BufferFlags::default()).unwrap()).unwrap();
+        output.append_chain(&mut candidate).unwrap();
+
+        let values = output
+            .iter()
+            .map(|buffer| buffer.unwrap().bytes().unwrap().unwrap())
+            .collect::<alloc::vec::Vec<_>>();
+        assert_eq!(values, [b"head".as_slice(), b"body".as_slice()]);
+
+        let foreign_owner = TestPool::new();
+        let foreign_pool = foreign_owner.handle();
+        let mut foreign = foreign_pool.chain();
+        foreign
+            .append(foreign_pool.copy_buffer(b"foreign", BufferFlags::default()).unwrap())
+            .unwrap();
+
+        assert_eq!(
+            output.append_chain(&mut foreign),
+            Err(ChainError::Buffer(BufferError::ForeignPool))
+        );
+        let values = output
+            .iter()
+            .map(|buffer| buffer.unwrap().bytes().unwrap().unwrap())
+            .collect::<alloc::vec::Vec<_>>();
+        assert_eq!(values, [b"head".as_slice(), b"body".as_slice()]);
     }
 
     #[cfg(target_pointer_width = "64")]
