@@ -2053,7 +2053,7 @@ impl<'callback> RequestRefMut<'callback> {
     }
 
     /// Request pool.
-    pub fn pool(&self) -> Result<Pool<'_>, RequestError> {
+    pub fn pool(&self) -> Result<Pool<'callback>, RequestError> {
         let pool = unsafe { self.raw.as_ref().pool };
         if pool.is_null() {
             return Err(RequestError::MissingPool);
@@ -4513,6 +4513,28 @@ mod tests {
             unsafe { checked_ngx_str((*raw.headers_out.location).value) }.unwrap().as_bytes(),
             b"/next"
         );
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn request_pool_prepares_a_body_before_output_headers_commit() {
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+
+        let mut request = request_from(&mut raw);
+        let pool = request.pool().unwrap();
+        let buffer = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
+        let mut body = pool.chain();
+        body.append(buffer).unwrap();
+
+        {
+            let mut headers = request.clean_headers_out_builder(1).unwrap();
+            headers.add(b"Content-Type", b"text/plain").unwrap();
+            headers.commit();
+        }
+
+        assert!(!body.into_raw().is_null());
     }
 
     #[cfg(feature = "test-link")]
