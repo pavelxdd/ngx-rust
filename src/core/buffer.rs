@@ -500,7 +500,7 @@ impl<'pool> Pool<'pool> {
     /// File slices duplicate only the native file descriptor and adjust its offsets.
     pub fn buffer_slice(
         &self,
-        source: BufferRef<'pool>,
+        source: BufferRef<'_>,
         range: Range<usize>,
         flags: BufferFlags,
     ) -> Result<PoolBuffer<'pool>, BufferError> {
@@ -527,7 +527,7 @@ impl<'pool> Pool<'pool> {
     /// Duplicates file metadata and builds a bounded file slice.
     pub fn file_buffer_slice(
         &self,
-        source: BufferRef<'pool>,
+        source: BufferRef<'_>,
         range: Range<usize>,
         flags: BufferFlags,
     ) -> Result<PoolBuffer<'pool>, BufferError> {

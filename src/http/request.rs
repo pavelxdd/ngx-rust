@@ -1157,7 +1157,7 @@ impl RequestTempFileState {
     pub fn append_buffer<'callback>(
         &mut self,
         request: &RequestRefMut<'callback>,
-        input: BufferRef<'callback>,
+        input: BufferRef<'_>,
         flags: BufferFlags,
     ) -> Result<PoolChain<'callback>, RequestTempFileError> {
         let pool = self.checked_pool(request)?;
@@ -5127,6 +5127,27 @@ mod tests {
         assert_eq!(native.offset, 6);
         #[cfg(unix)]
         assert_eq!(temp_file_bytes(native), b"onetwo");
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn temp_file_state_copies_a_short_buffer_reborrow() {
+        let mut fixture = TempFileFixture::new();
+        let mut state = request_from(&mut fixture.request).temp_file_state().unwrap();
+
+        let offsets = unsafe {
+            RequestRefMut::with_raw(&raw mut fixture.request, |request| {
+                let pool = request.pool().unwrap();
+                let input = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
+                let output =
+                    state.append_buffer(&request, input.view(), input.view().flags()).unwrap();
+                let file = output.iter().next().unwrap().unwrap().file().unwrap().unwrap();
+                (file.start(), file.end())
+            })
+        }
+        .unwrap();
+
+        assert_eq!(offsets, (0, 4));
     }
 
     #[cfg(feature = "test-link")]
