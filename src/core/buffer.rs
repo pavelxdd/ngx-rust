@@ -607,6 +607,32 @@ impl<'chain> ChainMut<'chain> {
         ChainIterMut { next: self.head, _lifetime: PhantomData }
     }
 
+    /// Appends `suffix` before passing the combined chain to an nginx output filter.
+    ///
+    /// The appended raw links remain connected after `f` returns because an nginx output filter
+    /// may retain the chain when it returns `NGX_AGAIN`. Both input handles are consumed, and the
+    /// combined callback-scoped handle cannot escape through a safe return value.
+    /// # Safety
+    ///
+    /// `suffix` must remain valid for as long as the output filter can retain the combined chain.
+    /// This is normally true for an nginx output-filter input chain, whose links remain valid
+    /// after the callback returns `NGX_AGAIN`.
+    pub unsafe fn append_for_output_filter<'suffix, R>(
+        self,
+        suffix: ChainMut<'suffix>,
+        f: impl for<'scope> FnOnce(ChainMut<'scope>) -> R,
+    ) -> Result<R, ChainError> {
+        let Some(mut tail) = self.tail()? else {
+            return unsafe { Self::with_raw(suffix.head, f) };
+        };
+        if suffix.head.is_null() {
+            return unsafe { Self::with_raw(self.head, f) };
+        }
+
+        unsafe { tail.as_mut().next = suffix.head };
+        unsafe { Self::with_raw(self.head, f) }
+    }
+
     pub(crate) fn as_ptr(&self) -> *mut ngx_chain_t {
         self.head
     }
@@ -620,6 +646,24 @@ impl<'chain> ChainMut<'chain> {
             link = unsafe { (*link).next };
         }
         false
+    }
+
+    fn tail(&self) -> Result<Option<NonNull<ngx_chain_t>>, ChainError> {
+        let mut current = NonNull::new(self.head);
+        while let Some(link) = current {
+            if !link.as_ptr().is_aligned() {
+                return Err(ChainError::MisalignedLink);
+            }
+            let next = unsafe { link.as_ref().next };
+            if next.is_null() {
+                return Ok(Some(link));
+            }
+            if !next.is_aligned() {
+                return Err(ChainError::MisalignedLink);
+            }
+            current = NonNull::new(next);
+        }
+        Ok(None)
     }
 }
 
@@ -813,6 +857,7 @@ fn file_range(buffer: &ngx_buf_t) -> Result<Option<FileView<'_>>, BufferError> {
 #[cfg(test)]
 mod tests {
     extern crate alloc;
+    extern crate std;
 
     use super::*;
 
@@ -927,6 +972,28 @@ mod tests {
         assert!(raw.file().unwrap().is_none());
         let range = raw.file_range().unwrap().unwrap();
         assert_eq!((range.start(), range.end(), range.len()), (9, 9, 0));
+    }
+
+    #[test]
+    fn output_filter_append_keeps_links_on_return_and_unwind() {
+        let mut first: ngx_buf_t = unsafe { core::mem::zeroed() };
+        let mut second: ngx_buf_t = unsafe { core::mem::zeroed() };
+        let mut prefix = ngx_chain_t { buf: &raw mut first, next: ptr::null_mut() };
+        let mut suffix = ngx_chain_t { buf: &raw mut second, next: ptr::null_mut() };
+        let combined = unsafe { ChainMut::from_raw(&raw mut prefix) }.unwrap();
+        let appended = unsafe { ChainMut::from_raw(&raw mut suffix) }.unwrap();
+        let count = unsafe { combined.append_for_output_filter(appended, |chain| chain.iter().count()) }.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(prefix.next, &raw mut suffix);
+        prefix.next = ptr::null_mut();
+        let result = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            let combined = unsafe { ChainMut::from_raw(&raw mut prefix) }.unwrap();
+            let appended = unsafe { ChainMut::from_raw(&raw mut suffix) }.unwrap();
+            unsafe { combined.append_for_output_filter(appended, |_| panic!("test callback panic")) }.unwrap();
+        }));
+        assert!(result.is_err());
+        assert_eq!(prefix.next, &raw mut suffix);
+        assert!(suffix.next.is_null());
     }
 
     #[test]
