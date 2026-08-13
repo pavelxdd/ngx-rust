@@ -735,6 +735,32 @@ impl<'chain> ChainMut<'chain> {
         ChainIterMut { next: self.head, _lifetime: PhantomData }
     }
 
+    /// Appends `suffix` before passing the combined chain to an nginx output filter.
+    ///
+    /// The appended raw links remain connected after `f` returns because an nginx output filter
+    /// may retain the chain when it returns `NGX_AGAIN`. Both input handles are consumed, and the
+    /// combined callback-scoped handle cannot escape through a safe return value.
+    /// # Safety
+    ///
+    /// `suffix` must remain valid for as long as the output filter can retain the combined chain.
+    /// This is normally true for an nginx output-filter input chain, whose links remain valid
+    /// after the callback returns `NGX_AGAIN`.
+    pub unsafe fn append_for_output_filter<'suffix, R>(
+        self,
+        suffix: ChainMut<'suffix>,
+        f: impl for<'scope> FnOnce(ChainMut<'scope>) -> R,
+    ) -> Result<R, ChainError> {
+        let Some(mut tail) = self.tail()? else {
+            return unsafe { Self::with_raw(suffix.head, f) };
+        };
+        if suffix.head.is_null() {
+            return unsafe { Self::with_raw(self.head, f) };
+        }
+
+        unsafe { tail.as_mut().next = suffix.head };
+        unsafe { Self::with_raw(self.head, f) }
+    }
+
     pub(crate) fn as_ptr(&self) -> *mut ngx_chain_t {
         self.head
     }
@@ -748,6 +774,24 @@ impl<'chain> ChainMut<'chain> {
             link = unsafe { (*link).next };
         }
         false
+    }
+
+    fn tail(&self) -> Result<Option<NonNull<ngx_chain_t>>, ChainError> {
+        let mut current = NonNull::new(self.head);
+        while let Some(link) = current {
+            if !link.as_ptr().is_aligned() {
+                return Err(ChainError::MisalignedLink);
+            }
+            let next = unsafe { link.as_ref().next };
+            if next.is_null() {
+                return Ok(Some(link));
+            }
+            if !next.is_aligned() {
+                return Err(ChainError::MisalignedLink);
+            }
+            current = NonNull::new(next);
+        }
+        Ok(None)
     }
 }
 
@@ -954,6 +998,7 @@ mod tests {
 
     use alloc::boxed::Box;
     use core::mem;
+    use core::panic::AssertUnwindSafe;
     use core::ptr;
 
     use nginx_sys::{
@@ -1157,6 +1202,53 @@ mod tests {
 
         assert_eq!(first.pos, unsafe { first_bytes.as_ptr().add(1) }.cast_mut());
         assert_eq!(second.pos, unsafe { second_bytes.as_ptr().add(1) }.cast_mut());
+    }
+
+    #[test]
+    fn mutable_chain_appends_a_suffix_for_an_output_filter() {
+        let prefix_bytes = *b"prefix";
+        let suffix_bytes = *b"suffix";
+        let mut prefix_buffer = memory_buffer(&prefix_bytes);
+        let mut suffix_buffer = memory_buffer(&suffix_bytes);
+        let mut prefix_link = ngx_chain_t { buf: &raw mut prefix_buffer, next: ptr::null_mut() };
+        let mut suffix_link = ngx_chain_t { buf: &raw mut suffix_buffer, next: ptr::null_mut() };
+
+        let prefix = unsafe { ChainMut::from_raw(&raw mut prefix_link) }.unwrap();
+        let suffix = unsafe { ChainMut::from_raw(&raw mut suffix_link) }.unwrap();
+        let bytes = unsafe {
+            prefix.append_for_output_filter(suffix, |chain| {
+                chain
+                    .iter()
+                    .map(|buffer| buffer.unwrap().bytes().unwrap().unwrap().to_vec())
+                    .collect::<alloc::vec::Vec<_>>()
+            })
+        }
+        .unwrap();
+
+        assert_eq!(bytes, [b"prefix".to_vec(), b"suffix".to_vec()]);
+        assert_eq!(prefix_link.next, &raw mut suffix_link);
+        assert_eq!(suffix_link.next, ptr::null_mut());
+    }
+
+    #[test]
+    fn mutable_chain_keeps_an_appended_suffix_when_its_output_filter_panics() {
+        let prefix_bytes = *b"prefix";
+        let suffix_bytes = *b"suffix";
+        let mut prefix_buffer = memory_buffer(&prefix_bytes);
+        let mut suffix_buffer = memory_buffer(&suffix_bytes);
+        let mut prefix_link = ngx_chain_t { buf: &raw mut prefix_buffer, next: ptr::null_mut() };
+        let mut suffix_link = ngx_chain_t { buf: &raw mut suffix_buffer, next: ptr::null_mut() };
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let prefix = unsafe { ChainMut::from_raw(&raw mut prefix_link) }.unwrap();
+            let suffix = unsafe { ChainMut::from_raw(&raw mut suffix_link) }.unwrap();
+            unsafe { prefix.append_for_output_filter(suffix, |_| panic!("test callback panic")) }
+                .unwrap();
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(prefix_link.next, &raw mut suffix_link);
+        assert_eq!(suffix_link.next, ptr::null_mut());
     }
 
     #[cfg(feature = "test-link")]
