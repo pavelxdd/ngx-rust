@@ -35,7 +35,6 @@ pub enum HttpConfigError {
 #[derive(Clone, Copy)]
 struct ModuleIndexes {
     context: usize,
-    module_slots: usize,
     http_slots: usize,
 }
 
@@ -66,7 +65,7 @@ fn module_indexes(
         return Err(HttpConfigError::ContextIndexOutOfBounds);
     }
 
-    Ok(ModuleIndexes { context: context_index, module_slots, http_slots })
+    Ok(ModuleIndexes { context: context_index, http_slots })
 }
 
 fn live_module_slot_count() -> usize {
@@ -109,10 +108,11 @@ unsafe fn main_conf_from_cycle<'cycle, T>(
     module: &ngx_module_t,
     http_slot_count: usize,
 ) -> Result<Option<&'cycle T>, HttpConfigError> {
-    let indexes = module_indexes(module, live_module_slot_count(), http_slot_count)?;
-    let Some(context) = (unsafe { cycle_http_context(cycle, indexes.module_slots)? }) else {
+    let module_slots = live_module_slot_count();
+    let Some(context) = (unsafe { cycle_http_context(cycle, module_slots)? }) else {
         return Ok(None);
     };
+    let indexes = module_indexes(module, module_slots, http_slot_count)?;
 
     Ok(unsafe {
         conf_slot(context.main_conf, indexes.context, indexes.http_slots)
@@ -1575,6 +1575,25 @@ mod tests {
 
         globals.set_active_cycle(&raw mut old_cycle);
         assert_eq!(unsafe { TestHttpModule::with_active_main_conf(|value| *value) }, Ok(Some(11)));
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn process_callbacks_ignore_absent_http_context_before_slot_validation() {
+        let _globals = HttpGlobals::new(2, 0);
+        let mut contexts: [*mut *mut *mut c_void; 2] = [ptr::null_mut(), ptr::null_mut()];
+        let mut cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+        cycle.conf_ctx = contexts.as_mut_ptr();
+
+        assert_eq!(
+            unsafe {
+                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
+                    cycle.main_conf::<ProcessModule>().map(|value| value.copied())
+                })
+            },
+            Ok(Ok(None))
+        );
+        assert_eq!(unsafe { init_process::<ProcessModule>(&raw mut cycle) }, Status::NGX_OK.0);
     }
 
     #[cfg(feature = "test-link")]
