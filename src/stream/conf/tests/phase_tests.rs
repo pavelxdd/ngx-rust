@@ -10,14 +10,36 @@ use super::StreamGlobals;
 use crate::collections::NgxArray;
 use crate::core::Status;
 use crate::ffi::{
-    NGX_STREAM_MODULE, ngx_array_t, ngx_conf_t, ngx_create_pool, ngx_destroy_pool, ngx_log_t,
-    ngx_pool_t, ngx_stream_conf_ctx_t, ngx_stream_core_main_conf_t, ngx_stream_handler_pt,
-    ngx_stream_session_t, ngx_uint_t,
+    NGX_LOG_EMERG, NGX_STREAM_MODULE, ngx_array_t, ngx_conf_t, ngx_create_pool, ngx_destroy_pool,
+    ngx_log_t, ngx_pool_t, ngx_stream_conf_ctx_t, ngx_stream_core_main_conf_t,
+    ngx_stream_handler_pt, ngx_stream_session_t, ngx_uint_t,
 };
-use crate::stream::{Session, StreamPhase, StreamSessionHandler, add_phase_handler};
+use crate::stream::{
+    Session, StreamPhase, StreamSessionHandler, add_phase_handler, try_add_phase_handler,
+};
 
 const PHASE_COUNT: usize = StreamPhase::Log as usize + 1;
 const PHASE_HANDLER_CAPACITY: usize = 4;
+
+struct LogCapture {
+    len: usize,
+}
+
+unsafe extern "C" fn capture_log(
+    log: *mut ngx_log_t,
+    _level: ngx_uint_t,
+    _bytes: *mut u8,
+    len: usize,
+) {
+    let Some(log) = (unsafe { log.as_mut() }) else {
+        return;
+    };
+    let Some(capture) = (unsafe { log.wdata.cast::<LogCapture>().as_mut() }) else {
+        return;
+    };
+
+    capture.len = len;
+}
 
 fn phase_handler_array(
     elts: *mut c_void,
@@ -31,6 +53,7 @@ struct PhaseFixture {
     _globals: StreamGlobals,
     pool: *mut ngx_pool_t,
     _log: Box<ngx_log_t>,
+    capture: Box<LogCapture>,
     _handler_storage: Box<[[ngx_stream_handler_pt; PHASE_HANDLER_CAPACITY]; PHASE_COUNT]>,
     main: Box<ngx_stream_core_main_conf_t>,
     main_slots: Box<[*mut c_void; 1]>,
@@ -42,6 +65,7 @@ impl PhaseFixture {
     fn new() -> Self {
         let globals = StreamGlobals::new(1, 1);
         let mut log = Box::new(unsafe { mem::zeroed::<ngx_log_t>() });
+        let capture = Box::new(LogCapture { len: 0 });
         let pool = unsafe { ngx_create_pool(4096, &raw mut *log) };
         assert!(!pool.is_null());
 
@@ -67,6 +91,7 @@ impl PhaseFixture {
             _globals: globals,
             pool,
             _log: log,
+            capture,
             _handler_storage: handler_storage,
             main,
             main_slots,
@@ -77,6 +102,12 @@ impl PhaseFixture {
 
     fn phase_handlers(&mut self, phase: StreamPhase) -> &mut ngx_array_t {
         &mut self.main.phases[phase as usize].handlers
+    }
+
+    fn capture_errors(&mut self) {
+        self._log.log_level = NGX_LOG_EMERG as _;
+        self._log.writer = Some(capture_log);
+        self._log.wdata = (&raw mut *self.capture).cast();
     }
 }
 
@@ -248,6 +279,16 @@ fn phase_registration_reports_push_failure_without_appending() {
     fixture.phase_handlers(StreamPhase::Preread).pool = ptr::null_mut();
 
     assert_preread_registration_error(&mut fixture);
+}
+
+#[test]
+fn try_phase_registration_returns_error_without_logging() {
+    let mut fixture = PhaseFixture::new();
+    fixture.capture_errors();
+    fixture.phase_handlers(StreamPhase::Preread).pool = ptr::null_mut();
+
+    assert!(try_add_phase_handler::<PrereadHandler>(&mut fixture.cf).is_err());
+    assert_eq!(fixture.capture.len, 0);
 }
 
 #[test]
