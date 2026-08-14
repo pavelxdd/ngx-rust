@@ -139,6 +139,8 @@ impl NginxSource {
 /// Generates Rust bindings for NGINX
 fn generate_binding(nginx: &NginxSource) {
     let autoconf_makefile_path = nginx.build_dir.join("Makefile");
+    let makefile = read_to_string(&autoconf_makefile_path).expect("configured NGINX Makefile");
+    let standard = c_standard(&logical_makefile_lines(&makefile));
     let (includes, defines) = parse_makefile(&autoconf_makefile_path);
     let includes: Vec<_> = includes
         .into_iter()
@@ -146,6 +148,10 @@ fn generate_binding(nginx: &NginxSource) {
         .collect();
     let mut clang_args: Vec<String> =
         includes.iter().map(|path| format!("-I{}", path.to_string_lossy())).collect();
+
+    if let Some(standard) = &standard {
+        clang_args.push(standard.clone());
+    }
 
     clang_args.extend(
         defines.iter().map(
@@ -210,8 +216,76 @@ fn generate_binding(nginx: &NginxSource) {
     let out_path = PathBuf::from(out_dir_env);
     bindings.write_to_file(out_path.join("bindings.rs")).expect("Couldn't write bindings!");
 
+    #[cfg(feature = "http")]
+    build_http_request_shim(&includes, &defines, standard.as_deref());
+
     #[cfg(feature = "test-link")]
     build_test_library(nginx, &includes, &defines);
+}
+
+#[cfg(feature = "http")]
+fn build_http_request_shim(
+    includes: &[PathBuf],
+    defines: &[(String, Option<String>)],
+    standard: Option<&str>,
+) {
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let shim = out_dir.join("nginx_http_request_shim.c");
+    let mut file = File::create(&shim).expect("NGINX HTTP request shim");
+    file.write_all(
+        br"#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_http.h>
+
+ngx_uint_t
+ngx_rs_http_request_is_internal(const ngx_http_request_t *request)
+{
+    return request->internal;
+}
+
+ngx_uint_t
+ngx_rs_http_request_header_only(const ngx_http_request_t *request)
+{
+    return request->header_only;
+}
+
+ngx_uint_t
+ngx_rs_http_request_keepalive(const ngx_http_request_t *request)
+{
+    return request->keepalive;
+}
+
+void
+ngx_rs_http_request_set_keepalive(ngx_http_request_t *request, ngx_uint_t keepalive)
+{
+    request->keepalive = keepalive != 0;
+}
+
+void
+ngx_rs_http_request_set_header_only(ngx_http_request_t *request, ngx_uint_t header_only)
+{
+    request->header_only = header_only != 0;
+}
+
+void
+ngx_rs_http_request_set_header_sent(ngx_http_request_t *request, ngx_uint_t header_sent)
+{
+    request->header_sent = header_sent != 0;
+}
+",
+    )
+    .expect("NGINX HTTP request shim");
+
+    let mut build = cc::Build::new();
+    build.includes(includes).file(shim);
+    for (name, value) in defines {
+        build.define(name, value.as_deref());
+    }
+    if let Some(standard) = standard {
+        build.flag(standard);
+    }
+    build.warnings(false);
+    build.compile("nginx_http_request_shim");
 }
 
 #[cfg(feature = "test-link")]
@@ -305,6 +379,39 @@ ngx_rs_test_delete_posted_event(ngx_event_t *ev)
     )
     .expect("NGINX event test wrapper");
     sources.push(event_wrapper);
+
+    #[cfg(feature = "http")]
+    {
+        let request_wrapper = out_dir.join("nginx_test_http_request.c");
+        let mut file = File::create(&request_wrapper).expect("NGINX HTTP request test wrapper");
+        file.write_all(
+            br"#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_http.h>
+
+ngx_uint_t
+ngx_rs_test_http_request_flags(const ngx_http_request_t *request)
+{
+    ngx_uint_t flags = 0;
+
+    flags |= request->header_only;
+    flags |= request->keepalive << 1;
+    flags |= request->header_sent << 2;
+    flags |= request->internal << 3;
+
+    return flags;
+}
+
+void
+ngx_rs_test_http_request_set_internal(ngx_http_request_t *request, ngx_uint_t internal)
+{
+    request->internal = internal != 0;
+}
+",
+        )
+        .expect("NGINX HTTP request test wrapper");
+        sources.push(request_wrapper);
+    }
 
     let alloc_wrapper = out_dir.join("nginx_test_alloc.c");
     let mut file = File::create(&alloc_wrapper).expect("NGINX allocation test wrapper");
@@ -511,7 +618,6 @@ ngx_rs_test_stream_proxy_protocol_addr_port(ngx_stream_session_t *session,
     emit_nginx_link_libraries(nginx, &lines);
 }
 
-#[cfg(feature = "test-link")]
 fn logical_makefile_lines(makefile: &str) -> Vec<String> {
     let mut lines = Vec::new();
     let mut logical = String::new();
@@ -590,7 +696,6 @@ fn resolve_makefile_path(nginx: &NginxSource, path: &str) -> PathBuf {
     panic!("NGINX Makefile path does not exist: {}", path.display());
 }
 
-#[cfg(feature = "test-link")]
 fn c_standard(lines: &[String]) -> Option<String> {
     lines.iter().find_map(|line| {
         let flags = line.strip_prefix("CFLAGS")?.strip_prefix(" =")?;

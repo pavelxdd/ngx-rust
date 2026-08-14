@@ -1803,7 +1803,7 @@ impl RequestRef<'_> {
 
     /// Whether nginx marked this request as internal.
     pub fn is_internal(&self) -> bool {
-        unsafe { self.raw.as_ref().internal() != 0 }
+        unsafe { ngx_rs_http_request_is_internal(self.raw.as_ptr()) != 0 }
     }
 
     /// Number of additional nested subrequests nginx permits from this request.
@@ -1932,7 +1932,12 @@ impl RequestRef<'_> {
 
     /// Whether nginx marked the response as header-only.
     pub fn header_only(&self) -> bool {
-        unsafe { self.raw.as_ref().header_only() != 0 }
+        unsafe { ngx_rs_http_request_header_only(self.raw.as_ptr()) != 0 }
+    }
+
+    /// Whether nginx may reuse the client connection after this response.
+    pub fn keepalive(&self) -> bool {
+        unsafe { ngx_rs_http_request_keepalive(self.raw.as_ptr()) != 0 }
     }
 
     /// Returns a checked byte-oriented view over input headers.
@@ -2368,6 +2373,11 @@ impl<'callback> RequestRefMut<'callback> {
         self.view().header_only()
     }
 
+    /// Whether nginx may reuse the client connection after this response.
+    pub fn keepalive(&self) -> bool {
+        self.view().keepalive()
+    }
+
     /// Returns a checked byte-oriented view over input headers.
     pub fn headers_in(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
         checked_header_list(unsafe { &self.raw.as_ref().headers_in.headers })
@@ -2513,6 +2523,21 @@ impl<'callback> RequestRefMut<'callback> {
     /// Sets the HTTP response status.
     pub fn set_status(&mut self, status: HTTPStatus) {
         unsafe { self.raw.as_mut().headers_out.status = status.into() };
+    }
+
+    /// Sets whether nginx may reuse the client connection after this response.
+    pub fn set_keepalive(&mut self, keepalive: bool) {
+        unsafe { ngx_rs_http_request_set_keepalive(self.raw.as_ptr(), keepalive.into()) };
+    }
+
+    /// Sets whether nginx must suppress the response body.
+    pub fn set_header_only(&mut self, header_only: bool) {
+        unsafe { ngx_rs_http_request_set_header_only(self.raw.as_ptr(), header_only.into()) };
+    }
+
+    /// Marks whether nginx has sent the response headers.
+    pub fn set_header_sent(&mut self, header_sent: bool) {
+        unsafe { ngx_rs_http_request_set_header_sent(self.raw.as_ptr(), header_sent.into()) };
     }
 
     /// Gets the value of a complex value.
@@ -3378,6 +3403,11 @@ mod tests {
     unsafe extern "C" {
         fn ngx_rs_test_fail_allocations_after(successes: ngx_uint_t);
         fn ngx_rs_test_reset_allocation_failures();
+        fn ngx_rs_test_http_request_flags(request: *const ngx_http_request_t) -> ngx_uint_t;
+        fn ngx_rs_test_http_request_set_internal(
+            request: *mut ngx_http_request_t,
+            internal: ngx_uint_t,
+        );
     }
 
     #[cfg(all(feature = "test-link", unix))]
@@ -6533,14 +6563,31 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-link")]
     #[test]
     fn internal_redirect_flag_is_exposed() {
         let mut raw = zeroed_request();
 
         assert!(!request_from(&mut raw).is_internal());
 
-        raw.set_internal(1);
+        unsafe { ngx_rs_test_http_request_set_internal(&raw mut raw, 1) };
         assert!(request_from(&mut raw).is_internal());
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn request_bitfields_match_nginx_c_abi() {
+        let mut raw = zeroed_request();
+        let mut request = request_from(&mut raw);
+        request.set_header_only(true);
+        request.set_keepalive(true);
+        request.set_header_sent(true);
+        unsafe { ngx_rs_test_http_request_set_internal(request.as_ptr(), 1) };
+
+        assert!(request.is_internal());
+        assert!(request.header_only());
+        assert!(request.keepalive());
+        assert_eq!(unsafe { ngx_rs_test_http_request_flags(request.as_ptr()) }, 15);
     }
 
     #[test]
