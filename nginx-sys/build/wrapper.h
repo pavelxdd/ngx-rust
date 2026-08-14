@@ -10,6 +10,13 @@
 
 #if defined(NGX_RS_FEATURE_HTTP) && __has_include(<ngx_http.h>)
 #include <ngx_http.h>
+
+ngx_uint_t ngx_rs_http_request_is_internal(const ngx_http_request_t *request);
+ngx_uint_t ngx_rs_http_request_header_only(const ngx_http_request_t *request);
+ngx_uint_t ngx_rs_http_request_keepalive(const ngx_http_request_t *request);
+void ngx_rs_http_request_set_keepalive(ngx_http_request_t *request, ngx_uint_t keepalive);
+void ngx_rs_http_request_set_header_only(ngx_http_request_t *request, ngx_uint_t header_only);
+void ngx_rs_http_request_set_header_sent(ngx_http_request_t *request, ngx_uint_t header_sent);
 #endif
 
 #if defined(NGX_RS_FEATURE_MAIL) && __has_include(<ngx_mail.h>)
