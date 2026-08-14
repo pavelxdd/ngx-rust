@@ -495,6 +495,24 @@ mod core_module {
         type ServerConf = ngx_stream_core_srv_conf_t;
     }
 
+    /// Registers a typed handler in its declared Stream phase without logging failures.
+    ///
+    /// Call this function from the module's postconfiguration callback when the caller owns the
+    /// configuration diagnostic.
+    pub fn try_add_phase_handler<H>(cf: &mut ngx_conf_t) -> Result<(), AllocError>
+    where
+        H: StreamSessionHandler,
+    {
+        let main =
+            NgxStreamCoreModule::main_conf_mut(cf).map_err(|_| AllocError)?.ok_or(AllocError)?;
+        let phase = main.phases.get_mut(H::PHASE as usize).ok_or(AllocError)?;
+        let handlers =
+            unsafe { NgxArray::<ngx_stream_handler_pt>::from_ngx_array_mut(&mut phase.handlers) }
+                .ok_or(AllocError)?;
+
+        handlers.push(Some(crate::stream::raw_handler::<H>)).map(|_| ())
+    }
+
     /// Registers a typed handler in its declared Stream phase.
     ///
     /// Call this function from the module's postconfiguration callback.
@@ -502,18 +520,7 @@ mod core_module {
     where
         H: StreamSessionHandler,
     {
-        let result = (|| {
-            let main = NgxStreamCoreModule::main_conf_mut(cf)
-                .map_err(|_| AllocError)?
-                .ok_or(AllocError)?;
-            let phase = main.phases.get_mut(H::PHASE as usize).ok_or(AllocError)?;
-            let handlers = unsafe {
-                NgxArray::<ngx_stream_handler_pt>::from_ngx_array_mut(&mut phase.handlers)
-            }
-            .ok_or(AllocError)?;
-
-            handlers.push(Some(crate::stream::raw_handler::<H>)).map(|_| ())
-        })();
+        let result = try_add_phase_handler::<H>(cf);
 
         if result.is_err() && !cf.log.is_null() {
             ngx_conf_log_error!(NGX_LOG_EMERG, cf, "failed to register {} handler", H::name(),);
@@ -523,7 +530,7 @@ mod core_module {
     }
 }
 
-pub use core_module::{NgxStreamCoreModule, add_phase_handler};
+pub use core_module::{NgxStreamCoreModule, add_phase_handler, try_add_phase_handler};
 
 #[cfg(ngx_feature = "stream_ssl")]
 mod ssl {
