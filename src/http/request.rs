@@ -2653,8 +2653,11 @@ impl<'callback> RequestRefMut<'callback> {
 impl RequestHold {
     /// Removes this hold from its context and grants the only terminal continuation.
     ///
-    /// This consumes the callback-scoped request borrow so a terminal operation cannot leave a
-    /// safe request view after nginx may free the request.
+    /// A nonzero main-request count may consist solely of this hold after nginx finalized the
+    /// original asynchronous callback. Only terminal finalization can consume that reference;
+    /// phase resumption still requires a releasable hold. This consumes the callback-scoped
+    /// request borrow so a terminal operation cannot leave a safe request view after nginx may
+    /// free the request.
     pub fn take<'callback>(
         hold: &mut Option<Self>,
         request: RequestRefMut<'callback>,
@@ -2664,7 +2667,7 @@ impl RequestHold {
         if current.request != request.raw || current.main != main {
             return Err(RequestHoldError::ForeignRequest);
         }
-        if unsafe { main.as_ref().count() } <= 1 {
+        if unsafe { main.as_ref().count() } == 0 {
             return Err(RequestHoldError::InactiveMain);
         }
 
@@ -2785,6 +2788,8 @@ impl RequestContinuation<'_> {
 
     /// Finalizes the request and consumes this terminal continuation before entering nginx.
     ///
+    /// nginx consumes the hold's retained main-request reference during finalization.
+    ///
     /// ```compile_fail
     /// use ngx::http::{HTTPStatus, RequestContinuation};
     ///
@@ -2795,9 +2800,7 @@ impl RequestContinuation<'_> {
     /// ```
     pub fn finalize(mut self, status: impl Into<Status>) -> Result<(), RequestContinuationError> {
         self.ensure_active()?;
-        self.ensure_releasable_hold()?;
         self.request.validate_terminal_operation()?;
-        Self::release_hold(&mut self._hold);
         self.consumed = true;
         let status = status.into();
         unsafe { ngx_http_finalize_request(self.request.raw.as_ptr(), status.0) };
@@ -3667,12 +3670,112 @@ mod tests {
         fn log(&mut self) -> NonNull<ngx_log_t> {
             NonNull::from(&mut *self._log)
         }
+
+        fn disarm(&mut self) {
+            self.raw = ptr::null_mut();
+        }
     }
 
     #[cfg(feature = "test-link")]
     impl Drop for TestPool {
         fn drop(&mut self) {
-            unsafe { ngx_destroy_pool(self.raw) };
+            if !self.raw.is_null() {
+                unsafe { ngx_destroy_pool(self.raw) };
+            }
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    struct TerminalRequestFixture {
+        _globals: RequestGlobals,
+        request_pool: TestPool,
+        connection_pool: TestPool,
+        _log: Box<ngx_log_t>,
+        _log_context: Box<ngx_http_log_ctx_t>,
+        _read: Box<ngx_event_t>,
+        _write: Box<ngx_event_t>,
+        connection: Box<ngx_connection_t>,
+        _core: Box<ngx_http_core_loc_conf_t>,
+        _loc_conf: Box<[*mut c_void; 1]>,
+        _main_conf: Box<ngx_http_core_main_conf_t>,
+        _main_conf_slots: Box<[*mut c_void; 1]>,
+        request: Box<ngx_http_request_t>,
+    }
+
+    #[cfg(feature = "test-link")]
+    impl TerminalRequestFixture {
+        fn new() -> Self {
+            let globals = RequestGlobals::new(1, 1);
+            unsafe {
+                let module = &raw mut nginx_sys::ngx_http_core_module;
+                (*module).type_ = NGX_HTTP_MODULE as _;
+                (*module).index = 0;
+                (*module).ctx_index = 0;
+            }
+
+            let request_pool = TestPool::new();
+            let connection_pool = TestPool::new();
+            let mut log = Box::new(unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() });
+            let mut log_context =
+                Box::new(unsafe { MaybeUninit::<ngx_http_log_ctx_t>::zeroed().assume_init() });
+            log.data = (&raw mut *log_context).cast();
+            let mut read = Box::new(unsafe { MaybeUninit::<ngx_event_t>::zeroed().assume_init() });
+            let mut write = Box::new(unsafe { MaybeUninit::<ngx_event_t>::zeroed().assume_init() });
+            let mut connection =
+                Box::new(unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() });
+            connection.pool = connection_pool.raw;
+            connection.log = &raw mut *log;
+            connection.read = &raw mut *read;
+            connection.write = &raw mut *write;
+            connection.fd = -1;
+
+            let mut core = Box::new(unsafe {
+                MaybeUninit::<ngx_http_core_loc_conf_t>::zeroed().assume_init()
+            });
+            core.keepalive_timeout = 0;
+            core.lingering_close = 0;
+            let mut loc_conf = Box::new([(&raw mut *core).cast::<c_void>()]);
+            let mut main_conf = Box::new(unsafe {
+                MaybeUninit::<ngx_http_core_main_conf_t>::zeroed().assume_init()
+            });
+            let mut main_conf_slots = Box::new([(&raw mut *main_conf).cast::<c_void>()]);
+            let mut request = Box::new(zeroed_request());
+            request.main = &raw mut *request;
+            request.parent = &raw mut *request;
+            request.pool = request_pool.raw;
+            request.connection = &raw mut *connection;
+            request.loc_conf = loc_conf.as_mut_ptr();
+            request.main_conf = main_conf_slots.as_mut_ptr();
+            request.set_logged(1);
+            request.set_count(1);
+
+            Self {
+                _globals: globals,
+                request_pool,
+                connection_pool,
+                _log: log,
+                _log_context: log_context,
+                _read: read,
+                _write: write,
+                connection,
+                _core: core,
+                _loc_conf: loc_conf,
+                _main_conf: main_conf,
+                _main_conf_slots: main_conf_slots,
+                request,
+            }
+        }
+
+        fn hold(&mut self, hold: &mut Option<RequestHold>) {
+            request_from(&mut self.request).hold(hold).unwrap();
+        }
+
+        fn disarm_nginx_pools(&mut self) {
+            self.request_pool.disarm();
+            self.connection_pool.disarm();
+            assert!(self.request.pool.is_null());
+            assert_eq!(self.request.count(), 0);
+            assert_ne!(self.connection.destroyed(), 0);
         }
     }
 
@@ -5664,8 +5767,24 @@ mod tests {
         assert_eq!(main.count(), 2);
     }
 
+    #[cfg(feature = "test-link")]
     #[test]
-    fn request_hold_cannot_continue_an_invalidated_main_count() {
+    fn request_hold_allows_terminal_finalization_with_its_only_live_reference() {
+        let mut fixture = TerminalRequestFixture::new();
+        let mut hold = None;
+        fixture.hold(&mut hold);
+        fixture.request.set_count(1);
+
+        let continuation =
+            RequestHold::take(&mut hold, request_from(&mut fixture.request)).unwrap();
+        continuation
+            .finalize(Status::NGX_DONE)
+            .expect("terminal finalization accepts the held reference");
+        fixture.disarm_nginx_pools();
+    }
+
+    #[test]
+    fn phase_resume_rejects_the_only_live_hold() {
         let mut main = zeroed_request();
         initialize_request(&mut main);
         main.set_count(1);
@@ -5680,14 +5799,29 @@ mod tests {
         }
         main.set_count(1);
 
-        let request = request_from(&mut raw);
-        assert!(matches!(
-            RequestHold::take(&mut hold, request),
-            Err(RequestHoldError::InactiveMain)
-        ));
-        assert!(hold.is_some());
+        let continuation = RequestHold::take(&mut hold, request_from(&mut raw)).unwrap();
+        assert_eq!(
+            continuation.resume_preaccess(),
+            Err(RequestContinuationError::Hold(RequestHoldError::InactiveMain))
+        );
+    }
 
+    #[test]
+    fn request_hold_rejects_zero_main_request_count() {
+        let mut main = zeroed_request();
+        initialize_request(&mut main);
+        main.set_count(1);
+
+        let mut raw = zeroed_request();
+        raw.main = &raw mut main;
+        raw.parent = &raw mut main;
+        let mut hold = None;
+        {
+            let mut request = request_from(&mut raw);
+            request.hold(&mut hold).unwrap();
+        }
         main.set_count(0);
+
         let request = request_from(&mut raw);
         assert!(matches!(
             RequestHold::take(&mut hold, request),
