@@ -474,10 +474,11 @@ ngx_rust_make_module () {
 END
     fi
 
+    # Keep the jobserver descriptors open for Cargo during parallel GNU Make builds.
     cat << END                                                >> "$NGX_MAKEFILE"
 
 $ngx_rust_obj: .NGX_RUST_PHONY
-	"$NGX_CARGO" rustc \\
+	+"$NGX_CARGO" rustc \\
 		--config "$ngx_cargo_config" \\
 		--crate-type staticlib \\
 		--locked \\
