@@ -61,6 +61,34 @@ case "$1" in
         [ -r "$(dirname "$manifest")/Cargo.lock" ] || exit 4
         ;;
     rustc)
+        if [ "$CHECK_JOBSERVER" = 1 ]; then
+            jobserver=
+            case " $MAKEFLAGS " in
+                *" --jobserver-auth="*)
+                    jobserver=${{MAKEFLAGS#*--jobserver-auth=}}
+                    ;;
+                *" --jobserver-fds="*)
+                    jobserver=${{MAKEFLAGS#*--jobserver-fds=}}
+                    ;;
+            esac
+            jobserver=${{jobserver%% *}}
+            case "$jobserver" in
+                "")
+                    ;;
+                [0-9]*,[0-9]*)
+                    read_fd=${{jobserver%,*}}
+                    write_fd=${{jobserver#*,}}
+                    eval ": <&$read_fd" || exit 6
+                    eval ": >&$write_fd" || exit 7
+                    ;;
+                fifo:*)
+                    [ -p "${{jobserver#fifo:}}" ] || exit 8
+                    ;;
+                *)
+                    exit 9
+                    ;;
+            esac
+        fi
         printf 'rustc' >> {}
         shift
         for arg in "$@"; do
@@ -159,6 +187,15 @@ ngx_modext=.so
             .current_dir(&self.source)
             .output()
             .expect("run generated Makefile")
+    }
+
+    fn make_parallel(&self) -> Output {
+        Command::new("make")
+            .args(["-j2", "-f", "objs/Makefile", "all"])
+            .env("CHECK_JOBSERVER", "1")
+            .current_dir(&self.source)
+            .output()
+            .expect("run generated Makefile in parallel")
     }
 }
 
@@ -301,6 +338,22 @@ fn configures_three_manifests_and_rebuilds_every_archive() {
         fs::write(two.join("src/lib.rs"), format!("pub fn fixture_{expected_calls}() {{}}\n"))
             .unwrap();
     }
+}
+
+#[test]
+fn parallel_make_preserves_an_advertised_jobserver_for_cargo() {
+    let fixture = Fixture::new();
+    let addon = fixture.addon("one addon", "crate-one", "target_one", &[]);
+    let body = format!(
+        "{}{}\nprintf '\\nall: %s\\n' \"$LINK_DEPS\" >> \"$NGX_MAKEFILE\"\n",
+        register_module("one", &addon, "target_one", "ngx_http_one_module", "", "STATIC"),
+        emit_make("one", &addon),
+    );
+    let output = fixture.run(&body, &[]);
+    assert!(output.status.success(), "{}", output_text(&output));
+
+    let output = fixture.make_parallel();
+    assert!(output.status.success(), "{}", output_text(&output));
 }
 
 #[test]
