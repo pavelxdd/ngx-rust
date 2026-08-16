@@ -327,6 +327,21 @@ impl HttpVariableValue<'_> {
         self.set_found(len, data, true)
     }
 
+    /// Stores a noncacheable value backed by nginx-owned bytes without copying them.
+    ///
+    /// # Safety
+    ///
+    /// `data` must point to `len` initialized bytes that remain valid and unchanged until nginx no
+    /// longer can read this variable value. The backing storage must not be stack, context, parser,
+    /// or other callback-scoped memory.
+    pub unsafe fn set_borrowed_uncached(
+        &mut self,
+        data: *mut u8,
+        len: usize,
+    ) -> Result<(), HttpVariableValueError> {
+        self.set_found(len, data, false)
+    }
+
     /// Stores bytes already retained by the current request pool.
     ///
     /// The setter accepts only bytes retained by the current request pool, so arbitrary stack,
@@ -1364,6 +1379,17 @@ mod tests {
 
         unsafe { value.set_borrowed(BACKING.as_ptr().cast_mut(), BACKING.len()) }.unwrap();
         assert_found(&raw, &value, BACKING, true, BACKING.as_ptr().cast_mut());
+    }
+
+    #[test]
+    fn borrowed_uncached_values_keep_their_original_backing() {
+        static BACKING: &[u8] = b"borrowed";
+
+        let mut raw = poisoned_value();
+        let mut value = unsafe { HttpVariableValue::from_raw(&raw mut raw) }.unwrap();
+
+        unsafe { value.set_borrowed_uncached(BACKING.as_ptr().cast_mut(), BACKING.len()) }.unwrap();
+        assert_found(&raw, &value, BACKING, false, BACKING.as_ptr().cast_mut());
     }
 
     #[test]
