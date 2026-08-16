@@ -1149,6 +1149,17 @@ impl fmt::Display for EventPeerKeepaliveTransferError<'_> {
 
 impl error::Error for EventPeerKeepaliveTransferError<'_> {}
 
+/// Native state that can make a keepalive connection stale.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EventPeerKeepaliveState {
+    /// nginx has recorded a connection error.
+    pub connection_error: bool,
+    /// The read event reached end of file.
+    pub read_eof: bool,
+    /// The read event has unread input available.
+    pub read_ready: bool,
+}
+
 /// Owner of a reusable event-peer socket outside an active request.
 ///
 /// ```compile_fail
@@ -1173,21 +1184,31 @@ impl<'address> EventPeerKeepalive<'address> {
         self.peer.prepare(preparation)
     }
 
-    /// Rejects a connection with an nginx error, end of file, or unread input.
-    pub fn validate(&self) -> Result<(), EventPeerConnectionError> {
+    /// Returns the native state that determines whether this connection is stale.
+    pub fn stale_state(&self) -> Result<EventPeerKeepaliveState, EventPeerConnectionError> {
         let connection = self.peer.connection()?;
         let (read, _) = checked_event_peer_events(connection)?;
 
         unsafe {
-            if connection.as_ref().error() != 0 {
-                return Err(EventPeerConnectionError::StaleConnectionError);
-            }
-            if read.as_ref().eof() != 0 {
-                return Err(EventPeerConnectionError::StaleReadEndOfFile);
-            }
-            if read.as_ref().ready() != 0 {
-                return Err(EventPeerConnectionError::StaleReadReady);
-            }
+            Ok(EventPeerKeepaliveState {
+                connection_error: connection.as_ref().error() != 0,
+                read_eof: read.as_ref().eof() != 0,
+                read_ready: read.as_ref().ready() != 0,
+            })
+        }
+    }
+
+    /// Rejects a connection with an nginx error, end of file, or unread input.
+    pub fn validate(&self) -> Result<(), EventPeerConnectionError> {
+        let state = self.stale_state()?;
+        if state.connection_error {
+            return Err(EventPeerConnectionError::StaleConnectionError);
+        }
+        if state.read_eof {
+            return Err(EventPeerConnectionError::StaleReadEndOfFile);
+        }
+        if state.read_ready {
+            return Err(EventPeerConnectionError::StaleReadReady);
         }
 
         Ok(())

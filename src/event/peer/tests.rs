@@ -12,8 +12,8 @@ use std::sync::MutexGuard;
 use super::{
     EventPeer, EventPeerAddress, EventPeerAddressError, EventPeerAttachError, EventPeerBuildError,
     EventPeerBuilder, EventPeerCallbacks, EventPeerConnectError, EventPeerConnectStatus,
-    EventPeerConnectionError, EventPeerConnectionState, EventPeerHandlers, EventPeerLogError,
-    EventPeerPreparation,
+    EventPeerConnectionError, EventPeerConnectionState, EventPeerHandlers, EventPeerKeepaliveState,
+    EventPeerLogError, EventPeerPreparation,
 };
 use crate::core::{ConnectionError, SocketAddressError, SocketType};
 #[cfg(unix)]
@@ -848,6 +848,35 @@ fn keepalive_validation_rejects_error_eof_and_readable_connections() {
     assert_eq!(keepalive.validate(), Err(EventPeerConnectionError::StaleReadReady));
     unsafe { raw.read.as_mut().unwrap().set_ready(0) };
     keepalive.validate().unwrap();
+}
+
+#[test]
+fn keepalive_stale_state_reports_all_native_bits() {
+    let _globals = PeerGlobals::new(true, add_event_ok);
+    let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let peer = EventPeerBuilder::new(remote.peer_address())
+        .log(&log)
+        .callbacks(EventPeerCallbacks::direct())
+        .socket_type(SocketType::Datagram)
+        .build()
+        .unwrap();
+    let keepalive =
+        peer.connect().unwrap().into_peer().into_connection().unwrap().into_keepalive().unwrap();
+    let raw = keepalive.peer.raw.connection;
+    let raw = unsafe { raw.as_mut() }.unwrap();
+
+    raw.set_error(1);
+    unsafe {
+        raw.read.as_mut().unwrap().set_eof(1);
+        raw.read.as_mut().unwrap().set_ready(1);
+    }
+
+    assert_eq!(
+        keepalive.stale_state(),
+        Ok(EventPeerKeepaliveState { connection_error: true, read_eof: true, read_ready: true })
+    );
+    assert_eq!(keepalive.validate(), Err(EventPeerConnectionError::StaleConnectionError));
 }
 
 #[test]
