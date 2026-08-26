@@ -25,6 +25,7 @@ use crate::ffi::{
     ngx_event_handler_pt, ngx_event_t, ngx_event_timer_init, ngx_int_t, ngx_log_t,
     ngx_peer_connection_t, ngx_str_t, ngx_uint_t, sockaddr_in, sockaddr_in6,
 };
+use crate::log::LogRef;
 
 static FREE_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static FREE_STATE: AtomicUsize = AtomicUsize::new(0);
@@ -238,9 +239,10 @@ fn wait_for_writable_socket(fd: c_int) {
 
 fn build_peer<'peer>(
     address: EventPeerAddress<'peer>,
-    log: &'peer ngx_log_t,
+    log: *mut ngx_log_t,
     callbacks: EventPeerCallbacks,
 ) -> EventPeer<'peer> {
+    let log = unsafe { LogRef::from_raw(log) }.unwrap();
     EventPeerBuilder::new(address).log(log).callbacks(callbacks).build().unwrap()
 }
 
@@ -288,11 +290,12 @@ fn builder_requires_valid_address_log_and_get_callback() {
         name: ngx_str_t { len: 4, data: c"peer".as_ptr().cast_mut() },
     };
     let address = unsafe { EventPeerAddress::from_raw(&raw const address) }.unwrap();
-    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let mut log: ngx_log_t = unsafe { mem::zeroed() };
+    let log = unsafe { LogRef::from_raw(&raw mut log) }.unwrap();
 
     assert!(matches!(EventPeerBuilder::new(address).build(), Err(EventPeerBuildError::MissingLog)));
     assert!(matches!(
-        EventPeerBuilder::new(address).log(&log).build(),
+        EventPeerBuilder::new(address).log(log).build(),
         Err(EventPeerBuildError::MissingGetCallback)
     ));
 
@@ -363,7 +366,7 @@ fn builder_initializes_every_configured_peer_field() {
     #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
     let callbacks = callbacks.set_session(record_set_session).save_session(record_save_session);
     let peer = EventPeerBuilder::new(remote.peer_address())
-        .log(&log)
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(callbacks)
         .local_address(local.peer_address())
         .tries(ngx_uint_t::MAX)
@@ -509,7 +512,11 @@ fn peer_address_rejects_socket_length_and_family_mismatches() {
 fn builder_defaults_to_a_fresh_stream_peer() {
     let remote = TestAddress::ipv4([192, 0, 2, 10], 8443);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let raw = &peer.raw;
 
     assert!(raw.connection.is_null());
@@ -561,7 +568,11 @@ fn connect_preserves_selector_statuses_without_publishing_connection() {
         (declined_get as PeerGet, EventPeerConnectStatus::Declined),
         (error_get as PeerGet, EventPeerConnectStatus::Error),
     ] {
-        let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::default().get(get));
+        let peer = build_peer(
+            remote.peer_address(),
+            (&raw const log).cast_mut(),
+            EventPeerCallbacks::default().get(get),
+        );
         let result = peer.connect().unwrap();
         assert_eq!(result.status(), status);
         assert!(result.into_peer().raw.connection.is_null());
@@ -572,7 +583,11 @@ fn connect_preserves_selector_statuses_without_publishing_connection() {
 fn connect_rejects_unknown_or_empty_success_results() {
     let remote = TestAddress::ipv4([192, 0, 2, 10], 8443);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::default().get(done_get));
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::default().get(done_get),
+    );
     match peer.connect() {
         Err(EventPeerConnectError::UnexpectedStatus { status, peer }) => {
             assert_eq!(status, NGX_DONE as _);
@@ -585,7 +600,11 @@ fn connect_rejects_unknown_or_empty_success_results() {
         (NGX_OK as ngx_int_t, EventPeerConnectStatus::Connected),
         (NGX_AGAIN as ngx_int_t, EventPeerConnectStatus::Pending),
     ] {
-        let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+        let peer = build_peer(
+            remote.peer_address(),
+            (&raw const log).cast_mut(),
+            EventPeerCallbacks::direct(),
+        );
         match peer.classify_connect(native_status) {
             Err(EventPeerConnectError::MissingConnection { status, peer }) => {
                 assert_eq!(status, expected_status);
@@ -595,7 +614,11 @@ fn connect_rejects_unknown_or_empty_success_results() {
         }
     }
 
-    let mut peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let mut peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     peer.raw.connection = ptr::without_provenance_mut::<ngx_connection_t>(1);
     match peer.classify_connect(NGX_OK as _) {
         Err(EventPeerConnectError::MisalignedConnection { status, peer }) => {
@@ -612,7 +635,7 @@ fn native_datagram_connect_transfers_and_releases_connection() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
     let peer = EventPeerBuilder::new(remote.peer_address())
-        .log(&log)
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(EventPeerCallbacks::direct())
         .socket_type(SocketType::Datagram)
         .build()
@@ -633,8 +656,13 @@ fn native_stream_connect_returns_pending_connection() {
     let port = listener.local_addr().unwrap().port();
     let remote = TestAddress::ipv4([127, 0, 0, 1], port);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let result =
-        build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct()).connect().unwrap();
+    let result = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    )
+    .connect()
+    .unwrap();
     assert_eq!(result.status(), EventPeerConnectStatus::Pending);
 
     drop(result.into_peer());
@@ -647,8 +675,13 @@ fn native_connect_allocation_failure_keeps_peer_detached() {
     let globals = PeerGlobals::new(false, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let result =
-        build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct()).connect().unwrap();
+    let result = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    )
+    .connect()
+    .unwrap();
     assert_eq!(result.status(), EventPeerConnectStatus::Error);
     assert!(result.into_peer().raw.connection.is_null());
     assert_eq!(globals.free_connection_n(), 0);
@@ -659,8 +692,13 @@ fn native_connect_event_registration_failure_closes_connection() {
     let globals = PeerGlobals::new(true, add_event_error);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let result =
-        build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct()).connect().unwrap();
+    let result = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    )
+    .connect()
+    .unwrap();
     assert_eq!(result.status(), EventPeerConnectStatus::Error);
     assert!(result.into_peer().raw.connection.is_null());
     assert_eq!(globals.free_connection_n(), 1);
@@ -672,7 +710,7 @@ fn invalid_failure_status_detaches_a_native_connection() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
     let mut peer = EventPeerBuilder::new(remote.peer_address())
-        .log(&log)
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(EventPeerCallbacks::direct())
         .socket_type(SocketType::Datagram)
         .build()
@@ -699,7 +737,7 @@ fn unknown_status_detaches_a_native_connection() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
     let mut peer = EventPeerBuilder::new(remote.peer_address())
-        .log(&log)
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(EventPeerCallbacks::direct())
         .socket_type(SocketType::Datagram)
         .build()
@@ -735,7 +773,7 @@ fn connected_peer_prepares_transfers_and_closes_socket_pool_and_events() {
     EVENT_HANDLER_CALLS.store(0, Ordering::Relaxed);
 
     let peer = EventPeerBuilder::new(remote.peer_address())
-        .log(&request_log)
+        .log(unsafe { LogRef::from_raw((&raw const request_log).cast_mut()).unwrap() })
         .callbacks(EventPeerCallbacks::direct())
         .socket_type(SocketType::Datagram)
         .build()
@@ -744,7 +782,7 @@ fn connected_peer_prepares_transfers_and_closes_socket_pool_and_events() {
     assert_eq!(connection.state(), EventPeerConnectionState::Connected);
     let request_preparation = unsafe {
         EventPeerPreparation::new(
-            &request_log,
+            LogRef::from_raw((&raw const request_log).cast_mut()).unwrap(),
             EventPeerHandlers::new(active_read_handler, active_write_handler),
             128,
         )
@@ -781,7 +819,7 @@ fn connected_peer_prepares_transfers_and_closes_socket_pool_and_events() {
 
     let idle_preparation = unsafe {
         EventPeerPreparation::new(
-            &idle_log,
+            LogRef::from_raw((&raw const idle_log).cast_mut()).unwrap(),
             EventPeerHandlers::new(idle_read_handler, idle_write_handler),
             0,
         )
@@ -826,7 +864,7 @@ fn keepalive_validation_rejects_error_eof_and_readable_connections() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
     let peer = EventPeerBuilder::new(remote.peer_address())
-        .log(&log)
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(EventPeerCallbacks::direct())
         .socket_type(SocketType::Datagram)
         .build()
@@ -856,7 +894,7 @@ fn keepalive_stale_state_reports_all_native_bits() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
     let peer = EventPeerBuilder::new(remote.peer_address())
-        .log(&log)
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(EventPeerCallbacks::direct())
         .socket_type(SocketType::Datagram)
         .build()
@@ -885,7 +923,11 @@ fn pending_peer_checks_connect_completion() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let remote = TestAddress::ipv4([127, 0, 0, 1], listener.local_addr().unwrap().port());
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     assert_eq!(connection.state(), EventPeerConnectionState::Pending);
     let fd = unsafe { connection.peer.raw.connection.as_ref().unwrap().fd };
@@ -905,7 +947,11 @@ fn pending_peer_reports_refused_and_invalid_socket_completion() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], listener.local_addr().unwrap().port());
     drop(listener);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     assert_eq!(connection.state(), EventPeerConnectionState::Pending);
 
@@ -930,7 +976,11 @@ fn pending_peer_stays_owned_until_completed_or_closed() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let remote = TestAddress::ipv4([127, 0, 0, 1], listener.local_addr().unwrap().port());
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     assert_eq!(connection.state(), EventPeerConnectionState::Pending);
 
@@ -946,7 +996,7 @@ fn connected_peer_rejects_a_second_native_connect() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
     let peer = EventPeerBuilder::new(remote.peer_address())
-        .log(&log)
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(EventPeerCallbacks::direct())
         .socket_type(SocketType::Datagram)
         .build()
@@ -970,7 +1020,7 @@ fn peer_preparation_reuses_existing_pool_and_reports_allocation_failure() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
     let peer = EventPeerBuilder::new(remote.peer_address())
-        .log(&log)
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(EventPeerCallbacks::direct())
         .socket_type(SocketType::Datagram)
         .build()
@@ -979,15 +1029,31 @@ fn peer_preparation_reuses_existing_pool_and_reports_allocation_failure() {
     let handlers = EventPeerHandlers::new(active_read_handler, active_write_handler);
 
     assert_eq!(
-        connection.prepare(EventPeerPreparation::new(&log, handlers, usize::MAX)),
+        connection.prepare(EventPeerPreparation::new(
+            unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
+            handlers,
+            usize::MAX
+        )),
         Err(EventPeerConnectionError::PoolAllocation)
     );
     let raw = connection.peer.raw.connection;
     assert!(unsafe { raw.as_ref().unwrap().pool.is_null() });
 
-    connection.prepare(EventPeerPreparation::new(&log, handlers, 128)).unwrap();
+    connection
+        .prepare(EventPeerPreparation::new(
+            unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
+            handlers,
+            128,
+        ))
+        .unwrap();
     let pool = unsafe { raw.as_ref().unwrap().pool };
-    connection.prepare(EventPeerPreparation::new(&log, handlers, 0)).unwrap();
+    connection
+        .prepare(EventPeerPreparation::new(
+            unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
+            handlers,
+            0,
+        ))
+        .unwrap();
     assert_eq!(unsafe { raw.as_ref().unwrap().pool }, pool);
 
     drop(connection);
@@ -1000,7 +1066,7 @@ fn keepalive_attach_transfers_external_socket_and_rejects_invalid_connection() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
     let mut source = EventPeerBuilder::new(remote.peer_address())
-        .log(&log)
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(EventPeerCallbacks::direct())
         .socket_type(SocketType::Datagram)
         .build()
@@ -1014,7 +1080,7 @@ fn keepalive_attach_transfers_external_socket_and_rejects_invalid_connection() {
 
     let attached = unsafe {
         EventPeerBuilder::new(remote.peer_address())
-            .log(&log)
+            .log(LogRef::from_raw((&raw const log).cast_mut()).unwrap())
             .callbacks(EventPeerCallbacks::direct())
             .build()
             .unwrap()
@@ -1027,7 +1093,7 @@ fn keepalive_attach_transfers_external_socket_and_rejects_invalid_connection() {
     assert_eq!(globals.free_connection_n(), 1);
 
     let detached = EventPeerBuilder::new(remote.peer_address())
-        .log(&log)
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(EventPeerCallbacks::direct())
         .build()
         .unwrap();
@@ -1046,8 +1112,13 @@ fn native_connect_decline_closes_connection() {
     let globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestUnixAddress::invalid_path();
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let result =
-        build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct()).connect().unwrap();
+    let result = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    )
+    .connect()
+    .unwrap();
     assert_eq!(result.status(), EventPeerConnectStatus::Declined);
     assert!(result.into_peer().raw.connection.is_null());
     assert_eq!(globals.free_connection_n(), 1);

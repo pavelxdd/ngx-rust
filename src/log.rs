@@ -1,5 +1,7 @@
+use core::cell::UnsafeCell;
 use core::cmp;
 use core::fmt::{self, Write};
+use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 
@@ -7,6 +9,41 @@ use crate::ffi::{self, NGX_MAX_ERROR_STR, ngx_err_t, ngx_log_t, ngx_uint_t};
 
 #[cfg(feature = "log")]
 pub mod interop;
+
+/// Opaque access to an nginx logger that native code may mutate.
+///
+/// The handle does not create a Rust reference to [`ngx_log_t`]. It is neither [`Send`] nor
+/// [`Sync`] because nginx loggers belong to their owning event-loop thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct LogRef<'log> {
+    raw: NonNull<ngx_log_t>,
+    _lifetime: PhantomData<&'log UnsafeCell<ngx_log_t>>,
+    _not_thread_safe: PhantomData<*mut ()>,
+}
+
+impl LogRef<'_> {
+    /// Creates an opaque logger handle from a native pointer.
+    ///
+    /// # Safety
+    ///
+    /// `log` must identify a live, properly aligned nginx logger for the returned lifetime. The
+    /// logger must remain on its owning event-loop thread, and native reads and writes through
+    /// aliases must be valid for that lifetime. Null and misaligned pointers are rejected.
+    pub unsafe fn from_raw(log: *mut ngx_log_t) -> Option<Self> {
+        let raw = NonNull::new(log)?;
+        if !log.is_aligned() {
+            return None;
+        }
+
+        Some(Self { raw, _lifetime: PhantomData, _not_thread_safe: PhantomData })
+    }
+
+    /// Returns the native logger pointer.
+    pub fn as_ptr(self) -> *mut ngx_log_t {
+        self.raw.as_ptr()
+    }
+}
 
 /// This constant is set to `true` if NGINX is compiled with debug logging (`--with-debug`).
 pub const DEBUG: bool = cfg!(ngx_feature = "debug");

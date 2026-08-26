@@ -74,7 +74,11 @@ fn readiness_returns_immediately_for_a_ready_read_event() {
     let _globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     let raw = connection.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().read.as_mut().unwrap().set_ready(1) };
@@ -90,7 +94,11 @@ fn readiness_returns_immediately_for_a_ready_write_event() {
     let _globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     let raw = connection.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().write.as_mut().unwrap().set_ready(1) };
@@ -107,7 +115,7 @@ fn readiness_returns_immediately_for_a_connected_peer() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
     let peer = EventPeerBuilder::new(remote.peer_address())
-        .log(&log)
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(EventPeerCallbacks::direct())
         .socket_type(SocketType::Datagram)
         .build()
@@ -126,7 +134,11 @@ fn readiness_returns_ready_before_zero_timeout() {
     let _globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     let raw = connection.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().read.as_mut().unwrap().set_ready(1) };
@@ -143,7 +155,7 @@ fn readiness_reports_native_error_before_connected_state() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
     let peer = EventPeerBuilder::new(remote.peer_address())
-        .log(&log)
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(EventPeerCallbacks::direct())
         .socket_type(SocketType::Datagram)
         .build()
@@ -166,7 +178,11 @@ fn readiness_reports_an_invalid_selected_event() {
     let _globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     let raw = connection.peer.raw.connection;
     let read = unsafe { raw.as_ref().unwrap().read };
@@ -191,7 +207,11 @@ fn readiness_reports_an_invalid_socket_while_completing_connect() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let remote = TestAddress::ipv4([127, 0, 0, 1], listener.local_addr().unwrap().port());
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     assert_eq!(connection.state(), EventPeerConnectionState::Pending);
     let raw = connection.peer.raw.connection;
@@ -218,7 +238,11 @@ fn readiness_wakes_for_delayed_read_and_restores_handler() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let remote = TestAddress::ipv4([127, 0, 0, 1], listener.local_addr().unwrap().port());
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     let raw = connection.peer.raw.connection;
     let fd = unsafe { raw.as_ref().unwrap().fd };
@@ -227,7 +251,7 @@ fn readiness_wakes_for_delayed_read_and_restores_handler() {
     let (mut server, _) = listener.accept().unwrap();
     connection
         .prepare(EventPeerPreparation::new(
-            &log,
+            unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
             EventPeerHandlers::new(active_read_handler, active_write_handler),
             128,
         ))
@@ -260,7 +284,11 @@ fn readiness_rearms_after_a_partial_write_cycle() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let remote = TestAddress::ipv4([127, 0, 0, 1], listener.local_addr().unwrap().port());
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     let raw = connection.peer.raw.connection;
     let fd = unsafe { raw.as_ref().unwrap().fd };
@@ -269,7 +297,7 @@ fn readiness_rearms_after_a_partial_write_cycle() {
     let _server = listener.accept().unwrap();
     connection
         .prepare(EventPeerPreparation::new(
-            &log,
+            unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
             EventPeerHandlers::new(active_read_handler, active_write_handler),
             128,
         ))
@@ -309,7 +337,11 @@ fn readiness_completes_pending_connect_after_so_error_check() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let remote = TestAddress::ipv4([127, 0, 0, 1], listener.local_addr().unwrap().port());
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     assert_eq!(connection.state(), EventPeerConnectionState::Pending);
     let raw = connection.peer.raw.connection;
@@ -338,7 +370,11 @@ fn readiness_reports_refused_pending_connect_from_so_error() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], listener.local_addr().unwrap().port());
     drop(listener);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     assert_eq!(connection.state(), EventPeerConnectionState::Pending);
     let raw = connection.peer.raw.connection;
@@ -366,7 +402,11 @@ fn readiness_reports_eof_and_connection_error() {
     let _globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     let raw = connection.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().read.as_mut().unwrap().set_eof(1) };
@@ -395,11 +435,15 @@ fn readiness_times_out_without_installing_for_zero_duration() {
     let _globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     connection
         .prepare(EventPeerPreparation::new(
-            &log,
+            unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
             EventPeerHandlers::new(active_read_handler, active_write_handler),
             128,
         ))
@@ -423,11 +467,15 @@ fn readiness_rounds_a_submillisecond_timeout_up_to_one_millisecond() {
     reset_timer_tree();
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     connection
         .prepare(EventPeerPreparation::new(
-            &log,
+            unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
             EventPeerHandlers::new(active_read_handler, active_write_handler),
             128,
         ))
@@ -457,7 +505,11 @@ fn readiness_chunks_a_timeout_larger_than_one_nginx_timer_step() {
     reset_timer_tree();
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     let raw = connection.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().read.as_mut().unwrap().set_ready(0) };
@@ -486,11 +538,15 @@ fn readiness_rejects_an_event_timer_owned_by_another_handler() {
     reset_timer_tree();
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     connection
         .prepare(EventPeerPreparation::new(
-            &log,
+            unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
             EventPeerHandlers::new(active_read_handler, active_write_handler),
             128,
         ))
@@ -518,11 +574,15 @@ fn readiness_restores_the_handler_when_native_registration_fails() {
     let _globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     connection
         .prepare(EventPeerPreparation::new(
-            &log,
+            unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
             EventPeerHandlers::new(active_read_handler, active_write_handler),
             128,
         ))
@@ -551,11 +611,15 @@ fn readiness_drop_cancels_timeout_and_leaves_no_late_waker() {
     reset_timer_tree();
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     connection
         .prepare(EventPeerPreparation::new(
-            &log,
+            unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
             EventPeerHandlers::new(active_read_handler, active_write_handler),
             128,
         ))
@@ -594,7 +658,7 @@ fn readiness_keeps_a_borrowed_peer_open_and_transferable_after_drop() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
     let peer = EventPeerBuilder::new(remote.peer_address())
-        .log(&log)
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(EventPeerCallbacks::direct())
         .socket_type(SocketType::Datagram)
         .build()
@@ -623,7 +687,11 @@ fn readiness_uses_the_latest_waker_for_event_and_finite_timeout() {
     reset_timer_tree();
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     let raw = connection.peer.raw.connection;
     let read = unsafe { raw.as_ref().unwrap().read };
@@ -656,7 +724,11 @@ fn readiness_returns_timeout_for_a_native_timedout_event() {
     let _globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     let raw = connection.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().read.as_mut().unwrap().set_timedout(1) };
@@ -674,11 +746,15 @@ fn dropping_an_unpolled_readiness_future_does_not_change_peer_ownership() {
     let globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(remote.peer_address(), &log, EventPeerCallbacks::direct());
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     connection
         .prepare(EventPeerPreparation::new(
-            &log,
+            unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
             EventPeerHandlers::new(active_read_handler, active_write_handler),
             128,
         ))

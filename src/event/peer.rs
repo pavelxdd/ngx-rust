@@ -20,6 +20,7 @@ use crate::ffi::{
 };
 #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
 use crate::ffi::{ngx_event_save_peer_session_pt, ngx_event_set_peer_session_pt};
+use crate::log::LogRef;
 
 /// Failure while validating an nginx address used for an outbound event peer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -237,25 +238,17 @@ impl EventPeerHandlers {
 
 /// Connection preparation applied before a peer is used by a request or keepalive wrapper.
 pub struct EventPeerPreparation<'address> {
-    log: NonNull<ngx_log_t>,
+    log: LogRef<'address>,
     handlers: EventPeerHandlers,
     pool_size: usize,
     data: *mut c_void,
     idle: bool,
-    _address: PhantomData<&'address ngx_log_t>,
 }
 
 impl<'address> EventPeerPreparation<'address> {
     /// Creates preparation that uses `log`, installs `handlers`, and creates a pool when absent.
-    pub fn new(log: &'address ngx_log_t, handlers: EventPeerHandlers, pool_size: usize) -> Self {
-        Self {
-            log: NonNull::from(log),
-            handlers,
-            pool_size,
-            data: ptr::null_mut(),
-            idle: false,
-            _address: PhantomData,
-        }
+    pub fn new(log: LogRef<'address>, handlers: EventPeerHandlers, pool_size: usize) -> Self {
+        Self { log, handlers, pool_size, data: ptr::null_mut(), idle: false }
     }
 
     /// Supplies opaque connection data for the selected handlers.
@@ -394,7 +387,7 @@ impl error::Error for EventPeerBuildError {}
 pub struct EventPeerBuilder<'address> {
     address: EventPeerAddress<'address>,
     local: Option<EventPeerAddress<'address>>,
-    log: Option<NonNull<ngx_log_t>>,
+    log: Option<LogRef<'address>>,
     callbacks: EventPeerCallbacks,
     data: *mut c_void,
     tries: ngx_uint_t,
@@ -434,8 +427,8 @@ impl<'address> EventPeerBuilder<'address> {
     }
 
     /// Supplies the nginx logger used by native connect diagnostics.
-    pub fn log(mut self, log: &'address ngx_log_t) -> Self {
-        self.log = Some(NonNull::from(log));
+    pub fn log(mut self, log: LogRef<'address>) -> Self {
+        self.log = Some(log);
         self
     }
 
@@ -444,13 +437,15 @@ impl<'address> EventPeerBuilder<'address> {
     /// # Safety
     ///
     /// `log` must point to a live `ngx_log_t` for `'address` on this nginx worker.
-    pub unsafe fn log_from_raw(mut self, log: *mut ngx_log_t) -> Result<Self, EventPeerBuildError> {
-        let log = NonNull::new(log).ok_or(EventPeerBuildError::MissingLog)?;
-        if !log.as_ptr().is_aligned() {
-            return Err(EventPeerBuildError::MisalignedLog);
-        }
-        self.log = Some(log);
-        Ok(self)
+    pub unsafe fn log_from_raw(self, log: *mut ngx_log_t) -> Result<Self, EventPeerBuildError> {
+        let log = unsafe { LogRef::from_raw(log) }.ok_or_else(|| {
+            if log.is_null() {
+                EventPeerBuildError::MissingLog
+            } else {
+                EventPeerBuildError::MisalignedLog
+            }
+        })?;
+        Ok(self.log(log))
     }
 
     /// Supplies the native callbacks used while nginx selects and releases this peer.
@@ -604,20 +599,6 @@ fn socket_type_raw(socket_type: SocketType) -> c_int {
 /// One fully initialized native event peer.
 ///
 /// Dropping a peer that still owns a connected nginx socket closes that socket.
-///
-/// ```compile_fail
-/// use ngx::event::{EventPeer, EventPeerAddress, EventPeerBuilder, EventPeerCallbacks};
-/// use ngx::ffi::ngx_log_t;
-///
-/// fn escape<'address>(address: EventPeerAddress<'address>) -> EventPeer<'address> {
-///     let log = unsafe { core::mem::zeroed::<ngx_log_t>() };
-///     EventPeerBuilder::new(address)
-///         .log(&log)
-///         .callbacks(EventPeerCallbacks::direct())
-///         .build()
-///         .unwrap()
-/// }
-/// ```
 ///
 /// ```compile_fail
 /// use ngx::event::EventPeer;
