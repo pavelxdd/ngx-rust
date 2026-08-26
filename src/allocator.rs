@@ -9,13 +9,14 @@
 
 use ::core::alloc::Layout;
 use ::core::ffi::c_void;
-use ::core::marker::PhantomData;
 use ::core::mem;
 use ::core::ptr::{self, NonNull};
 pub use allocator_api2::alloc::{AllocError, Allocator};
 #[cfg(feature = "alloc")]
 pub use allocator_api2::{alloc::Global, boxed::Box, unsize_box};
 use nginx_sys::{NGX_ALIGNMENT, ngx_alloc, ngx_calloc, ngx_log_t};
+
+use crate::log::LogRef;
 
 #[cfg(all(test, feature = "test-link"))]
 unsafe extern "C" {
@@ -35,15 +36,7 @@ unsafe extern "C" {
 /// to values with an independent lifetime, unlike [`crate::core::Pool`], whose allocations are
 /// released with the pool.
 ///
-/// The allocator cannot outlive the logger supplied to [`new`](Self::new):
-///
-/// ```compile_fail
-/// # use ngx::allocator::NginxAllocator;
-/// # use ngx::ffi::ngx_log_t;
-/// fn escape(log: &ngx_log_t) -> NginxAllocator<'static> {
-///     NginxAllocator::new(log)
-/// }
-/// ```
+/// The allocator cannot outlive the [`LogRef`] supplied to [`new`](Self::new).
 ///
 /// A raw logger pointer is callback-scoped through [`with_raw`](Self::with_raw):
 ///
@@ -56,14 +49,13 @@ unsafe extern "C" {
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct NginxAllocator<'log> {
-    log: NonNull<ngx_log_t>,
-    _lifetime: PhantomData<&'log ngx_log_t>,
+    log: LogRef<'log>,
 }
 
 impl<'log> NginxAllocator<'log> {
-    /// Creates an allocator borrowing `log` for all allocations made through it.
-    pub fn new(log: &'log ngx_log_t) -> Self {
-        Self { log: NonNull::from(log), _lifetime: PhantomData }
+    /// Creates an allocator using an opaque native logger handle.
+    pub fn new(log: LogRef<'log>) -> Self {
+        Self { log }
     }
 
     /// Creates an allocator from a live nginx logger pointer.
@@ -74,12 +66,8 @@ impl<'log> NginxAllocator<'log> {
     /// operations on a thread where the logger remains usable. Null and misaligned pointers are
     /// rejected.
     pub unsafe fn from_raw(log: *mut ngx_log_t) -> Option<Self> {
-        let log = NonNull::new(log)?;
-        if !log.as_ptr().is_aligned() {
-            return None;
-        }
-
-        Some(Self { log, _lifetime: PhantomData })
+        let log = unsafe { LogRef::from_raw(log) }?;
+        Some(Self::new(log))
     }
 
     /// Invokes `f` with an allocator that cannot safely escape the raw logger's callback scope.
@@ -269,7 +257,7 @@ mod tests {
 
     use nginx_sys::{NGX_ALIGNMENT, ngx_log_t, ngx_uint_t};
 
-    use super::{Allocator, NginxAllocator};
+    use super::{Allocator, LogRef, NginxAllocator};
 
     unsafe extern "C" {
         fn ngx_rs_test_track_free(ptr: *mut c_void);
@@ -287,14 +275,15 @@ mod tests {
             Self { raw: Box::new(unsafe { mem::zeroed() }) }
         }
 
-        fn allocator(&self) -> NginxAllocator<'_> {
-            NginxAllocator::new(&self.raw)
+        fn allocator(&mut self) -> NginxAllocator<'_> {
+            let log = unsafe { LogRef::from_raw(&raw mut *self.raw) }.unwrap();
+            NginxAllocator::new(log)
         }
     }
 
     #[test]
     fn allocator_covers_zeroed_and_configured_alignment() {
-        let logger = TestLogger::new();
+        let mut logger = TestLogger::new();
         let allocator = logger.allocator();
         let zero = Layout::from_size_align(0, NGX_ALIGNMENT * 2).unwrap();
         let normal = Layout::from_size_align(32, NGX_ALIGNMENT).unwrap();
@@ -321,7 +310,7 @@ mod tests {
 
     #[test]
     fn allocator_grows_and_shrinks_without_losing_initialized_bytes() {
-        let logger = TestLogger::new();
+        let mut logger = TestLogger::new();
         let allocator = logger.allocator();
         let initial = Layout::from_size_align(16, NGX_ALIGNMENT).unwrap();
         let grown = Layout::from_size_align(64, NGX_ALIGNMENT).unwrap();
@@ -390,7 +379,7 @@ mod tests {
         }
 
         let _guard = TEST_LOCK.lock().unwrap();
-        let logger = TestLogger::new();
+        let mut logger = TestLogger::new();
         let allocator = logger.allocator();
         let drops = Rc::new(Cell::new(0));
 
