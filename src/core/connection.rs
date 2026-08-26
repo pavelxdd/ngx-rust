@@ -616,9 +616,10 @@ impl<'callback> ConnectionRef<'callback> {
     ///
     /// # Safety
     ///
-    /// `connection` must point to a live initialized nginx connection for `'callback`. Nginx must
-    /// not mutably access it while this shared view exists, and the view must remain on its owning
-    /// event-loop thread.
+    /// `connection` must point to a live initialized nginx connection for `'callback`. Its memory
+    /// pool must not be reset before that pool is destroyed. Nginx must not mutably access the
+    /// connection while this shared view exists, and the view must remain on its owning event-loop
+    /// thread.
     pub unsafe fn from_raw(connection: *const ngx_connection_t) -> Result<Self, ConnectionError> {
         let raw = checked_connection_ptr(connection)?;
         Ok(Self { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
@@ -753,9 +754,9 @@ impl<'callback> ConnectionRefMut<'callback> {
     ///
     /// # Safety
     ///
-    /// `connection` must point to a live initialized nginx connection for `'callback`. No other
-    /// mutable or shared Rust view may exist for the same connection, and the view must remain on
-    /// its owning event-loop thread.
+    /// `connection` must point to a live initialized nginx connection for `'callback`. Its memory
+    /// pool must not be reset before that pool is destroyed. No other mutable or shared Rust view
+    /// may exist for the same connection, and the view must remain on its owning event-loop thread.
     pub unsafe fn from_raw(connection: *mut ngx_connection_t) -> Result<Self, ConnectionError> {
         let raw = checked_connection_ptr(connection)?;
         Ok(Self { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
@@ -846,7 +847,12 @@ impl<'callback> ConnectionRefMut<'callback> {
     /// Sends a chain through nginx and returns the unconsumed tail, if any.
     ///
     /// Nginx may advance the chain's buffer cursors, so the input is exclusive.
-    pub fn send_chain<'chain>(
+    ///
+    /// # Safety
+    /// Every chain link, buffer descriptor, and selected memory or file resource must remain valid
+    /// and exclusively owned until nginx completes or cancels any asynchronous send started by
+    /// this call. Dropping a pending result does not cancel native sendfile work.
+    pub unsafe fn send_chain<'chain>(
         &mut self,
         input: ChainMut<'chain>,
         limit: off_t,
@@ -1389,11 +1395,17 @@ pub unsafe fn parse_socket_address<'callback>(
         return Err(SocketAddressError::MisalignedAddress);
     }
     let len = usize::try_from(socklen).map_err(|_| SocketAddressError::InvalidLength)?;
-    if len < size_of::<sa_family_t>() {
+    let family_offset = offset_of!(sockaddr, sa_family);
+    let family_end = family_offset
+        .checked_add(size_of::<sa_family_t>())
+        .ok_or(SocketAddressError::InvalidLength)?;
+    if len < family_end {
         return Err(SocketAddressError::TruncatedAddress);
     }
 
-    let family = unsafe { address.as_ref().sa_family };
+    let family = unsafe {
+        address.as_ptr().cast::<u8>().add(family_offset).cast::<sa_family_t>().read_unaligned()
+    };
     if c_int::from(family) == libc::AF_INET {
         return parse_ipv4_address(address, len);
     }
@@ -1458,13 +1470,9 @@ fn parse_unix_address<'callback>(
     if len < path_offset || len > size_of::<sockaddr_un>() {
         return Err(SocketAddressError::InvalidLength);
     }
-    let address = address.cast::<sockaddr_un>();
-    if !address.as_ptr().is_aligned() {
-        return Err(SocketAddressError::MisalignedAddress);
-    }
-    let address = unsafe { address.as_ref() };
-    let path =
-        unsafe { slice::from_raw_parts(address.sun_path.as_ptr().cast(), len - path_offset) };
+    let path = unsafe {
+        slice::from_raw_parts(address.as_ptr().cast::<u8>().add(path_offset), len - path_offset)
+    };
     Ok(SocketAddress::Unix { path, _callback: PhantomData, _not_thread_safe: PhantomData })
 }
 

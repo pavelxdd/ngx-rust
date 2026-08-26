@@ -63,19 +63,25 @@ pub trait InitMainConf {
     fn init_main_conf(&mut self) -> Result<(), MergeConfigError>;
 }
 
-fn configuration_pool(cf: &ngx_conf_t) -> Option<Pool<'_>> {
+/// # Safety
+///
+/// `cf.pool` must not be reset before the pool is destroyed.
+unsafe fn configuration_pool(cf: &ngx_conf_t) -> Option<Pool<'_>> {
     let pool = NonNull::new(cf.pool)?;
     unsafe { Pool::from_raw(pool.as_ptr()) }
 }
 
-fn allocate_configuration<T>(cf: *mut ngx_conf_t) -> *mut c_void
+/// # Safety
+///
+/// `cf` must point to a live nginx parser state whose pool is not reset before destruction.
+unsafe fn allocate_configuration<T>(cf: *mut ngx_conf_t) -> *mut c_void
 where
     T: Default + 'static,
 {
     let Some(cf) = (unsafe { cf.as_ref() }) else {
         return ptr::null_mut();
     };
-    let Some(pool) = configuration_pool(cf) else {
+    let Some(pool) = (unsafe { configuration_pool(cf) }) else {
         return ptr::null_mut();
     };
 
@@ -122,13 +128,13 @@ pub unsafe trait StreamModule {
     ///
     /// # Safety
     /// `cf` must point to a valid nginx configuration parser state whose pool remains alive for
-    /// the configuration lifetime.
+    /// the configuration lifetime and is not reset before it is destroyed.
     unsafe extern "C" fn create_main_conf(cf: *mut ngx_conf_t) -> *mut c_void
     where
         Self: StreamModuleMainConf,
         Self::MainConf: Default,
     {
-        allocate_configuration::<Self::MainConf>(cf)
+        unsafe { allocate_configuration::<Self::MainConf>(cf) }
     }
 
     /// Initializes the module's main configuration after parsing.
@@ -154,13 +160,13 @@ pub unsafe trait StreamModule {
     ///
     /// # Safety
     /// `cf` must point to a valid nginx configuration parser state whose pool remains alive for
-    /// the configuration lifetime.
+    /// the configuration lifetime and is not reset before it is destroyed.
     unsafe extern "C" fn create_srv_conf(cf: *mut ngx_conf_t) -> *mut c_void
     where
         Self: StreamModuleServerConf,
         Self::ServerConf: Default,
     {
-        allocate_configuration::<Self::ServerConf>(cf)
+        unsafe { allocate_configuration::<Self::ServerConf>(cf) }
     }
 
     /// Merges the module's server configuration with its parent.

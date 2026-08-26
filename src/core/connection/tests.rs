@@ -1,11 +1,15 @@
 extern crate alloc;
 extern crate std;
 
+#[cfg(unix)]
+use alloc::alloc::{alloc_zeroed, dealloc};
 use alloc::boxed::Box;
 #[cfg(feature = "test-link")]
 use alloc::vec;
 #[cfg(all(feature = "test-link", feature = "stream", ngx_feature = "stream"))]
 use alloc::vec::Vec;
+#[cfg(unix)]
+use core::alloc::Layout;
 use core::mem::{self, size_of};
 use core::panic::AssertUnwindSafe;
 use core::ptr;
@@ -16,6 +20,8 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(all(feature = "test-link", unix))]
 use std::os::fd::AsRawFd;
 
+#[cfg(unix)]
+use super::parse_socket_address;
 use super::{
     ConnectionChainWriteError, ConnectionChainWriteResult, ConnectionError, ConnectionIoError,
     ConnectionReadResult, ConnectionRef, ConnectionRefMut, ConnectionWriteResult,
@@ -25,8 +31,6 @@ use super::{
 use crate::core::{BufferError, BufferFlags, ChainMut, Pool};
 #[cfg(feature = "test-link")]
 use crate::ffi::ngx_proxy_protocol_read;
-#[cfg(unix)]
-use crate::ffi::sockaddr_un;
 use crate::ffi::{
     NGX_AGAIN, NGX_ERROR, in6_addr__bindgen_ty_1, ngx_buf_t, ngx_chain_t, ngx_connection_t,
     ngx_create_pool, ngx_destroy_pool, ngx_event_t, ngx_listening_t, ngx_log_t, ngx_pool_t,
@@ -34,6 +38,8 @@ use crate::ffi::{
 };
 #[cfg(all(feature = "test-link", feature = "stream", ngx_feature = "stream"))]
 use crate::ffi::{NGX_OK, ngx_int_t, ngx_stream_session_t, ngx_stream_variable_value_t};
+#[cfg(unix)]
+use crate::ffi::{sa_family_t, sockaddr_un};
 
 #[cfg(feature = "test-link")]
 unsafe extern "C" {
@@ -327,18 +333,21 @@ fn connection_chain_send_preserves_the_unsent_tail_and_maps_terminal_results() {
     raw.send_chain = Some(send_chain_tail);
     let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
     let input = unsafe { ChainMut::from_raw(&raw mut head) }.unwrap();
-    assert_eq!(connection.send_chain(input, 0).unwrap().into_raw(), &raw mut tail,);
+    assert_eq!(unsafe { connection.send_chain(input, 0) }.unwrap().into_raw(), &raw mut tail,);
 
     raw.send_chain = Some(send_chain_complete);
     let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
     let input = unsafe { ChainMut::from_raw(&raw mut head) }.unwrap();
-    assert!(matches!(connection.send_chain(input, 0), Ok(ConnectionChainWriteResult::Complete)));
+    assert!(matches!(
+        unsafe { connection.send_chain(input, 0) },
+        Ok(ConnectionChainWriteResult::Complete)
+    ));
 
     raw.send_chain = Some(send_chain_error);
     let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
     let input = unsafe { ChainMut::from_raw(&raw mut head) }.unwrap();
     assert!(matches!(
-        connection.send_chain(input, 0),
+        unsafe { connection.send_chain(input, 0) },
         Err(ConnectionChainWriteError::SendChainFailed)
     ));
 
@@ -346,7 +355,7 @@ fn connection_chain_send_preserves_the_unsent_tail_and_maps_terminal_results() {
     let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
     let input = unsafe { ChainMut::from_raw(&raw mut head) }.unwrap();
     assert!(matches!(
-        connection.send_chain(input, 0),
+        unsafe { connection.send_chain(input, 0) },
         Err(ConnectionChainWriteError::UnexpectedTail)
     ));
 
@@ -354,7 +363,7 @@ fn connection_chain_send_preserves_the_unsent_tail_and_maps_terminal_results() {
     let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
     let input = unsafe { ChainMut::from_raw(&raw mut head) }.unwrap();
     assert!(matches!(
-        connection.send_chain(input, 0),
+        unsafe { connection.send_chain(input, 0) },
         Err(ConnectionChainWriteError::MissingSendChain)
     ));
 }
@@ -581,6 +590,30 @@ fn unix_addresses_preserve_the_reported_path_bytes() {
     let peer = connection.peer_address().unwrap();
     assert_eq!(peer.unix_path(), Some(path.as_slice()));
     assert_eq!(peer.port(), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_addresses_accept_exact_short_backing_allocations() {
+    let family_offset = core::mem::offset_of!(sockaddr_un, sun_family);
+    let path_offset = core::mem::offset_of!(sockaddr_un, sun_path);
+
+    for path in [b"".as_slice(), b"\0ngx-rust".as_slice()] {
+        let len = path_offset + path.len();
+        let layout = Layout::from_size_align(len, core::mem::align_of::<sockaddr_un>()).unwrap();
+        let raw = unsafe { alloc_zeroed(layout) };
+        assert!(!raw.is_null());
+        unsafe {
+            raw.add(family_offset).cast::<sa_family_t>().write_unaligned(libc::AF_UNIX as _);
+            ptr::copy_nonoverlapping(path.as_ptr(), raw.add(path_offset), path.len());
+        }
+
+        {
+            let address = unsafe { parse_socket_address(raw.cast(), len as _) }.unwrap();
+            assert_eq!(address.unix_path(), Some(path));
+        }
+        unsafe { dealloc(raw, layout) };
+    }
 }
 
 #[test]
