@@ -4,7 +4,8 @@ use core::ptr::{self, NonNull};
 use core::slice;
 
 use crate::ffi::*;
-use crate::core::Pool;
+use crate::core::{Pool, PoolCleanupError};
+use core::mem;
 
 /// The `Buffer` trait provides methods for working with an nginx buffer (`ngx_buf_t`).
 ///
@@ -248,6 +249,14 @@ pub enum BufferError {
     ForeignPool,
     /// Nginx could not allocate buffer storage.
     Allocation,
+    FileDescriptor,
+}
+
+struct RetainedFile { file: ngx_file_t }
+
+#[cfg(unix)]
+impl Drop for RetainedFile {
+    fn drop(&mut self) { unsafe { libc::close(self.file.fd) }; }
 }
 
 /// Control flags copied to newly built buffers.
@@ -409,6 +418,83 @@ impl<'pool> Pool<'pool> {
         flags: BufferFlags,
     ) -> Result<MemoryBuffer, BufferError> {
         let file = source.file()?.ok_or(BufferError::NotFile)?;
+        self.build_file_buffer(file, range, flags)
+    }
+
+    /// Retains a callback-scoped file descriptor and builds a pool-owned bounded slice.
+    ///
+    /// The retained file has an independent close-on-exec descriptor and fresh asynchronous I/O
+    /// state. Its descriptor is closed by the pool cleanup.
+    pub fn retain_file_buffer_slice(
+        &self,
+        source: &impl Buffer,
+        range: Range<usize>,
+        flags: BufferFlags,
+    ) -> Result<MemoryBuffer, BufferError> {
+        let source = source.file()?.ok_or(BufferError::NotFile)?;
+        if range.start > range.end || range.end > source.len {
+            return Err(BufferError::OutOfRange);
+        }
+        if range.is_empty() {
+            return self.control_buffer(flags);
+        }
+
+        let source_file = unsafe { source.file.as_ref() };
+        let name = self.copy_file_name(source_file.name)?;
+        let log = unsafe { (*self.as_ptr()).log };
+        if log.is_null() {
+            return Err(BufferError::InvalidFileRange);
+        }
+        let directio = source_file.directio();
+        let retained = self
+            .try_allocate_with_cleanup(|| {
+                let fd = duplicate_file_descriptor(source_file.fd)?;
+                let mut file: ngx_file_t = unsafe { mem::zeroed() };
+                file.fd = fd;
+                file.name = name;
+                file.log = log;
+                file.set_directio(directio);
+                Ok(RetainedFile { file })
+            })
+            .map_err(|error| match error {
+                PoolCleanupError::Allocation => BufferError::Allocation,
+                PoolCleanupError::Construction(error) => error,
+            })?;
+        let file = FileView {
+            file: NonNull::from(&retained.file),
+            start: source.start,
+            end: source.end,
+            len: source.len,
+            _lifetime: PhantomData,
+        };
+        match self.build_file_buffer(file, range, flags) {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                retained.remove();
+                Err(error)
+            }
+        }
+    }
+
+    fn copy_file_name(&self, name: ngx_str_t) -> Result<ngx_str_t, BufferError> {
+        if name.len == 0 {
+            return Ok(ngx_str_t { len: 0, data: ptr::null_mut() });
+        }
+        if name.data.is_null() || name.len > isize::MAX as usize {
+            return Err(BufferError::InvalidFileRange);
+        }
+        let data =
+            NonNull::new(self.alloc(name.len).cast::<u8>()).ok_or(BufferError::Allocation)?;
+        unsafe { ptr::copy_nonoverlapping(name.data, data.as_ptr(), name.len) };
+        Ok(ngx_str_t { len: name.len, data: data.as_ptr() })
+    }
+
+    fn build_file_buffer(
+        &self,
+        file: FileView<'_>,
+        range: Range<usize>,
+        flags: BufferFlags,
+    ) -> Result<MemoryBuffer, BufferError> {
         if range.start > range.end || range.end > file.len {
             return Err(BufferError::OutOfRange);
         }
@@ -802,6 +888,18 @@ impl<'pool> PoolChain<'pool> {
     fn tail_ptr(&self) -> *mut ngx_chain_t {
         self.tail.map_or(ptr::null_mut(), NonNull::as_ptr)
     }
+}
+
+#[cfg(unix)]
+fn duplicate_file_descriptor(fd: ngx_fd_t) -> Result<ngx_fd_t, BufferError> {
+    let retained = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if retained == -1 { return Err(BufferError::FileDescriptor); }
+    Ok(retained)
+}
+
+#[cfg(not(unix))]
+fn duplicate_file_descriptor(_: ngx_fd_t) -> Result<ngx_fd_t, BufferError> {
+    Err(BufferError::FileDescriptor)
 }
 
 fn check_chain_ptr(chain: *mut ngx_chain_t) -> Result<(), ChainError> {
