@@ -228,10 +228,7 @@ where
 /// See also [::core::alloc::Layout::dangling()]
 #[inline(always)]
 pub(crate) const fn dangling_for_layout(layout: &Layout) -> NonNull<u8> {
-    unsafe {
-        let ptr = ptr::null_mut::<u8>().byte_add(layout.align());
-        NonNull::new_unchecked(ptr)
-    }
+    unsafe { NonNull::new_unchecked(ptr::without_provenance_mut(layout.align())) }
 }
 
 #[cfg(feature = "alloc")]
