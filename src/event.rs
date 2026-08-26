@@ -9,7 +9,7 @@ use crate::allocator::AllocError;
 use crate::core::{Pool, PoolValue};
 use crate::ffi::{
     NGX_OK, NGX_READ_EVENT, NGX_WRITE_EVENT, ngx_add_timer, ngx_del_timer, ngx_delete_posted_event,
-    ngx_event_actions, ngx_event_t, ngx_int_t, ngx_msec_t, ngx_post_event, ngx_posted_events,
+    ngx_event_actions, ngx_event_t, ngx_msec_t, ngx_post_event, ngx_posted_events,
     ngx_posted_next_events,
 };
 #[cfg(ngx_feature = "stat_stub")]
@@ -51,24 +51,6 @@ pub enum NotifyError {
     Unavailable,
     /// The selected nginx event module rejected the notification.
     Failed,
-}
-
-/// A readiness direction registered with nginx's event module.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EventKind {
-    /// Read readiness.
-    Read,
-    /// Write readiness.
-    Write,
-}
-
-impl EventKind {
-    fn native(self) -> ngx_int_t {
-        match self {
-            Self::Read => NGX_READ_EVENT,
-            Self::Write => NGX_WRITE_EVENT,
-        }
-    }
 }
 
 /// Failure returned while unregistering native readiness.
@@ -181,16 +163,21 @@ impl EventRef<'_> {
         unsafe { self.raw.as_ref().active() != 0 }
     }
 
-    /// Unregisters active readiness for the supplied direction.
+    /// Unregisters active readiness for this event's native direction.
     ///
     /// Returns `false` when the event is already inactive.
-    pub fn unregister(&mut self, kind: EventKind) -> Result<bool, EventDeleteError> {
+    pub fn unregister(&mut self) -> Result<bool, EventDeleteError> {
         if !self.is_active() {
             return Ok(false);
         }
 
+        let kind = if unsafe { self.raw.as_ref().write() } == 0 {
+            NGX_READ_EVENT
+        } else {
+            NGX_WRITE_EVENT
+        };
         let delete = (unsafe { ngx_event_actions.del }).ok_or(EventDeleteError::Unavailable)?;
-        if unsafe { delete(self.raw.as_ptr(), kind.native(), 0) } != NGX_OK as _ {
+        if unsafe { delete(self.raw.as_ptr(), kind, 0) } != NGX_OK as _ {
             return Err(EventDeleteError::Failed);
         }
 
@@ -876,17 +863,17 @@ mod event_tests {
     use std::sync::{Mutex, MutexGuard};
 
     use super::{
-        EventError, EventKind, EventRef, NotifyError, PostedEvent, PostedEventError, PostedQueue,
-        Timer, TimerError, notify,
+        EventError, EventRef, NotifyError, PostedEvent, PostedEventError, PostedQueue, Timer,
+        TimerError, notify,
     };
     use crate::core::Pool;
     use crate::ffi::{
-        NGX_AGAIN, NGX_OK, NGX_WRITE_EVENT, ngx_create_pool, ngx_current_msec, ngx_cycle_t,
-        ngx_destroy_pool, ngx_event_actions, ngx_event_expire_timers, ngx_event_handler_pt,
-        ngx_event_move_posted_next, ngx_event_no_timers_left, ngx_event_process_posted,
-        ngx_event_t, ngx_event_timer_init, ngx_int_t, ngx_log_t, ngx_msec_int_t, ngx_msec_t,
-        ngx_pool_t, ngx_posted_events, ngx_posted_next_events, ngx_queue_empty, ngx_queue_init,
-        ngx_queue_t, ngx_uint_t,
+        NGX_AGAIN, NGX_OK, NGX_READ_EVENT, NGX_WRITE_EVENT, ngx_create_pool, ngx_current_msec,
+        ngx_cycle_t, ngx_destroy_pool, ngx_event_actions, ngx_event_expire_timers,
+        ngx_event_handler_pt, ngx_event_move_posted_next, ngx_event_no_timers_left,
+        ngx_event_process_posted, ngx_event_t, ngx_event_timer_init, ngx_int_t, ngx_log_t,
+        ngx_msec_int_t, ngx_msec_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events,
+        ngx_queue_empty, ngx_queue_init, ngx_queue_t, ngx_uint_t,
     };
 
     unsafe extern "C" {
@@ -1072,27 +1059,31 @@ mod event_tests {
     }
 
     #[test]
-    fn event_ref_unregisters_an_active_write_event_once() {
+    fn event_ref_derives_unregister_direction_from_the_native_write_bit() {
         let _globals = EventGlobals::lock();
         let _delete = EventDeleteOverride::install(delete_active_event);
-        EVENT_DELETE_CALLS.store(0, Ordering::Relaxed);
-        EVENT_DELETE_KIND.store(usize::MAX, Ordering::Relaxed);
 
-        let mut event = TestEvent::new();
-        event.event.set_active(1);
+        for (write, expected) in [(0, NGX_READ_EVENT), (1, NGX_WRITE_EVENT)] {
+            EVENT_DELETE_CALLS.store(0, Ordering::Relaxed);
+            EVENT_DELETE_KIND.store(usize::MAX, Ordering::Relaxed);
 
-        unsafe {
-            EventRef::with_raw(event.raw(), |mut event| {
-                assert!(event.is_active());
-                assert_eq!(event.unregister(EventKind::Write), Ok(true));
-                assert!(!event.is_active());
-                assert_eq!(event.unregister(EventKind::Write), Ok(false));
-            })
-            .expect("valid test event");
+            let mut event = TestEvent::new();
+            event.event.set_write(write);
+            event.event.set_active(1);
+
+            unsafe {
+                EventRef::with_raw(event.raw(), |mut event| {
+                    assert!(event.is_active());
+                    assert_eq!(event.unregister(), Ok(true));
+                    assert!(!event.is_active());
+                    assert_eq!(event.unregister(), Ok(false));
+                })
+                .expect("valid test event");
+            }
+
+            assert_eq!(EVENT_DELETE_CALLS.load(Ordering::Relaxed), 1);
+            assert_eq!(EVENT_DELETE_KIND.load(Ordering::Relaxed), expected as usize);
         }
-
-        assert_eq!(EVENT_DELETE_CALLS.load(Ordering::Relaxed), 1);
-        assert_eq!(EVENT_DELETE_KIND.load(Ordering::Relaxed), NGX_WRITE_EVENT as usize);
     }
 
     #[test]
