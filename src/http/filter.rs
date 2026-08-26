@@ -275,11 +275,11 @@ mod tests {
         BodyFilter, HeaderFilter, HttpFilter, HttpFilterError, HttpFilterSlot, body_filter,
         filter_postconfiguration, header_filter,
     };
-    use crate::core::{ChainMut, ChainRef, ConnectionError, Status};
+    use crate::core::{ChainMut, ConnectionError, Pool, Status};
     use crate::ffi::{
         NGX_HTTP_MODULE, ngx_buf_t, ngx_chain_t, ngx_conf_t, ngx_connection_t, ngx_cycle_t,
         ngx_http_output_body_filter_pt, ngx_http_output_header_filter_pt, ngx_http_request_t,
-        ngx_int_t, ngx_log_t, ngx_module_t,
+        ngx_int_t, ngx_log_t, ngx_module_t, ngx_pool_t,
     };
     use crate::http::{
         HttpModule, RequestContinuationError, RequestError, RequestHold, RequestRefMut,
@@ -1292,23 +1292,25 @@ mod tests {
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
         let mut connection = unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() };
         connection.log = &raw mut log;
+        let mut pool = unsafe { MaybeUninit::<ngx_pool_t>::zeroed().assume_init() };
+        let pool = unsafe { Pool::from_raw(&raw mut pool).unwrap() };
         let mut raw = request();
         raw.main = &raw mut raw;
         raw.connection = &raw mut connection;
-        let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
+        raw.pool = pool.as_ptr();
         {
             let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
 
             NEXT_HEADER_CALLS.store(0, Ordering::Relaxed);
             NEXT_BODY_CALLS.store(0, Ordering::Relaxed);
             assert_eq!(request.send_header(), Ok(Status::NGX_DECLINED));
-            assert_eq!(request.output_filter(chain), Ok(Status::NGX_DECLINED));
+            assert_eq!(request.output_filter(pool.chain()), Ok(Status::NGX_DECLINED));
             assert_eq!(NEXT_HEADER_CALLS.load(Ordering::Relaxed), 1);
             assert_eq!(NEXT_BODY_CALLS.load(Ordering::Relaxed), 1);
 
             globals.set(Some(failing_header), Some(failing_body));
             assert_eq!(request.send_header(), Ok(Status::NGX_ERROR));
-            assert_eq!(request.output_filter(chain), Ok(Status::NGX_ERROR));
+            assert_eq!(request.output_filter(pool.chain()), Ok(Status::NGX_ERROR));
         }
         assert_eq!(connection.error(), 1);
     }
@@ -1319,12 +1321,14 @@ mod tests {
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
         let mut connection = unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() };
         connection.log = &raw mut log;
+        let mut pool = unsafe { MaybeUninit::<ngx_pool_t>::zeroed().assume_init() };
+        let pool = unsafe { Pool::from_raw(&raw mut pool).unwrap() };
         let mut raw = request();
         raw.main = &raw mut raw;
         raw.connection = &raw mut connection;
+        raw.pool = pool.as_ptr();
         raw.set_count(1);
         let mut hold = None;
-        let chain = unsafe { ChainRef::from_raw(ptr::null_mut()).unwrap() };
         let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
         request.hold(&mut hold).unwrap();
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
@@ -1332,10 +1336,30 @@ mod tests {
         NEXT_HEADER_CALLS.store(0, Ordering::Relaxed);
         NEXT_BODY_CALLS.store(0, Ordering::Relaxed);
         assert_eq!(continuation.send_header(), Ok(Status::NGX_DECLINED));
-        assert_eq!(continuation.output_filter(chain), Ok(Status::NGX_DECLINED));
+        assert_eq!(continuation.output_filter(pool.chain()), Ok(Status::NGX_DECLINED));
         assert_eq!(NEXT_HEADER_CALLS.load(Ordering::Relaxed), 1);
         assert_eq!(NEXT_BODY_CALLS.load(Ordering::Relaxed), 1);
         assert_eq!(continuation.cancel(), Ok(()));
+    }
+
+    #[test]
+    fn checked_request_output_rejects_a_foreign_pool_chain() {
+        let _globals = FilterGlobals::new();
+        let mut request_pool = unsafe { MaybeUninit::<ngx_pool_t>::zeroed().assume_init() };
+        let mut foreign_pool = unsafe { MaybeUninit::<ngx_pool_t>::zeroed().assume_init() };
+        let foreign_pool = unsafe { Pool::from_raw(&raw mut foreign_pool).unwrap() };
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut connection = unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() };
+        connection.log = &raw mut log;
+        let mut raw = request();
+        raw.main = &raw mut raw;
+        raw.connection = &raw mut connection;
+        raw.pool = &raw mut request_pool;
+        let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
+
+        NEXT_BODY_CALLS.store(0, Ordering::Relaxed);
+        assert_eq!(request.output_filter(foreign_pool.chain()), Err(RequestError::ForeignPool));
+        assert_eq!(NEXT_BODY_CALLS.load(Ordering::Relaxed), 0);
     }
 
     #[test]

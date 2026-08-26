@@ -219,8 +219,9 @@ impl Session<'_> {
     ///
     /// # Safety
     ///
-    /// `session` must point to a live initialized nginx session for `'callback`. Nginx must make
-    /// it exclusively available for that lifetime, and the view must remain on the owning
+    /// `session` must point to a live initialized nginx session for `'callback`. Its client
+    /// connection pool must not be reset before that pool is destroyed. Nginx must make the
+    /// session exclusively available for that lifetime, and the view must remain on the owning
     /// event-loop thread.
     pub unsafe fn from_raw(session: *mut ngx_stream_session_t) -> Result<Self, SessionError> {
         let raw = NonNull::new(session).ok_or(SessionError::NullSession)?;

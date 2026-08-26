@@ -237,6 +237,8 @@ pub enum RequestError {
     MissingPool,
     /// The request pool pointer does not satisfy `ngx_pool_t` alignment.
     MisalignedPool,
+    /// An output chain belongs to a different nginx pool.
+    ForeignPool,
     /// The client connection is invalid.
     Connection(ConnectionError),
     /// A native request string has a nonzero length but no data pointer.
@@ -1168,7 +1170,7 @@ impl RequestTempFileState {
                 self.append_temp_file_buffer(&mut output, &pool, temp_file, start, end, flags)?;
             }
             BufferView::File(file) => {
-                output.append(pool.file_buffer_slice(input, 0..file.len(), flags)?)?;
+                output.append(pool.retain_file_buffer_slice(input, 0..file.len(), flags)?)?;
             }
             BufferView::Control(_) => output.append(pool.control_buffer(flags)?)?,
         }
@@ -1208,15 +1210,11 @@ impl RequestTempFileState {
         end: off_t,
         flags: BufferFlags,
     ) -> Result<(), RequestTempFileError> {
-        let file = NonNull::new(pool.calloc_type::<ngx_file_t>())
-            .ok_or(RequestTempFileError::Allocation)?;
-        unsafe { file.as_ptr().write(temp_file.as_ref().file) };
-
         let mut buffer = NonNull::new(pool.calloc_type::<ngx_buf_t>())
             .ok_or(RequestTempFileError::Allocation)?;
         unsafe {
             let buffer = buffer.as_mut();
-            buffer.file = file.as_ptr();
+            buffer.file = &raw mut (*temp_file.as_ptr()).file;
             buffer.file_pos = start;
             buffer.file_last = end;
             buffer.set_in_file(1);
@@ -1226,8 +1224,8 @@ impl RequestTempFileState {
             buffer.set_last_in_chain(u32::from(flags.last_in_chain));
         }
 
-        let buffer = unsafe { BufferRef::from_raw(buffer.as_ptr()) }?;
-        output.append_borrowed(buffer)?;
+        let buffer = unsafe { pool.owned_buffer_from_raw(buffer) };
+        output.append(buffer)?;
         Ok(())
     }
 
@@ -1727,9 +1725,10 @@ impl RequestRef<'_> {
     ///
     /// # Safety
     ///
-    /// `request` must point to a live initialized nginx request for `'callback`. Nginx must not
-    /// mutate it while this shared view exists, and the view must remain on its owning event-loop
-    /// thread.
+    /// `request` must point to a live initialized nginx request for `'callback`. Neither its
+    /// request pool nor its client connection pool may be reset before that pool is destroyed.
+    /// Nginx must not mutate the request while this shared view exists, and the view must remain on
+    /// its owning event-loop thread.
     pub unsafe fn from_raw(request: *const ngx_http_request_t) -> Result<Self, RequestError> {
         let raw = checked_request_ptr(request.cast_mut())?;
         Ok(Self { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
@@ -2055,9 +2054,10 @@ impl<'callback> RequestRefMut<'callback> {
     ///
     /// # Safety
     ///
-    /// `request` must point to a live initialized nginx request for `'callback`. Nginx must make
-    /// it exclusively available for that lifetime, and the view must remain on its owning
-    /// event-loop thread.
+    /// `request` must point to a live initialized nginx request for `'callback`. Neither its
+    /// request pool nor its client connection pool may be reset before that pool is destroyed.
+    /// Nginx must make the request exclusively available for that lifetime, and the view must
+    /// remain on its owning event-loop thread.
     pub unsafe fn from_raw(request: *mut ngx_http_request_t) -> Result<Self, RequestError> {
         let raw = checked_request_ptr(request)?;
         Ok(Self { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
@@ -2601,10 +2601,14 @@ impl<'callback> RequestRefMut<'callback> {
         Ok(Status(unsafe { ngx_http_send_header(self.raw.as_ptr()) }))
     }
 
-    /// Sends a checked response chain through nginx's current output filter.
-    pub fn output_filter(&mut self, body: ChainRef<'_>) -> Result<Status, RequestError> {
+    /// Transfers a request-pool-owned response chain to nginx's current output filter.
+    pub fn output_filter(&mut self, body: PoolChain<'_>) -> Result<Status, RequestError> {
         self.validate_terminal_operation()?;
-        Ok(Status(unsafe { ngx_http_output_filter(self.raw.as_ptr(), body.as_ptr()) }))
+        let pool = self.pool()?;
+        if !body.belongs_to(&pool) {
+            return Err(RequestError::ForeignPool);
+        }
+        Ok(Status(unsafe { ngx_http_output_filter(self.raw.as_ptr(), body.into_raw()) }))
     }
 
     /// Finalizes this request with an explicit nginx status.
@@ -2763,10 +2767,10 @@ impl RequestContinuation<'_> {
         self.request.send_header().map_err(Into::into)
     }
 
-    /// Sends this checked response chain while the continuation remains active.
+    /// Transfers this request-pool-owned response chain while the continuation remains active.
     pub fn output_filter(
         &mut self,
-        chain: ChainRef<'_>,
+        chain: PoolChain<'_>,
     ) -> Result<Status, RequestContinuationError> {
         self.ensure_active()?;
         self.request.output_filter(chain).map_err(Into::into)
@@ -3569,6 +3573,10 @@ mod tests {
         unsafe { MaybeUninit::zeroed().assume_init() }
     }
 
+    fn zeroed_pool() -> ngx_pool_t {
+        unsafe { MaybeUninit::zeroed().assume_init() }
+    }
+
     fn initialize_request(raw: &mut ngx_http_request_t) {
         raw.signature = NGX_HTTP_MODULE as _;
         if raw.main.is_null() {
@@ -3887,22 +3895,22 @@ mod tests {
         start: off_t,
         end: off_t,
         flags: BufferFlags,
-    ) -> (BufferRef<'pool>, NonNull<ngx_file_t>) {
+    ) -> (PoolBuffer<'pool>, NonNull<ngx_file_t>) {
         let mut file = NonNull::new(pool.calloc_type::<ngx_file_t>()).unwrap();
         let mut buffer = NonNull::new(pool.calloc_type::<ngx_buf_t>()).unwrap();
         unsafe {
             file.as_mut().fd = fd;
-            let buffer = buffer.as_mut();
-            buffer.file = file.as_ptr();
-            buffer.file_pos = start;
-            buffer.file_last = end;
-            buffer.set_in_file(1);
-            buffer.set_flush(u32::from(flags.flush));
-            buffer.set_sync(u32::from(flags.sync));
-            buffer.set_last_buf(u32::from(flags.last_buf));
-            buffer.set_last_in_chain(u32::from(flags.last_in_chain));
+            let native = buffer.as_mut();
+            native.file = file.as_ptr();
+            native.file_pos = start;
+            native.file_last = end;
+            native.set_in_file(1);
+            native.set_flush(u32::from(flags.flush));
+            native.set_sync(u32::from(flags.sync));
+            native.set_last_buf(u32::from(flags.last_buf));
+            native.set_last_in_chain(u32::from(flags.last_in_chain));
         }
-        (unsafe { BufferRef::from_raw(buffer.as_ptr()) }.unwrap(), file)
+        (unsafe { pool.owned_buffer_from_raw(buffer) }, file)
     }
 
     #[cfg(feature = "test-link")]
@@ -5317,7 +5325,7 @@ mod tests {
         let (file, source_file) = pool_file_buffer(&pool, 47, 7, 10, file_flags);
         let mut input = pool.chain();
         input.append(pool.copy_buffer(b"left", memory_flags).unwrap()).unwrap();
-        input.append_borrowed(file).unwrap();
+        input.append(file).unwrap();
         input.append(pool.control_buffer(control_flags).unwrap()).unwrap();
         input.append(pool.copy_buffer(b"right", last_flags).unwrap()).unwrap();
         let mut writer = request.temp_file().unwrap();
@@ -5341,7 +5349,7 @@ mod tests {
         let file_view = file.file().unwrap().unwrap();
         assert_eq!((file_view.start(), file_view.end()), (7, 10));
         assert_eq!(unsafe { (*file_view.file_ptr()).fd }, unsafe { source_file.as_ref().fd });
-        assert_ne!(file_view.file_ptr(), source_file.as_ptr());
+        assert_eq!(file_view.file_ptr(), source_file.as_ptr());
 
         let control = output.next().unwrap().unwrap();
         assert_eq!(control.flags(), control_flags);
@@ -5364,7 +5372,7 @@ mod tests {
         let pool = request.pool().unwrap();
         let (file, source_file) = pool_file_buffer(&pool, 49, 11, 16, flags);
         let mut input = pool.chain();
-        input.append_borrowed(file).unwrap();
+        input.append(file).unwrap();
         let mut writer = request.temp_file().unwrap();
 
         let output = writer.append(chain_ref(input)).unwrap();
@@ -5374,7 +5382,7 @@ mod tests {
         let file = output.file().unwrap().unwrap();
         assert_eq!((file.start(), file.end()), (11, 16));
         assert_eq!(unsafe { (*file.file_ptr()).fd }, unsafe { source_file.as_ref().fd });
-        assert_ne!(file.file_ptr(), source_file.as_ptr());
+        assert_eq!(file.file_ptr(), source_file.as_ptr());
     }
 
     #[cfg(feature = "test-link")]
@@ -5386,7 +5394,7 @@ mod tests {
         let (invalid, _) = pool_file_buffer(&pool, 48, -1, 1, BufferFlags::default());
         let mut input = pool.chain();
         input.append(pool.copy_buffer(b"valid", BufferFlags::default()).unwrap()).unwrap();
-        input.append_borrowed(invalid).unwrap();
+        input.append(invalid).unwrap();
         let mut writer = request.temp_file().unwrap();
 
         assert!(matches!(
@@ -5909,14 +5917,18 @@ mod tests {
         raw.parent = &raw mut main;
         let mut hold = None;
 
+        let mut output_pool = zeroed_pool();
+        let output_pool = unsafe { Pool::from_raw(&raw mut output_pool).unwrap() };
         let mut request = request_from(&mut raw);
         request.hold(&mut hold).unwrap();
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
         continuation.cancel().unwrap();
-        let chain = unsafe { ChainRef::from_raw(core::ptr::null_mut()).unwrap() };
 
         assert_eq!(continuation.send_header(), Err(RequestContinuationError::Consumed));
-        assert_eq!(continuation.output_filter(chain), Err(RequestContinuationError::Consumed));
+        assert_eq!(
+            continuation.output_filter(output_pool.chain()),
+            Err(RequestContinuationError::Consumed)
+        );
         assert_eq!(
             continuation.finalize(HTTPStatus::BAD_REQUEST),
             Err(RequestContinuationError::Consumed)
@@ -5940,13 +5952,14 @@ mod tests {
 
     #[test]
     fn terminal_operations_reject_requests_without_connections() {
+        let mut output_pool = zeroed_pool();
+        let output_pool = unsafe { Pool::from_raw(&raw mut output_pool).unwrap() };
         let mut raw = zeroed_request();
         let mut request = request_from(&mut raw);
-        let chain = unsafe { ChainRef::from_raw(core::ptr::null_mut()).unwrap() };
         let expected = RequestError::Connection(ConnectionError::NullConnection);
 
         assert_eq!(request.send_header(), Err(expected));
-        assert_eq!(request.output_filter(chain), Err(expected));
+        assert_eq!(request.output_filter(output_pool.chain()), Err(expected));
 
         let mut finalize_raw = zeroed_request();
         assert_eq!(

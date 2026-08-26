@@ -1,13 +1,15 @@
 use core::marker::PhantomData;
+use core::mem;
 use core::ops::Range;
 use core::ptr::{self, NonNull};
 use core::slice;
 
 use nginx_sys::{
-    ngx_alloc_chain_link, ngx_buf_t, ngx_chain_t, ngx_create_temp_buf, ngx_file_t, off_t,
+    ngx_alloc_chain_link, ngx_buf_t, ngx_chain_t, ngx_create_temp_buf, ngx_fd_t, ngx_file_t,
+    ngx_str_t, off_t,
 };
 
-use crate::core::Pool;
+use crate::core::{Pool, PoolCleanupError};
 
 /// Failure returned while validating or constructing an nginx buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +34,19 @@ pub enum BufferError {
     ForeignPool,
     /// Nginx could not allocate buffer storage.
     Allocation,
+    /// The source file descriptor could not be retained independently.
+    FileDescriptor,
+}
+
+struct RetainedFile {
+    file: ngx_file_t,
+}
+
+#[cfg(unix)]
+impl Drop for RetainedFile {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.file.fd) };
+    }
 }
 
 /// Control flags copied to newly built buffers.
@@ -529,14 +544,78 @@ impl<'pool> Pool<'pool> {
         }
     }
 
-    /// Duplicates file metadata and builds a bounded file slice.
+    /// Builds a bounded file slice whose metadata remains borrowed for the pool lifetime.
     pub fn file_buffer_slice(
+        &self,
+        source: BufferRef<'pool>,
+        range: Range<usize>,
+        flags: BufferFlags,
+    ) -> Result<PoolBuffer<'pool>, BufferError> {
+        let file = source.file()?.ok_or(BufferError::NotFile)?;
+        self.build_file_buffer(file, range, flags)
+    }
+
+    /// Retains a callback-scoped file descriptor and builds a pool-owned bounded slice.
+    ///
+    /// The retained file has an independent close-on-exec descriptor and fresh asynchronous I/O
+    /// state. Its descriptor is closed by the pool cleanup.
+    pub fn retain_file_buffer_slice(
         &self,
         source: BufferRef<'_>,
         range: Range<usize>,
         flags: BufferFlags,
     ) -> Result<PoolBuffer<'pool>, BufferError> {
-        let file = source.file()?.ok_or(BufferError::NotFile)?;
+        let source = source.file()?.ok_or(BufferError::NotFile)?;
+        if range.start > range.end || range.end > source.len {
+            return Err(BufferError::OutOfRange);
+        }
+        if range.is_empty() {
+            return self.control_buffer(flags);
+        }
+
+        let source_file = unsafe { source.file.as_ref() };
+        let name = self.copy_file_name(source_file.name)?;
+        let log = unsafe { (*self.as_ptr()).log };
+        if log.is_null() {
+            return Err(BufferError::InvalidFileRange);
+        }
+        let directio = source_file.directio();
+        let retained = self
+            .try_allocate_with_cleanup(|| {
+                let fd = duplicate_file_descriptor(source_file.fd)?;
+                let mut file: ngx_file_t = unsafe { mem::zeroed() };
+                file.fd = fd;
+                file.name = name;
+                file.log = log;
+                file.set_directio(directio);
+                Ok(RetainedFile { file })
+            })
+            .map_err(|error| match error {
+                PoolCleanupError::Allocation => BufferError::Allocation,
+                PoolCleanupError::Construction(error) => error,
+            })?;
+        let file = FileView {
+            file: NonNull::from(&retained.file),
+            start: source.start,
+            end: source.end,
+            len: source.len,
+            _lifetime: PhantomData,
+        };
+        match self.build_file_buffer(file, range, flags) {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                retained.remove();
+                Err(error)
+            }
+        }
+    }
+
+    fn build_file_buffer(
+        &self,
+        file: FileView<'_>,
+        range: Range<usize>,
+        flags: BufferFlags,
+    ) -> Result<PoolBuffer<'pool>, BufferError> {
         if range.start > range.end || range.end > file.len {
             return Err(BufferError::OutOfRange);
         }
@@ -548,20 +627,28 @@ impl<'pool> Pool<'pool> {
         let end = off_t::try_from(range.end).map_err(|_| BufferError::Overflow)?;
         let file_start = file.start.checked_add(start).ok_or(BufferError::Overflow)?;
         let file_end = file.start.checked_add(end).ok_or(BufferError::Overflow)?;
-
-        let copied_file =
-            NonNull::new(self.alloc_type::<ngx_file_t>()).ok_or(BufferError::Allocation)?;
-        unsafe { copied_file.as_ptr().write(file.file.as_ptr().read()) };
-
         let mut raw = self.empty_buffer()?;
         unsafe {
-            raw.as_mut().file = copied_file.as_ptr();
+            raw.as_mut().file = file.file.as_ptr();
             raw.as_mut().file_pos = file_start;
             raw.as_mut().file_last = file_end;
             raw.as_mut().set_in_file(1);
             flags.write(raw.as_mut());
         }
         Ok(PoolBuffer { raw, pool: self.clone() })
+    }
+
+    fn copy_file_name(&self, name: ngx_str_t) -> Result<ngx_str_t, BufferError> {
+        if name.len == 0 {
+            return Ok(ngx_str_t { len: 0, data: ptr::null_mut() });
+        }
+        if name.data.is_null() || name.len > isize::MAX as usize {
+            return Err(BufferError::InvalidFileRange);
+        }
+        let data =
+            NonNull::new(self.alloc(name.len).cast::<u8>()).ok_or(BufferError::Allocation)?;
+        unsafe { ptr::copy_nonoverlapping(name.data, data.as_ptr(), name.len) };
+        Ok(ngx_str_t { len: name.len, data: data.as_ptr() })
     }
 
     /// Builds a zero-size buffer carrying only the requested control flags.
@@ -574,6 +661,18 @@ impl<'pool> Pool<'pool> {
     /// Starts an empty pool-owned chain builder.
     pub fn chain(&self) -> PoolChain<'pool> {
         PoolChain { head: None, tail: None, pool: self.clone() }
+    }
+
+    /// Wraps a fully initialized buffer owned by this pool.
+    ///
+    /// # Safety
+    /// `raw` and every selected memory or file resource must remain valid for the pool lifetime.
+    /// The caller transfers exclusive ownership of the buffer cursor to the returned value.
+    pub(crate) unsafe fn owned_buffer_from_raw(
+        &self,
+        raw: NonNull<ngx_buf_t>,
+    ) -> PoolBuffer<'pool> {
+        PoolBuffer { raw, pool: self.clone() }
     }
 
     fn reference_memory(
@@ -679,10 +778,6 @@ impl<'chain> ChainRef<'chain> {
     /// Returns whether the chain has no nginx-visible bytes.
     pub fn is_empty(self) -> Result<bool, ChainError> {
         self.len().map(|len| len == 0)
-    }
-
-    pub(crate) fn as_ptr(self) -> *mut ngx_chain_t {
-        self.head
     }
 }
 
@@ -862,11 +957,6 @@ impl<'pool> PoolChain<'pool> {
         self.append_raw(buffer.raw)
     }
 
-    /// Appends one lifetime-proven borrowed buffer at the current tail.
-    pub fn append_borrowed(&mut self, buffer: BufferRef<'pool>) -> Result<(), ChainError> {
-        self.append_raw(buffer.raw)
-    }
-
     /// Appends every fully prepared link from `candidate` and leaves it empty.
     ///
     /// The candidate remains unchanged when it belongs to a different pool.
@@ -894,6 +984,10 @@ impl<'pool> PoolChain<'pool> {
     /// Iterates over the current chain in append order.
     pub fn iter(&self) -> ChainIter<'_> {
         ChainIter { next: self.head_ptr(), _lifetime: PhantomData }
+    }
+
+    pub(crate) fn belongs_to(&self, pool: &Pool<'_>) -> bool {
+        ptr::eq(self.pool.as_ptr(), pool.as_ptr())
     }
 
     /// Transfers the nullable chain head while the pool retains all storage.
@@ -934,6 +1028,20 @@ impl<'pool> PoolChain<'pool> {
     fn tail_ptr(&self) -> *mut ngx_chain_t {
         self.tail.map_or(ptr::null_mut(), NonNull::as_ptr)
     }
+}
+
+#[cfg(unix)]
+fn duplicate_file_descriptor(fd: ngx_fd_t) -> Result<ngx_fd_t, BufferError> {
+    let retained = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if retained == -1 {
+        return Err(BufferError::FileDescriptor);
+    }
+    Ok(retained)
+}
+
+#[cfg(not(unix))]
+fn duplicate_file_descriptor(_fd: ngx_fd_t) -> Result<ngx_fd_t, BufferError> {
+    Err(BufferError::FileDescriptor)
 }
 
 fn checked_buffer_ptr(buffer: *const ngx_buf_t) -> Result<NonNull<ngx_buf_t>, BufferError> {
@@ -1000,6 +1108,8 @@ mod tests {
     use core::mem;
     use core::panic::AssertUnwindSafe;
     use core::ptr;
+    #[cfg(all(feature = "test-link", unix))]
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     use nginx_sys::{
         ngx_buf_t, ngx_chain_t, ngx_create_pool, ngx_destroy_pool, ngx_file_t, ngx_log_t, off_t,
@@ -1299,7 +1409,7 @@ mod tests {
             )
             .unwrap();
         let file_view = file_buffer.view().file().unwrap().unwrap();
-        assert_ne!(file_view.file_ptr(), &raw mut file);
+        assert_eq!(file_view.file_ptr(), &raw mut file);
         assert_eq!(unsafe { (*file_view.file_ptr()).fd }, 23);
         assert_eq!(unsafe { (*file_view.file_ptr()).offset }, 99);
         assert_eq!((file_view.start(), file_view.end()), (102, 107));
@@ -1312,9 +1422,45 @@ mod tests {
         assert!(control.view().flags().last_buf);
     }
 
+    #[cfg(all(feature = "test-link", unix))]
+    #[test]
+    fn retained_file_buffer_slice_owns_its_descriptor_until_pool_cleanup() {
+        let mut descriptors = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let source = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        let _writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+
+        let mut file: ngx_file_t = unsafe { mem::zeroed() };
+        file.fd = source.as_raw_fd();
+        let mut raw_file: ngx_buf_t = unsafe { mem::zeroed() };
+        raw_file.file = &raw mut file;
+        raw_file.file_last = 1;
+        raw_file.set_in_file(1);
+
+        let retained_fd = {
+            let owner = TestPool::new();
+            let pool = owner.handle();
+            let retained = pool
+                .retain_file_buffer_slice(
+                    unsafe { BufferRef::from_raw(&raw const raw_file) }.unwrap(),
+                    0..1,
+                    BufferFlags::default(),
+                )
+                .unwrap();
+            let retained_fd = unsafe { (*retained.view().file().unwrap().unwrap().file_ptr()).fd };
+
+            assert_ne!(retained_fd, source.as_raw_fd());
+            drop(source);
+            assert_ne!(unsafe { libc::fcntl(retained_fd, libc::F_GETFD) }, -1);
+            retained_fd
+        };
+
+        assert_eq!(unsafe { libc::fcntl(retained_fd, libc::F_GETFD) }, -1);
+    }
+
     #[cfg(feature = "test-link")]
     #[test]
-    fn buffer_slice_references_full_memory_and_duplicates_file_metadata() {
+    fn buffer_slice_references_full_memory_and_file_metadata() {
         static BORROWED: &[u8] = b"borrowed";
 
         let owner = TestPool::new();
@@ -1358,7 +1504,7 @@ mod tests {
             )
             .unwrap();
         let file_view = sliced_file.view().file().unwrap().unwrap();
-        assert_ne!(file_view.file_ptr(), &raw mut file);
+        assert_eq!(file_view.file_ptr(), &raw mut file);
         assert_eq!((file_view.start(), file_view.end()), (102, 107));
     }
 
@@ -1380,26 +1526,18 @@ mod tests {
     #[cfg(feature = "test-link")]
     #[test]
     fn pool_chain_preserves_append_order_and_rejects_null_links() {
-        let borrowed_bytes = *b"four";
-        let borrowed = memory_buffer(&borrowed_bytes);
         let owner = TestPool::new();
         let pool = owner.handle();
         let mut chain = pool.chain();
         chain.append(pool.copy_buffer(b"one", BufferFlags::default()).unwrap()).unwrap();
         chain.append(pool.copy_buffer(b"two", BufferFlags::default()).unwrap()).unwrap();
         chain.append(pool.copy_buffer(b"three", BufferFlags::default()).unwrap()).unwrap();
-        chain
-            .append_borrowed(unsafe { BufferRef::from_raw(&raw const borrowed) }.unwrap())
-            .unwrap();
 
         let values = chain
             .iter()
             .map(|value| value.unwrap().bytes().unwrap().unwrap())
             .collect::<alloc::vec::Vec<_>>();
-        assert_eq!(
-            values,
-            [b"one".as_slice(), b"two".as_slice(), b"three".as_slice(), b"four".as_slice()]
-        );
+        assert_eq!(values, [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()]);
         assert_eq!(unsafe { (*chain.tail_ptr()).next }, ptr::null_mut());
 
         let mut invalid = ngx_chain_t { buf: ptr::null_mut(), next: ptr::null_mut() };

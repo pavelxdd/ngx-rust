@@ -14,8 +14,10 @@ use nginx_sys::{
 
 use crate::allocator::{AllocError, Allocator, dangling_for_layout};
 
-/// Non-owning wrapper for an [`ngx_pool_t`] pointer, providing methods for working with memory
-/// pools.
+/// Non-owning wrapper for a stable [`ngx_pool_t`] that is never reset before destruction.
+///
+/// This invariant makes allocations and cleanup entries created through the handle stable. A
+/// resettable nginx pool cannot be represented by this type through safe code.
 ///
 /// See <https://nginx.org/en/docs/dev/development_guide.html#pool>
 ///
@@ -263,9 +265,11 @@ impl<'pool> Pool<'pool> {
     /// Creates a non-owning pool handle from an [`ngx_pool_t`] pointer.
     ///
     /// # Safety
-    /// The pointer must identify a live nginx pool for all of `'pool`. The caller must also ensure
-    /// nginx pool operations remain confined to the owning worker thread. Null and misaligned
-    /// pointers are rejected.
+    /// The pointer must identify a live nginx pool for all of `'pool`. The pool must never be reset
+    /// before it is destroyed, including after `'pool`, because cleanup entries registered through
+    /// this handle remain linked until destruction. The caller must also ensure nginx pool
+    /// operations remain confined to the owning worker thread. Null and misaligned pointers are
+    /// rejected.
     ///
     /// ```compile_fail
     /// # use ngx::core::Pool;
@@ -286,8 +290,10 @@ impl<'pool> Pool<'pool> {
     /// Invokes a closure with a pool handle that cannot escape the closure through a safe value.
     ///
     /// # Safety
-    /// The pointer must identify a live nginx pool for the complete closure call. Nginx pool
-    /// operations must remain confined to the owning worker thread.
+    /// The pointer must identify a live nginx pool for the complete closure call. The pool must
+    /// never be reset before it is destroyed, including after the closure returns, because cleanup
+    /// entries registered by the closure remain linked until destruction. Nginx pool operations
+    /// must remain confined to the owning worker thread.
     ///
     /// ```compile_fail
     /// # use ngx::core::Pool;
@@ -306,8 +312,10 @@ impl<'pool> Pool<'pool> {
         Some(f(pool))
     }
 
-    /// Expose the underlying `ngx_pool_t` pointer, for use with `ngx::ffi`
-    /// functions.
+    /// Exposes the underlying `ngx_pool_t` pointer for use with `ngx::ffi` functions.
+    ///
+    /// Calling `ngx_reset_pool` through this pointer violates the invariant of every handle and
+    /// value derived from this pool.
     pub fn as_ptr(&self) -> *mut ngx_pool_t {
         self.raw.as_ptr()
     }
@@ -482,13 +490,16 @@ impl<'pool> Pool<'pool> {
         old_layout: Layout,
         new_layout: Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
-        if unsafe {
-            ptr.byte_add(old_layout.size()).as_ptr() == (*self.raw.as_ptr()).d.last
-                && ptr.byte_add(new_layout.size()).as_ptr() <= (*self.raw.as_ptr()).d.end
-                && ptr.align_offset(new_layout.align()) == 0
-        } {
-            let pool = self.raw.as_ptr();
-            unsafe { (*pool).d.last = ptr.byte_add(new_layout.size()).as_ptr() };
+        let pool = self.raw.as_ptr();
+        let (last, end) = unsafe { ((*pool).d.last, (*pool).d.end) };
+        let address = ptr.as_ptr().addr();
+        let is_last = address.checked_add(old_layout.size()) == Some(last.addr());
+        let fits =
+            end.addr().checked_sub(address).is_some_and(|available| new_layout.size() <= available);
+
+        if is_last && fits && address % new_layout.align() == 0 {
+            let new_last = unsafe { ptr.byte_add(new_layout.size()).as_ptr() };
+            unsafe { (*pool).d.last = new_last };
             Ok(NonNull::slice_from_raw_parts(ptr, new_layout.size()))
         } else {
             let size = core::cmp::min(old_layout.size(), new_layout.size());
@@ -649,6 +660,27 @@ mod tests {
             }
             .iter()
             .all(|byte| *byte == 0)
+        );
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn resize_moves_the_last_allocation_when_growth_exceeds_the_pool_block() {
+        let owner = TestPool::new();
+        let pool = owner.handle();
+        let initial = Layout::from_size_align(16, 8).unwrap();
+        let ptr = pool.allocate(initial).unwrap().cast::<u8>();
+        unsafe { ptr.as_ptr().write_bytes(0x5a, initial.size()) };
+        let available =
+            unsafe { (*owner.raw).d.end }.addr().checked_sub(ptr.as_ptr().addr()).unwrap();
+        let grown = Layout::from_size_align(available.checked_add(1).unwrap(), 8).unwrap();
+
+        let grown_ptr = unsafe { pool.grow(ptr, initial, grown) }.unwrap().cast::<u8>();
+
+        assert_ne!(grown_ptr, ptr);
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(grown_ptr.as_ptr(), initial.size()) },
+            [0x5a; 16]
         );
     }
 

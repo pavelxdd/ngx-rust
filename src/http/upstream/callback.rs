@@ -131,6 +131,10 @@ pub struct UpstreamConfiguration<'callback> {
 }
 
 impl UpstreamConfiguration<'_> {
+    /// # Safety
+    ///
+    /// `configuration` must point to the live nginx parser state for the callback. Its
+    /// configuration pool must not be reset before that pool is destroyed.
     unsafe fn from_raw(configuration: *mut ngx_conf_t) -> Result<Self, UpstreamCallbackError> {
         let raw = NonNull::new(configuration).ok_or(UpstreamCallbackError::NullConfiguration)?;
         if !configuration.is_aligned() {
@@ -522,6 +526,7 @@ where
     H: HttpUpstreamInitializer,
 {
     upstream_callback_status(|| {
+        // SAFETY: nginx invokes this initializer with its stable configuration pool.
         let mut configuration = unsafe { UpstreamConfiguration::from_raw(configuration) }?;
         let mut upstream = unsafe { UpstreamServerConf::from_raw(upstream) }?;
         H::init(&mut configuration, &mut upstream)
