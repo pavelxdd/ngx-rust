@@ -10,10 +10,11 @@ use std::net::TcpListener;
 use std::sync::MutexGuard;
 
 use super::{
-    EventPeer, EventPeerAddress, EventPeerAddressError, EventPeerAttachError, EventPeerBuildError,
-    EventPeerBuilder, EventPeerCallbacks, EventPeerConnectError, EventPeerConnectStatus,
-    EventPeerConnectionError, EventPeerConnectionState, EventPeerHandlers, EventPeerKeepaliveState,
-    EventPeerLogError, EventPeerPreparation, inert_event_handler,
+    EVENT_PEER_MIN_POOL_SIZE, EventPeer, EventPeerAddress, EventPeerAddressError,
+    EventPeerAttachError, EventPeerBuildError, EventPeerBuilder, EventPeerCallbacks,
+    EventPeerConnectError, EventPeerConnectStatus, EventPeerConnectionError,
+    EventPeerConnectionState, EventPeerHandlers, EventPeerKeepaliveState, EventPeerLogError,
+    EventPeerPreparation, inert_event_handler,
 };
 use crate::core::{ConnectionError, SocketAddressError, SocketType};
 use crate::event::EventError;
@@ -24,7 +25,7 @@ use crate::ffi::{
     ngx_close_connection, ngx_connection_counter, ngx_connection_t, ngx_current_msec, ngx_cycle,
     ngx_cycle_t, ngx_event_actions, ngx_event_actions_t, ngx_event_connect_peer, ngx_event_flags,
     ngx_event_handler_pt, ngx_event_t, ngx_event_timer_init, ngx_int_t, ngx_log_t,
-    ngx_peer_connection_t, ngx_str_t, ngx_uint_t, sockaddr_in, sockaddr_in6,
+    ngx_peer_connection_t, ngx_pool_t, ngx_str_t, ngx_uint_t, sockaddr_in, sockaddr_in6,
 };
 use crate::log::LogRef;
 
@@ -1056,6 +1057,22 @@ fn peer_preparation_reuses_existing_pool_and_reports_allocation_failure() {
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     let handlers = EventPeerHandlers::new(active_read_handler, active_write_handler);
 
+    for pool_size in [0, mem::size_of::<ngx_pool_t>() - 1, EVENT_PEER_MIN_POOL_SIZE - 1] {
+        assert_eq!(
+            connection.prepare(EventPeerPreparation::new(
+                unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
+                handlers,
+                pool_size,
+            )),
+            Err(EventPeerConnectionError::PoolTooSmall {
+                requested: pool_size,
+                minimum: EVENT_PEER_MIN_POOL_SIZE,
+            })
+        );
+    }
+    let raw = connection.peer.raw.connection;
+    assert!(unsafe { raw.as_ref().unwrap().pool.is_null() });
+
     assert_eq!(
         connection.prepare(EventPeerPreparation::new(
             unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
@@ -1064,14 +1081,13 @@ fn peer_preparation_reuses_existing_pool_and_reports_allocation_failure() {
         )),
         Err(EventPeerConnectionError::PoolAllocation)
     );
-    let raw = connection.peer.raw.connection;
     assert!(unsafe { raw.as_ref().unwrap().pool.is_null() });
 
     connection
         .prepare(EventPeerPreparation::new(
             unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
             handlers,
-            128,
+            EVENT_PEER_MIN_POOL_SIZE,
         ))
         .unwrap();
     let pool = unsafe { raw.as_ref().unwrap().pool };
