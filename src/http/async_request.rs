@@ -271,7 +271,8 @@ async fn handler_future<H>(
         debug_assert!(state.output.is_none());
         state.output = Some(output);
     }
-    let _ = unsafe { Pin::new_unchecked(continuation) }.post(PostedQueue::Next);
+    // Scheduler tasks run on the initialized nginx worker event-loop thread.
+    let _ = unsafe { Pin::new_unchecked(continuation).post(PostedQueue::Next) };
 }
 
 fn async_phase_continuation<H>(event: PostedEventCallback<'_, RefCell<AsyncContinuationState<H>>>)

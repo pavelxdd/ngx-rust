@@ -289,6 +289,16 @@ pub enum TimerError {
 
 /// Pinned owner of an nginx timer and its callback state.
 ///
+/// ```compile_fail
+/// use ngx::event::Timer;
+/// use ngx::log::LogRef;
+///
+/// fn cannot_arm_from_safe_code(log: LogRef<'_>) {
+///     let mut timer = Box::pin(Timer::new(log, (), |_| {}));
+///     timer.as_mut().arm(1).unwrap();
+/// }
+/// ```
+///
 /// A timer must be pinned before it can be armed. Rust-owned timers are canceled by [`Drop`]; use
 /// [`allocate_in_pool`](Self::allocate_in_pool) for a pool-owned timer so its cleanup is registered
 /// before the timer can be armed.
@@ -409,7 +419,11 @@ where
     ///
     /// Returns [`TimerError::AlreadyArmed`] instead of applying nginx's lazy timer update. Use
     /// [`rearm`](Self::rearm) to replace an existing timeout deliberately.
-    pub fn arm(mut self: Pin<&mut Self>, timeout: ngx_msec_t) -> Result<(), TimerError> {
+    ///
+    /// # Safety
+    ///
+    /// This must run on the initialized nginx event-loop thread that owns the timer tree.
+    pub unsafe fn arm(mut self: Pin<&mut Self>, timeout: ngx_msec_t) -> Result<(), TimerError> {
         let this = unsafe { self.as_mut().get_unchecked_mut() };
         if this.event.timer_set() != 0 {
             return Err(TimerError::AlreadyArmed);
@@ -421,7 +435,11 @@ where
     }
 
     /// Replaces the current timeout, if any, with a fresh timeout.
-    pub fn rearm(mut self: Pin<&mut Self>, timeout: ngx_msec_t) {
+    ///
+    /// # Safety
+    ///
+    /// This must run on the initialized nginx event-loop thread that owns the timer tree.
+    pub unsafe fn rearm(mut self: Pin<&mut Self>, timeout: ngx_msec_t) {
         let this = unsafe { self.as_mut().get_unchecked_mut() };
         if this.event.timer_set() != 0 {
             unsafe { ngx_del_timer(&raw mut this.event) };
@@ -635,6 +653,16 @@ pub enum PostedEventError {
 
 /// Pinned owner of an nginx posted event and its callback state.
 ///
+/// ```compile_fail
+/// use ngx::event::{PostedEvent, PostedQueue};
+/// use ngx::log::LogRef;
+///
+/// fn cannot_post_from_safe_code(log: LogRef<'_>) {
+///     let mut event = Box::pin(PostedEvent::new(log, (), |_| {}));
+///     event.as_mut().post(PostedQueue::Normal).unwrap();
+/// }
+/// ```
+///
 /// A posted event must be pinned before it can be posted, canceled, or shut down. Rust-owned
 /// events are canceled by [`Drop`]; use [`allocate_in_pool`](Self::allocate_in_pool) for a
 /// pool-owned event so its cleanup is registered before it can be posted.
@@ -761,9 +789,16 @@ where
 
     /// Posts this event to the selected nginx queue.
     ///
-    /// Returns `Ok(false)` when nginx has already queued the event. Posting is only valid on the
-    /// owning nginx event-loop thread; foreign threads must use [`notify`] instead.
-    pub fn post(mut self: Pin<&mut Self>, queue: PostedQueue) -> Result<bool, PostedEventError> {
+    /// Returns `Ok(false)` when nginx has already queued the event. Foreign threads must use
+    /// [`notify`] instead.
+    ///
+    /// # Safety
+    ///
+    /// This must run on the initialized nginx event-loop thread that owns the posted queues.
+    pub unsafe fn post(
+        mut self: Pin<&mut Self>,
+        queue: PostedQueue,
+    ) -> Result<bool, PostedEventError> {
         let this = unsafe { self.as_mut().get_unchecked_mut() };
         post_owned_event(&mut this.event, this.stopped, queue)
     }
@@ -1466,9 +1501,9 @@ mod event_tests {
         }));
         let first_address = first.as_ref().get_ref() as *const _;
 
-        assert_eq!(first.as_mut().post(PostedQueue::Normal), Ok(true));
-        assert_eq!(first.as_mut().post(PostedQueue::Next), Ok(false));
-        assert_eq!(second.as_mut().post(PostedQueue::Normal), Ok(true));
+        assert_eq!(unsafe { first.as_mut().post(PostedQueue::Normal) }, Ok(true));
+        assert_eq!(unsafe { first.as_mut().post(PostedQueue::Next) }, Ok(false));
+        assert_eq!(unsafe { second.as_mut().post(PostedQueue::Normal) }, Ok(true));
         assert_eq!(first.as_ref().get_ref() as *const _, first_address);
 
         let mut cycle = TestCycle::new();
@@ -1490,7 +1525,7 @@ mod event_tests {
             callback_calls.set(callback_calls.get() + 1);
         }));
 
-        assert_eq!(posted.as_mut().post(PostedQueue::Next), Ok(true));
+        assert_eq!(unsafe { posted.as_mut().post(PostedQueue::Next) }, Ok(true));
         unsafe {
             assert!(ngx_queue_empty(&raw const ngx_posted_events));
             assert!(!ngx_queue_empty(&raw const ngx_posted_next_events));
@@ -1517,7 +1552,7 @@ mod event_tests {
             callback_calls.set(callback_calls.get() + 1);
         }));
 
-        assert_eq!(posted.as_mut().post(PostedQueue::Normal), Ok(true));
+        assert_eq!(unsafe { posted.as_mut().post(PostedQueue::Normal) }, Ok(true));
         assert!(posted.as_mut().cancel());
         assert!(!posted.as_mut().cancel());
 
@@ -1525,7 +1560,7 @@ mod event_tests {
         unsafe { ngx_event_process_posted(cycle.raw(), &raw mut ngx_posted_events) };
 
         assert_eq!(calls.get(), 0);
-        assert_eq!(posted.as_mut().post(PostedQueue::Normal), Ok(true));
+        assert_eq!(unsafe { posted.as_mut().post(PostedQueue::Normal) }, Ok(true));
         unsafe { ngx_event_process_posted(cycle.raw(), &raw mut ngx_posted_events) };
         assert_eq!(calls.get(), 1);
     }
@@ -1546,7 +1581,7 @@ mod event_tests {
             }
         }));
 
-        assert_eq!(posted.as_mut().post(PostedQueue::Normal), Ok(true));
+        assert_eq!(unsafe { posted.as_mut().post(PostedQueue::Normal) }, Ok(true));
         let mut cycle = TestCycle::new();
         unsafe { ngx_event_process_posted(cycle.raw(), &raw mut ngx_posted_events) };
 
@@ -1566,10 +1601,13 @@ mod event_tests {
             callback_calls.set(callback_calls.get() + 1);
         }));
 
-        assert_eq!(posted.as_mut().post(PostedQueue::Next), Ok(true));
+        assert_eq!(unsafe { posted.as_mut().post(PostedQueue::Next) }, Ok(true));
         assert!(posted.as_mut().shutdown());
         assert!(posted.is_shutdown());
-        assert_eq!(posted.as_mut().post(PostedQueue::Normal), Err(PostedEventError::Shutdown));
+        assert_eq!(
+            unsafe { posted.as_mut().post(PostedQueue::Normal) },
+            Err(PostedEventError::Shutdown)
+        );
         assert!(!posted.as_mut().shutdown());
 
         let mut cycle = TestCycle::new();
@@ -1594,7 +1632,7 @@ mod event_tests {
                 Box::pin(PostedEvent::new(logger, DropState(drops.clone()), move |_| {
                     callback_calls.set(callback_calls.get() + 1)
                 }));
-            assert_eq!(posted.as_mut().post(PostedQueue::Normal), Ok(true));
+            assert_eq!(unsafe { posted.as_mut().post(PostedQueue::Normal) }, Ok(true));
         }
         assert_eq!(drops.get(), 1);
 
@@ -1648,7 +1686,7 @@ mod event_tests {
             let address = posted.as_non_null();
             let mut posted = posted;
             assert_eq!(posted.as_non_null(), address);
-            assert_eq!(posted.as_pin_mut().post(PostedQueue::Next), Ok(true));
+            assert_eq!(unsafe { posted.as_pin_mut().post(PostedQueue::Next) }, Ok(true));
             assert_eq!(posted.as_non_null(), address);
         }
 
@@ -1729,7 +1767,7 @@ mod event_tests {
             }
         }));
 
-        timer.as_mut().arm(5).unwrap();
+        unsafe { timer.as_mut().arm(5) }.unwrap();
         unsafe {
             ngx_current_msec = 5;
             ngx_event_expire_timers();
@@ -1764,8 +1802,8 @@ mod event_tests {
 
         timer.as_mut().set_cancelable(true);
         assert!(timer.is_cancelable());
-        timer.as_mut().arm(5).unwrap();
-        assert_eq!(timer.as_mut().arm(5), Err(TimerError::AlreadyArmed));
+        unsafe { timer.as_mut().arm(5) }.unwrap();
+        assert_eq!(unsafe { timer.as_mut().arm(5) }, Err(TimerError::AlreadyArmed));
         assert!(timer.as_mut().cancel());
         assert!(!timer.is_armed());
         assert!(!timer.as_mut().cancel());
@@ -1788,7 +1826,7 @@ mod event_tests {
         let mut zero = Box::pin(Timer::new(logger, (), move |_| {
             zero_callback_calls.set(zero_callback_calls.get() + 1);
         }));
-        zero.as_mut().arm(0).unwrap();
+        unsafe { zero.as_mut().arm(0) }.unwrap();
         unsafe { ngx_event_expire_timers() };
         assert_eq!(zero_calls.get(), 1);
 
@@ -1796,7 +1834,7 @@ mod event_tests {
         let mut full_range = Box::pin(Timer::new(logger, (), move |_| {
             full_range_callback_calls.set(full_range_callback_calls.get() + 1);
         }));
-        full_range.as_mut().arm(ngx_msec_t::MAX).unwrap();
+        unsafe { full_range.as_mut().arm(ngx_msec_t::MAX) }.unwrap();
         unsafe { ngx_event_expire_timers() };
         assert_eq!(full_range_calls.get(), 1);
 
@@ -1805,7 +1843,7 @@ mod event_tests {
             maximum_callback_calls.set(maximum_callback_calls.get() + 1);
         }));
         let maximum_timeout = ngx_msec_int_t::MAX as ngx_msec_t;
-        maximum.as_mut().arm(maximum_timeout).unwrap();
+        unsafe { maximum.as_mut().arm(maximum_timeout) }.unwrap();
         unsafe {
             ngx_current_msec = maximum_timeout - 1;
             ngx_event_expire_timers();
@@ -1822,7 +1860,7 @@ mod event_tests {
             wrapping_callback_calls.set(wrapping_callback_calls.get() + 1);
         }));
         unsafe { ngx_current_msec = ngx_msec_t::MAX - 2 };
-        wrapping.as_mut().arm(5).unwrap();
+        unsafe { wrapping.as_mut().arm(5) }.unwrap();
         assert_eq!(wrapping.as_ref().get_ref().event.timer.key, 2);
         unsafe {
             ngx_current_msec = 1;
@@ -1846,7 +1884,7 @@ mod event_tests {
         log.wdata = (&raw mut capture).cast();
         let logger = log_ref(&mut log);
         let mut timer = Box::pin(Timer::new(logger, (), |_| {}));
-        timer.as_mut().arm(5).unwrap();
+        unsafe { timer.as_mut().arm(5) }.unwrap();
 
         unsafe {
             ngx_current_msec = 5;
@@ -1871,8 +1909,8 @@ mod event_tests {
             callback_calls.set(callback_calls.get() + 1);
         }));
 
-        timer.as_mut().arm(300).unwrap();
-        timer.as_mut().rearm(301);
+        unsafe { timer.as_mut().arm(300) }.unwrap();
+        unsafe { timer.as_mut().rearm(301) };
         assert_eq!(timer.as_ref().get_ref().event.timer.key, 301);
 
         unsafe {
@@ -1894,7 +1932,7 @@ mod event_tests {
         let logger = log_ref(&mut log);
         let mut timer = Box::pin(Timer::new(logger, (), |_| {}));
 
-        timer.as_mut().arm(5).unwrap();
+        unsafe { timer.as_mut().arm(5) }.unwrap();
         unsafe {
             ngx_current_msec = 5;
             ngx_event_expire_timers();
@@ -1904,7 +1942,7 @@ mod event_tests {
         assert!(timer.as_mut().take_timeout());
         assert!(!timer.as_mut().take_timeout());
 
-        timer.as_mut().arm(5).unwrap();
+        unsafe { timer.as_mut().arm(5) }.unwrap();
         assert!(!timer.is_timed_out());
         assert!(timer.as_mut().cancel());
         assert!(!timer.as_mut().cancel());
@@ -1917,7 +1955,7 @@ mod event_tests {
         let logger = log_ref(&mut log);
         let mut timer = Box::pin(Timer::new(logger, (), |_| {}));
 
-        timer.as_mut().arm(5).unwrap();
+        unsafe { timer.as_mut().arm(5) }.unwrap();
         assert_eq!(unsafe { ngx_event_no_timers_left() }, NGX_AGAIN as _);
         timer.as_mut().set_cancelable(true);
         assert_eq!(unsafe { ngx_event_no_timers_left() }, NGX_OK as _);
@@ -1937,7 +1975,7 @@ mod event_tests {
             let mut timer = Box::pin(Timer::new(logger, DropState(drops.clone()), move |_| {
                 callback_calls.set(callback_calls.get() + 1)
             }));
-            timer.as_mut().arm(5).unwrap();
+            unsafe { timer.as_mut().arm(5) }.unwrap();
         }
         assert_eq!(drops.get(), 1);
 
@@ -1997,7 +2035,7 @@ mod event_tests {
             let address = timer.as_non_null();
             let mut timer = timer;
             assert_eq!(timer.as_non_null(), address);
-            timer.as_pin_mut().arm(5).unwrap();
+            unsafe { timer.as_pin_mut().arm(5) }.unwrap();
             assert_eq!(timer.as_non_null(), address);
         }
 

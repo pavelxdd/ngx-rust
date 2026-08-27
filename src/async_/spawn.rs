@@ -361,7 +361,8 @@ impl WorkerScheduler {
     }
 
     fn post(&mut self) -> bool {
-        self.posted.as_mut().post(PostedQueue::Next).is_ok()
+        // WorkerScheduler exists only between init_worker and shutdown_worker on its owner thread.
+        unsafe { self.posted.as_mut().post(PostedQueue::Next) }.is_ok()
     }
 
     fn shutdown(&mut self) {
@@ -934,7 +935,8 @@ fn clear_active_scheduler(scheduler: &Arc<Scheduler>) {
 ///
 /// # Safety
 ///
-/// `log` must remain live and usable on this event-loop thread until [`shutdown_worker`] completes.
+/// This must run from the nginx worker process-start hook on the initialized event-loop thread.
+/// `log` must remain live and usable on that thread until [`shutdown_worker`] completes.
 pub unsafe fn init_worker(log: LogRef<'_>) -> Result<(), SchedulerInitError> {
     let stopped = WORKER_SCHEDULER.with(|worker| match worker.borrow().as_ref() {
         None => Ok(false),

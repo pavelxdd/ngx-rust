@@ -87,7 +87,7 @@ fn readiness_restores_the_inert_handler_after_a_pending_connect_wait() {
     let write = unsafe { raw.as_ref().unwrap().write };
     unsafe { (*write).set_ready(0) };
 
-    let mut readiness = Box::pin(connection.wait_connect(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_connect(None) });
     let mut context = Context::from_waker(Waker::noop());
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
     wait_for_writable_socket(unsafe { raw.as_ref().unwrap().fd });
@@ -112,7 +112,7 @@ fn readiness_returns_immediately_for_a_ready_read_event() {
     let raw = connection.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().read.as_mut().unwrap().set_ready(1) };
 
-    let mut readiness = Box::pin(connection.wait_read(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_read(None) });
     let mut context = Context::from_waker(Waker::noop());
 
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Ready(Ok(Readiness::Read)));
@@ -132,7 +132,7 @@ fn readiness_returns_immediately_for_a_ready_write_event() {
     let raw = connection.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().write.as_mut().unwrap().set_ready(1) };
 
-    let mut readiness = Box::pin(connection.wait_write(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_write(None) });
     let mut context = Context::from_waker(Waker::noop());
 
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Ready(Ok(Readiness::Write)));
@@ -152,7 +152,7 @@ fn readiness_returns_immediately_for_a_connected_peer() {
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     let raw = connection.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().write.as_mut().unwrap().set_ready(0) };
-    let mut readiness = Box::pin(connection.wait_connect(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_connect(None) });
     let mut context = Context::from_waker(Waker::noop());
 
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Ready(Ok(Readiness::Connect)));
@@ -172,7 +172,7 @@ fn readiness_returns_ready_before_zero_timeout() {
     let raw = connection.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().read.as_mut().unwrap().set_ready(1) };
 
-    let mut readiness = Box::pin(connection.wait_read(Some(Duration::ZERO)));
+    let mut readiness = Box::pin(unsafe { connection.wait_read(Some(Duration::ZERO)) });
     let mut context = Context::from_waker(Waker::noop());
 
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Ready(Ok(Readiness::Read)));
@@ -193,7 +193,7 @@ fn readiness_reports_native_error_before_connected_state() {
     let raw = connection.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().write.as_mut().unwrap().set_error(1) };
 
-    let mut readiness = Box::pin(connection.wait_connect(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_connect(None) });
     let mut context = Context::from_waker(Waker::noop());
 
     assert_eq!(
@@ -217,7 +217,7 @@ fn readiness_reports_an_invalid_selected_event() {
     let read = unsafe { raw.as_ref().unwrap().read };
     unsafe { raw.as_mut().unwrap().read = ptr::null_mut() };
 
-    let mut readiness = Box::pin(connection.wait_read(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_read(None) });
     let mut context = Context::from_waker(Waker::noop());
     assert_eq!(
         Pin::as_mut(&mut readiness).poll(&mut context),
@@ -250,7 +250,7 @@ fn readiness_reports_an_invalid_socket_while_completing_connect() {
         raw.as_mut().unwrap().fd = -1;
     }
 
-    let mut readiness = Box::pin(connection.wait_connect(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_connect(None) });
     let mut context = Context::from_waker(Waker::noop());
     assert!(matches!(
         Pin::as_mut(&mut readiness).poll(&mut context),
@@ -290,7 +290,7 @@ fn readiness_wakes_for_delayed_read_and_restores_handler() {
     unsafe { (*read).set_ready(0) };
 
     let (waker, state) = recording_waker();
-    let mut readiness = Box::pin(connection.wait_read(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_read(None) });
     let mut context = Context::from_waker(&waker);
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
     assert!(!same_event_handler(unsafe { (*read).handler }, active_read_handler));
@@ -332,7 +332,7 @@ fn readiness_repoll_consumes_a_delivered_callback_before_cancellation() {
     unsafe { (*read).set_ready(0) };
 
     let (waker, state) = recording_waker();
-    let mut readiness = Box::pin(connection.wait_read(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_read(None) });
     let mut context = Context::from_waker(&waker);
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
     invoke_event_handler(read);
@@ -372,7 +372,7 @@ fn readiness_rearms_after_a_partial_write_cycle() {
     unsafe { (*write).set_ready(0) };
 
     let (first_waker, first_state) = recording_waker();
-    let mut first = Box::pin(connection.wait_write(None));
+    let mut first = Box::pin(unsafe { connection.wait_write(None) });
     let mut first_context = Context::from_waker(&first_waker);
     assert_eq!(Pin::as_mut(&mut first).poll(&mut first_context), Poll::Pending);
     wait_for_socket(fd, libc::POLLOUT);
@@ -384,7 +384,7 @@ fn readiness_rearms_after_a_partial_write_cycle() {
 
     unsafe { (*write).set_ready(0) };
     let (second_waker, second_state) = recording_waker();
-    let mut second = Box::pin(connection.wait_write(None));
+    let mut second = Box::pin(unsafe { connection.wait_write(None) });
     let mut second_context = Context::from_waker(&second_waker);
     assert_eq!(Pin::as_mut(&mut second).poll(&mut second_context), Poll::Pending);
     unsafe { (*write).set_ready(1) };
@@ -416,7 +416,7 @@ fn readiness_completes_pending_connect_after_so_error_check() {
     unsafe { (*write).set_ready(0) };
 
     let (waker, state) = recording_waker();
-    let mut readiness = Box::pin(connection.wait_connect(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_connect(None) });
     let mut context = Context::from_waker(&waker);
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
     wait_for_writable_socket(fd);
@@ -449,7 +449,7 @@ fn readiness_reports_refused_pending_connect_from_so_error() {
     unsafe { (*write).set_ready(0) };
 
     let (waker, state) = recording_waker();
-    let mut readiness = Box::pin(connection.wait_connect(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_connect(None) });
     let mut context = Context::from_waker(&waker);
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
     wait_for_writable_socket(fd);
@@ -477,7 +477,7 @@ fn readiness_reports_eof_and_connection_error() {
     let raw = connection.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().read.as_mut().unwrap().set_eof(1) };
 
-    let mut eof = Box::pin(connection.wait_read(None));
+    let mut eof = Box::pin(unsafe { connection.wait_read(None) });
     let mut context = Context::from_waker(Waker::noop());
     assert_eq!(
         Pin::as_mut(&mut eof).poll(&mut context),
@@ -489,7 +489,7 @@ fn readiness_reports_eof_and_connection_error() {
         raw.as_ref().unwrap().read.as_mut().unwrap().set_eof(0);
         raw.as_mut().unwrap().set_error(1);
     }
-    let mut error = Box::pin(connection.wait_write(None));
+    let mut error = Box::pin(unsafe { connection.wait_write(None) });
     assert_eq!(
         Pin::as_mut(&mut error).poll(&mut context),
         Poll::Ready(Err(ReadinessError::Connection))
@@ -518,7 +518,7 @@ fn readiness_times_out_without_installing_for_zero_duration() {
     let read = unsafe { raw.as_ref().unwrap().read };
     unsafe { (*read).set_ready(0) };
 
-    let mut readiness = Box::pin(connection.wait_read(Some(Duration::ZERO)));
+    let mut readiness = Box::pin(unsafe { connection.wait_read(Some(Duration::ZERO)) });
     let mut context = Context::from_waker(Waker::noop());
     assert_eq!(
         Pin::as_mut(&mut readiness).poll(&mut context),
@@ -551,7 +551,7 @@ fn readiness_rounds_a_submillisecond_timeout_up_to_one_millisecond() {
     unsafe { (*read).set_ready(0) };
 
     let (waker, state) = recording_waker();
-    let mut readiness = Box::pin(connection.wait_read(Some(Duration::from_nanos(1))));
+    let mut readiness = Box::pin(unsafe { connection.wait_read(Some(Duration::from_nanos(1))) });
     let mut context = Context::from_waker(&waker);
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
     advance_to(0);
@@ -582,9 +582,9 @@ fn readiness_chunks_a_timeout_larger_than_one_nginx_timer_step() {
     let maximum = ngx_msec_int_t::MAX as u64;
 
     let (waker, state) = recording_waker();
-    let mut readiness = Box::pin(
-        connection.wait_read(Some(Duration::from_millis(maximum.checked_add(1).unwrap()))),
-    );
+    let mut readiness = Box::pin(unsafe {
+        connection.wait_read(Some(Duration::from_millis(maximum.checked_add(1).unwrap())))
+    });
     let mut context = Context::from_waker(&waker);
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
     advance_to(maximum as ngx_msec_t);
@@ -624,7 +624,7 @@ fn readiness_rejects_an_event_timer_owned_by_another_handler() {
         ngx_add_timer(read, 5);
     }
 
-    let mut readiness = Box::pin(connection.wait_read(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_read(None) });
     let mut context = Context::from_waker(Waker::noop());
     assert_eq!(
         Pin::as_mut(&mut readiness).poll(&mut context),
@@ -662,7 +662,7 @@ fn readiness_restores_the_handler_when_native_registration_fails() {
         ngx_event_flags = NGX_USE_CLEAR_EVENT as _;
     }
 
-    let mut readiness = Box::pin(connection.wait_read(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_read(None) });
     let mut context = Context::from_waker(Waker::noop());
     assert_eq!(
         Pin::as_mut(&mut readiness).poll(&mut context),
@@ -697,7 +697,7 @@ fn readiness_drop_forwards_a_delivered_edge_and_leaves_no_late_waker() {
     EVENT_HANDLER_CALLS.store(0, Ordering::Relaxed);
 
     let (waker, state) = recording_waker();
-    let mut readiness = Box::pin(connection.wait_read(Some(Duration::from_millis(5))));
+    let mut readiness = Box::pin(unsafe { connection.wait_read(Some(Duration::from_millis(5))) });
     let mut context = Context::from_waker(&waker);
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
     unsafe { (*read).set_ready(1) };
@@ -745,7 +745,7 @@ fn readiness_close_cancels_a_delivered_handoff_before_dispatch() {
     unsafe { (*read).set_ready(0) };
     EVENT_HANDLER_CALLS.store(0, Ordering::Relaxed);
 
-    let mut readiness = Box::pin(connection.wait_read(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_read(None) });
     let mut context = Context::from_waker(Waker::noop());
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
     unsafe { (*read).set_ready(1) };
@@ -779,7 +779,7 @@ fn readiness_keeps_a_borrowed_peer_open_and_transferable_after_drop() {
     let raw = borrowed.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().read.as_mut().unwrap().set_ready(1) };
 
-    let mut readiness = Box::pin(borrowed.wait_read(None));
+    let mut readiness = Box::pin(unsafe { borrowed.wait_read(None) });
     let mut context = Context::from_waker(Waker::noop());
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Ready(Ok(Readiness::Read)));
     drop(readiness);
@@ -808,7 +808,7 @@ fn readiness_uses_the_latest_waker_for_event_and_finite_timeout() {
 
     let (first_waker, first_state) = recording_waker();
     let (second_waker, second_state) = recording_waker();
-    let mut readiness = Box::pin(connection.wait_read(Some(Duration::from_millis(5))));
+    let mut readiness = Box::pin(unsafe { connection.wait_read(Some(Duration::from_millis(5))) });
     let mut first_context = Context::from_waker(&first_waker);
     let mut second_context = Context::from_waker(&second_waker);
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut first_context), Poll::Pending);
@@ -842,7 +842,7 @@ fn readiness_returns_timeout_for_a_native_timedout_event() {
     let raw = connection.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().read.as_mut().unwrap().set_timedout(1) };
 
-    let mut readiness = Box::pin(connection.wait_read(None));
+    let mut readiness = Box::pin(unsafe { connection.wait_read(None) });
     let mut context = Context::from_waker(Waker::noop());
     assert_eq!(
         Pin::as_mut(&mut readiness).poll(&mut context),
@@ -870,7 +870,7 @@ fn dropping_an_unpolled_readiness_future_does_not_change_peer_ownership() {
         .unwrap();
     let raw = connection.peer.raw.connection;
     let read = unsafe { raw.as_ref().unwrap().read };
-    let readiness = connection.wait_read(Some(Duration::from_millis(5)));
+    let readiness = unsafe { connection.wait_read(Some(Duration::from_millis(5))) };
     drop(readiness);
 
     assert!(same_event_handler(unsafe { (*read).handler }, active_read_handler));
