@@ -6954,10 +6954,10 @@ mod tests {
                 .unwrap();
             let mut timer =
                 unsafe { context.as_mut().map_unchecked_mut(|context| &mut context.timer) };
-            timer.as_mut().arm(5).unwrap();
+            unsafe { timer.as_mut().arm(5) }.unwrap();
             let mut posted =
                 unsafe { context.as_mut().map_unchecked_mut(|context| &mut context.posted) };
-            assert_eq!(posted.as_mut().post(PostedQueue::Next), Ok(true));
+            assert_eq!(unsafe { posted.as_mut().post(PostedQueue::Next) }, Ok(true));
         }
 
         drop(owner);
