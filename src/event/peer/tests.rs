@@ -5,16 +5,16 @@ use alloc::boxed::Box;
 use core::ffi::{c_int, c_void};
 use core::mem::{self, offset_of, size_of};
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use std::net::TcpListener;
 use std::sync::MutexGuard;
 
 use super::{
     EVENT_PEER_MIN_POOL_SIZE, EventPeer, EventPeerAddress, EventPeerAddressError,
     EventPeerAttachError, EventPeerBuildError, EventPeerBuilder, EventPeerCallbacks,
-    EventPeerConnectError, EventPeerConnectStatus, EventPeerConnectionError,
-    EventPeerConnectionState, EventPeerHandlers, EventPeerKeepaliveState, EventPeerLogError,
-    EventPeerPreparation, inert_event_handler,
+    EventPeerConnectError, EventPeerConnectResult, EventPeerConnectStatus,
+    EventPeerConnectionError, EventPeerConnectionState, EventPeerHandlers, EventPeerKeepaliveState,
+    EventPeerLogError, EventPeerPreparation, EventPeerReleaseState, inert_event_handler,
 };
 use crate::core::{ConnectionError, SocketAddressError, SocketType};
 use crate::event::EventError;
@@ -29,15 +29,7 @@ use crate::ffi::{
 };
 use crate::log::LogRef;
 
-static FREE_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
-static FREE_STATE: AtomicUsize = AtomicUsize::new(0);
-static NOTIFY_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
-static NOTIFY_TYPE: AtomicUsize = AtomicUsize::new(0);
 static EVENT_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
-static SET_SESSION_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
-#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
-static SAVE_SESSION_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 type EventAdd = unsafe extern "C" fn(*mut ngx_event_t, ngx_int_t, ngx_uint_t) -> ngx_int_t;
 type PeerGet = unsafe extern "C" fn(*mut ngx_peer_connection_t, *mut c_void) -> ngx_int_t;
@@ -191,8 +183,71 @@ unsafe extern "C" fn error_get(_peer: *mut ngx_peer_connection_t, _data: *mut c_
     NGX_ERROR as _
 }
 
-unsafe extern "C" fn done_get(_peer: *mut ngx_peer_connection_t, _data: *mut c_void) -> ngx_int_t {
+unsafe extern "C" fn done_get(peer: *mut ngx_peer_connection_t, data: *mut c_void) -> ngx_int_t {
+    let state = unsafe { &mut *data.cast::<CallbackState>() };
+    unsafe { (*peer).connection = state.connection };
     NGX_DONE as _
+}
+
+unsafe extern "C" fn again_get(_peer: *mut ngx_peer_connection_t, _data: *mut c_void) -> ngx_int_t {
+    NGX_AGAIN as _
+}
+
+unsafe extern "C" fn selected_get(
+    _peer: *mut ngx_peer_connection_t,
+    _data: *mut c_void,
+) -> ngx_int_t {
+    NGX_OK as _
+}
+
+#[derive(Default)]
+struct CallbackState {
+    connection: *mut ngx_connection_t,
+    free_count: usize,
+    free_state: ngx_uint_t,
+    notify_count: usize,
+    notify_type: ngx_uint_t,
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    set_session_count: usize,
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    save_session_count: usize,
+}
+
+unsafe extern "C" fn record_free(
+    peer: *mut ngx_peer_connection_t,
+    data: *mut c_void,
+    state: ngx_uint_t,
+) {
+    let callback = unsafe { &mut *data.cast::<CallbackState>() };
+    callback.free_count += 1;
+    callback.free_state = state;
+    unsafe { (*peer).connection = ptr::null_mut() };
+}
+
+unsafe extern "C" fn record_notify(
+    _peer: *mut ngx_peer_connection_t,
+    data: *mut c_void,
+    type_: ngx_uint_t,
+) {
+    let callback = unsafe { &mut *data.cast::<CallbackState>() };
+    callback.notify_count += 1;
+    callback.notify_type = type_;
+}
+
+#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+unsafe extern "C" fn record_set_session(
+    _peer: *mut ngx_peer_connection_t,
+    data: *mut c_void,
+) -> ngx_int_t {
+    let callback = unsafe { &mut *data.cast::<CallbackState>() };
+    callback.set_session_count += 1;
+    NGX_OK as _
+}
+
+#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+unsafe extern "C" fn record_save_session(_peer: *mut ngx_peer_connection_t, data: *mut c_void) {
+    let callback = unsafe { &mut *data.cast::<CallbackState>() };
+    callback.save_session_count += 1;
 }
 
 unsafe extern "C" fn add_event_ok(
@@ -248,40 +303,8 @@ fn build_peer<'peer>(
     EventPeerBuilder::new(address).log(log).callbacks(callbacks).build().unwrap()
 }
 
-unsafe extern "C" fn record_free(
-    _peer: *mut ngx_peer_connection_t,
-    data: *mut c_void,
-    state: ngx_uint_t,
-) {
-    FREE_DATA.store(data, Ordering::Relaxed);
-    FREE_STATE.store(state, Ordering::Relaxed);
-}
-
-unsafe extern "C" fn record_notify(
-    _peer: *mut ngx_peer_connection_t,
-    data: *mut c_void,
-    type_: ngx_uint_t,
-) {
-    NOTIFY_DATA.store(data, Ordering::Relaxed);
-    NOTIFY_TYPE.store(type_, Ordering::Relaxed);
-}
-
-#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
-unsafe extern "C" fn record_set_session(
-    _peer: *mut ngx_peer_connection_t,
-    data: *mut c_void,
-) -> ngx_int_t {
-    SET_SESSION_DATA.store(data, Ordering::Relaxed);
-    NGX_OK as _
-}
-
-#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
-unsafe extern "C" fn record_save_session(_peer: *mut ngx_peer_connection_t, data: *mut c_void) {
-    SAVE_SESSION_DATA.store(data, Ordering::Relaxed);
-}
-
 #[test]
-fn builder_requires_valid_address_log_and_get_callback() {
+fn builder_requires_valid_address_and_log() {
     let mut socket: sockaddr_in = unsafe { mem::zeroed() };
     socket.sin_family = libc::AF_INET as _;
     socket.sin_port = 8443_u16.to_be();
@@ -352,17 +375,7 @@ fn builder_initializes_every_configured_peer_field() {
     let remote = TestAddress::ipv4([192, 0, 2, 10], 8443);
     let local = TestAddress::ipv4([198, 51, 100, 20], 443);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let mut data = 0_u8;
-    FREE_DATA.store(ptr::null_mut(), Ordering::Relaxed);
-    FREE_STATE.store(0, Ordering::Relaxed);
-    NOTIFY_DATA.store(ptr::null_mut(), Ordering::Relaxed);
-    NOTIFY_TYPE.store(0, Ordering::Relaxed);
-    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
-    {
-        SET_SESSION_DATA.store(ptr::null_mut(), Ordering::Relaxed);
-        SAVE_SESSION_DATA.store(ptr::null_mut(), Ordering::Relaxed);
-    }
-
+    let mut state = CallbackState::default();
     let callbacks =
         EventPeerCallbacks::default().get(busy_get).free(record_free).notify(record_notify);
     #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
@@ -381,7 +394,7 @@ fn builder_initializes_every_configured_peer_field() {
         .keepalive(true)
         .down(true)
         .log_error(EventPeerLogError::Info);
-    let mut peer = unsafe { peer.data((&raw mut data).cast()) }.build().unwrap();
+    let mut peer = unsafe { peer.data((&raw mut state).cast()) }.build().unwrap();
     let raw = &mut peer.raw;
 
     assert!(raw.connection.is_null());
@@ -393,7 +406,7 @@ fn builder_initializes_every_configured_peer_field() {
     assert!(raw.get.is_some());
     assert!(raw.free.is_some());
     assert!(raw.notify.is_some());
-    assert_eq!(raw.data, (&raw mut data).cast());
+    assert_eq!(raw.data, (&raw mut state).cast());
     #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
     {
         assert!(raw.set_session.is_some());
@@ -418,20 +431,6 @@ fn builder_initializes_every_configured_peer_field() {
     assert_eq!(raw.so_keepalive(), 1);
     assert_eq!(raw.down(), 1);
     assert_eq!(raw.log_error(), EventPeerLogError::Info.raw());
-
-    unsafe { raw.free.unwrap()(raw, raw.data, 9) };
-    unsafe { raw.notify.unwrap()(raw, raw.data, 11) };
-    assert_eq!(FREE_DATA.load(Ordering::Relaxed), raw.data);
-    assert_eq!(FREE_STATE.load(Ordering::Relaxed), 9);
-    assert_eq!(NOTIFY_DATA.load(Ordering::Relaxed), raw.data);
-    assert_eq!(NOTIFY_TYPE.load(Ordering::Relaxed), 11);
-    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
-    {
-        assert_eq!(unsafe { raw.set_session.unwrap()(raw, raw.data) }, NGX_OK as _);
-        unsafe { raw.save_session.unwrap()(raw, raw.data) };
-        assert_eq!(SET_SESSION_DATA.load(Ordering::Relaxed), raw.data);
-        assert_eq!(SAVE_SESSION_DATA.load(Ordering::Relaxed), raw.data);
-    }
 }
 
 #[test]
@@ -548,6 +547,105 @@ fn builder_defaults_to_a_fresh_stream_peer() {
 }
 
 #[test]
+fn cached_selection_dispatches_callbacks_and_releases_once() {
+    let remote = TestAddress::ipv4([192, 0, 2, 10], 8443);
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let mut read: ngx_event_t = unsafe { mem::zeroed() };
+    let mut write: ngx_event_t = unsafe { mem::zeroed() };
+    let mut connection: ngx_connection_t = unsafe { mem::zeroed() };
+    connection.read = &raw mut read;
+    connection.write = &raw mut write;
+    let mut state = CallbackState { connection: &raw mut connection, ..Default::default() };
+    let callbacks =
+        EventPeerCallbacks::default().get(done_get).free(record_free).notify(record_notify);
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    let callbacks = callbacks.set_session(record_set_session).save_session(record_save_session);
+    let peer = unsafe {
+        EventPeerBuilder::new(remote.peer_address())
+            .log(LogRef::from_raw((&raw const log).cast_mut()).unwrap())
+            .callbacks(callbacks)
+            .data((&raw mut state).cast())
+            .build()
+            .unwrap()
+    };
+
+    let peer = match peer.connect().unwrap() {
+        EventPeerConnectResult::Reused(peer) => peer,
+        result => panic!("unexpected connect result: {result:?}"),
+    };
+    let mut connection = peer.into_connection().unwrap();
+    assert!(connection.notify(17));
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    {
+        assert_eq!(connection.set_session(), Some(NGX_OK as _));
+        assert!(connection.save_session());
+    }
+    connection.release(EventPeerReleaseState::NEXT.union(EventPeerReleaseState::FAILED));
+
+    assert_eq!(state.free_count, 1);
+    assert_eq!(state.free_state, 6);
+    assert_eq!(state.notify_count, 1);
+    assert_eq!(state.notify_type, 17);
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    {
+        assert_eq!(state.set_session_count, 1);
+        assert_eq!(state.save_session_count, 1);
+    }
+}
+
+#[test]
+fn selected_peer_drop_releases_with_failed_state_once() {
+    let globals = PeerGlobals::new(false, add_event_ok);
+    let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let mut state = CallbackState::default();
+    let peer = unsafe {
+        EventPeerBuilder::new(remote.peer_address())
+            .log(LogRef::from_raw((&raw const log).cast_mut()).unwrap())
+            .callbacks(EventPeerCallbacks::default().get(selected_get).free(record_free))
+            .data((&raw mut state).cast())
+            .build()
+            .unwrap()
+    };
+
+    let result = peer.connect().unwrap();
+    assert_eq!(result.status(), EventPeerConnectStatus::Error);
+    drop(result);
+
+    assert_eq!(state.free_count, 1);
+    assert_eq!(state.free_state, EventPeerReleaseState::FAILED.0);
+    assert_eq!(globals.free_connection_n(), 0);
+}
+
+#[test]
+fn unselected_callback_statuses_do_not_release_peer() {
+    let globals = PeerGlobals::new(false, add_event_ok);
+    let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+
+    for (get, expected) in [
+        (busy_get as PeerGet, EventPeerConnectStatus::Busy),
+        (again_get as PeerGet, EventPeerConnectStatus::SelectionPending),
+    ] {
+        let mut state = CallbackState::default();
+        let peer = unsafe {
+            EventPeerBuilder::new(remote.peer_address())
+                .log(LogRef::from_raw((&raw const log).cast_mut()).unwrap())
+                .callbacks(EventPeerCallbacks::default().get(get).free(record_free))
+                .data((&raw mut state).cast())
+                .build()
+                .unwrap()
+        };
+        let result = peer.connect().unwrap();
+        assert_eq!(result.status(), expected);
+        drop(result);
+        assert_eq!(state.free_count, 0);
+    }
+
+    assert_eq!(globals.free_connection_n(), 0);
+}
+
+#[test]
 fn builder_rejects_negative_socket_buffers() {
     let remote = TestAddress::ipv4([192, 0, 2, 10], 8443);
     assert!(matches!(
@@ -561,7 +659,7 @@ fn builder_rejects_negative_socket_buffers() {
 }
 
 #[test]
-fn connect_preserves_selector_statuses_without_publishing_connection() {
+fn connect_preserves_unselected_callback_statuses() {
     let remote = TestAddress::ipv4([192, 0, 2, 10], 8443);
     let log: ngx_log_t = unsafe { mem::zeroed() };
 
@@ -585,18 +683,6 @@ fn connect_preserves_selector_statuses_without_publishing_connection() {
 fn connect_rejects_unknown_or_empty_success_results() {
     let remote = TestAddress::ipv4([192, 0, 2, 10], 8443);
     let log: ngx_log_t = unsafe { mem::zeroed() };
-    let peer = build_peer(
-        remote.peer_address(),
-        (&raw const log).cast_mut(),
-        EventPeerCallbacks::default().get(done_get),
-    );
-    match peer.connect() {
-        Err(EventPeerConnectError::UnexpectedStatus { status, peer }) => {
-            assert_eq!(status, NGX_DONE as _);
-            assert!(peer.raw.connection.is_null());
-        }
-        result => panic!("unexpected connect result: {result:?}"),
-    }
 
     for (native_status, expected_status) in [
         (NGX_OK as ngx_int_t, EventPeerConnectStatus::Connected),
@@ -757,7 +843,7 @@ fn invalid_failure_status_detaches_a_native_connection() {
 }
 
 #[test]
-fn unknown_status_detaches_a_native_connection() {
+fn done_status_reuses_the_selected_native_connection() {
     let globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
@@ -771,15 +857,12 @@ fn unknown_status_detaches_a_native_connection() {
     assert!(!peer.raw.connection.is_null());
     let connection = peer.raw.connection;
 
-    match peer.classify_connect(NGX_DONE as _) {
-        Err(EventPeerConnectError::UnexpectedStatus { status, peer }) => {
-            assert_eq!(status, NGX_DONE as _);
-            assert!(peer.raw.connection.is_null());
-        }
+    let peer = match peer.classify_connect(NGX_DONE as _).unwrap() {
+        EventPeerConnectResult::Reused(peer) => peer,
         result => panic!("unexpected connect result: {result:?}"),
-    }
-    assert_eq!(globals.free_connection_n(), 0);
-    unsafe { ngx_close_connection(connection) };
+    };
+    assert_eq!(peer.raw.connection, connection);
+    drop(peer);
     assert_eq!(globals.free_connection_n(), 1);
 }
 

@@ -12,7 +12,7 @@ use crate::core::{
     parse_socket_address,
 };
 use crate::ffi::{
-    NGX_AGAIN, NGX_BUSY, NGX_DECLINED, NGX_ERROR, NGX_OK, ngx_addr_t, ngx_connection_t,
+    NGX_AGAIN, NGX_BUSY, NGX_DECLINED, NGX_DONE, NGX_ERROR, NGX_OK, ngx_addr_t, ngx_connection_t,
     ngx_create_pool, ngx_destroy_pool, ngx_event_connect_peer, ngx_event_free_peer_pt,
     ngx_event_get_peer, ngx_event_get_peer_pt, ngx_event_handler_pt, ngx_event_notify_peer_pt,
     ngx_event_t, ngx_int_t, ngx_log_t, ngx_msec_t, ngx_peer_connection_t, ngx_pool_large_t,
@@ -133,9 +133,6 @@ fn checked_name(name: &ngx_str_t) -> Result<&[u8], EventPeerAddressError> {
 }
 
 /// Native callback set supplied to an [`EventPeerBuilder`].
-///
-/// Every callback must obey nginx's ABI and must not unwind through nginx. The get callback is
-/// required; the remaining callbacks are optional and default to absent.
 #[derive(Clone, Copy, Default)]
 pub struct EventPeerCallbacks {
     get: ngx_event_get_peer_pt,
@@ -148,7 +145,7 @@ pub struct EventPeerCallbacks {
 }
 
 impl EventPeerCallbacks {
-    /// Uses nginx's direct peer selector for a preselected address.
+    /// Uses nginx's direct selector for a preselected address.
     pub fn direct() -> Self {
         Self::default().get(ngx_event_get_peer)
     }
@@ -162,7 +159,7 @@ impl EventPeerCallbacks {
         self
     }
 
-    /// Installs an optional peer-release callback.
+    /// Installs the optional peer-release callback.
     pub fn free(
         mut self,
         callback: unsafe extern "C" fn(*mut ngx_peer_connection_t, *mut c_void, ngx_uint_t),
@@ -171,7 +168,7 @@ impl EventPeerCallbacks {
         self
     }
 
-    /// Installs an optional peer-notification callback.
+    /// Installs the optional peer-notification callback.
     pub fn notify(
         mut self,
         callback: unsafe extern "C" fn(*mut ngx_peer_connection_t, *mut c_void, ngx_uint_t),
@@ -180,7 +177,7 @@ impl EventPeerCallbacks {
         self
     }
 
-    /// Installs an optional SSL peer-session lookup callback.
+    /// Installs the optional SSL session lookup callback.
     #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
     pub fn set_session(
         mut self,
@@ -190,7 +187,7 @@ impl EventPeerCallbacks {
         self
     }
 
-    /// Installs an optional SSL peer-session save callback.
+    /// Installs the optional SSL session save callback.
     #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
     pub fn save_session(
         mut self,
@@ -465,17 +462,17 @@ impl<'address> EventPeerBuilder<'address> {
         Ok(self.log(log))
     }
 
-    /// Supplies the native callbacks used while nginx selects and releases this peer.
+    /// Supplies the native callbacks used to select and release this peer.
     pub fn callbacks(mut self, callbacks: EventPeerCallbacks) -> Self {
         self.callbacks = callbacks;
         self
     }
 
-    /// Supplies opaque callback data. Null is valid when the selected callbacks permit it.
+    /// Supplies opaque callback data.
     ///
     /// # Safety
     ///
-    /// `data` must remain valid while nginx can invoke a selected callback with this peer.
+    /// `data` must satisfy every installed callback and remain live until selection is released.
     pub unsafe fn data(mut self, data: *mut c_void) -> Self {
         self.data = data;
         self
@@ -600,9 +597,30 @@ impl<'address> EventPeerBuilder<'address> {
         Ok(EventPeer {
             raw,
             state: EventPeerState::Detached,
+            selected: false,
             _address: PhantomData,
             _not_thread_safe: PhantomData,
         })
+    }
+}
+
+/// Native release flags passed to an event peer's `free` callback.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct EventPeerReleaseState(ngx_uint_t);
+
+impl EventPeerReleaseState {
+    /// Releases a peer without an additional retry or failure flag.
+    pub const NONE: Self = Self(0);
+    /// The connection may be retained by a keepalive selector.
+    pub const KEEPALIVE: Self = Self(1);
+    /// The caller will try another peer.
+    pub const NEXT: Self = Self(2);
+    /// The selected peer failed.
+    pub const FAILED: Self = Self(4);
+
+    /// Combines independent native release flags.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 }
 
@@ -615,7 +633,8 @@ fn socket_type_raw(socket_type: SocketType) -> c_int {
 
 /// One fully initialized native event peer.
 ///
-/// Dropping a peer that still owns a connected nginx socket closes that socket.
+/// Dropping a selected peer releases it with [`EventPeerReleaseState::FAILED`], then closes any
+/// connection the release callback did not retain.
 ///
 /// ```compile_fail
 /// use ngx::event::EventPeer;
@@ -631,6 +650,7 @@ fn socket_type_raw(socket_type: SocketType) -> c_int {
 pub struct EventPeer<'address> {
     raw: ngx_peer_connection_t,
     state: EventPeerState,
+    selected: bool,
     _address: PhantomData<&'address ngx_addr_t>,
     _not_thread_safe: PhantomData<*mut ()>,
 }
@@ -655,7 +675,20 @@ impl<'address> EventPeer<'address> {
         if self.state != EventPeerState::Detached || !self.raw.connection.is_null() {
             return Err(EventPeerConnectError::AlreadyOwned { peer: self });
         }
+        let get = self.raw.get.expect("validated event peer selector");
+        let selection_status = unsafe { get(&raw mut self.raw, self.raw.data) };
+        if selection_status != NGX_OK as _ {
+            self.selected = selection_status == NGX_DONE as _;
+            if selection_status == NGX_AGAIN as _ {
+                return Ok(EventPeerConnectResult::SelectionPending(self));
+            }
+            return self.classify_connect(selection_status);
+        }
+
+        self.selected = true;
+        self.raw.get = Some(ngx_event_get_peer);
         let status = unsafe { ngx_event_connect_peer(&raw mut self.raw) };
+        self.raw.get = Some(get);
         self.classify_connect(status)
     }
 
@@ -666,6 +699,7 @@ impl<'address> EventPeer<'address> {
     ) -> Result<EventPeerConnectResult<'address>, EventPeerConnectError<'address>> {
         let status = match status {
             value if value == NGX_OK as _ => EventPeerConnectStatus::Connected,
+            value if value == NGX_DONE as _ => EventPeerConnectStatus::Reused,
             value if value == NGX_AGAIN as _ => EventPeerConnectStatus::Pending,
             value if value == NGX_BUSY as _ => EventPeerConnectStatus::Busy,
             value if value == NGX_DECLINED as _ => EventPeerConnectStatus::Declined,
@@ -677,7 +711,9 @@ impl<'address> EventPeer<'address> {
         };
 
         match status {
-            EventPeerConnectStatus::Connected | EventPeerConnectStatus::Pending => {
+            EventPeerConnectStatus::Connected
+            | EventPeerConnectStatus::Reused
+            | EventPeerConnectStatus::Pending => {
                 let connection = self.raw.connection;
                 if connection.is_null() {
                     return Err(EventPeerConnectError::MissingConnection { status, peer: self });
@@ -702,10 +738,10 @@ impl<'address> EventPeer<'address> {
                     read.as_mut().handler = Some(inert_event_handler);
                     write.as_mut().handler = Some(inert_event_handler);
                 }
-                self.state = if status == EventPeerConnectStatus::Connected {
-                    EventPeerState::Connected
-                } else {
+                self.state = if status == EventPeerConnectStatus::Pending {
                     EventPeerState::Pending
+                } else {
+                    EventPeerState::Connected
                 };
             }
             EventPeerConnectStatus::Busy
@@ -716,11 +752,14 @@ impl<'address> EventPeer<'address> {
                     return Err(EventPeerConnectError::ConnectionOnFailure { status, peer: self });
                 }
             }
+            EventPeerConnectStatus::SelectionPending => unreachable!("classified native status"),
         }
 
         Ok(match status {
             EventPeerConnectStatus::Connected => EventPeerConnectResult::Connected(self),
+            EventPeerConnectStatus::Reused => EventPeerConnectResult::Reused(self),
             EventPeerConnectStatus::Pending => EventPeerConnectResult::Pending(self),
+            EventPeerConnectStatus::SelectionPending => unreachable!("classified native status"),
             EventPeerConnectStatus::Busy => EventPeerConnectResult::Busy(self),
             EventPeerConnectStatus::Declined => EventPeerConnectResult::Declined(self),
             EventPeerConnectStatus::Error => EventPeerConnectResult::Error(self),
@@ -769,9 +808,50 @@ impl<'address> EventPeer<'address> {
         Ok(EventPeerKeepalive { peer: self })
     }
 
+    /// Releases the selected peer exactly once, then closes any connection the callback did not
+    /// retain.
+    pub fn release(mut self, state: EventPeerReleaseState) {
+        self.release_selection(state);
+    }
+
+    /// Notifies the active selector. Returns `false` when no selection or callback exists.
+    pub fn notify(&mut self, type_: ngx_uint_t) -> bool {
+        let Some(callback) = self.selected.then_some(self.raw.notify).flatten() else {
+            return false;
+        };
+        unsafe { callback(&raw mut self.raw, self.raw.data, type_) };
+        true
+    }
+
+    /// Loads a selected peer's SSL session when the callback is configured.
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    pub fn set_session(&mut self) -> Option<ngx_int_t> {
+        let callback = self.selected.then_some(self.raw.set_session).flatten()?;
+        Some(unsafe { callback(&raw mut self.raw, self.raw.data) })
+    }
+
+    /// Saves a selected peer's SSL session. Returns `false` when no callback exists.
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    pub fn save_session(&mut self) -> bool {
+        let Some(callback) = self.selected.then_some(self.raw.save_session).flatten() else {
+            return false;
+        };
+        unsafe { callback(&raw mut self.raw, self.raw.data) };
+        true
+    }
+
     /// Closes the owned socket and optional pool immediately.
     pub fn close(self) {
         drop(self);
+    }
+
+    fn release_selection(&mut self, state: EventPeerReleaseState) {
+        if !mem::take(&mut self.selected) {
+            return;
+        }
+        if let Some(callback) = self.raw.free {
+            unsafe { callback(&raw mut self.raw, self.raw.data, state.0) };
+        }
     }
 
     fn connection(&self) -> Result<NonNull<ngx_connection_t>, EventPeerConnectionError> {
@@ -882,6 +962,7 @@ impl<'address> EventPeer<'address> {
 
 impl Drop for EventPeer<'_> {
     fn drop(&mut self) {
+        self.release_selection(EventPeerReleaseState::FAILED);
         self.close_owned();
     }
 }
@@ -1106,6 +1187,28 @@ impl<'address> EventPeerConnection<'address> {
         unsafe { ConnectionRefMut::with_raw(connection.as_ptr(), f) }.map_err(Into::into)
     }
 
+    /// Notifies the active selector. Returns `false` when no callback exists.
+    pub fn notify(&mut self, type_: ngx_uint_t) -> bool {
+        self.peer.notify(type_)
+    }
+
+    /// Loads this peer's SSL session when the selector configured a callback.
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    pub fn set_session(&mut self) -> Option<ngx_int_t> {
+        self.peer.set_session()
+    }
+
+    /// Saves this peer's SSL session when the selector configured a callback.
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    pub fn save_session(&mut self) -> bool {
+        self.peer.save_session()
+    }
+
+    /// Releases the selected peer exactly once and closes any connection it does not retain.
+    pub fn release(self, state: EventPeerReleaseState) {
+        self.peer.release(state);
+    }
+
     /// Clears active handlers, timers, and connection data before keepalive transfer.
     #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub fn into_keepalive(
@@ -1259,6 +1362,28 @@ impl<'address> EventPeerKeepalive<'address> {
         Ok(EventPeerConnection { peer: self.peer, state: EventPeerConnectionState::Borrowed })
     }
 
+    /// Notifies the active selector. Returns `false` when no callback exists.
+    pub fn notify(&mut self, type_: ngx_uint_t) -> bool {
+        self.peer.notify(type_)
+    }
+
+    /// Loads this peer's SSL session when the selector configured a callback.
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    pub fn set_session(&mut self) -> Option<ngx_int_t> {
+        self.peer.set_session()
+    }
+
+    /// Saves this peer's SSL session when the selector configured a callback.
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    pub fn save_session(&mut self) -> bool {
+        self.peer.save_session()
+    }
+
+    /// Releases the selected peer exactly once and closes any connection it does not retain.
+    pub fn release(self, state: EventPeerReleaseState) {
+        self.peer.release(state);
+    }
+
     /// Closes the owned socket and optional pool immediately.
     pub fn close(self) {
         drop(self);
@@ -1303,8 +1428,12 @@ impl error::Error for EventPeerKeepaliveIntoConnectionError<'_> {}
 pub enum EventPeerConnectStatus {
     /// The socket connected immediately.
     Connected,
+    /// The selector returned a cached connection with `NGX_DONE`.
+    Reused,
     /// The socket is connecting asynchronously.
     Pending,
+    /// The selector asked to resume selection later without acquiring a peer.
+    SelectionPending,
     /// The peer selector reported that no resource is currently available.
     Busy,
     /// The peer selector or native connect rejected the peer.
@@ -1318,8 +1447,12 @@ pub enum EventPeerConnectStatus {
 pub enum EventPeerConnectResult<'address> {
     /// nginx connected the socket immediately.
     Connected(EventPeer<'address>),
+    /// The selector returned a cached connection with `NGX_DONE`.
+    Reused(EventPeer<'address>),
     /// nginx started a nonblocking connect operation.
     Pending(EventPeer<'address>),
+    /// The selector returned `NGX_AGAIN` without acquiring a peer.
+    SelectionPending(EventPeer<'address>),
     /// nginx returned `NGX_BUSY` without publishing a connection.
     Busy(EventPeer<'address>),
     /// nginx returned `NGX_DECLINED` without publishing a connection.
@@ -1333,7 +1466,9 @@ impl<'address> EventPeerConnectResult<'address> {
     pub fn status(&self) -> EventPeerConnectStatus {
         match self {
             Self::Connected(_) => EventPeerConnectStatus::Connected,
+            Self::Reused(_) => EventPeerConnectStatus::Reused,
             Self::Pending(_) => EventPeerConnectStatus::Pending,
+            Self::SelectionPending(_) => EventPeerConnectStatus::SelectionPending,
             Self::Busy(_) => EventPeerConnectStatus::Busy,
             Self::Declined(_) => EventPeerConnectStatus::Declined,
             Self::Error(_) => EventPeerConnectStatus::Error,
@@ -1344,7 +1479,9 @@ impl<'address> EventPeerConnectResult<'address> {
     pub fn into_peer(self) -> EventPeer<'address> {
         match self {
             Self::Connected(peer)
+            | Self::Reused(peer)
             | Self::Pending(peer)
+            | Self::SelectionPending(peer)
             | Self::Busy(peer)
             | Self::Declined(peer)
             | Self::Error(peer) => peer,
@@ -1362,7 +1499,7 @@ pub enum EventPeerConnectError<'address> {
         /// The retained peer.
         peer: EventPeer<'address>,
     },
-    /// nginx returned a status outside the five documented event-peer results.
+    /// nginx returned a status outside the supported event-peer results.
     UnexpectedStatus {
         /// The raw nginx status.
         status: ngx_int_t,
