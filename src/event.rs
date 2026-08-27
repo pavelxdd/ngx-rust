@@ -17,6 +17,7 @@ use crate::ffi::{
     ngx_atomic_t, ngx_stat_accepted, ngx_stat_active, ngx_stat_handled, ngx_stat_reading,
     ngx_stat_requests, ngx_stat_waiting, ngx_stat_writing,
 };
+use crate::log::LogRef;
 use crate::ngx_container_of;
 
 mod peer;
@@ -258,11 +259,10 @@ pub enum TimerError {
 ///
 /// ```compile_fail
 /// use core::pin::Pin;
-/// use core::ptr::NonNull;
 /// use ngx::event::Timer;
-/// use ngx::ffi::ngx_log_t;
+/// use ngx::log::LogRef;
 ///
-/// fn cannot_move_after_arming(log: NonNull<ngx_log_t>) {
+/// fn cannot_move_after_arming(log: LogRef<'_>) {
 ///     let mut timer = Box::pin(Timer::new(log, (), |_| {}));
 ///     timer.as_mut().arm(1).unwrap();
 ///     let _timer = Pin::into_inner(timer);
@@ -270,21 +270,34 @@ pub enum TimerError {
 /// ```
 ///
 /// ```compile_fail
-/// use core::ptr::NonNull;
 /// use ngx::event::Timer;
-/// use ngx::ffi::ngx_log_t;
+/// use ngx::log::LogRef;
 ///
-/// fn cannot_retain_callback_state(log: NonNull<ngx_log_t>) {
+/// fn cannot_retain_callback_state(log: LogRef<'_>) {
 ///     let mut escaped: Option<&mut u8> = None;
 ///     let _timer = Timer::new(log, 0_u8, |mut timer| {
 ///         escaped = Some(timer.state_mut());
 ///     });
 /// }
 /// ```
-pub struct Timer<T, F> {
+///
+/// ```compile_fail
+/// use ngx::event::{Timer, TimerCallback};
+/// use ngx::log::LogRef;
+///
+/// type Callback = for<'callback> fn(TimerCallback<'callback, ()>);
+///
+/// fn callback(_: TimerCallback<'_, ()>) {}
+///
+/// fn cannot_outlive_logger<'log>(log: LogRef<'log>) -> Timer<'static, (), Callback> {
+///     Timer::new(log, (), callback as Callback)
+/// }
+/// ```
+pub struct Timer<'log, T, F> {
     event: ngx_event_t,
     state: T,
     callback: F,
+    _log: PhantomData<LogRef<'log>>,
     _pin: PhantomPinned,
     _not_thread_safe: PhantomData<*mut ()>,
 }
@@ -297,7 +310,7 @@ pub struct TimerCallback<'callback, T> {
     state: &'callback mut T,
 }
 
-impl<T, F> Timer<T, F>
+impl<'log, T, F> Timer<'log, T, F>
 where
     F: for<'callback> FnMut(TimerCallback<'callback, T>),
 {
@@ -305,30 +318,20 @@ where
     ///
     /// The returned timer must be pinned before calling [`arm`](Self::arm), [`rearm`](Self::rearm),
     /// or [`cancel`](Self::cancel).
-    pub fn new(log: NonNull<crate::ffi::ngx_log_t>, state: T, callback: F) -> Self {
+    pub fn new(log: LogRef<'log>, state: T, callback: F) -> Self {
         let mut event = unsafe { mem::zeroed::<ngx_event_t>() };
         event.data = (&raw const TIMER_IDENT).cast_mut().cast();
         event.handler = Some(timer_handler::<T, F>);
         event.log = log.as_ptr();
 
-        Self { event, state, callback, _pin: PhantomPinned, _not_thread_safe: PhantomData }
-    }
-
-    /// Allocates a pinned timer in an nginx pool and registers its destructor before returning it.
-    ///
-    /// The returned [`PoolValue`] retains the stable address and pool cleanup. Its timer must be
-    /// armed through [`PoolValue::as_pin_mut`].
-    pub fn allocate_in_pool<'pool>(
-        pool: &Pool<'pool>,
-        log: NonNull<crate::ffi::ngx_log_t>,
-        state: T,
-        callback: F,
-    ) -> Result<PoolValue<'pool, Self>, AllocError>
-    where
-        T: 'static,
-        F: 'static,
-    {
-        pool.allocate_with_cleanup(|| Self::new(log, state, callback))
+        Self {
+            event,
+            state,
+            callback,
+            _log: PhantomData,
+            _pin: PhantomPinned,
+            _not_thread_safe: PhantomData,
+        }
     }
 
     /// Returns the timer state outside a callback without mutable access.
@@ -409,6 +412,31 @@ where
     }
 }
 
+impl<T, F> Timer<'static, T, F>
+where
+    T: 'static,
+    F: for<'callback> FnMut(TimerCallback<'callback, T>) + 'static,
+{
+    /// Allocates a pinned timer in an nginx pool and registers its destructor before returning it.
+    ///
+    /// The returned [`PoolValue`] retains the stable address and pool cleanup. Its timer must be
+    /// armed through [`PoolValue::as_pin_mut`].
+    ///
+    /// # Safety
+    ///
+    /// `log` must remain live and usable on its owning event-loop thread until the pool destroys
+    /// this timer or [`PoolValue::remove`] removes it.
+    pub unsafe fn allocate_in_pool<'pool>(
+        pool: &Pool<'pool>,
+        log: LogRef<'_>,
+        state: T,
+        callback: F,
+    ) -> Result<PoolValue<'pool, Self>, AllocError> {
+        let log = unsafe { LogRef::from_raw(log.as_ptr()) }.expect("validated timer logger");
+        pool.allocate_with_cleanup(|| Self::new(log, state, callback))
+    }
+}
+
 impl<T> TimerCallback<'_, T> {
     /// Returns the callback-scoped timer state.
     pub fn state(&self) -> &T {
@@ -472,7 +500,7 @@ where
     let Ok(event) = (unsafe { EventRef::from_raw(raw) }) else {
         return;
     };
-    let timer = ngx_container_of!(event.as_ptr(), Timer<T, F>, event);
+    let timer = ngx_container_of!(event.as_ptr(), Timer<'_, T, F>, event);
     let timer = unsafe { &mut *timer };
     let callback = &mut timer.callback;
     let state = &mut timer.state;
@@ -480,7 +508,7 @@ where
     callback(TimerCallback { event, state });
 }
 
-impl<T, F> Drop for Timer<T, F> {
+impl<T, F> Drop for Timer<'_, T, F> {
     fn drop(&mut self) {
         if self.event.timer_set() != 0 {
             unsafe { ngx_del_timer(&raw mut self.event) };
@@ -503,11 +531,10 @@ pub enum PostedEventError {
 ///
 /// ```compile_fail
 /// use core::pin::Pin;
-/// use core::ptr::NonNull;
 /// use ngx::event::{PostedEvent, PostedQueue};
-/// use ngx::ffi::ngx_log_t;
+/// use ngx::log::LogRef;
 ///
-/// fn cannot_move_after_post(log: NonNull<ngx_log_t>) {
+/// fn cannot_move_after_post(log: LogRef<'_>) {
 ///     let mut event = Box::pin(PostedEvent::new(log, (), |_| {}));
 ///     event.as_mut().post(PostedQueue::Normal).unwrap();
 ///     let _event = Pin::into_inner(event);
@@ -515,11 +542,10 @@ pub enum PostedEventError {
 /// ```
 ///
 /// ```compile_fail
-/// use core::ptr::NonNull;
 /// use ngx::event::PostedEvent;
-/// use ngx::ffi::ngx_log_t;
+/// use ngx::log::LogRef;
 ///
-/// fn cannot_retain_callback_state(log: NonNull<ngx_log_t>) {
+/// fn cannot_retain_callback_state(log: LogRef<'_>) {
 ///     let mut escaped: Option<&mut u8> = None;
 ///     let _event = PostedEvent::new(log, 0_u8, |mut event| {
 ///         escaped = Some(event.state_mut());
@@ -528,20 +554,35 @@ pub enum PostedEventError {
 /// ```
 ///
 /// ```compile_fail
-/// use core::ptr::NonNull;
 /// use ngx::event::PostedEvent;
-/// use ngx::ffi::ngx_log_t;
+/// use ngx::log::LogRef;
 ///
-/// fn cannot_move_to_another_thread(log: NonNull<ngx_log_t>) {
+/// fn cannot_move_to_another_thread(log: LogRef<'_>) {
 ///     let event = PostedEvent::new(log, (), |_| {});
 ///     std::thread::spawn(move || drop(event));
 /// }
 /// ```
-pub struct PostedEvent<T, F> {
+///
+/// ```compile_fail
+/// use ngx::event::{PostedEvent, PostedEventCallback};
+/// use ngx::log::LogRef;
+///
+/// type Callback = for<'callback> fn(PostedEventCallback<'callback, ()>);
+///
+/// fn callback(_: PostedEventCallback<'_, ()>) {}
+///
+/// fn cannot_outlive_logger<'log>(
+///     log: LogRef<'log>,
+/// ) -> PostedEvent<'static, (), Callback> {
+///     PostedEvent::new(log, (), callback as Callback)
+/// }
+/// ```
+pub struct PostedEvent<'log, T, F> {
     event: ngx_event_t,
     state: T,
     callback: F,
     stopped: bool,
+    _log: PhantomData<LogRef<'log>>,
     _pin: PhantomPinned,
     _not_thread_safe: PhantomData<*mut ()>,
 }
@@ -555,7 +596,7 @@ pub struct PostedEventCallback<'callback, T> {
     stopped: &'callback mut bool,
 }
 
-impl<T, F> PostedEvent<T, F>
+impl<'log, T, F> PostedEvent<'log, T, F>
 where
     F: for<'callback> FnMut(PostedEventCallback<'callback, T>),
 {
@@ -563,7 +604,7 @@ where
     ///
     /// The returned event must be pinned before calling [`post`](Self::post),
     /// [`cancel`](Self::cancel), or [`shutdown`](Self::shutdown).
-    pub fn new(log: NonNull<crate::ffi::ngx_log_t>, state: T, callback: F) -> Self {
+    pub fn new(log: LogRef<'log>, state: T, callback: F) -> Self {
         let mut event = unsafe { mem::zeroed::<ngx_event_t>() };
         event.data = (&raw const POSTED_EVENT_IDENT).cast_mut().cast();
         event.handler = Some(posted_event_handler::<T, F>);
@@ -574,26 +615,10 @@ where
             state,
             callback,
             stopped: false,
+            _log: PhantomData,
             _pin: PhantomPinned,
             _not_thread_safe: PhantomData,
         }
-    }
-
-    /// Allocates a pinned posted event in an nginx pool and registers its destructor first.
-    ///
-    /// The returned [`PoolValue`] retains the stable address and pool cleanup. Its event is posted
-    /// through [`PoolValue::as_pin_mut`].
-    pub fn allocate_in_pool<'pool>(
-        pool: &Pool<'pool>,
-        log: NonNull<crate::ffi::ngx_log_t>,
-        state: T,
-        callback: F,
-    ) -> Result<PoolValue<'pool, Self>, AllocError>
-    where
-        T: 'static,
-        F: 'static,
-    {
-        pool.allocate_with_cleanup(|| Self::new(log, state, callback))
     }
 
     /// Returns the event state outside a callback without mutable access.
@@ -635,6 +660,31 @@ where
         let this = unsafe { self.as_mut().get_unchecked_mut() };
         this.stopped = true;
         cancel_owned_event(&mut this.event)
+    }
+}
+
+impl<T, F> PostedEvent<'static, T, F>
+where
+    T: 'static,
+    F: for<'callback> FnMut(PostedEventCallback<'callback, T>) + 'static,
+{
+    /// Allocates a pinned posted event in an nginx pool and registers its destructor first.
+    ///
+    /// The returned [`PoolValue`] retains the stable address and pool cleanup. Its event is posted
+    /// through [`PoolValue::as_pin_mut`].
+    ///
+    /// # Safety
+    ///
+    /// `log` must remain live and usable on its owning event-loop thread until the pool destroys
+    /// this event or [`PoolValue::remove`] removes it.
+    pub unsafe fn allocate_in_pool<'pool>(
+        pool: &Pool<'pool>,
+        log: LogRef<'_>,
+        state: T,
+        callback: F,
+    ) -> Result<PoolValue<'pool, Self>, AllocError> {
+        let log = unsafe { LogRef::from_raw(log.as_ptr()) }.expect("validated event logger");
+        pool.allocate_with_cleanup(|| Self::new(log, state, callback))
     }
 }
 
@@ -724,7 +774,7 @@ where
     let Ok(event) = (unsafe { EventRef::from_raw(raw) }) else {
         return;
     };
-    let posted = ngx_container_of!(event.as_ptr(), PostedEvent<T, F>, event);
+    let posted = ngx_container_of!(event.as_ptr(), PostedEvent<'_, T, F>, event);
     let posted = unsafe { &mut *posted };
     let callback = &mut posted.callback;
     let state = &mut posted.state;
@@ -733,7 +783,7 @@ where
     callback(PostedEventCallback { event, state, stopped });
 }
 
-impl<T, F> Drop for PostedEvent<T, F> {
+impl<T, F> Drop for PostedEvent<'_, T, F> {
     fn drop(&mut self) {
         cancel_owned_event(&mut self.event);
     }
@@ -856,9 +906,9 @@ mod event_tests {
     use alloc::boxed::Box;
     use alloc::rc::Rc;
     use alloc::vec::Vec;
-    use core::cell::{Cell, RefCell};
+    use core::cell::{Cell, RefCell, UnsafeCell};
     use core::mem::MaybeUninit;
-    use core::ptr::{self, NonNull};
+    use core::ptr;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard};
 
@@ -875,6 +925,7 @@ mod event_tests {
         ngx_msec_int_t, ngx_msec_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events,
         ngx_queue_empty, ngx_queue_init, ngx_queue_t, ngx_uint_t,
     };
+    use crate::log::LogRef;
 
     unsafe extern "C" {
         fn ngx_rs_test_fail_allocations_after(successes: ngx_uint_t);
@@ -962,6 +1013,10 @@ mod event_tests {
         unsafe { core::ptr::addr_of!(ngx_posted_events).read().next }
     }
 
+    fn log_ref(log: &mut ngx_log_t) -> LogRef<'_> {
+        unsafe { LogRef::from_raw(log) }.expect("test logger")
+    }
+
     struct TestEvent {
         event: ngx_event_t,
         log: ngx_log_t,
@@ -998,13 +1053,15 @@ mod event_tests {
 
     struct TestPool {
         raw: *mut ngx_pool_t,
-        log: Box<ngx_log_t>,
+        log: Box<UnsafeCell<ngx_log_t>>,
     }
 
     impl TestPool {
         fn new() -> Self {
-            let mut log = Box::new(unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() });
-            let raw = unsafe { ngx_create_pool(4096, &raw mut *log) };
+            let log = Box::new(UnsafeCell::new(unsafe {
+                MaybeUninit::<ngx_log_t>::zeroed().assume_init()
+            }));
+            let raw = unsafe { ngx_create_pool(4096, log.get()) };
             assert!(!raw.is_null());
             Self { raw, log }
         }
@@ -1013,8 +1070,8 @@ mod event_tests {
             unsafe { Pool::from_raw(self.raw) }.unwrap()
         }
 
-        fn log(&mut self) -> NonNull<ngx_log_t> {
-            NonNull::from(&mut *self.log)
+        fn log(&self) -> LogRef<'_> {
+            unsafe { LogRef::from_raw(self.log.get()) }.expect("test pool logger")
         }
     }
 
@@ -1176,17 +1233,16 @@ mod event_tests {
     fn posted_owner_coalesces_duplicate_posts_and_preserves_fifo_order() {
         let _globals = EventGlobals::lock();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let logger = log_ref(&mut log);
         let order = Rc::new(RefCell::new(Vec::new()));
         let first_order = order.clone();
         let second_order = order.clone();
-        let mut first =
-            Box::pin(PostedEvent::new(NonNull::from(&mut log), 1_usize, move |event| {
-                first_order.borrow_mut().push(*event.state())
-            }));
-        let mut second =
-            Box::pin(PostedEvent::new(NonNull::from(&mut log), 2_usize, move |event| {
-                second_order.borrow_mut().push(*event.state())
-            }));
+        let mut first = Box::pin(PostedEvent::new(logger, 1_usize, move |event| {
+            first_order.borrow_mut().push(*event.state())
+        }));
+        let mut second = Box::pin(PostedEvent::new(logger, 2_usize, move |event| {
+            second_order.borrow_mut().push(*event.state())
+        }));
         let first_address = first.as_ref().get_ref() as *const _;
 
         assert_eq!(first.as_mut().post(PostedQueue::Normal), Ok(true));
@@ -1206,9 +1262,10 @@ mod event_tests {
     fn posted_owner_moves_next_queue_at_the_next_cycle_boundary() {
         let _globals = EventGlobals::lock();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let logger = log_ref(&mut log);
         let calls = Rc::new(Cell::new(0));
         let callback_calls = calls.clone();
-        let mut posted = Box::pin(PostedEvent::new(NonNull::from(&mut log), (), move |_| {
+        let mut posted = Box::pin(PostedEvent::new(logger, (), move |_| {
             callback_calls.set(callback_calls.get() + 1);
         }));
 
@@ -1232,9 +1289,10 @@ mod event_tests {
     fn posted_owner_cancels_queued_callback_before_dispatch() {
         let _globals = EventGlobals::lock();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let logger = log_ref(&mut log);
         let calls = Rc::new(Cell::new(0));
         let callback_calls = calls.clone();
-        let mut posted = Box::pin(PostedEvent::new(NonNull::from(&mut log), (), move |_| {
+        let mut posted = Box::pin(PostedEvent::new(logger, (), move |_| {
             callback_calls.set(callback_calls.get() + 1);
         }));
 
@@ -1255,17 +1313,17 @@ mod event_tests {
     fn posted_owner_callback_can_repost_after_nginx_clears_its_flag() {
         let _globals = EventGlobals::lock();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let logger = log_ref(&mut log);
         let calls = Rc::new(Cell::new(0));
         let callback_calls = calls.clone();
-        let mut posted =
-            Box::pin(PostedEvent::new(NonNull::from(&mut log), 0_usize, move |mut event| {
-                assert!(!event.is_posted());
-                *event.state_mut() += 1;
-                callback_calls.set(callback_calls.get() + 1);
-                if *event.state() == 1 {
-                    assert_eq!(event.post(PostedQueue::Normal), Ok(true));
-                }
-            }));
+        let mut posted = Box::pin(PostedEvent::new(logger, 0_usize, move |mut event| {
+            assert!(!event.is_posted());
+            *event.state_mut() += 1;
+            callback_calls.set(callback_calls.get() + 1);
+            if *event.state() == 1 {
+                assert_eq!(event.post(PostedQueue::Normal), Ok(true));
+            }
+        }));
 
         assert_eq!(posted.as_mut().post(PostedQueue::Normal), Ok(true));
         let mut cycle = TestCycle::new();
@@ -1280,9 +1338,10 @@ mod event_tests {
     fn posted_owner_shutdown_cancels_the_queue_and_rejects_new_posts() {
         let _globals = EventGlobals::lock();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let logger = log_ref(&mut log);
         let calls = Rc::new(Cell::new(0));
         let callback_calls = calls.clone();
-        let mut posted = Box::pin(PostedEvent::new(NonNull::from(&mut log), (), move |_| {
+        let mut posted = Box::pin(PostedEvent::new(logger, (), move |_| {
             callback_calls.set(callback_calls.get() + 1);
         }));
 
@@ -1304,16 +1363,16 @@ mod event_tests {
     fn dropped_posted_owner_cancels_before_destroying_its_state() {
         let _globals = EventGlobals::lock();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let logger = log_ref(&mut log);
         let calls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
 
         {
             let callback_calls = calls.clone();
-            let mut posted = Box::pin(PostedEvent::new(
-                NonNull::from(&mut log),
-                DropState(drops.clone()),
-                move |_| callback_calls.set(callback_calls.get() + 1),
-            ));
+            let mut posted =
+                Box::pin(PostedEvent::new(logger, DropState(drops.clone()), move |_| {
+                    callback_calls.set(callback_calls.get() + 1)
+                }));
             assert_eq!(posted.as_mut().post(PostedQueue::Normal), Ok(true));
         }
         assert_eq!(drops.get(), 1);
@@ -1326,7 +1385,7 @@ mod event_tests {
     #[test]
     fn pool_posted_owner_cancels_queued_callback_before_pool_cleanup_drops_state() {
         let _globals = EventGlobals::lock();
-        let mut owner = TestPool::new();
+        let owner = TestPool::new();
         let calls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
 
@@ -1334,11 +1393,12 @@ mod event_tests {
             let log = owner.log();
             let pool = owner.handle();
             let callback_calls = calls.clone();
-            let posted =
+            let posted = unsafe {
                 PostedEvent::allocate_in_pool(&pool, log, DropState(drops.clone()), move |_| {
                     callback_calls.set(callback_calls.get() + 1)
                 })
-                .unwrap();
+            }
+            .unwrap();
             let address = posted.as_non_null();
             let mut posted = posted;
             assert_eq!(posted.as_non_null(), address);
@@ -1409,9 +1469,10 @@ mod event_tests {
     fn timer_owner_invokes_callback_on_expiry() {
         let _globals = EventGlobals::lock();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let logger = log_ref(&mut log);
         let calls = Rc::new(Cell::new(0));
         let callback_calls = calls.clone();
-        let mut timer = Box::pin(Timer::new(NonNull::from(&mut log), 0_usize, move |mut timer| {
+        let mut timer = Box::pin(Timer::new(logger, 0_usize, move |mut timer| {
             assert!(timer.is_timed_out());
             assert!(timer.take_timeout());
             assert!(!timer.is_timed_out());
@@ -1448,7 +1509,8 @@ mod event_tests {
     fn timer_exposes_explicit_arm_cancelable_and_cancel_states() {
         let _globals = EventGlobals::lock();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-        let mut timer = Box::pin(Timer::new(NonNull::from(&mut log), (), |_| {}));
+        let logger = log_ref(&mut log);
+        let mut timer = Box::pin(Timer::new(logger, (), |_| {}));
 
         assert!(!timer.is_armed());
         assert!(!timer.is_timed_out());
@@ -1470,13 +1532,14 @@ mod event_tests {
     fn timer_arms_zero_maximum_and_wrapping_deadlines() {
         let _globals = EventGlobals::lock();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let logger = log_ref(&mut log);
         let zero_calls = Rc::new(Cell::new(0));
         let full_range_calls = Rc::new(Cell::new(0));
         let maximum_calls = Rc::new(Cell::new(0));
         let wrapping_calls = Rc::new(Cell::new(0));
 
         let zero_callback_calls = zero_calls.clone();
-        let mut zero = Box::pin(Timer::new(NonNull::from(&mut log), (), move |_| {
+        let mut zero = Box::pin(Timer::new(logger, (), move |_| {
             zero_callback_calls.set(zero_callback_calls.get() + 1);
         }));
         zero.as_mut().arm(0).unwrap();
@@ -1484,7 +1547,7 @@ mod event_tests {
         assert_eq!(zero_calls.get(), 1);
 
         let full_range_callback_calls = full_range_calls.clone();
-        let mut full_range = Box::pin(Timer::new(NonNull::from(&mut log), (), move |_| {
+        let mut full_range = Box::pin(Timer::new(logger, (), move |_| {
             full_range_callback_calls.set(full_range_callback_calls.get() + 1);
         }));
         full_range.as_mut().arm(ngx_msec_t::MAX).unwrap();
@@ -1492,7 +1555,7 @@ mod event_tests {
         assert_eq!(full_range_calls.get(), 1);
 
         let maximum_callback_calls = maximum_calls.clone();
-        let mut maximum = Box::pin(Timer::new(NonNull::from(&mut log), (), move |_| {
+        let mut maximum = Box::pin(Timer::new(logger, (), move |_| {
             maximum_callback_calls.set(maximum_callback_calls.get() + 1);
         }));
         let maximum_timeout = ngx_msec_int_t::MAX as ngx_msec_t;
@@ -1509,7 +1572,7 @@ mod event_tests {
         assert_eq!(maximum_calls.get(), 1);
 
         let wrapping_callback_calls = wrapping_calls.clone();
-        let mut wrapping = Box::pin(Timer::new(NonNull::from(&mut log), (), move |_| {
+        let mut wrapping = Box::pin(Timer::new(logger, (), move |_| {
             wrapping_callback_calls.set(wrapping_callback_calls.get() + 1);
         }));
         unsafe { ngx_current_msec = ngx_msec_t::MAX - 2 };
@@ -1531,9 +1594,10 @@ mod event_tests {
     fn timer_rearm_bypasses_nginx_lazy_update() {
         let _globals = EventGlobals::lock();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let logger = log_ref(&mut log);
         let calls = Rc::new(Cell::new(0));
         let callback_calls = calls.clone();
-        let mut timer = Box::pin(Timer::new(NonNull::from(&mut log), (), move |_| {
+        let mut timer = Box::pin(Timer::new(logger, (), move |_| {
             callback_calls.set(callback_calls.get() + 1);
         }));
 
@@ -1557,7 +1621,8 @@ mod event_tests {
     fn timer_arm_clears_timeout_and_cancel_after_expiry_is_idempotent() {
         let _globals = EventGlobals::lock();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-        let mut timer = Box::pin(Timer::new(NonNull::from(&mut log), (), |_| {}));
+        let logger = log_ref(&mut log);
+        let mut timer = Box::pin(Timer::new(logger, (), |_| {}));
 
         timer.as_mut().arm(5).unwrap();
         unsafe {
@@ -1579,7 +1644,8 @@ mod event_tests {
     fn timer_cancelable_state_allows_worker_exit() {
         let _globals = EventGlobals::lock();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-        let mut timer = Box::pin(Timer::new(NonNull::from(&mut log), (), |_| {}));
+        let logger = log_ref(&mut log);
+        let mut timer = Box::pin(Timer::new(logger, (), |_| {}));
 
         timer.as_mut().arm(5).unwrap();
         assert_eq!(unsafe { ngx_event_no_timers_left() }, NGX_AGAIN as _);
@@ -1592,16 +1658,15 @@ mod event_tests {
     fn dropped_timer_cancels_its_pending_callback() {
         let _globals = EventGlobals::lock();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let logger = log_ref(&mut log);
         let calls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
 
         {
             let callback_calls = calls.clone();
-            let mut timer = Box::pin(Timer::new(
-                NonNull::from(&mut log),
-                DropState(drops.clone()),
-                move |_| callback_calls.set(callback_calls.get() + 1),
-            ));
+            let mut timer = Box::pin(Timer::new(logger, DropState(drops.clone()), move |_| {
+                callback_calls.set(callback_calls.get() + 1)
+            }));
             timer.as_mut().arm(5).unwrap();
         }
         assert_eq!(drops.get(), 1);
@@ -1617,7 +1682,7 @@ mod event_tests {
     #[test]
     fn pool_owned_timer_cancels_before_pool_cleanup_drops_state() {
         let _globals = EventGlobals::lock();
-        let mut owner = TestPool::new();
+        let owner = TestPool::new();
         let calls = Rc::new(Cell::new(0));
         let drops = Rc::new(Cell::new(0));
 
@@ -1625,9 +1690,11 @@ mod event_tests {
             let log = owner.log();
             let pool = owner.handle();
             let callback_calls = calls.clone();
-            let timer = Timer::allocate_in_pool(&pool, log, DropState(drops.clone()), move |_| {
-                callback_calls.set(1)
-            })
+            let timer = unsafe {
+                Timer::allocate_in_pool(&pool, log, DropState(drops.clone()), move |_| {
+                    callback_calls.set(1)
+                })
+            }
             .unwrap();
             let address = timer.as_non_null();
             let mut timer = timer;
@@ -1650,7 +1717,7 @@ mod event_tests {
     #[test]
     fn pool_timer_does_not_publish_cleanup_when_allocation_fails() {
         let _globals = EventGlobals::lock();
-        let mut owner = TestPool::new();
+        let owner = TestPool::new();
         let cleanup = unsafe { (*owner.raw).cleanup };
         unsafe { (*owner.raw).max = 0 };
 
@@ -1659,7 +1726,8 @@ mod event_tests {
             let log = owner.log();
             let pool = owner.handle();
             unsafe { ngx_rs_test_fail_allocations_after(successes) };
-            let result = Timer::allocate_in_pool(&pool, log, DropState(drops.clone()), |_| {});
+            let result =
+                unsafe { Timer::allocate_in_pool(&pool, log, DropState(drops.clone()), |_| {}) };
             unsafe { ngx_rs_test_reset_allocation_failures() };
 
             assert!(result.is_err());

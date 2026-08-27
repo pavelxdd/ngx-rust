@@ -11,6 +11,7 @@ use crate::http::{
     HttpModuleRequestContext, HttpPhase, HttpRequestHandler, IntoHandlerStatus, RequestHold,
     RequestRefMut, add_phase_handler,
 };
+use crate::log::LogRef;
 use crate::{ngx_log_debug_http, ngx_log_error};
 
 /// An asynchronous HTTP phase handler.
@@ -57,7 +58,7 @@ pub enum AsyncHandlerRegistrationError {
 type AsyncContinuationCallback<H> =
     for<'callback> fn(PostedEventCallback<'callback, RefCell<AsyncContinuationState<H>>>);
 type AsyncContinuation<H> =
-    PostedEvent<RefCell<AsyncContinuationState<H>>, AsyncContinuationCallback<H>>;
+    PostedEvent<'static, RefCell<AsyncContinuationState<H>>, AsyncContinuationCallback<H>>;
 
 struct AsyncContinuationState<H>
 where
@@ -174,12 +175,15 @@ where
                 Err(_) => return NGX_ERROR as ngx_int_t,
             };
             let pool_raw = pool.as_ptr();
-            let continuation = match AsyncContinuation::allocate_in_pool(
-                &pool,
-                log,
-                RefCell::new(AsyncContinuationState::new()),
-                async_phase_continuation::<H> as AsyncContinuationCallback<H>,
-            ) {
+            let log = unsafe { LogRef::from_raw(log.as_ptr()) }.expect("request logger");
+            let continuation = match unsafe {
+                AsyncContinuation::allocate_in_pool(
+                    &pool,
+                    log,
+                    RefCell::new(AsyncContinuationState::new()),
+                    async_phase_continuation::<H> as AsyncContinuationCallback<H>,
+                )
+            } {
                 Ok(continuation) => continuation.into_non_null(),
                 Err(_) => {
                     ngx_log_error!(
@@ -834,7 +838,8 @@ mod tests {
         }
 
         fn init(&mut self) {
-            crate::async_::init_worker(NonNull::from(&mut self.cycle.log)).unwrap();
+            let log = unsafe { LogRef::from_raw(&raw mut self.cycle.log) }.expect("test logger");
+            unsafe { crate::async_::init_worker(log) }.unwrap();
         }
 
         fn process_posted(&mut self) {

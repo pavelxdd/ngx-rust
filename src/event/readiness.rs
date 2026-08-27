@@ -299,7 +299,7 @@ pub struct EventReadiness<'connection, 'address> {
     kind: WaitKind,
     timeout_remaining: Option<u128>,
     timeout_armed: u128,
-    timer: Timer<ReadinessTimerState, ReadinessTimerCallback>,
+    timer: Timer<'address, ReadinessTimerState, ReadinessTimerCallback>,
     event: Option<NonNull<ngx_event_t>>,
     saved_handler: Option<ngx_event_handler_pt>,
     state: ReadinessState,

@@ -3395,6 +3395,8 @@ mod tests {
     #[cfg(feature = "test-link")]
     use crate::event::{PostedEvent, PostedEventCallback, PostedQueue, Timer, TimerCallback};
     use crate::http::{HttpModule, HttpModuleRequestContext};
+    #[cfg(feature = "test-link")]
+    use crate::log::LogRef;
 
     #[cfg(feature = "test-link")]
     use crate::ffi::{
@@ -3532,8 +3534,8 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     struct EventContext {
-        timer: Timer<(), TimerContextCallback>,
-        posted: PostedEvent<(), PostedContextCallback>,
+        timer: Timer<'static, (), TimerContextCallback>,
+        posted: PostedEvent<'static, (), PostedContextCallback>,
     }
 
     #[cfg(feature = "test-link")]
@@ -3541,6 +3543,12 @@ mod tests {
         fn drop(&mut self) {
             EVENT_CONTEXT_DROPS.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    #[cfg(feature = "test-link")]
+    fn static_log_ref() -> LogRef<'static> {
+        let log = Box::leak(Box::new(unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() }));
+        unsafe { LogRef::from_raw(log) }.expect("test logger")
     }
 
     #[cfg(feature = "test-link")]
@@ -6923,8 +6931,8 @@ mod tests {
     fn request_pool_cleanup_cancels_pinned_timer_and_posted_event_before_drop() {
         let _globals = RequestGlobals::new(1, 1);
         reset_event_context_state();
-        let mut owner = TestPool::new();
-        let log = owner.log();
+        let owner = TestPool::new();
+        let log = static_log_ref();
         let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
         let mut raw = zeroed_request();
         raw.pool = owner.raw;
