@@ -1538,6 +1538,55 @@ fn keepalive_attach_transfers_external_socket_and_rejects_invalid_connection() {
     ));
 }
 
+#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+#[test]
+fn keepalive_attach_rejects_ssl_connection_without_taking_ownership() {
+    let globals = PeerGlobals::new(true, add_event_ok);
+    let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let mut source = EventPeerBuilder::new(remote.peer_address())
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
+        .callbacks(EventPeerCallbacks::direct())
+        .socket_type(SocketType::Datagram)
+        .build()
+        .unwrap()
+        .connect()
+        .unwrap()
+        .into_peer();
+    let raw = source.raw.connection;
+    source.raw.connection = ptr::null_mut();
+    drop(source);
+    unsafe { (*raw).ssl = core::ptr::NonNull::<u8>::dangling().as_ptr().cast() };
+
+    let result = unsafe {
+        EventPeerBuilder::new(remote.peer_address())
+            .log(LogRef::from_raw((&raw const log).cast_mut()).unwrap())
+            .callbacks(EventPeerCallbacks::direct())
+            .build()
+            .unwrap()
+            .attach_keepalive(raw)
+    };
+    match result {
+        Err(EventPeerAttachError::Connection {
+            error: EventPeerConnectionError::SslConnection,
+            peer,
+        }) => {
+            drop(peer);
+            unsafe {
+                (*raw).ssl = ptr::null_mut();
+                crate::ffi::ngx_close_connection(raw);
+            }
+        }
+        Ok(attached) => {
+            unsafe { (*raw).ssl = ptr::null_mut() };
+            drop(attached);
+            panic!("SSL connection ownership must be rejected");
+        }
+        Err(error) => panic!("unexpected SSL connection result: {error:?}"),
+    }
+    assert_eq!(globals.free_connection_n(), 1);
+}
+
 #[cfg(unix)]
 #[test]
 fn native_connect_decline_closes_connection() {

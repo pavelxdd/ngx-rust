@@ -170,8 +170,9 @@ impl EventPeerCallbacks {
     /// # Safety
     ///
     /// `callback` must accept the builder's `data` and a live peer pointer, uphold nginx's
-    /// selection contract for its returned status and any published connection, and not unwind.
-    /// Its required data and owner state must remain valid through the call to `connect`.
+    /// selection contract for its returned status and any published connection, publish only a
+    /// plain connection without SSL state, and not unwind. Its required data and owner state must
+    /// remain valid through the call to `connect`.
     pub unsafe fn get(
         mut self,
         callback: unsafe extern "C" fn(*mut ngx_peer_connection_t, *mut c_void) -> ngx_int_t,
@@ -288,7 +289,7 @@ impl EventPeerHandlers {
     /// Both handlers must accept every event on which this pair is installed and must not unwind.
     /// Their event, logger, connection, and `connection.data` preconditions must be satisfied from
     /// publication until the handlers are replaced or the connection is closed. They must not
-    /// invalidate event or owner storage during dispatch.
+    /// install SSL state or invalidate event or owner storage during dispatch.
     pub unsafe fn new(
         read: unsafe extern "C" fn(*mut ngx_event_t),
         write: unsafe extern "C" fn(*mut ngx_event_t),
@@ -354,6 +355,8 @@ pub enum EventPeerConnectionError {
     },
     /// nginx did not create a connection pool.
     PoolAllocation,
+    /// The connection has SSL state that this plain-socket owner cannot finalize.
+    SslConnection,
     /// The native `getsockopt(SO_ERROR)` call failed.
     SocketOption(ngx_int_t),
     /// The completed socket reported a nonzero `SO_ERROR` value.
@@ -409,6 +412,7 @@ impl fmt::Display for EventPeerConnectionError {
             Self::PoolAllocation => {
                 formatter.write_str("event peer connection pool allocation failed")
             }
+            Self::SslConnection => formatter.write_str("event peer does not own SSL connections"),
             Self::SocketOption(error) => {
                 write!(formatter, "event peer SO_ERROR lookup failed with socket error {error}")
             }
@@ -719,10 +723,11 @@ fn socket_type_raw(socket_type: SocketType) -> c_int {
     }
 }
 
-/// One fully initialized native event peer.
+/// One fully initialized native event peer for plain, non-SSL connections.
 ///
 /// Dropping a selected peer releases it with [`EventPeerReleaseState::FAILED`], then closes any
-/// connection the release callback did not retain.
+/// connection the release callback did not retain. This owner rejects native connections with SSL
+/// state because synchronous [`Drop`] cannot complete nginx's asynchronous SSL shutdown lifecycle.
 ///
 /// ```compile_fail
 /// use ngx::event::EventPeer;
@@ -879,8 +884,9 @@ impl<'address, 'log> EventPeer<'address, 'log> {
     ///
     /// # Safety
     ///
-    /// `connection` must be a live nginx connection with initialized read and write events. On
-    /// success this owner becomes solely responsible for closing its socket and optional pool.
+    /// `connection` must be a live nginx connection with initialized read and write events and no
+    /// SSL state. It must remain plain while owned. On success this owner becomes solely
+    /// responsible for closing its socket and optional pool.
     #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub unsafe fn attach_keepalive(
         mut self,
@@ -966,7 +972,7 @@ impl<'address, 'log> EventPeer<'address, 'log> {
         if self.raw.connection.is_null() {
             return Err(EventPeerConnectionError::Detached);
         }
-        checked_event_peer_connection_ptr(self.raw.connection)
+        checked_plain_event_peer_connection_ptr(self.raw.connection)
     }
 
     fn prepare(
@@ -1150,10 +1156,21 @@ unsafe extern "C" fn inert_event_handler(_event: *mut ngx_event_t) {}
 fn checked_event_peer_connection(
     connection: *mut ngx_connection_t,
 ) -> Result<(), EventPeerConnectionError> {
-    let connection = checked_event_peer_connection_ptr(connection)?;
+    let connection = checked_plain_event_peer_connection_ptr(connection)?;
     let _ = checked_event_peer_events(connection)?;
     let _ = checked_event_peer_pool(connection)?;
     Ok(())
+}
+
+fn checked_plain_event_peer_connection_ptr(
+    connection: *mut ngx_connection_t,
+) -> Result<NonNull<ngx_connection_t>, EventPeerConnectionError> {
+    let connection = checked_event_peer_connection_ptr(connection)?;
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    if !unsafe { connection.as_ref().ssl }.is_null() {
+        return Err(EventPeerConnectionError::SslConnection);
+    }
+    Ok(connection)
 }
 
 fn checked_event_peer_connection_ptr(
