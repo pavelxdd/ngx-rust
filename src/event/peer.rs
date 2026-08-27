@@ -885,8 +885,9 @@ impl<'address, 'log> EventPeer<'address, 'log> {
     /// # Safety
     ///
     /// `connection` must be a live nginx connection with initialized read and write events and no
-    /// SSL state. It must remain plain while owned. On success this owner becomes solely
-    /// responsible for closing its socket and optional pool.
+    /// SSL state. It must remain plain while owned. On success this owner removes both event
+    /// timers, replaces their handlers, clears `connection.data`, and becomes solely responsible
+    /// for closing the socket and optional pool.
     #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub unsafe fn attach_keepalive(
         mut self,
@@ -900,6 +901,10 @@ impl<'address, 'log> EventPeer<'address, 'log> {
         }
 
         self.raw.connection = connection;
+        if let Err(error) = self.quiesce(true) {
+            self.raw.connection = ptr::null_mut();
+            return Err(EventPeerAttachError::Connection { error, peer: self });
+        }
         self.state = EventPeerState::Keepalive;
         Ok(EventPeerKeepalive { peer: self })
     }

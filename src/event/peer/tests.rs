@@ -1538,6 +1538,73 @@ fn keepalive_attach_transfers_external_socket_and_rejects_invalid_connection() {
     ));
 }
 
+#[test]
+fn keepalive_attach_quiesces_previous_handlers_data_and_timers() {
+    let globals = PeerGlobals::new(true, add_event_ok);
+    unsafe {
+        assert_eq!(ngx_event_timer_init(ptr::null_mut()), NGX_OK as _);
+        ngx_current_msec = 0;
+    }
+    let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let mut source_data = 1_u8;
+    EVENT_HANDLER_CALLS.store(0, Ordering::Relaxed);
+
+    let peer = EventPeerBuilder::new(remote.peer_address())
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
+        .callbacks(EventPeerCallbacks::direct())
+        .socket_type(SocketType::Datagram)
+        .build()
+        .unwrap();
+    let mut source = peer.connect().unwrap().into_peer().into_connection().unwrap();
+    source
+        .prepare(unsafe {
+            EventPeerPreparation::new(
+                LogRef::from_raw((&raw const log).cast_mut()).unwrap(),
+                test_event_handlers(active_read_handler, active_write_handler),
+                EVENT_PEER_MIN_POOL_SIZE,
+            )
+            .data((&raw mut source_data).cast())
+        })
+        .unwrap();
+    source
+        .with_connection(|mut connection| unsafe {
+            connection.read_event().unwrap().add_timer(7);
+            connection.write_event().unwrap().add_timer(11);
+        })
+        .unwrap();
+    let raw = source.peer.raw.connection;
+    unsafe {
+        (*(*raw).read).set_active(1);
+        (*(*raw).write).set_active(1);
+    }
+    source.peer.raw.connection = ptr::null_mut();
+    drop(source);
+
+    let attached = unsafe {
+        EventPeerBuilder::new(remote.peer_address())
+            .log(LogRef::from_raw((&raw const log).cast_mut()).unwrap())
+            .callbacks(EventPeerCallbacks::direct())
+            .build()
+            .unwrap()
+            .attach_keepalive(raw)
+    }
+    .unwrap();
+
+    assert!(unsafe { (*raw).data.is_null() });
+    assert_eq!(unsafe { (*raw).idle() }, 1);
+    assert_eq!(unsafe { (*(*raw).read).active() }, 1);
+    assert_eq!(unsafe { (*(*raw).write).active() }, 1);
+    assert_eq!(unsafe { (*(*raw).read).timer_set() }, 0);
+    assert_eq!(unsafe { (*(*raw).write).timer_set() }, 0);
+    unsafe { (*(*raw).read).handler.unwrap()((*raw).read) };
+    unsafe { (*(*raw).write).handler.unwrap()((*raw).write) };
+    assert_eq!(EVENT_HANDLER_CALLS.load(Ordering::Relaxed), 0);
+
+    drop(attached);
+    assert_eq!(globals.free_connection_n(), 1);
+}
+
 #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
 #[test]
 fn keepalive_attach_rejects_ssl_connection_without_taking_ownership() {
