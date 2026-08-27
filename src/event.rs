@@ -8,9 +8,9 @@ use core::ptr::{self, NonNull};
 use crate::allocator::AllocError;
 use crate::core::{Pool, PoolValue};
 use crate::ffi::{
-    NGX_OK, NGX_READ_EVENT, NGX_WRITE_EVENT, ngx_add_timer, ngx_del_timer, ngx_delete_posted_event,
-    ngx_event_actions, ngx_event_t, ngx_msec_t, ngx_post_event, ngx_posted_events,
-    ngx_posted_next_events,
+    NGX_OK, NGX_READ_EVENT, NGX_WRITE_EVENT, ngx_add_timer, ngx_connection_t, ngx_del_timer,
+    ngx_delete_posted_event, ngx_event_actions, ngx_event_t, ngx_msec_t, ngx_post_event,
+    ngx_posted_events, ngx_posted_next_events,
 };
 #[cfg(ngx_feature = "stat_stub")]
 use crate::ffi::{
@@ -78,7 +78,17 @@ pub unsafe fn notify(handler: unsafe extern "C" fn(*mut ngx_event_t)) -> Result<
     if unsafe { notify(Some(handler)) } == NGX_OK as _ { Ok(()) } else { Err(NotifyError::Failed) }
 }
 
-static TIMER_IDENT: [usize; 1] = [0];
+#[repr(transparent)]
+struct TimerDebugIdentity(ngx_connection_t);
+
+// SAFETY: Rust and nginx only read this fully initialized identity through Timer::event.data.
+unsafe impl Sync for TimerDebugIdentity {}
+
+static TIMER_IDENT: TimerDebugIdentity = {
+    let mut connection = unsafe { mem::zeroed::<ngx_connection_t>() };
+    connection.fd = -1;
+    TimerDebugIdentity(connection)
+};
 static POSTED_EVENT_IDENT: [usize; 1] = [0];
 
 /// Exclusive callback-scoped access to an nginx-owned event.
@@ -334,7 +344,7 @@ where
     /// or [`cancel`](Self::cancel).
     pub fn new(log: LogRef<'log>, state: T, callback: F) -> Self {
         let mut event = unsafe { mem::zeroed::<ngx_event_t>() };
-        event.data = (&raw const TIMER_IDENT).cast_mut().cast();
+        event.data = (&raw const TIMER_IDENT.0).cast_mut().cast();
         event.handler = Some(timer_handler::<T, F>);
         event.log = log.as_ptr();
 
@@ -1060,12 +1070,12 @@ mod event_tests {
     };
     use crate::core::Pool;
     use crate::ffi::{
-        NGX_AGAIN, NGX_OK, NGX_READ_EVENT, NGX_WRITE_EVENT, ngx_create_pool, ngx_current_msec,
-        ngx_cycle_t, ngx_destroy_pool, ngx_event_actions, ngx_event_expire_timers,
-        ngx_event_handler_pt, ngx_event_move_posted_next, ngx_event_no_timers_left,
-        ngx_event_process_posted, ngx_event_t, ngx_event_timer_init, ngx_int_t, ngx_log_t,
-        ngx_msec_int_t, ngx_msec_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events,
-        ngx_queue_empty, ngx_queue_init, ngx_queue_t, ngx_uint_t,
+        NGX_AGAIN, NGX_LOG_DEBUG_EVENT, NGX_OK, NGX_READ_EVENT, NGX_WRITE_EVENT, ngx_create_pool,
+        ngx_current_msec, ngx_cycle_t, ngx_destroy_pool, ngx_event_actions,
+        ngx_event_expire_timers, ngx_event_handler_pt, ngx_event_move_posted_next,
+        ngx_event_no_timers_left, ngx_event_process_posted, ngx_event_t, ngx_event_timer_init,
+        ngx_int_t, ngx_log_t, ngx_msec_int_t, ngx_msec_t, ngx_pool_t, ngx_posted_events,
+        ngx_posted_next_events, ngx_queue_empty, ngx_queue_init, ngx_queue_t, ngx_uint_t,
     };
     use crate::log::LogRef;
 
@@ -1081,6 +1091,43 @@ mod event_tests {
     static NOTIFICATION_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
     static EVENT_DELETE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EVENT_DELETE_KIND: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+    struct LogCapture {
+        len: usize,
+        bytes: [u8; 256],
+    }
+
+    impl Default for LogCapture {
+        fn default() -> Self {
+            Self { len: 0, bytes: [0; 256] }
+        }
+    }
+
+    impl LogCapture {
+        fn contains(&self, expected: &[u8]) -> bool {
+            self.bytes[..self.len].windows(expected.len()).any(|window| window == expected)
+        }
+    }
+
+    unsafe extern "C" fn capture_log(
+        log: *mut ngx_log_t,
+        _level: ngx_uint_t,
+        bytes: *mut u8,
+        len: usize,
+    ) {
+        let Some(log) = (unsafe { log.as_mut() }) else {
+            return;
+        };
+        let Some(capture) = (unsafe { log.wdata.cast::<LogCapture>().as_mut() }) else {
+            return;
+        };
+        if bytes.is_null() {
+            return;
+        }
+
+        capture.len = len.min(capture.bytes.len());
+        unsafe { ptr::copy_nonoverlapping(bytes, capture.bytes.as_mut_ptr(), capture.len) };
+    }
 
     struct EventGlobals {
         _global: MutexGuard<'static, ()>,
@@ -1760,6 +1807,30 @@ mod event_tests {
             ngx_event_expire_timers();
         }
         assert_eq!(wrapping_calls.get(), 1);
+    }
+
+    #[test]
+    fn timer_expiry_logs_the_invalid_connection_identity() {
+        let _globals = EventGlobals::lock();
+        let mut capture = LogCapture::default();
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        log.log_level = NGX_LOG_DEBUG_EVENT as _;
+        log.writer = Some(capture_log);
+        log.wdata = (&raw mut capture).cast();
+        let logger = log_ref(&mut log);
+        let mut timer = Box::pin(Timer::new(logger, (), |_| {}));
+        timer.as_mut().arm(5).unwrap();
+
+        unsafe {
+            ngx_current_msec = 5;
+            ngx_event_expire_timers();
+        }
+
+        assert!(
+            capture.contains(b"event timer del: -1: 5"),
+            "captured log: {:?}",
+            &capture.bytes[..capture.len]
+        );
     }
 
     #[test]
