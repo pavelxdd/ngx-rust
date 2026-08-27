@@ -773,7 +773,11 @@ fn readiness_keeps_a_borrowed_peer_open_and_transferable_after_drop() {
         .build()
         .unwrap();
     let connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
-    let keepalive = connection.into_keepalive().unwrap();
+    let keepalive = connection
+        .into_keepalive(test_keepalive_preparation(unsafe {
+            LogRef::from_raw((&raw const log).cast_mut()).unwrap()
+        }))
+        .unwrap();
     let mut borrowed = keepalive.into_connection().unwrap();
     assert_eq!(borrowed.state(), EventPeerConnectionState::Borrowed);
     let raw = borrowed.peer.raw.connection;
@@ -783,8 +787,13 @@ fn readiness_keeps_a_borrowed_peer_open_and_transferable_after_drop() {
     let mut context = Context::from_waker(Waker::noop());
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Ready(Ok(Readiness::Read)));
     drop(readiness);
+    unsafe { (*raw).read.as_mut().unwrap().set_ready(0) };
 
-    let keepalive = borrowed.into_keepalive().unwrap();
+    let keepalive = borrowed
+        .into_keepalive(test_keepalive_preparation(unsafe {
+            LogRef::from_raw((&raw const log).cast_mut()).unwrap()
+        }))
+        .unwrap();
     assert_eq!(globals.free_connection_n(), 0);
     drop(keepalive);
     assert_eq!(globals.free_connection_n(), 1);
