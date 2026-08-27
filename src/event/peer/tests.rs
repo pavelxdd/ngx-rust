@@ -804,7 +804,9 @@ fn connected_peer_prepares_transfers_and_closes_socket_pool_and_events() {
     ));
 
     connection
-        .with_connection(|mut connection| {
+        .with_connection(|mut connection| unsafe {
+            // SAFETY: EventPeer owns this live native connection and cancels both timers before
+            // transitioning or closing it.
             connection.read_event().unwrap().add_timer(7);
             connection.write_event().unwrap().add_timer(11);
         })
@@ -835,7 +837,9 @@ fn connected_peer_prepares_transfers_and_closes_socket_pool_and_events() {
     assert!(same_event_handler(unsafe { raw.write.as_ref().unwrap().handler }, idle_write_handler));
     keepalive.validate().unwrap();
     keepalive
-        .with_connection(|mut connection| {
+        .with_connection(|mut connection| unsafe {
+            // SAFETY: EventPeer retains the native connection until transition or Drop cancels
+            // the timer and closes its storage.
             connection.read_event().unwrap().add_timer(13);
         })
         .unwrap();

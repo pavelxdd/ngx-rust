@@ -211,7 +211,20 @@ impl EventRef<'_> {
     }
 
     /// Arms or updates this event's nginx timer.
-    pub fn add_timer(&mut self, timeout: ngx_msec_t) {
+    ///
+    /// ```compile_fail
+    /// use ngx::event::EventRef;
+    ///
+    /// fn cannot_publish_from_safe_code(event: &mut EventRef<'_>) {
+    ///     event.add_timer(1);
+    /// }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// The event must remain at a stable, valid address with a live handler, logger, and data until
+    /// the timer is deleted and quiesced or its expiry handler returns.
+    pub unsafe fn add_timer(&mut self, timeout: ngx_msec_t) {
         unsafe { ngx_add_timer(self.raw.as_ptr(), timeout) }
     }
 
@@ -232,7 +245,20 @@ impl EventRef<'_> {
     }
 
     /// Posts this event if it is not already posted.
-    pub fn post(&mut self, queue: PostedQueue) {
+    ///
+    /// ```compile_fail
+    /// use ngx::event::{EventRef, PostedQueue};
+    ///
+    /// fn cannot_publish_from_safe_code(event: &mut EventRef<'_>) {
+    ///     event.post(PostedQueue::Normal);
+    /// }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// The event must remain at a stable, valid address with a live handler, logger, and data until
+    /// it is deleted from the queue and quiesced or its posted handler returns.
+    pub unsafe fn post(&mut self, queue: PostedQueue) {
         unsafe {
             let queue = match queue {
                 PostedQueue::Normal => &raw mut ngx_posted_events,
@@ -1399,7 +1425,8 @@ mod event_tests {
         };
         CALLBACK_POSTED.store(usize::from(event.is_posted()), Ordering::Relaxed);
         if callback == 0 {
-            event.post(PostedQueue::Normal);
+            // SAFETY: the test retains the event through the immediately following dispatch.
+            unsafe { event.post(PostedQueue::Normal) };
         }
     }
 

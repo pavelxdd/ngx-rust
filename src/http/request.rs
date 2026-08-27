@@ -2871,7 +2871,9 @@ impl RequestContinuation<'_> {
                 }
 
                 Self::release_hold(hold);
-                event.post(PostedQueue::Next);
+                // SAFETY: nginx owns the connection write event through next-cycle dispatch; the
+                // request is current or was queued before releasing its hold.
+                unsafe { event.post(PostedQueue::Next) };
                 Ok(())
             })();
             if let Err(error) = posted {
