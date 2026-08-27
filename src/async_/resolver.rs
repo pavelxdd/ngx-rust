@@ -312,7 +312,7 @@ impl Drop for Resolution<'_> {
     fn drop(&mut self) {
         let owner = self.shared.borrow().owner;
         if let Some(mut owner) = owner {
-            unsafe { owner.as_mut() }.cancel();
+            let _ = unsafe { owner.as_mut() }.cancel();
         }
     }
 }
@@ -403,7 +403,7 @@ impl ResolutionOwner {
         }
     }
 
-    fn cancel(&mut self) {
+    fn cancel(&mut self) -> Option<Waker> {
         if let Some(mut context) = self.context.take() {
             context.make_inert();
             drop(context);
@@ -411,18 +411,23 @@ impl ResolutionOwner {
 
         let owner = NonNull::from(&*self);
         let mut shared = self.shared.borrow_mut();
-        if shared.owner == Some(owner) {
-            shared.owner = None;
-            shared.pool = None;
-            shared.completion = ResolutionCompletion::Canceled;
-            shared.waker.take();
+        if shared.owner != Some(owner) {
+            return None;
         }
+
+        shared.owner = None;
+        shared.pool = None;
+        shared.completion = ResolutionCompletion::Canceled;
+        shared.waker.take()
     }
 }
 
 impl Drop for ResolutionOwner {
     fn drop(&mut self) {
-        self.cancel();
+        let waker = self.cancel();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 }
 
@@ -1401,11 +1406,13 @@ mod tests {
             &pool,
             |_| {},
             |resolution, context| {
-                let waker = Waker::from(Arc::new(CountWaker(Arc::new(AtomicUsize::new(0)))));
+                let wakes = Arc::new(AtomicUsize::new(0));
+                let waker = Waker::from(Arc::new(CountWaker(Arc::clone(&wakes))));
                 assert!(matches!(poll_resolution(resolution, &waker), Poll::Pending));
 
                 let pending = mem::replace(resolution, canceled_resolution());
                 drop(pending);
+                assert_eq!(wakes.load(Ordering::Relaxed), 0);
                 assert!(context.data.is_null());
                 assert!(context.handler.is_none());
                 assert_eq!(globals.done_count(), 1);
@@ -1486,13 +1493,41 @@ mod tests {
 
                 owner.destroy();
                 assert!(context.data.is_null());
-                assert_eq!(wakes.load(Ordering::Relaxed), 0);
+                assert_eq!(wakes.load(Ordering::Relaxed), 1);
                 assert_eq!(globals.done_count(), 1);
 
                 unsafe { ResolutionOwner::handler(context) };
                 assert_eq!(globals.done_count(), 1);
                 assert!(matches!(
                     poll_resolution(resolution, &waker),
+                    Poll::Ready(Err(Error::Canceled))
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn pool_cleanup_waker_can_drop_the_resolution_reentrantly() {
+        let globals = ResolverGlobals::new();
+        let owner = TestPool::new();
+        let pool = owner.handle();
+
+        pending_resolution(
+            &pool,
+            |_| {},
+            |resolution, context| {
+                let cancel_waker = Arc::new(CancelWaker {
+                    resolution: AtomicPtr::new(core::ptr::from_mut(resolution).cast()),
+                });
+                let waker = Waker::from(Arc::clone(&cancel_waker));
+                assert!(matches!(poll_resolution(resolution, &waker), Poll::Pending));
+
+                owner.destroy();
+                assert!(cancel_waker.resolution.load(Ordering::Relaxed).is_null());
+                assert!(context.data.is_null());
+                assert_eq!(globals.done_count(), 1);
+                assert!(matches!(
+                    poll_resolution(resolution, Waker::noop()),
                     Poll::Ready(Err(Error::Canceled))
                 ));
             },
