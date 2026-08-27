@@ -669,6 +669,22 @@ impl<'address> EventPeer<'address> {
                     self.raw.connection = ptr::null_mut();
                     return Err(EventPeerConnectError::MisalignedConnection { status, peer: self });
                 }
+                let connection = unsafe { NonNull::new_unchecked(connection) };
+                let (mut read, mut write) = match checked_event_peer_events(connection) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        self.raw.connection = ptr::null_mut();
+                        return Err(EventPeerConnectError::InvalidConnection {
+                            status,
+                            error,
+                            peer: self,
+                        });
+                    }
+                };
+                unsafe {
+                    read.as_mut().handler = Some(inert_event_handler);
+                    write.as_mut().handler = Some(inert_event_handler);
+                }
                 self.state = if status == EventPeerConnectStatus::Connected {
                     EventPeerState::Connected
                 } else {
@@ -1344,6 +1360,15 @@ pub enum EventPeerConnectError<'address> {
         /// The retained peer.
         peer: EventPeer<'address>,
     },
+    /// nginx returned a success category with invalid embedded events.
+    InvalidConnection {
+        /// The success category that had invalid connection state.
+        status: EventPeerConnectStatus,
+        /// The embedded event validation failure.
+        error: EventPeerConnectionError,
+        /// The retained detached peer.
+        peer: EventPeer<'address>,
+    },
     /// nginx returned a failure category after publishing a connection pointer.
     ///
     /// The pointer is detached because a failed peer selector can retain its own connection.
@@ -1363,6 +1388,7 @@ impl<'address> EventPeerConnectError<'address> {
             | Self::UnexpectedStatus { peer, .. }
             | Self::MissingConnection { peer, .. }
             | Self::MisalignedConnection { peer, .. }
+            | Self::InvalidConnection { peer, .. }
             | Self::ConnectionOnFailure { peer, .. } => peer,
         }
     }
@@ -1382,6 +1408,9 @@ impl fmt::Display for EventPeerConnectError<'_> {
             }
             Self::MisalignedConnection { .. } => {
                 formatter.write_str("event peer connected with a misaligned connection")
+            }
+            Self::InvalidConnection { error, .. } => {
+                write!(formatter, "event peer connected with invalid native events: {error}")
             }
             Self::ConnectionOnFailure { .. } => {
                 formatter.write_str("event peer failed after publishing a connection")

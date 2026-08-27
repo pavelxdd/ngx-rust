@@ -70,6 +70,34 @@ fn advance_to(msec: ngx_msec_t) {
 }
 
 #[test]
+fn readiness_restores_the_inert_handler_after_a_pending_connect_wait() {
+    let _globals = PeerGlobals::new(true, add_event_ok);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let remote = TestAddress::ipv4([127, 0, 0, 1], listener.local_addr().unwrap().port());
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
+    let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
+    assert_eq!(connection.state(), EventPeerConnectionState::Pending);
+    let raw = connection.peer.raw.connection;
+    let write = unsafe { raw.as_ref().unwrap().write };
+    unsafe { (*write).set_ready(0) };
+
+    let mut readiness = Box::pin(connection.wait_connect(None));
+    let mut context = Context::from_waker(Waker::noop());
+    assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
+    wait_for_writable_socket(unsafe { raw.as_ref().unwrap().fd });
+    unsafe { (*write).set_ready(1) };
+    invoke_event_handler(write);
+    assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Ready(Ok(Readiness::Connect)));
+    drop(readiness);
+    assert!(same_event_handler(unsafe { (*write).handler }, inert_event_handler));
+}
+
+#[test]
 fn readiness_returns_immediately_for_a_ready_read_event() {
     let _globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);

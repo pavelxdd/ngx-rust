@@ -13,9 +13,10 @@ use super::{
     EventPeer, EventPeerAddress, EventPeerAddressError, EventPeerAttachError, EventPeerBuildError,
     EventPeerBuilder, EventPeerCallbacks, EventPeerConnectError, EventPeerConnectStatus,
     EventPeerConnectionError, EventPeerConnectionState, EventPeerHandlers, EventPeerKeepaliveState,
-    EventPeerLogError, EventPeerPreparation,
+    EventPeerLogError, EventPeerPreparation, inert_event_handler,
 };
 use crate::core::{ConnectionError, SocketAddressError, SocketType};
+use crate::event::EventError;
 #[cfg(unix)]
 use crate::ffi::sockaddr_un;
 use crate::ffi::{
@@ -627,6 +628,22 @@ fn connect_rejects_unknown_or_empty_success_results() {
         }
         result => panic!("unexpected connect result: {result:?}"),
     }
+
+    let mut invalid_connection = unsafe { mem::zeroed::<ngx_connection_t>() };
+    let mut peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
+    peer.raw.connection = &raw mut invalid_connection;
+    match peer.classify_connect(NGX_OK as _) {
+        Err(EventPeerConnectError::InvalidConnection { status, error, peer }) => {
+            assert_eq!(status, EventPeerConnectStatus::Connected);
+            assert!(matches!(error, EventPeerConnectionError::Event(EventError::NullEvent)));
+            assert!(peer.raw.connection.is_null());
+        }
+        result => panic!("unexpected connect result: {result:?}"),
+    }
 }
 
 #[test]
@@ -645,6 +662,9 @@ fn native_datagram_connect_transfers_and_releases_connection() {
 
     let peer = result.into_peer();
     assert!(!peer.raw.connection.is_null());
+    let connection = unsafe { peer.raw.connection.as_ref() }.unwrap();
+    assert!(same_event_handler(unsafe { (*connection.read).handler }, inert_event_handler));
+    assert!(same_event_handler(unsafe { (*connection.write).handler }, inert_event_handler));
     drop(peer);
     assert_eq!(globals.free_connection_n(), 1);
 }
@@ -665,7 +685,11 @@ fn native_stream_connect_returns_pending_connection() {
     .unwrap();
     assert_eq!(result.status(), EventPeerConnectStatus::Pending);
 
-    drop(result.into_peer());
+    let peer = result.into_peer();
+    let connection = unsafe { peer.raw.connection.as_ref() }.unwrap();
+    assert!(same_event_handler(unsafe { (*connection.read).handler }, inert_event_handler));
+    assert!(same_event_handler(unsafe { (*connection.write).handler }, inert_event_handler));
+    drop(peer);
     assert_eq!(globals.free_connection_n(), 1);
     drop(listener);
 }
