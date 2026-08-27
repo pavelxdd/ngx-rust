@@ -271,7 +271,7 @@ fn same_handler(
 /// ```compile_fail
 /// use ngx::event::EventPeerConnection;
 ///
-/// fn reject(mut connection: EventPeerConnection<'_>) {
+/// fn reject(mut connection: EventPeerConnection<'_, '_>) {
 ///     let read = connection.wait_read(None);
 ///     let write = connection.wait_write(None);
 ///     drop((read, write));
@@ -282,7 +282,7 @@ fn same_handler(
 /// use ngx::event::{EventPeerConnection, EventPeerPreparation};
 ///
 /// fn reject(
-///     mut connection: EventPeerConnection<'_>,
+///     mut connection: EventPeerConnection<'_, '_>,
 ///     preparation: EventPeerPreparation<'_>,
 /// ) {
 ///     let wait = connection.wait_read(None);
@@ -296,17 +296,17 @@ fn same_handler(
 ///
 /// fn require_send<T: Send>(_: T) {}
 ///
-/// fn reject(mut connection: EventPeerConnection<'_>) {
+/// fn reject(mut connection: EventPeerConnection<'_, '_>) {
 ///     require_send(connection.wait_read(None));
 /// }
 /// ```
 #[must_use = "futures do nothing unless polled or awaited"]
-pub struct EventReadiness<'connection, 'address> {
-    connection: &'connection mut EventPeerConnection<'address>,
+pub struct EventReadiness<'connection, 'address, 'log> {
+    connection: &'connection mut EventPeerConnection<'address, 'log>,
     kind: WaitKind,
     timeout_remaining: Option<u128>,
     timeout_armed: u128,
-    timer: Timer<'address, ReadinessTimerState, ReadinessTimerCallback>,
+    timer: Timer<'log, ReadinessTimerState, ReadinessTimerCallback>,
     event: Option<NonNull<ngx_event_t>>,
     saved_handler: Option<ngx_event_handler_pt>,
     state: ReadinessState,
@@ -314,9 +314,9 @@ pub struct EventReadiness<'connection, 'address> {
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
-impl<'connection, 'address> EventReadiness<'connection, 'address> {
+impl<'connection, 'address, 'log> EventReadiness<'connection, 'address, 'log> {
     fn new(
-        connection: &'connection mut EventPeerConnection<'address>,
+        connection: &'connection mut EventPeerConnection<'address, 'log>,
         kind: WaitKind,
         timeout: Option<Duration>,
     ) -> Self {
@@ -482,7 +482,7 @@ impl<'connection, 'address> EventReadiness<'connection, 'address> {
     }
 }
 
-impl Future for EventReadiness<'_, '_> {
+impl Future for EventReadiness<'_, '_, '_> {
     type Output = Result<Readiness, ReadinessError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -526,20 +526,23 @@ impl Future for EventReadiness<'_, '_> {
     }
 }
 
-impl Drop for EventReadiness<'_, '_> {
+impl Drop for EventReadiness<'_, '_, '_> {
     fn drop(&mut self) {
         self.finish(true);
     }
 }
 
-impl<'address> EventPeerConnection<'address> {
+impl<'address, 'log> EventPeerConnection<'address, 'log> {
     /// Waits for the peer read event, optionally bounded by an nginx timer.
     ///
     /// # Safety
     ///
     /// The future must be polled and dropped on the initialized nginx event-loop thread that owns
     /// this connection and its event registrations.
-    pub unsafe fn wait_read(&mut self, timeout: Option<Duration>) -> EventReadiness<'_, 'address> {
+    pub unsafe fn wait_read(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> EventReadiness<'_, 'address, 'log> {
         EventReadiness::new(self, WaitKind::Read, timeout)
     }
 
@@ -549,7 +552,10 @@ impl<'address> EventPeerConnection<'address> {
     ///
     /// The future must be polled and dropped on the initialized nginx event-loop thread that owns
     /// this connection and its event registrations.
-    pub unsafe fn wait_write(&mut self, timeout: Option<Duration>) -> EventReadiness<'_, 'address> {
+    pub unsafe fn wait_write(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> EventReadiness<'_, 'address, 'log> {
         EventReadiness::new(self, WaitKind::Write, timeout)
     }
 
@@ -562,7 +568,7 @@ impl<'address> EventPeerConnection<'address> {
     pub unsafe fn wait_connect(
         &mut self,
         timeout: Option<Duration>,
-    ) -> EventReadiness<'_, 'address> {
+    ) -> EventReadiness<'_, 'address, 'log> {
         EventReadiness::new(self, WaitKind::Connect, timeout)
     }
 }
