@@ -15,12 +15,18 @@ use crate::ffi::{
     NGX_AGAIN, NGX_BUSY, NGX_DECLINED, NGX_ERROR, NGX_OK, ngx_addr_t, ngx_connection_t,
     ngx_create_pool, ngx_destroy_pool, ngx_event_connect_peer, ngx_event_free_peer_pt,
     ngx_event_get_peer, ngx_event_get_peer_pt, ngx_event_handler_pt, ngx_event_notify_peer_pt,
-    ngx_event_t, ngx_int_t, ngx_log_t, ngx_msec_t, ngx_peer_connection_t, ngx_pool_t,
-    ngx_socket_errno, ngx_str_t, ngx_uint_t,
+    ngx_event_t, ngx_int_t, ngx_log_t, ngx_msec_t, ngx_peer_connection_t, ngx_pool_large_t,
+    ngx_pool_t, ngx_socket_errno, ngx_str_t, ngx_uint_t,
 };
 #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
 use crate::ffi::{ngx_event_save_peer_session_pt, ngx_event_set_peer_session_pt};
 use crate::log::LogRef;
+
+const NGX_POOL_ALIGNMENT: usize = 16;
+const EVENT_PEER_MIN_POOL_SIZE: usize =
+    (mem::size_of::<ngx_pool_t>() + 2 * mem::size_of::<ngx_pool_large_t>() + NGX_POOL_ALIGNMENT
+        - 1)
+        & !(NGX_POOL_ALIGNMENT - 1);
 
 /// Failure while validating an nginx address used for an outbound event peer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,6 +292,13 @@ pub enum EventPeerConnectionError {
     Detached,
     /// The requested operation requires a pending nonblocking connect.
     NotPending,
+    /// The requested connection pool is smaller than nginx's minimum layout.
+    PoolTooSmall {
+        /// The requested pool size.
+        requested: usize,
+        /// The minimum size required by the native pool layout.
+        minimum: usize,
+    },
     /// nginx did not create a connection pool.
     PoolAllocation,
     /// The native `getsockopt(SO_ERROR)` call failed.
@@ -323,6 +336,10 @@ impl fmt::Display for EventPeerConnectionError {
         match self {
             Self::Detached => formatter.write_str("event peer connection is detached"),
             Self::NotPending => formatter.write_str("event peer connection is not pending"),
+            Self::PoolTooSmall { requested, minimum } => write!(
+                formatter,
+                "event peer connection pool size {requested} is smaller than minimum {minimum}"
+            ),
             Self::PoolAllocation => {
                 formatter.write_str("event peer connection pool allocation failed")
             }
@@ -773,6 +790,12 @@ impl<'address> EventPeer<'address> {
         let mut pool = match checked_event_peer_pool(connection)? {
             Some(pool) => pool,
             None => {
+                if preparation.pool_size < EVENT_PEER_MIN_POOL_SIZE {
+                    return Err(EventPeerConnectionError::PoolTooSmall {
+                        requested: preparation.pool_size,
+                        minimum: EVENT_PEER_MIN_POOL_SIZE,
+                    });
+                }
                 let pool = NonNull::new(unsafe {
                     ngx_create_pool(preparation.pool_size, preparation.log.as_ptr())
                 })
