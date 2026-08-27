@@ -437,7 +437,9 @@ impl<'connection, 'address> EventReadiness<'connection, 'address> {
         self.timeout_armed = milliseconds;
         let mut timer = unsafe { Pin::new_unchecked(&mut self.timer) };
         timer.as_mut().set_cancelable(true);
-        timer.as_mut().arm(timeout).expect("readiness timer was checked unarmed before arming");
+        unsafe {
+            timer.as_mut().arm(timeout).expect("readiness timer was checked unarmed before arming");
+        }
     }
 
     fn finish(&mut self, forward_delivered: bool) {
@@ -521,17 +523,35 @@ impl Drop for EventReadiness<'_, '_> {
 
 impl<'address> EventPeerConnection<'address> {
     /// Waits for the peer read event, optionally bounded by an nginx timer.
-    pub fn wait_read(&mut self, timeout: Option<Duration>) -> EventReadiness<'_, 'address> {
+    ///
+    /// # Safety
+    ///
+    /// The future must be polled and dropped on the initialized nginx event-loop thread that owns
+    /// this connection and its event registrations.
+    pub unsafe fn wait_read(&mut self, timeout: Option<Duration>) -> EventReadiness<'_, 'address> {
         EventReadiness::new(self, WaitKind::Read, timeout)
     }
 
     /// Waits for the peer write event, optionally bounded by an nginx timer.
-    pub fn wait_write(&mut self, timeout: Option<Duration>) -> EventReadiness<'_, 'address> {
+    ///
+    /// # Safety
+    ///
+    /// The future must be polled and dropped on the initialized nginx event-loop thread that owns
+    /// this connection and its event registrations.
+    pub unsafe fn wait_write(&mut self, timeout: Option<Duration>) -> EventReadiness<'_, 'address> {
         EventReadiness::new(self, WaitKind::Write, timeout)
     }
 
     /// Waits for a pending nonblocking peer connection and validates `SO_ERROR` on readiness.
-    pub fn wait_connect(&mut self, timeout: Option<Duration>) -> EventReadiness<'_, 'address> {
+    ///
+    /// # Safety
+    ///
+    /// The future must be polled and dropped on the initialized nginx event-loop thread that owns
+    /// this connection and its event registrations.
+    pub unsafe fn wait_connect(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> EventReadiness<'_, 'address> {
         EventReadiness::new(self, WaitKind::Connect, timeout)
     }
 }
