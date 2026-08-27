@@ -9,7 +9,7 @@
 
 use alloc::rc::Rc;
 use alloc::string::String;
-use core::cell::RefCell;
+use core::cell::{RefCell, UnsafeCell};
 use core::ffi::c_void;
 use core::fmt;
 use core::marker::PhantomData;
@@ -27,7 +27,7 @@ use nginx_sys::{
 
 use crate::{
     collections::Vec,
-    core::{Pool, Status},
+    core::{NgxStr, Pool, Status},
     ffi::{
         ngx_addr_t, ngx_msec_t, ngx_pool_t, ngx_resolve_name, ngx_resolve_start,
         ngx_resolver_ctx_t, ngx_resolver_t, ngx_str_t,
@@ -115,43 +115,80 @@ impl From<NonZero<isize>> for ResolverError {
 type Res<'pool> = Result<Vec<ngx_addr_t, Pool<'pool>>, Error>;
 type RawRes = Result<RawAddresses, Error>;
 
-/// A wrapper for an ngx_resolver_t which provides an async Rust API
-pub struct Resolver {
+/// A wrapper for an ngx_resolver_t which provides an async Rust API.
+///
+/// A dangling native resolver cannot be introduced through safe code:
+///
+/// ```compile_fail
+/// use core::ptr::NonNull;
+/// use ngx::{async_::resolver::Resolver, ffi::ngx_resolver_t};
+///
+/// let _ = Resolver::from_raw(NonNull::<ngx_resolver_t>::dangling().as_ptr(), 1_000);
+/// ```
+///
+/// Query bytes must come from a valid Rust borrow rather than a raw `ngx_str_t`:
+///
+/// ```compile_fail
+/// use core::ptr::NonNull;
+/// use ngx::{
+///     async_::resolver::Resolver,
+///     core::Pool,
+///     ffi::ngx_str_t,
+/// };
+///
+/// fn resolve_dangling(resolver: &Resolver<'_>, pool: &Pool<'_>) {
+///     let name = ngx_str_t { len: 1, data: NonNull::<u8>::dangling().as_ptr() };
+///     let _ = resolver.resolve_name(&name, pool);
+/// }
+/// ```
+pub struct Resolver<'resolver> {
     resolver: NonNull<ngx_resolver_t>,
     timeout: ngx_msec_t,
+    _lifetime: PhantomData<&'resolver UnsafeCell<ngx_resolver_t>>,
+    _not_thread_safe: PhantomData<*mut ()>,
 }
 
-impl Resolver {
-    /// Create a new `Resolver` from existing pointer to `ngx_resolver_t` and
-    /// timeout.
-    pub fn from_resolver(resolver: NonNull<ngx_resolver_t>, timeout: ngx_msec_t) -> Self {
-        Self { resolver, timeout }
+impl<'resolver> Resolver<'resolver> {
+    /// Creates a resolver capability from a native nginx resolver.
+    ///
+    /// # Safety
+    ///
+    /// `resolver` must identify a live, properly aligned nginx resolver for `'resolver`, including
+    /// its referenced configuration, connections, and logger. The resolver must remain on its
+    /// owning event-loop thread. Null and misaligned pointers are rejected.
+    pub unsafe fn from_raw(resolver: *mut ngx_resolver_t, timeout: ngx_msec_t) -> Option<Self> {
+        let resolver = NonNull::new(resolver)?;
+        if !resolver.as_ptr().is_aligned() {
+            return None;
+        }
+
+        Some(Self { resolver, timeout, _lifetime: PhantomData, _not_thread_safe: PhantomData })
     }
 
     /// Resolve a name into a set of addresses.
     ///
     /// ```compile_fail
     /// use ngx::{
-    ///     async_::Resolver,
-    ///     core::Pool,
-    ///     ffi::{ngx_pool_t, ngx_str_t},
+    ///     async_::resolver::Resolver,
+    ///     core::{NgxStr, Pool},
+    ///     ffi::ngx_pool_t,
     /// };
     ///
-    /// fn escape(resolver: &Resolver, name: &ngx_str_t, raw: *mut ngx_pool_t) {
+    /// fn escape(resolver: &Resolver<'_>, name: &NgxStr, raw: *mut ngx_pool_t) {
     ///     let _future = unsafe {
     ///         Pool::with_raw(raw, |pool| resolver.resolve_name(name, &pool))
     ///     };
     /// }
     /// ```
-    pub async fn resolve_name<'pool>(&self, name: &ngx_str_t, pool: &Pool<'pool>) -> Res<'pool> {
-        Resolution::new(name, &ngx_str_t::empty(), self, pool)?.await
+    pub async fn resolve_name<'pool>(&self, name: &NgxStr, pool: &Pool<'pool>) -> Res<'pool> {
+        Resolution::new(name, NgxStr::from_bytes(&[]), self, pool)?.await
     }
 
     /// Resolve a service into a set of addresses.
     pub async fn resolve_service<'pool>(
         &self,
-        name: &ngx_str_t,
-        service: &ngx_str_t,
+        name: &NgxStr,
+        service: &NgxStr,
         pool: &Pool<'pool>,
     ) -> Res<'pool> {
         Resolution::new(name, service, self, pool)?.await
@@ -165,9 +202,9 @@ struct Resolution<'pool> {
 
 impl<'pool> Resolution<'pool> {
     fn new(
-        name: &ngx_str_t,
-        service: &ngx_str_t,
-        resolver: &Resolver,
+        name: &NgxStr,
+        service: &NgxStr,
+        resolver: &Resolver<'_>,
         pool: &Pool<'pool>,
     ) -> Result<Self, Error> {
         let name = copy_string(name, pool)?;
@@ -340,7 +377,9 @@ impl ResolutionOwner {
         }
 
         owned.make_inert();
-        let result = copy_result(&owned, self.pool);
+        // The resolver callback owns this context, and nginx keeps its reported result fields live
+        // until ngx_resolve_name_done.
+        let result = unsafe { copy_result(&owned, self.pool) };
         let owner = NonNull::from(&*self);
         let waker = {
             let mut shared = self.shared.borrow_mut();
@@ -477,21 +516,25 @@ impl ResolverCtx {
     }
 }
 
-fn copy_result(context: &ngx_resolver_ctx_t, pool: NonNull<ngx_pool_t>) -> RawRes {
+/// # Safety
+///
+/// The native result pointers reachable from `context` must remain readable for their reported
+/// lengths until this function returns, and `pool` must identify the live resolution pool.
+unsafe fn copy_result(context: &ngx_resolver_ctx_t, pool: NonNull<ngx_pool_t>) -> RawRes {
     if let Some(error) = NonZero::new(context.state) {
-        let name = String::from_utf8_lossy(checked_bytes(&context.name)?).into_owned();
+        let name = String::from_utf8_lossy(unsafe { checked_bytes(&context.name) }?).into_owned();
         return Err(Error::Resolver(ResolverError::from(error), name));
     }
 
     let count = context.naddrs;
-    let addresses = checked_slice(context.addrs, count)?;
+    let addresses = unsafe { checked_slice(context.addrs, count) }?;
     let raw_pool = pool;
     let pool = unsafe { Pool::from_raw(raw_pool.as_ptr()) }.ok_or(Error::Internal)?;
     let mut copied = Vec::new_in(pool.clone());
     copied.try_reserve_exact(addresses.len()).map_err(|_| Error::AllocationFailed)?;
 
     for address in addresses {
-        copied.push(copy_resolved_addr(address, &pool)?);
+        copied.push(unsafe { copy_resolved_addr(address, &pool) }?);
     }
 
     let (pointer, length, capacity, _) = copied.into_raw_parts_with_alloc();
@@ -499,7 +542,11 @@ fn copy_result(context: &ngx_resolver_ctx_t, pool: NonNull<ngx_pool_t>) -> RawRe
     Ok(RawAddresses { pool: raw_pool, pointer, length, capacity })
 }
 
-fn checked_slice<'a, T>(pointer: *const T, length: usize) -> Result<&'a [T], Error> {
+/// # Safety
+///
+/// A non-empty range must be aligned, initialized, and readable for `length` elements throughout
+/// `'a`.
+unsafe fn checked_slice<'a, T>(pointer: *const T, length: usize) -> Result<&'a [T], Error> {
     if length == 0 {
         return Ok(&[]);
     }
@@ -512,12 +559,16 @@ fn checked_slice<'a, T>(pointer: *const T, length: usize) -> Result<&'a [T], Err
     Ok(unsafe { slice::from_raw_parts(pointer, length) })
 }
 
-fn checked_bytes(value: &ngx_str_t) -> Result<&[u8], Error> {
-    checked_slice(value.data.cast_const(), value.len)
+/// # Safety
+///
+/// A non-empty native string must remain readable for its reported length through the returned
+/// borrow.
+unsafe fn checked_bytes(value: &ngx_str_t) -> Result<&[u8], Error> {
+    unsafe { checked_slice(value.data.cast_const(), value.len) }
 }
 
-fn copy_string(value: &ngx_str_t, pool: &Pool<'_>) -> Result<ngx_str_t, Error> {
-    let bytes = checked_bytes(value)?;
+fn copy_string(value: &NgxStr, pool: &Pool<'_>) -> Result<ngx_str_t, Error> {
+    let bytes = value.as_bytes();
     if bytes.is_empty() {
         return Ok(ngx_str_t::empty());
     }
@@ -525,7 +576,10 @@ fn copy_string(value: &ngx_str_t, pool: &Pool<'_>) -> Result<ngx_str_t, Error> {
     unsafe { ngx_str_t::from_bytes(pool.as_ptr(), bytes) }.ok_or(Error::AllocationFailed)
 }
 
-fn copy_resolved_addr(
+/// # Safety
+///
+/// Native address and name storage must remain readable for their reported lengths until copied.
+unsafe fn copy_resolved_addr(
     addr: &nginx_sys::ngx_resolver_addr_t,
     pool: &Pool<'_>,
 ) -> Result<ngx_addr_t, Error> {
@@ -539,7 +593,7 @@ fn copy_resolved_addr(
     let source = NonNull::new(addr.sockaddr.cast::<u8>()).ok_or(Error::Internal)?;
     let target = NonNull::new(pool.alloc(socklen).cast::<u8>()).ok_or(Error::AllocationFailed)?;
     unsafe { ptr::copy_nonoverlapping(source.as_ptr(), target.as_ptr(), socklen) };
-    let bytes = checked_bytes(&addr.name)?;
+    let bytes = unsafe { checked_bytes(&addr.name) }?;
     let name = if bytes.is_empty() {
         ngx_str_t::empty()
     } else {
@@ -660,8 +714,8 @@ mod tests {
             resolver
         }
 
-        fn resolver(&mut self) -> Resolver {
-            Resolver::from_resolver(NonNull::from(&mut *self.raw), 1_000)
+        fn resolver(&mut self) -> Resolver<'_> {
+            unsafe { Resolver::from_raw(&raw mut *self.raw, 1_000) }.unwrap()
         }
     }
 
@@ -771,14 +825,23 @@ mod tests {
     }
 
     #[test]
+    fn resolver_factory_rejects_null_and_misaligned_native_owners() {
+        assert!(unsafe { Resolver::from_raw(ptr::null_mut(), 1_000) }.is_none());
+
+        let mut resolver = MaybeUninit::<ngx_resolver_t>::uninit();
+        let misaligned = unsafe { resolver.as_mut_ptr().cast::<u8>().add(1).cast() };
+        assert!(unsafe { Resolver::from_raw(misaligned, 1_000) }.is_none());
+    }
+
+    #[test]
     fn numeric_name_resolves_without_a_configured_dns_server() {
         let globals = ResolverGlobals::new();
         let owner = TestPool::new();
         let pool = owner.handle();
         let mut raw_resolver = TestResolver::new();
         let resolver = raw_resolver.resolver();
-        let name = ngx_str_t { data: c"127.0.0.1".as_ptr().cast_mut(), len: 9 };
-        let mut resolution = core::pin::pin!(resolver.resolve_name(&name, &pool));
+        let name = NgxStr::from_bytes(b"127.0.0.1");
+        let mut resolution = core::pin::pin!(resolver.resolve_name(name, &pool));
         let mut context = Context::from_waker(Waker::noop());
 
         match resolution.as_mut().poll(&mut context) {
@@ -802,8 +865,8 @@ mod tests {
         let pool = owner.handle();
         let mut raw_resolver = TestResolver::new();
         let resolver = raw_resolver.resolver();
-        let name = ngx_str_t { data: c"example.test".as_ptr().cast_mut(), len: 12 };
-        let mut resolution = core::pin::pin!(resolver.resolve_name(&name, &pool));
+        let name = NgxStr::from_bytes(b"example.test");
+        let mut resolution = core::pin::pin!(resolver.resolve_name(name, &pool));
         let mut context = Context::from_waker(Waker::noop());
 
         assert!(matches!(
@@ -820,9 +883,9 @@ mod tests {
         let pool = owner.handle();
         let mut raw_resolver = TestResolver::with_connection();
         let resolver = raw_resolver.resolver();
-        let name = ngx_str_t { data: c"example.test".as_ptr().cast_mut(), len: 12 };
+        let name = NgxStr::from_bytes(b"example.test");
 
-        drop(resolver.resolve_name(&name, &pool));
+        drop(resolver.resolve_name(name, &pool));
         assert_eq!(globals.done_count(), 0);
     }
 
@@ -833,9 +896,9 @@ mod tests {
         let pool = owner.handle();
         let mut raw_resolver = TestResolver::with_connection();
         let resolver = raw_resolver.resolver();
-        let name = ngx_str_t { data: c"example.test".as_ptr().cast_mut(), len: 12 };
+        let name = NgxStr::from_bytes(b"example.test");
         unsafe { ngx_rs_test_fail_allocations_after(0) };
-        let mut resolution = core::pin::pin!(resolver.resolve_name(&name, &pool));
+        let mut resolution = core::pin::pin!(resolver.resolve_name(name, &pool));
         let mut context = Context::from_waker(Waker::noop());
 
         assert!(matches!(
@@ -853,9 +916,9 @@ mod tests {
         leave_pool_bytes(&pool, 8);
         let mut raw_resolver = TestResolver::new();
         let resolver = raw_resolver.resolver();
-        let name = ngx_str_t { data: c"x".as_ptr().cast_mut(), len: 1 };
+        let name = NgxStr::from_bytes(b"x");
         unsafe { ngx_rs_test_fail_allocations_after(0) };
-        let mut resolution = core::pin::pin!(resolver.resolve_name(&name, &pool));
+        let mut resolution = core::pin::pin!(resolver.resolve_name(name, &pool));
         let mut context = Context::from_waker(Waker::noop());
 
         assert!(matches!(
@@ -872,10 +935,10 @@ mod tests {
         let pool = owner.handle();
         let mut raw_resolver = TestResolver::with_connection();
         let resolver = raw_resolver.resolver();
-        let name = ngx_str_t { data: c"example.test".as_ptr().cast_mut(), len: 12 };
-        let service = ngx_str_t { data: c"https".as_ptr().cast_mut(), len: 5 };
+        let name = NgxStr::from_bytes(b"example.test");
+        let service = NgxStr::from_bytes(b"https");
         unsafe { ngx_rs_test_fail_allocations_after(1) };
-        let mut resolution = core::pin::pin!(resolver.resolve_service(&name, &service, &pool));
+        let mut resolution = core::pin::pin!(resolver.resolve_service(name, service, &pool));
         let mut context = Context::from_waker(Waker::noop());
 
         assert!(matches!(
@@ -1150,8 +1213,11 @@ mod tests {
                     },
                     second_sockaddr_copy
                 );
-                assert_eq!(checked_bytes(&addresses[0].name).unwrap(), b"first.example");
-                assert_eq!(checked_bytes(&addresses[1].name).unwrap(), b"second.example");
+                assert_eq!(unsafe { checked_bytes(&addresses[0].name) }.unwrap(), b"first.example");
+                assert_eq!(
+                    unsafe { checked_bytes(&addresses[1].name) }.unwrap(),
+                    b"second.example"
+                );
 
                 unsafe { ResolutionOwner::handler(context) };
                 assert_eq!(globals.done_count(), 1);
@@ -1263,14 +1329,14 @@ mod tests {
         context.state = NGX_OK as _;
         context.naddrs = 1;
         context.addrs = ptr::null_mut();
-        assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));
+        assert!(matches!(unsafe { copy_result(&context, raw_pool) }, Err(Error::Internal)));
 
         let mut address = unsafe { MaybeUninit::<ngx_resolver_addr_t>::zeroed().assume_init() };
         let mut context = unsafe { MaybeUninit::<ngx_resolver_ctx_t>::zeroed().assume_init() };
         context.state = NGX_OK as _;
         context.naddrs = 1;
         context.addrs = core::ptr::from_mut(&mut address);
-        assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));
+        assert!(matches!(unsafe { copy_result(&context, raw_pool) }, Err(Error::Internal)));
 
         let mut oversized = [0_u8; mem::size_of::<libc::sockaddr_storage>() + 1];
         let address = ngx_resolver_addr_t {
@@ -1284,7 +1350,7 @@ mod tests {
         context.state = NGX_OK as _;
         context.naddrs = 1;
         context.addrs = core::ptr::from_ref(&address).cast_mut();
-        assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));
+        assert!(matches!(unsafe { copy_result(&context, raw_pool) }, Err(Error::Internal)));
 
         let address = ngx_resolver_addr_t {
             sockaddr: ptr::null_mut(),
@@ -1297,7 +1363,7 @@ mod tests {
         context.state = NGX_OK as _;
         context.naddrs = 1;
         context.addrs = core::ptr::from_ref(&address).cast_mut();
-        assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));
+        assert!(matches!(unsafe { copy_result(&context, raw_pool) }, Err(Error::Internal)));
 
         let mut sockaddr = unsafe { MaybeUninit::<libc::sockaddr_in>::zeroed().assume_init() };
         let address = ngx_resolver_addr_t {
@@ -1311,18 +1377,18 @@ mod tests {
         context.state = NGX_OK as _;
         context.naddrs = 1;
         context.addrs = core::ptr::from_ref(&address).cast_mut();
-        assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));
+        assert!(matches!(unsafe { copy_result(&context, raw_pool) }, Err(Error::Internal)));
 
         let mut context = unsafe { MaybeUninit::<ngx_resolver_ctx_t>::zeroed().assume_init() };
         context.state = NGX_RESOLVE_NXDOMAIN as _;
         context.name = ngx_str_t { data: ptr::null_mut(), len: 1 };
-        assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));
+        assert!(matches!(unsafe { copy_result(&context, raw_pool) }, Err(Error::Internal)));
 
         let mut context = unsafe { MaybeUninit::<ngx_resolver_ctx_t>::zeroed().assume_init() };
         context.state = NGX_OK as _;
         context.naddrs = usize::MAX as ngx_uint_t;
         context.addrs = NonNull::<ngx_resolver_addr_t>::dangling().as_ptr();
-        assert!(matches!(copy_result(&context, raw_pool), Err(Error::Internal)));
+        assert!(matches!(unsafe { copy_result(&context, raw_pool) }, Err(Error::Internal)));
     }
 
     #[test]
