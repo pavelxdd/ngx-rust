@@ -27,7 +27,7 @@ use nginx_sys::{
 
 use crate::{
     collections::Vec,
-    core::{NgxStr, Pool, Status},
+    core::{NgxStr, Pool, SocketAddress, SocketAddressError, Status, parse_socket_address},
     ffi::{
         ngx_addr_t, ngx_msec_t, ngx_pool_t, ngx_resolve_name, ngx_resolve_start,
         ngx_resolver_ctx_t, ngx_resolver_t, ngx_str_t,
@@ -112,8 +112,70 @@ impl From<NonZero<isize>> for ResolverError {
     }
 }
 
-type Res<'pool> = Result<Vec<ngx_addr_t, Pool<'pool>>, Error>;
+type Res<'pool> = Result<Vec<ResolvedAddr<'pool>, Pool<'pool>>, Error>;
 type RawRes = Result<RawAddresses, Error>;
+
+/// A resolved nginx address bound to the pool that owns its native storage.
+///
+/// Moving an address out of its result vector preserves the pool lifetime:
+///
+/// ```compile_fail
+/// use ngx::{
+///     async_::resolver::ResolvedAddr,
+///     collections::Vec,
+///     core::Pool,
+/// };
+///
+/// fn detach<'pool>(
+///     mut addresses: Vec<ResolvedAddr<'pool>, Pool<'pool>>,
+/// ) -> ResolvedAddr<'static> {
+///     addresses.pop().unwrap()
+/// }
+/// ```
+///
+/// The native descriptor is not available through safe code:
+///
+/// ```compile_fail
+/// use ngx::{async_::resolver::ResolvedAddr, ffi::ngx_addr_t};
+///
+/// fn raw(address: &ResolvedAddr<'_>) -> &ngx_addr_t {
+///     address.as_raw()
+/// }
+/// ```
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct ResolvedAddr<'pool> {
+    raw: ngx_addr_t,
+    _pool: PhantomData<(&'pool ngx_pool_t, *mut ())>,
+}
+
+impl ResolvedAddr<'_> {
+    /// Returns the nginx-formatted address name.
+    pub fn name(&self) -> &NgxStr {
+        let name = &self.raw.name;
+        if name.len == 0 {
+            return NgxStr::from_bytes(&[]);
+        }
+
+        let data = NonNull::new(name.data).expect("resolved address name");
+        NgxStr::from_bytes(unsafe { slice::from_raw_parts(data.as_ptr(), name.len) })
+    }
+
+    /// Returns the checked socket address.
+    pub fn socket_address(&self) -> Result<SocketAddress<'_>, SocketAddressError> {
+        unsafe { parse_socket_address(self.raw.sockaddr, self.raw.socklen) }
+    }
+
+    /// Returns the native address descriptor for an explicit FFI operation.
+    ///
+    /// # Safety
+    ///
+    /// The descriptor and every pointer copied from it must not be retained beyond this address's
+    /// pool lifetime. The descriptor and its pointed-to storage must not be mutated.
+    pub unsafe fn as_raw(&self) -> &ngx_addr_t {
+        &self.raw
+    }
+}
 
 /// A wrapper for an ngx_resolver_t which provides an async Rust API.
 ///
@@ -439,8 +501,8 @@ struct RawAddresses {
 }
 
 impl RawAddresses {
-    unsafe fn into_vec(self, pool: Pool<'_>) -> Vec<ngx_addr_t, Pool<'_>> {
-        let pointer = self.pointer;
+    unsafe fn into_vec<'pool>(self, pool: Pool<'pool>) -> Vec<ResolvedAddr<'pool>, Pool<'pool>> {
+        let pointer = self.pointer.cast::<ResolvedAddr<'pool>>();
         let length = self.length;
         let capacity = self.capacity;
         mem::forget(self);
@@ -852,10 +914,7 @@ mod tests {
         match resolution.as_mut().poll(&mut context) {
             Poll::Ready(Ok(addresses)) => {
                 assert_eq!(addresses.len(), 1);
-                assert_eq!(
-                    addresses[0].socklen as usize,
-                    core::mem::size_of::<libc::sockaddr_in>()
-                );
+                assert!(matches!(addresses[0].socket_address(), Ok(SocketAddress::Ipv4 { .. })));
             }
             Poll::Ready(Err(error)) => panic!("numeric resolution failed: {error}"),
             Poll::Pending => panic!("numeric resolution did not complete synchronously"),
@@ -1200,29 +1259,28 @@ mod tests {
                     Poll::Pending => panic!("resolution remained pending after callback"),
                 };
                 assert_eq!(addresses.len(), 2);
+                let first = unsafe { addresses[0].as_raw() };
                 assert_eq!(
                     unsafe {
                         core::slice::from_raw_parts(
-                            addresses[0].sockaddr.cast::<u8>(),
-                            addresses[0].socklen as usize,
+                            first.sockaddr.cast::<u8>(),
+                            first.socklen as usize,
                         )
                     },
                     first_sockaddr_copy
                 );
+                let second = unsafe { addresses[1].as_raw() };
                 assert_eq!(
                     unsafe {
                         core::slice::from_raw_parts(
-                            addresses[1].sockaddr.cast::<u8>(),
-                            addresses[1].socklen as usize,
+                            second.sockaddr.cast::<u8>(),
+                            second.socklen as usize,
                         )
                     },
                     second_sockaddr_copy
                 );
-                assert_eq!(unsafe { checked_bytes(&addresses[0].name) }.unwrap(), b"first.example");
-                assert_eq!(
-                    unsafe { checked_bytes(&addresses[1].name) }.unwrap(),
-                    b"second.example"
-                );
+                assert_eq!(addresses[0].name().as_bytes(), b"first.example");
+                assert_eq!(addresses[1].name().as_bytes(), b"second.example");
 
                 unsafe { ResolutionOwner::handler(context) };
                 assert_eq!(globals.done_count(), 1);
