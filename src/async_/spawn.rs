@@ -8,7 +8,8 @@ use core::future::Future;
 use core::mem;
 use core::panic::AssertUnwindSafe;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::panic::catch_unwind;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -16,8 +17,11 @@ use std::thread::{self, ThreadId};
 
 use async_task::{Runnable, ScheduleInfo, Task as RawTask, WithInfo};
 
-use crate::event::{NotifyError, PostedEvent, PostedEventCallback, PostedQueue, notify};
-use crate::ffi::ngx_event_t;
+use crate::event::{PostedEvent, PostedEventCallback, PostedQueue};
+use crate::ffi::{
+    NGX_OK, ngx_close_connection, ngx_connection_t, ngx_event_t, ngx_get_connection,
+    ngx_handle_read_event, ngx_nonblocking,
+};
 use crate::log::LogRef;
 
 static ACTIVE_SCHEDULER: OnceLock<Mutex<Option<Arc<Scheduler>>>> = OnceLock::new();
@@ -34,8 +38,8 @@ std::thread_local! {
 pub enum SchedulerInitError {
     /// Another worker scheduler is still active in this process.
     AlreadyInitialized,
-    /// The selected event module cannot deliver cross-thread notifications.
-    Notify(NotifyError),
+    /// The worker could not create or register its private notification channel.
+    NotificationChannel,
 }
 
 /// Failure returned while spawning an async task.
@@ -341,23 +345,27 @@ struct RegisteredTask {
 struct WorkerScheduler {
     scheduler: Arc<Scheduler>,
     posted: Pin<Box<SchedulerPostedEvent>>,
+    notification: Option<NonNull<ngx_connection_t>>,
     tasks: Vec<RegisteredTask>,
     completed: Vec<Arc<TaskControl>>,
 }
 
 impl WorkerScheduler {
-    unsafe fn new(log: LogRef<'_>, scheduler: Arc<Scheduler>) -> Self {
+    unsafe fn new(log: LogRef<'_>, scheduler: Arc<Scheduler>) -> Result<Self, SchedulerInitError> {
         let log = unsafe { LogRef::from_raw(log.as_ptr()) }.expect("validated worker logger");
-        Self {
+        let notification = unsafe { open_notification_channel(log, &scheduler) }
+            .ok_or(SchedulerInitError::NotificationChannel)?;
+        Ok(Self {
             posted: Box::pin(PostedEvent::new(
                 log,
                 Arc::clone(&scheduler),
                 posted_scheduler_handler as SchedulerPostedCallback,
             )),
             scheduler,
+            notification: Some(notification),
             tasks: Vec::new(),
             completed: Vec::new(),
-        }
+        })
     }
 
     fn post(&mut self) -> bool {
@@ -367,6 +375,10 @@ impl WorkerScheduler {
 
     fn shutdown(&mut self) {
         self.posted.as_mut().shutdown();
+        self.scheduler.close_notification();
+        if let Some(connection) = self.notification.take() {
+            unsafe { ngx_close_connection(connection.as_ptr()) };
+        }
     }
 
     fn register_task(&mut self, control: Arc<TaskControl>, task: RawTask<()>) {
@@ -407,6 +419,8 @@ struct Scheduler {
     owner: ThreadId,
     inner: Mutex<SchedulerInner>,
     controls: Mutex<Vec<Weak<TaskControl>>>,
+    notification: Mutex<Option<libc::c_int>>,
+    notification_pending: AtomicBool,
 }
 
 struct SchedulerInner {
@@ -451,6 +465,8 @@ impl Scheduler {
                 processing: false,
             }),
             controls: Mutex::new(Vec::new()),
+            notification: Mutex::new(None),
+            notification_pending: AtomicBool::new(false),
         }
     }
 
@@ -541,7 +557,7 @@ impl Scheduler {
                 }
             }
             WakeAction::Foreign => {
-                if unsafe { notify(notification_handler) }.is_err() {
+                if !self.notify_worker() {
                     self.fail_from_foreign_thread();
                 }
             }
@@ -650,7 +666,7 @@ impl Scheduler {
                 }
             }
             ScheduleAction::Foreign => {
-                if unsafe { notify(notification_handler) }.is_err() {
+                if !self.notify_worker() {
                     self.fail_from_foreign_thread();
                 }
             }
@@ -671,7 +687,7 @@ impl Scheduler {
                 }
             }
             ScheduleAction::Foreign => {
-                if unsafe { notify(notification_handler) }.is_ok() {
+                if self.notify_worker() {
                     Ok(())
                 } else {
                     self.fail_from_foreign_thread();
@@ -686,6 +702,46 @@ impl Scheduler {
                 self.quarantine(runnable);
                 Err(SpawnError::ShuttingDown)
             }
+        }
+    }
+
+    fn notify_worker(&self) -> bool {
+        // A queued datagram represents the whole shared runnable queue, so concurrent wakes need
+        // no additional writes until the worker drains the channel.
+        if self.notification_pending.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+
+        let notification = self.notification.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(socket) = *notification else {
+            self.notification_pending.store(false, Ordering::Release);
+            return false;
+        };
+        let byte = 1_u8;
+
+        loop {
+            let written = unsafe { libc::send(socket, (&raw const byte).cast(), 1, 0) };
+            if written == 1 {
+                return true;
+            }
+            if written == -1 {
+                match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    Some(libc::EAGAIN) => return true,
+                    _ => {}
+                }
+            }
+
+            self.notification_pending.store(false, Ordering::Release);
+            return false;
+        }
+    }
+
+    fn close_notification(&self) {
+        let socket = self.notification.lock().unwrap_or_else(|error| error.into_inner()).take();
+        self.notification_pending.store(false, Ordering::Release);
+        if let Some(socket) = socket {
+            unsafe { libc::close(socket) };
         }
     }
 
@@ -894,14 +950,105 @@ fn posted_scheduler_handler(mut event: PostedEventCallback<'_, Arc<Scheduler>>) 
     }
 }
 
-unsafe extern "C" fn notification_handler(_event: *mut ngx_event_t) {
+/// # Safety
+///
+/// The current worker must have an initialized nginx cycle and event backend. `log` and the
+/// cycle connection array must remain live until worker shutdown closes the returned connection.
+unsafe fn open_notification_channel(
+    log: LogRef<'_>,
+    scheduler: &Arc<Scheduler>,
+) -> Option<NonNull<ngx_connection_t>> {
+    let mut sockets = [-1; 2];
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sockets.as_mut_ptr()) } != 0 {
+        return None;
+    }
+
+    let close_sockets = |sockets: [libc::c_int; 2]| unsafe {
+        libc::close(sockets[0]);
+        libc::close(sockets[1]);
+    };
+    for socket in sockets {
+        if unsafe { ngx_nonblocking(socket) } != 0
+            || unsafe { libc::fcntl(socket, libc::F_SETFD, libc::FD_CLOEXEC) } == -1
+        {
+            close_sockets(sockets);
+            return None;
+        }
+    }
+
+    let Some(connection) = NonNull::new(unsafe { ngx_get_connection(sockets[0], log.as_ptr()) })
+    else {
+        close_sockets(sockets);
+        return None;
+    };
+    unsafe {
+        (*connection.as_ptr()).read.as_mut().unwrap().handler = Some(notification_channel_handler);
+        (*connection.as_ptr()).read.as_mut().unwrap().log = log.as_ptr();
+        (*connection.as_ptr()).write.as_mut().unwrap().log = log.as_ptr();
+    }
+    if unsafe { ngx_handle_read_event((*connection.as_ptr()).read, 0) } != NGX_OK as _ {
+        unsafe { ngx_close_connection(connection.as_ptr()) };
+        unsafe { libc::close(sockets[1]) };
+        return None;
+    }
+
+    let mut notification = scheduler.notification.lock().unwrap_or_else(|error| error.into_inner());
+    if notification.is_some() {
+        drop(notification);
+        unsafe { ngx_close_connection(connection.as_ptr()) };
+        unsafe { libc::close(sockets[1]) };
+        return None;
+    }
+    *notification = Some(sockets[1]);
+    drop(notification);
+
+    Some(connection)
+}
+
+unsafe extern "C" fn notification_channel_handler(event: *mut ngx_event_t) {
     let scheduler = WORKER_SCHEDULER
         .with(|worker| worker.borrow().as_ref().map(|worker| Arc::clone(&worker.scheduler)));
+    let Some(scheduler) = scheduler else {
+        return;
+    };
+    let Some(event) = NonNull::new(event) else {
+        scheduler.stop_and_drop();
+        return;
+    };
+    let Some(connection) = NonNull::new(unsafe { event.as_ref().data.cast::<ngx_connection_t>() })
+    else {
+        scheduler.stop_and_drop();
+        return;
+    };
+    let socket = unsafe { connection.as_ref().fd };
+    let mut bytes = [0_u8; 64];
 
-    if let Some(scheduler) = scheduler {
-        if scheduler.process() && !scheduler.post_current() {
-            scheduler.stop_and_drop();
+    loop {
+        let received = unsafe { libc::recv(socket, bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+        if received > 0 {
+            continue;
         }
+        if received == -1 {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(error) if error == libc::EAGAIN || error == libc::EWOULDBLOCK => break,
+                _ => {
+                    scheduler.notification_pending.store(false, Ordering::Release);
+                    scheduler.stop_and_drop();
+                    return;
+                }
+            }
+        }
+
+        scheduler.notification_pending.store(false, Ordering::Release);
+        scheduler.stop_and_drop();
+        return;
+    }
+
+    unsafe { event.as_ptr().as_mut().unwrap().set_ready(0) };
+    scheduler.notification_pending.store(false, Ordering::Release);
+    if scheduler.process() && !scheduler.post_current() {
+        scheduler.stop_and_drop();
     }
 }
 
@@ -930,8 +1077,8 @@ fn clear_active_scheduler(scheduler: &Arc<Scheduler>) {
 /// Initializes the async scheduler for the current nginx worker.
 ///
 /// Call this from the module's process-start hook before calling [`spawn`]. The selected nginx
-/// event module must accept the notification callback so cloned wakers can safely wake from a
-/// foreign thread.
+/// worker must have an available connection slot so the private notification socket can be
+/// registered for cloned wakers invoked from a foreign thread.
 ///
 /// # Safety
 ///
@@ -960,21 +1107,18 @@ pub unsafe fn init_worker(log: LogRef<'_>) -> Result<(), SchedulerInitError> {
     }
 
     let scheduler = Arc::new(Scheduler::new(thread::current().id()));
-    {
+    let worker = {
         let mut active = active_scheduler().lock().unwrap_or_else(|error| error.into_inner());
         if active.is_some() {
             return Err(SchedulerInitError::AlreadyInitialized);
         }
+        let worker = unsafe { WorkerScheduler::new(log, Arc::clone(&scheduler)) }?;
         *active = Some(Arc::clone(&scheduler));
-    }
-    WORKER_SCHEDULER.with(|worker| {
-        *worker.borrow_mut() = Some(unsafe { WorkerScheduler::new(log, scheduler) });
+        worker
+    };
+    WORKER_SCHEDULER.with(|current| {
+        *current.borrow_mut() = Some(worker);
     });
-
-    if let Err(error) = unsafe { notify(notification_handler) } {
-        let _ = shutdown_worker();
-        return Err(SchedulerInitError::Notify(error));
-    }
 
     Ok(())
 }
@@ -1093,28 +1237,30 @@ mod worker_tests {
     use alloc::vec::Vec;
     use core::future::{Future, poll_fn};
     use core::mem::MaybeUninit;
-    use core::ptr::{self, NonNull};
+    use core::ptr;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use core::task::{Context, Poll, Waker};
     use std::sync::{Mutex, MutexGuard, mpsc};
     use std::thread;
 
     use super::*;
-    use crate::event::NotifyError;
     use crate::ffi::{
-        NGX_ERROR, NGX_OK, ngx_cycle_t, ngx_event_actions, ngx_event_handler_pt,
-        ngx_event_move_posted_next, ngx_event_process_posted, ngx_int_t, ngx_log_t,
-        ngx_posted_events, ngx_posted_next_events, ngx_queue_empty, ngx_queue_init,
+        NGX_OK, NGX_USE_CLEAR_EVENT, ngx_connection_t, ngx_cycle, ngx_cycle_t, ngx_event_actions,
+        ngx_event_actions_t, ngx_event_flags, ngx_event_handler_pt, ngx_event_move_posted_next,
+        ngx_event_process_posted, ngx_event_t, ngx_int_t, ngx_log_t, ngx_posted_events,
+        ngx_posted_next_events, ngx_queue_empty, ngx_queue_init, ngx_uint_t,
     };
 
     static NOTIFIED_HANDLER: Mutex<ngx_event_handler_pt> = Mutex::new(None);
-    static NOTIFY_SUCCEEDS: AtomicBool = AtomicBool::new(true);
     static NOTIFY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static NATIVE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     struct TestGlobals {
         _nginx: MutexGuard<'static, ()>,
         _scheduler: MutexGuard<'static, ()>,
-        previous_notify: Option<unsafe extern "C" fn(ngx_event_handler_pt) -> ngx_int_t>,
+        previous_cycle: *mut ngx_cycle_t,
+        previous_actions: ngx_event_actions_t,
+        previous_event_flags: ngx_uint_t,
     }
 
     impl TestGlobals {
@@ -1123,14 +1269,21 @@ mod worker_tests {
             let scheduler = SCHEDULER_TESTS.lock().unwrap_or_else(|error| error.into_inner());
             assert_eq!(shutdown_worker(), Ok(false));
 
-            let previous_notify = unsafe { ngx_event_actions.notify };
+            let previous_cycle = unsafe { ngx_cycle };
+            let previous_actions = unsafe { ngx_event_actions };
+            let previous_event_flags = unsafe { ngx_event_flags };
             reset_event_globals();
-            NOTIFY_SUCCEEDS.store(true, Ordering::Relaxed);
             NOTIFY_CALLS.store(0, Ordering::Relaxed);
+            NATIVE_HANDLER_CALLS.store(0, Ordering::Relaxed);
             *NOTIFIED_HANDLER.lock().unwrap_or_else(|error| error.into_inner()) = None;
-            unsafe { ngx_event_actions.notify = Some(test_notify) };
 
-            Self { _nginx: nginx, _scheduler: scheduler, previous_notify }
+            Self {
+                _nginx: nginx,
+                _scheduler: scheduler,
+                previous_cycle,
+                previous_actions,
+                previous_event_flags,
+            }
         }
     }
 
@@ -1138,13 +1291,20 @@ mod worker_tests {
         fn drop(&mut self) {
             let _ = shutdown_worker();
             reset_event_globals();
-            unsafe { ngx_event_actions.notify = self.previous_notify };
+            unsafe {
+                ngx_cycle = self.previous_cycle;
+                ngx_event_actions = self.previous_actions;
+                ngx_event_flags = self.previous_event_flags;
+            }
             *NOTIFIED_HANDLER.lock().unwrap_or_else(|error| error.into_inner()) = None;
         }
     }
 
     struct TestCycle {
         cycle: ngx_cycle_t,
+        connection: ngx_connection_t,
+        read: ngx_event_t,
+        write: ngx_event_t,
         log: ngx_log_t,
     }
 
@@ -1152,6 +1312,11 @@ mod worker_tests {
         fn new() -> Box<Self> {
             let mut cycle = Box::new(unsafe { MaybeUninit::<Self>::zeroed().assume_init() });
             cycle.cycle.log = &raw mut cycle.log;
+            cycle.cycle.connection_n = 1;
+            cycle.cycle.free_connection_n = 1;
+            cycle.cycle.free_connections = &raw mut cycle.connection;
+            cycle.connection.read = &raw mut cycle.read;
+            cycle.connection.write = &raw mut cycle.write;
             cycle
         }
 
@@ -1167,7 +1332,17 @@ mod worker_tests {
 
     impl TestWorker {
         fn new() -> Self {
-            Self { _globals: TestGlobals::new(), cycle: TestCycle::new() }
+            let globals = TestGlobals::new();
+            let mut cycle = TestCycle::new();
+            unsafe {
+                ngx_cycle = cycle.raw();
+                ngx_event_actions = mem::zeroed();
+                ngx_event_actions.add = Some(test_add_event);
+                ngx_event_actions.del = Some(test_delete_event);
+                ngx_event_actions.notify = Some(test_notify);
+                ngx_event_flags = NGX_USE_CLEAR_EVENT as _;
+            }
+            Self { _globals: globals, cycle }
         }
 
         fn init(&mut self) -> Result<(), SchedulerInitError> {
@@ -1183,9 +1358,13 @@ mod worker_tests {
         }
 
         fn deliver_notification(&self) {
-            let handler = *NOTIFIED_HANDLER.lock().unwrap_or_else(|error| error.into_inner());
-            let handler = handler.expect("notification handler was not registered");
-            unsafe { handler(ptr::null_mut()) };
+            let event = WORKER_SCHEDULER.with(|worker| {
+                let worker = worker.borrow();
+                let connection = worker.as_ref().unwrap().notification.unwrap();
+                unsafe { connection.as_ref().read }
+            });
+            let handler = unsafe { (*event).handler }.expect("notification handler");
+            unsafe { handler(event) };
         }
 
         fn queues_are_empty(&self) -> bool {
@@ -1217,24 +1396,84 @@ mod worker_tests {
         }
     }
 
+    unsafe extern "C" fn test_add_event(
+        event: *mut ngx_event_t,
+        _event_type: ngx_int_t,
+        _flags: ngx_uint_t,
+    ) -> ngx_int_t {
+        unsafe { (*event).set_active(1) };
+        NGX_OK as _
+    }
+
+    unsafe extern "C" fn test_delete_event(
+        event: *mut ngx_event_t,
+        _event_type: ngx_int_t,
+        _flags: ngx_uint_t,
+    ) -> ngx_int_t {
+        unsafe { (*event).set_active(0) };
+        NGX_OK as _
+    }
+
     unsafe extern "C" fn test_notify(handler: ngx_event_handler_pt) -> ngx_int_t {
         NOTIFY_CALLS.fetch_add(1, Ordering::Relaxed);
         *NOTIFIED_HANDLER.lock().unwrap_or_else(|error| error.into_inner()) = handler;
+        NGX_OK as _
+    }
 
-        if NOTIFY_SUCCEEDS.load(Ordering::Relaxed) { NGX_OK as _ } else { NGX_ERROR as _ }
+    unsafe extern "C" fn native_notification_handler(_event: *mut ngx_event_t) {
+        NATIVE_HANDLER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     #[test]
-    fn init_rejects_missing_or_failed_notification_hooks() {
+    fn private_channel_delivers_rust_and_competing_native_notifications() {
         let mut worker = TestWorker::new();
+        *NOTIFIED_HANDLER.lock().unwrap_or_else(|error| error.into_inner()) =
+            Some(native_notification_handler);
+        worker.init().unwrap();
+        let ready = Arc::new(AtomicBool::new(false));
+        let future_ready = Arc::clone(&ready);
+        let (waker_tx, waker_rx) = mpsc::channel();
+        let task = spawn(poll_fn(move |context| {
+            if future_ready.load(Ordering::Acquire) {
+                Poll::Ready(7)
+            } else {
+                waker_tx.send(context.waker().clone()).unwrap();
+                Poll::Pending
+            }
+        }))
+        .unwrap();
+        worker.process_posted();
+        let waker = waker_rx.recv().unwrap();
 
-        unsafe { ngx_event_actions.notify = None };
-        assert_eq!(worker.init(), Err(SchedulerInitError::Notify(NotifyError::Unavailable)));
-        assert!(matches!(spawn(async { 1 }), Err(SpawnError::Uninitialized)));
+        thread::spawn(move || {
+            ready.store(true, Ordering::Release);
+            waker.wake();
+        })
+        .join()
+        .unwrap();
+        unsafe { test_notify(Some(native_notification_handler)) };
 
-        unsafe { ngx_event_actions.notify = Some(test_notify) };
-        NOTIFY_SUCCEEDS.store(false, Ordering::Relaxed);
-        assert_eq!(worker.init(), Err(SchedulerInitError::Notify(NotifyError::Failed)));
+        worker.deliver_notification();
+        let native = NOTIFIED_HANDLER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("native notification handler");
+        unsafe { native(ptr::null_mut()) };
+
+        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(NATIVE_HANDLER_CALLS.load(Ordering::Relaxed), 1);
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Ok(7)));
+    }
+
+    #[test]
+    fn init_rejects_a_notification_channel_without_a_connection_slot() {
+        let mut worker = TestWorker::new();
+        worker.cycle.cycle.free_connections = ptr::null_mut();
+        worker.cycle.cycle.free_connection_n = 0;
+
+        assert_eq!(worker.init(), Err(SchedulerInitError::NotificationChannel));
         assert!(matches!(spawn(async { 1 }), Err(SpawnError::Uninitialized)));
     }
 
@@ -1481,7 +1720,7 @@ mod worker_tests {
         })
         .join()
         .unwrap();
-        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 0);
 
         worker.deliver_notification();
         worker.process_posted();
@@ -1489,7 +1728,7 @@ mod worker_tests {
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
 
         thread::spawn(move || waker.wake()).join().unwrap();
-        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 0);
         assert!(worker.queues_are_empty());
 
         let mut task = core::pin::pin!(task);
@@ -1574,7 +1813,7 @@ mod worker_tests {
         worker.process_posted();
         let waker = waker_rx.recv().unwrap();
 
-        NOTIFY_SUCCEEDS.store(false, Ordering::Relaxed);
+        current_scheduler().unwrap().close_notification();
         thread::spawn(move || waker.wake()).join().unwrap();
 
         let mut task = core::pin::pin!(task);
@@ -1605,7 +1844,7 @@ mod worker_tests {
         let mut context = Context::from_waker(&task_waker);
         assert_eq!(task.as_mut().poll(&mut context), Poll::Pending);
 
-        NOTIFY_SUCCEEDS.store(false, Ordering::Relaxed);
+        current_scheduler().unwrap().close_notification();
         thread::spawn(move || future_waker.wake()).join().unwrap();
 
         assert_eq!(wakes.load(Ordering::Relaxed), 1);
@@ -1719,7 +1958,7 @@ mod worker_tests {
         .join()
         .unwrap();
 
-        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 0);
         worker.deliver_notification();
         let polls = polls.lock().unwrap_or_else(|error| error.into_inner());
         assert_eq!(polls.as_slice(), &[worker_thread, worker_thread]);
@@ -1782,7 +2021,7 @@ mod worker_tests {
         .unwrap();
 
         worker.process_posted();
-        NOTIFY_SUCCEEDS.store(false, Ordering::Relaxed);
+        current_scheduler().unwrap().close_notification();
         let waker = waker_rx.recv().unwrap();
         let remote_ready = Arc::clone(&ready);
         thread::spawn(move || {
@@ -1792,9 +2031,8 @@ mod worker_tests {
         .join()
         .unwrap();
 
-        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 0);
         assert!(matches!(spawn(async {}), Err(SpawnError::ShuttingDown)));
-        worker.deliver_notification();
         assert_eq!(polls.load(Ordering::Relaxed), 1);
         let inner = scheduler.lock();
         assert!(inner.queue.is_empty());
@@ -1820,7 +2058,7 @@ mod worker_tests {
         let waker = waker_rx.recv().unwrap();
         thread::spawn(move || waker.wake()).join().unwrap();
 
-        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 0);
         let inner = scheduler.lock();
         assert!(inner.queue.is_empty());
         assert!(inner.quarantined.is_empty());
