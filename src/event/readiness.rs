@@ -10,7 +10,8 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use crate::event::{
-    EventPeerConnection, EventPeerConnectionError, EventPeerConnectionState, Timer, TimerCallback,
+    EventPeerConnection, EventPeerConnectionError, EventPeerConnectionState, EventRef, PostedQueue,
+    Timer, TimerCallback,
 };
 use crate::ffi::{
     NGX_OK, ngx_connection_t, ngx_event_handler_pt, ngx_event_t, ngx_handle_read_event,
@@ -156,6 +157,7 @@ struct ReadinessState {
     waker: WakerState,
     event: Cell<*mut ngx_event_t>,
     next: Cell<*mut ReadinessState>,
+    callback_delivered: Cell<bool>,
 }
 
 impl ReadinessState {
@@ -164,6 +166,7 @@ impl ReadinessState {
             waker: WakerState::new(),
             event: Cell::new(ptr::null_mut()),
             next: Cell::new(ptr::null_mut()),
+            callback_delivered: Cell::new(false),
         }
     }
 }
@@ -243,6 +246,7 @@ unsafe extern "C" fn readiness_handler(raw: *mut ngx_event_t) {
     while let Some(state) = NonNull::new(current) {
         let state_ref = unsafe { state.as_ref() };
         if ptr::eq(state_ref.event.get(), event.as_ptr()) {
+            state_ref.callback_delivered.set(true);
             state_ref.waker.wake();
             return;
         }
@@ -436,11 +440,13 @@ impl<'connection, 'address> EventReadiness<'connection, 'address> {
         timer.as_mut().arm(timeout).expect("readiness timer was checked unarmed before arming");
     }
 
-    fn finish(&mut self) {
+    fn finish(&mut self, forward_delivered: bool) {
         let mut timer = unsafe { Pin::new_unchecked(&mut self.timer) };
         timer.as_mut().cancel();
         timer.as_ref().get_ref().state().waker.clear();
         self.state.waker.clear();
+        let callback_delivered = self.state.callback_delivered.replace(false);
+        let forward_delivered = forward_delivered && callback_delivered;
 
         let Some(event) = self.event.take() else {
             return;
@@ -449,9 +455,14 @@ impl<'connection, 'address> EventReadiness<'connection, 'address> {
         let state = self.state_pointer();
         unregister_waiter(event, state);
         if same_handler(unsafe { event.as_ref().handler }, readiness_handler) {
-            unsafe {
-                event.as_ptr().as_mut().unwrap().handler = self.saved_handler.take().unwrap_or(None)
-            };
+            let saved_handler = self.saved_handler.take().unwrap_or(None);
+            unsafe { event.as_ptr().as_mut().unwrap().handler = saved_handler };
+            if forward_delivered && saved_handler.is_some() {
+                let mut event = unsafe { EventRef::from_raw(event.as_ptr()) }
+                    .expect("installed readiness event must remain valid");
+                // The borrowed peer keeps the event, restored handler, logger, and data live.
+                unsafe { event.post(PostedQueue::Normal) };
+            }
         } else {
             self.saved_handler.take();
         }
@@ -468,31 +479,32 @@ impl Future for EventReadiness<'_, '_> {
             match this.connection.readiness_parts(this.kind.uses_write_event()) {
                 Ok(parts) => parts,
                 Err(error) => {
-                    this.finish();
+                    this.finish(false);
                     return Poll::Ready(Err(error.into()));
                 }
             };
         if let Some(result) = this.event_result(connection, event) {
-            this.finish();
+            this.finish(false);
             return Poll::Ready(result);
         }
 
         if let Some(error) = this.timeout_result() {
-            this.finish();
+            this.finish(false);
             return Poll::Ready(Err(error));
         }
 
+        this.state.callback_delivered.set(false);
         this.state.waker.replace(cx.waker());
         this.timer.state().waker.replace(cx.waker());
         if this.event.is_none() {
             if let Err(error) = this.install(event) {
-                this.finish();
+                this.finish(false);
                 return Poll::Ready(Err(error));
             }
         }
 
         if let Some(result) = this.event_result(connection, event) {
-            this.finish();
+            this.finish(false);
             return Poll::Ready(result);
         }
 
@@ -503,7 +515,7 @@ impl Future for EventReadiness<'_, '_> {
 
 impl Drop for EventReadiness<'_, '_> {
     fn drop(&mut self) {
-        self.finish();
+        self.finish(true);
     }
 }
 
