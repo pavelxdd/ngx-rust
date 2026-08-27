@@ -343,11 +343,13 @@ fn wait_for_readable_socket(fd: c_int) {
     assert_eq!(unsafe { libc::poll(&raw mut descriptor, 1, 1_000) }, 1);
 }
 
-fn reject_keepalive_reuse<'address>(
-    keepalive: EventPeerKeepalive<'address>,
+fn reject_keepalive_reuse<'address, 'log>(
+    keepalive: EventPeerKeepalive<'address, 'log>,
     expected: EventPeerConnectionError,
-) -> EventPeerKeepalive<'address> {
-    match keepalive.into_connection() {
+) -> EventPeerKeepalive<'address, 'log> {
+    let log: LogRef<'log> =
+        unsafe { LogRef::from_raw(keepalive.peer.raw.log) }.expect("keepalive logger");
+    match keepalive.into_connection(log) {
         Err(EventPeerKeepaliveIntoConnectionError::Connection { error, keepalive }) => {
             assert_eq!(error, expected);
             keepalive
@@ -360,7 +362,7 @@ fn build_peer<'peer>(
     address: EventPeerAddress<'peer>,
     log: *mut ngx_log_t,
     callbacks: EventPeerCallbacks,
-) -> EventPeer<'peer> {
+) -> EventPeer<'peer, 'peer> {
     let log = unsafe { LogRef::from_raw(log) }.unwrap();
     EventPeerBuilder::new(address).log(log).callbacks(callbacks).build().unwrap()
 }
@@ -940,6 +942,7 @@ fn connected_peer_prepares_transfers_and_closes_socket_pool_and_events() {
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let request_log: ngx_log_t = unsafe { mem::zeroed() };
     let idle_log: ngx_log_t = unsafe { mem::zeroed() };
+    let next_log: ngx_log_t = unsafe { mem::zeroed() };
     let mut request_data = 1_u8;
     let mut idle_data = 2_u8;
     EVENT_HANDLER_CALLS.store(0, Ordering::Relaxed);
@@ -1005,6 +1008,7 @@ fn connected_peer_prepares_transfers_and_closes_socket_pool_and_events() {
     assert!(unsafe { raw.write.as_ref().unwrap().timer_set() == 0 });
     assert!(unsafe { raw.read.as_ref().unwrap().active() != 0 });
     assert_eq!(raw.log, (&raw const idle_log).cast_mut());
+    assert_eq!(keepalive.peer.raw.log, (&raw const idle_log).cast_mut());
     assert_eq!(unsafe { (*raw.pool).log }, (&raw const idle_log).cast_mut());
     assert_eq!(raw.data, (&raw mut idle_data).cast());
     assert_eq!(raw.idle(), 1);
@@ -1020,10 +1024,19 @@ fn connected_peer_prepares_transfers_and_closes_socket_pool_and_events() {
         .unwrap();
     assert!(unsafe { raw.read.as_ref().unwrap().timer_set() != 0 });
 
-    let borrowed = keepalive.into_connection().unwrap();
+    let borrowed = keepalive
+        .into_connection(unsafe { LogRef::from_raw((&raw const next_log).cast_mut()).unwrap() })
+        .unwrap();
     assert_eq!(borrowed.state(), EventPeerConnectionState::Borrowed);
     assert_eq!(raw.idle(), 0);
     assert!(raw.data.is_null());
+    assert_eq!(borrowed.peer.raw.log, (&raw const next_log).cast_mut());
+    #[cfg(feature = "async")]
+    assert_eq!(borrowed.readiness_log().as_ptr(), (&raw const next_log).cast_mut());
+    assert_eq!(raw.log, (&raw const next_log).cast_mut());
+    assert_eq!(unsafe { (*raw.read).log }, (&raw const next_log).cast_mut());
+    assert_eq!(unsafe { (*raw.write).log }, (&raw const next_log).cast_mut());
+    assert_eq!(unsafe { (*raw.pool).log }, (&raw const next_log).cast_mut());
     unsafe { globals._read.handler.unwrap()(&raw mut *globals._read) };
     unsafe { globals._write.handler.unwrap()(&raw mut *globals._write) };
     assert_eq!(EVENT_HANDLER_CALLS.load(Ordering::Relaxed), 0);
@@ -1126,7 +1139,9 @@ fn keepalive_reuse_rejects_every_terminal_flag_without_advisory_validation() {
     keepalive = reject_keepalive_reuse(keepalive, EventPeerConnectionError::StaleReadReady);
     unsafe { (*raw).read.as_mut().unwrap().set_ready(0) };
 
-    keepalive.into_connection().unwrap();
+    keepalive
+        .into_connection(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
+        .unwrap();
 }
 
 #[test]
@@ -1210,6 +1225,7 @@ fn keepalive_read_registration_failure_rolls_back_to_active_owner() {
     let _globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
+    let idle_log: ngx_log_t = unsafe { mem::zeroed() };
     let mut idle_data = 1_u8;
     let peer = EventPeerBuilder::new(remote.peer_address())
         .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
@@ -1225,7 +1241,7 @@ fn keepalive_read_registration_failure_rolls_back_to_active_owner() {
         ngx_event_actions.add = Some(add_event_error);
     }
     let preparation = unsafe {
-        test_keepalive_preparation(LogRef::from_raw((&raw const log).cast_mut()).unwrap())
+        test_keepalive_preparation(LogRef::from_raw((&raw const idle_log).cast_mut()).unwrap())
             .data((&raw mut idle_data).cast())
     };
 
@@ -1235,6 +1251,11 @@ fn keepalive_read_registration_failure_rolls_back_to_active_owner() {
             assert_eq!(connection.state(), EventPeerConnectionState::Connected);
             assert_eq!(unsafe { (*raw).idle() }, 0);
             assert!(unsafe { (*raw).data.is_null() });
+            assert_eq!(connection.peer.raw.log, (&raw const log).cast_mut());
+            assert_eq!(unsafe { (*raw).log }, (&raw const log).cast_mut());
+            assert_eq!(unsafe { (*(*raw).read).log }, (&raw const log).cast_mut());
+            assert_eq!(unsafe { (*(*raw).write).log }, (&raw const log).cast_mut());
+            assert_eq!(unsafe { (*(*raw).pool).log }, (&raw const log).cast_mut());
             assert!(same_event_handler(unsafe { (*(*raw).read).handler }, inert_event_handler,));
             assert!(same_event_handler(unsafe { (*(*raw).write).handler }, inert_event_handler,));
         }
@@ -1496,7 +1517,9 @@ fn keepalive_attach_transfers_external_socket_and_rejects_invalid_connection() {
             .attach_keepalive(raw)
     }
     .unwrap();
-    let borrowed = attached.into_connection().unwrap();
+    let borrowed = attached
+        .into_connection(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
+        .unwrap();
     assert_eq!(borrowed.state(), EventPeerConnectionState::Borrowed);
     drop(borrowed);
     assert_eq!(globals.free_connection_n(), 1);

@@ -780,7 +780,9 @@ fn readiness_keeps_a_borrowed_peer_open_and_transferable_after_drop() {
             LogRef::from_raw((&raw const log).cast_mut()).unwrap()
         }))
         .unwrap();
-    let mut borrowed = keepalive.into_connection().unwrap();
+    let mut borrowed = keepalive
+        .into_connection(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
+        .unwrap();
     assert_eq!(borrowed.state(), EventPeerConnectionState::Borrowed);
     let raw = borrowed.peer.raw.connection;
     unsafe { raw.as_ref().unwrap().read.as_mut().unwrap().set_ready(1) };
