@@ -282,6 +282,15 @@ unsafe extern "C" fn idle_write_handler(_event: *mut ngx_event_t) {
     EVENT_HANDLER_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
+fn test_event_handlers(
+    read: unsafe extern "C" fn(*mut ngx_event_t),
+    write: unsafe extern "C" fn(*mut ngx_event_t),
+) -> EventPeerHandlers {
+    // SAFETY: test handlers accept every fixture event, ignore event data, and do not unwind or
+    // invalidate their fixture owner.
+    unsafe { EventPeerHandlers::new(read, write) }
+}
+
 fn same_event_handler(
     actual: ngx_event_handler_pt,
     expected: unsafe extern "C" fn(*mut ngx_event_t),
@@ -376,10 +385,12 @@ fn builder_initializes_every_configured_peer_field() {
     let local = TestAddress::ipv4([198, 51, 100, 20], 443);
     let log: ngx_log_t = unsafe { mem::zeroed() };
     let mut state = CallbackState::default();
-    let callbacks =
-        EventPeerCallbacks::default().get(busy_get).free(record_free).notify(record_notify);
+    let callbacks = unsafe {
+        EventPeerCallbacks::default().get(busy_get).free(record_free).notify(record_notify)
+    };
     #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
-    let callbacks = callbacks.set_session(record_set_session).save_session(record_save_session);
+    let callbacks =
+        unsafe { callbacks.set_session(record_set_session).save_session(record_save_session) };
     let peer = EventPeerBuilder::new(remote.peer_address())
         .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
         .callbacks(callbacks)
@@ -556,10 +567,12 @@ fn cached_selection_dispatches_callbacks_and_releases_once() {
     connection.read = &raw mut read;
     connection.write = &raw mut write;
     let mut state = CallbackState { connection: &raw mut connection, ..Default::default() };
-    let callbacks =
-        EventPeerCallbacks::default().get(done_get).free(record_free).notify(record_notify);
+    let callbacks = unsafe {
+        EventPeerCallbacks::default().get(done_get).free(record_free).notify(record_notify)
+    };
     #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
-    let callbacks = callbacks.set_session(record_set_session).save_session(record_save_session);
+    let callbacks =
+        unsafe { callbacks.set_session(record_set_session).save_session(record_save_session) };
     let peer = unsafe {
         EventPeerBuilder::new(remote.peer_address())
             .log(LogRef::from_raw((&raw const log).cast_mut()).unwrap())
@@ -668,11 +681,9 @@ fn connect_preserves_unselected_callback_statuses() {
         (declined_get as PeerGet, EventPeerConnectStatus::Declined),
         (error_get as PeerGet, EventPeerConnectStatus::Error),
     ] {
-        let peer = build_peer(
-            remote.peer_address(),
-            (&raw const log).cast_mut(),
-            EventPeerCallbacks::default().get(get),
-        );
+        let peer = build_peer(remote.peer_address(), (&raw const log).cast_mut(), unsafe {
+            EventPeerCallbacks::default().get(get)
+        });
         let result = peer.connect().unwrap();
         assert_eq!(result.status(), status);
         assert!(result.into_peer().raw.connection.is_null());
@@ -891,7 +902,7 @@ fn connected_peer_prepares_transfers_and_closes_socket_pool_and_events() {
     let request_preparation = unsafe {
         EventPeerPreparation::new(
             LogRef::from_raw((&raw const request_log).cast_mut()).unwrap(),
-            EventPeerHandlers::new(active_read_handler, active_write_handler),
+            test_event_handlers(active_read_handler, active_write_handler),
             128,
         )
         .data((&raw mut request_data).cast())
@@ -930,7 +941,7 @@ fn connected_peer_prepares_transfers_and_closes_socket_pool_and_events() {
     let idle_preparation = unsafe {
         EventPeerPreparation::new(
             LogRef::from_raw((&raw const idle_log).cast_mut()).unwrap(),
-            EventPeerHandlers::new(idle_read_handler, idle_write_handler),
+            test_event_handlers(idle_read_handler, idle_write_handler),
             0,
         )
         .data((&raw mut idle_data).cast())
@@ -1138,7 +1149,7 @@ fn peer_preparation_reuses_existing_pool_and_reports_allocation_failure() {
         .build()
         .unwrap();
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
-    let handlers = EventPeerHandlers::new(active_read_handler, active_write_handler);
+    let handlers = test_event_handlers(active_read_handler, active_write_handler);
 
     for pool_size in [0, mem::size_of::<ngx_pool_t>() - 1, EVENT_PEER_MIN_POOL_SIZE - 1] {
         assert_eq!(
