@@ -365,12 +365,39 @@ impl<'connection, 'address> EventReadiness<'connection, 'address> {
         connection: NonNull<ngx_connection_t>,
         event: NonNull<ngx_event_t>,
     ) -> Option<Result<Readiness, ReadinessError>> {
+        if unsafe { event.as_ref().timedout() != 0 } {
+            return Some(Err(ReadinessError::Timeout));
+        }
+
+        if self.kind == WaitKind::Connect {
+            return match self.connection.state() {
+                EventPeerConnectionState::Pending => match self.connection.connect_ready() {
+                    Ok(ready) => {
+                        Some(ready.complete().map(|()| Readiness::Connect).map_err(Into::into))
+                    }
+                    Err(EventPeerConnectionError::NotReady) => None,
+                    Err(error) => Some(Err(error.into())),
+                },
+                EventPeerConnectionState::Connected | EventPeerConnectionState::Borrowed => {
+                    let error =
+                        unsafe { connection.as_ref().error() != 0 || event.as_ref().error() != 0 };
+                    if error {
+                        Some(Err(ReadinessError::Connection))
+                    } else if unsafe { event.as_ref().eof() != 0 } {
+                        Some(Err(ReadinessError::EndOfFile))
+                    } else {
+                        Some(Ok(Readiness::Connect))
+                    }
+                }
+                EventPeerConnectionState::Failed => {
+                    Some(Err(EventPeerConnectionError::NotPending.into()))
+                }
+            };
+        }
+
         let ready = unsafe {
             let connection = connection.as_ref();
             let event = event.as_ref();
-            if event.timedout() != 0 {
-                return Some(Err(ReadinessError::Timeout));
-            }
             if connection.error() != 0 || event.error() != 0 {
                 return Some(Err(ReadinessError::Connection));
             }
@@ -379,26 +406,7 @@ impl<'connection, 'address> EventReadiness<'connection, 'address> {
             }
             event.ready() != 0
         };
-
-        if self.kind == WaitKind::Connect
-            && self.connection.state() != EventPeerConnectionState::Pending
-        {
-            return Some(Ok(Readiness::Connect));
-        }
-
-        if !ready {
-            return None;
-        }
-
-        if self.kind == WaitKind::Connect
-            && self.connection.state() == EventPeerConnectionState::Pending
-        {
-            return Some(
-                self.connection.complete_connect().map(|()| Readiness::Connect).map_err(Into::into),
-            );
-        }
-
-        Some(Ok(self.kind.readiness()))
+        ready.then(|| Ok(self.kind.readiness()))
     }
 
     fn install(&mut self, event: NonNull<ngx_event_t>) -> Result<(), ReadinessError> {

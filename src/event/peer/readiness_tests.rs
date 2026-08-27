@@ -276,7 +276,8 @@ fn readiness_wakes_for_delayed_read_and_restores_handler() {
     let raw = connection.peer.raw.connection;
     let fd = unsafe { raw.as_ref().unwrap().fd };
     wait_for_writable_socket(fd);
-    connection.complete_connect().unwrap();
+    unsafe { (*raw).write.as_mut().unwrap().set_ready(1) };
+    connection.connect_ready().unwrap().complete().unwrap();
     let (mut server, _) = listener.accept().unwrap();
     connection
         .prepare(EventPeerPreparation::new(
@@ -359,7 +360,8 @@ fn readiness_rearms_after_a_partial_write_cycle() {
     let raw = connection.peer.raw.connection;
     let fd = unsafe { raw.as_ref().unwrap().fd };
     wait_for_writable_socket(fd);
-    connection.complete_connect().unwrap();
+    unsafe { (*raw).write.as_mut().unwrap().set_ready(1) };
+    connection.connect_ready().unwrap().complete().unwrap();
     let _server = listener.accept().unwrap();
     connection
         .prepare(EventPeerPreparation::new(
