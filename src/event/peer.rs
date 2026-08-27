@@ -15,8 +15,8 @@ use crate::ffi::{
     NGX_AGAIN, NGX_BUSY, NGX_DECLINED, NGX_DONE, NGX_ERROR, NGX_OK, ngx_addr_t, ngx_connection_t,
     ngx_create_pool, ngx_destroy_pool, ngx_event_connect_peer, ngx_event_free_peer_pt,
     ngx_event_get_peer, ngx_event_get_peer_pt, ngx_event_handler_pt, ngx_event_notify_peer_pt,
-    ngx_event_t, ngx_int_t, ngx_log_t, ngx_msec_t, ngx_peer_connection_t, ngx_pool_large_t,
-    ngx_pool_t, ngx_socket_errno, ngx_str_t, ngx_uint_t,
+    ngx_event_t, ngx_handle_read_event, ngx_int_t, ngx_log_t, ngx_msec_t, ngx_peer_connection_t,
+    ngx_pool_large_t, ngx_pool_t, ngx_socket_errno, ngx_str_t, ngx_uint_t,
 };
 #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
 use crate::ffi::{ngx_event_save_peer_session_pt, ngx_event_set_peer_session_pt};
@@ -321,12 +321,6 @@ impl<'address> EventPeerPreparation<'address> {
         self.data = data;
         self
     }
-
-    /// Marks the connection idle for the module-owned keepalive wrapper.
-    pub fn idle(mut self, idle: bool) -> Self {
-        self.idle = idle;
-        self
-    }
 }
 
 /// State of an event-peer connection owner.
@@ -366,8 +360,18 @@ pub enum EventPeerConnectionError {
     StaleConnectionError,
     /// A keepalive connection reached end of file.
     StaleReadEndOfFile,
+    /// A keepalive read event has a terminal error.
+    StaleReadError,
+    /// A keepalive read event timed out.
+    StaleReadTimedOut,
+    /// A keepalive write event has a terminal error.
+    StaleWriteError,
+    /// A keepalive write event timed out.
+    StaleWriteTimedOut,
     /// A keepalive connection has unread input.
     StaleReadReady,
+    /// nginx could not register the keepalive read event.
+    ReadEventRegistration,
     /// The checked connection view is invalid.
     Connection(ConnectionError),
     /// The checked event view is invalid.
@@ -413,8 +417,23 @@ impl fmt::Display for EventPeerConnectionError {
             Self::StaleReadEndOfFile => {
                 formatter.write_str("event peer keepalive connection reached end of file")
             }
+            Self::StaleReadError => {
+                formatter.write_str("event peer keepalive read event has an error")
+            }
+            Self::StaleReadTimedOut => {
+                formatter.write_str("event peer keepalive read event timed out")
+            }
+            Self::StaleWriteError => {
+                formatter.write_str("event peer keepalive write event has an error")
+            }
+            Self::StaleWriteTimedOut => {
+                formatter.write_str("event peer keepalive write event timed out")
+            }
             Self::StaleReadReady => {
                 formatter.write_str("event peer keepalive connection has unread input")
+            }
+            Self::ReadEventRegistration => {
+                formatter.write_str("event peer keepalive read event registration failed")
             }
             Self::Connection(_) => formatter.write_str("event peer connection is invalid"),
             Self::Event(_) => formatter.write_str("event peer connection event is invalid"),
@@ -984,6 +1003,58 @@ impl<'address> EventPeer<'address> {
         Ok(())
     }
 
+    fn keepalive_state(&self) -> Result<EventPeerKeepaliveState, EventPeerConnectionError> {
+        let connection = self.connection()?;
+        let (read, write) = checked_event_peer_events(connection)?;
+
+        unsafe {
+            Ok(EventPeerKeepaliveState {
+                connection_error: connection.as_ref().error() != 0,
+                read_eof: read.as_ref().eof() != 0,
+                read_error: read.as_ref().error() != 0,
+                read_timed_out: read.as_ref().timedout() != 0,
+                write_error: write.as_ref().error() != 0,
+                write_timed_out: write.as_ref().timedout() != 0,
+                read_ready: read.as_ref().ready() != 0,
+            })
+        }
+    }
+
+    fn validate_keepalive(&self) -> Result<(), EventPeerConnectionError> {
+        let state = self.keepalive_state()?;
+        if state.connection_error {
+            return Err(EventPeerConnectionError::StaleConnectionError);
+        }
+        if state.read_eof {
+            return Err(EventPeerConnectionError::StaleReadEndOfFile);
+        }
+        if state.read_error {
+            return Err(EventPeerConnectionError::StaleReadError);
+        }
+        if state.read_timed_out {
+            return Err(EventPeerConnectionError::StaleReadTimedOut);
+        }
+        if state.write_error {
+            return Err(EventPeerConnectionError::StaleWriteError);
+        }
+        if state.write_timed_out {
+            return Err(EventPeerConnectionError::StaleWriteTimedOut);
+        }
+        if state.read_ready {
+            return Err(EventPeerConnectionError::StaleReadReady);
+        }
+        Ok(())
+    }
+
+    fn register_keepalive_read(&mut self) -> Result<(), EventPeerConnectionError> {
+        let connection = self.connection()?;
+        let (read, _) = checked_event_peer_events(connection)?;
+        if unsafe { ngx_handle_read_event(read.as_ptr(), 0) } != NGX_OK as _ {
+            return Err(EventPeerConnectionError::ReadEventRegistration);
+        }
+        Ok(())
+    }
+
     fn close_owned(&mut self) {
         let connection = self.raw.connection;
         self.raw.connection = ptr::null_mut();
@@ -1267,15 +1338,28 @@ impl<'address> EventPeerConnection<'address> {
         self.peer.release(state);
     }
 
-    /// Clears active handlers, timers, and connection data before keepalive transfer.
+    /// Validates and prepares an idle connection, then registers read monitoring before transfer.
     #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub fn into_keepalive(
         mut self,
+        mut preparation: EventPeerPreparation<'address>,
     ) -> Result<EventPeerKeepalive<'address>, EventPeerKeepaliveTransferError<'address>> {
         if self.state == EventPeerConnectionState::Pending {
             return Err(EventPeerKeepaliveTransferError::Pending { connection: self });
         }
+        if let Err(error) = self.peer.validate_keepalive() {
+            return Err(EventPeerKeepaliveTransferError::Connection { error, connection: self });
+        }
         if let Err(error) = self.peer.quiesce(true) {
+            return Err(EventPeerKeepaliveTransferError::Connection { error, connection: self });
+        }
+
+        preparation.idle = true;
+        if let Err(error) = self.peer.prepare(preparation) {
+            return Err(EventPeerKeepaliveTransferError::Connection { error, connection: self });
+        }
+        if let Err(error) = self.peer.register_keepalive_read() {
+            let _ = self.peer.quiesce(false);
             return Err(EventPeerKeepaliveTransferError::Connection { error, connection: self });
         }
 
@@ -1297,9 +1381,9 @@ pub enum EventPeerKeepaliveTransferError<'address> {
         /// The retained active connection owner.
         connection: EventPeerConnection<'address>,
     },
-    /// The native connection could not be safely quiesced.
+    /// The native connection could not be validated, prepared, or registered for idle use.
     Connection {
-        /// The quiesce failure.
+        /// The transition failure.
         error: EventPeerConnectionError,
         /// The retained active connection owner.
         connection: EventPeerConnection<'address>,
@@ -1337,6 +1421,14 @@ pub struct EventPeerKeepaliveState {
     pub connection_error: bool,
     /// The read event reached end of file.
     pub read_eof: bool,
+    /// The read event has a terminal error.
+    pub read_error: bool,
+    /// The read event timed out.
+    pub read_timed_out: bool,
+    /// The write event has a terminal error.
+    pub write_error: bool,
+    /// The write event timed out.
+    pub write_timed_out: bool,
     /// The read event has unread input available.
     pub read_ready: bool,
 }
@@ -1357,42 +1449,14 @@ pub struct EventPeerKeepalive<'address> {
 }
 
 impl<'address> EventPeerKeepalive<'address> {
-    /// Creates a connection pool when absent, then installs idle log, data, and handlers.
-    pub fn prepare(
-        &mut self,
-        preparation: EventPeerPreparation<'address>,
-    ) -> Result<(), EventPeerConnectionError> {
-        self.peer.prepare(preparation)
-    }
-
     /// Returns the native state that determines whether this connection is stale.
     pub fn stale_state(&self) -> Result<EventPeerKeepaliveState, EventPeerConnectionError> {
-        let connection = self.peer.connection()?;
-        let (read, _) = checked_event_peer_events(connection)?;
-
-        unsafe {
-            Ok(EventPeerKeepaliveState {
-                connection_error: connection.as_ref().error() != 0,
-                read_eof: read.as_ref().eof() != 0,
-                read_ready: read.as_ref().ready() != 0,
-            })
-        }
+        self.peer.keepalive_state()
     }
 
-    /// Rejects a connection with an nginx error, end of file, or unread input.
+    /// Rejects a connection with terminal native event state or unread input.
     pub fn validate(&self) -> Result<(), EventPeerConnectionError> {
-        let state = self.stale_state()?;
-        if state.connection_error {
-            return Err(EventPeerConnectionError::StaleConnectionError);
-        }
-        if state.read_eof {
-            return Err(EventPeerConnectionError::StaleReadEndOfFile);
-        }
-        if state.read_ready {
-            return Err(EventPeerConnectionError::StaleReadReady);
-        }
-
-        Ok(())
+        self.peer.validate_keepalive()
     }
 
     /// Gives a callback-scoped mutable connection view to the caller.
@@ -1410,6 +1474,12 @@ impl<'address> EventPeerKeepalive<'address> {
         mut self,
     ) -> Result<EventPeerConnection<'address>, EventPeerKeepaliveIntoConnectionError<'address>>
     {
+        if let Err(error) = self.validate() {
+            return Err(EventPeerKeepaliveIntoConnectionError::Connection {
+                error,
+                keepalive: self,
+            });
+        }
         if let Err(error) = self.peer.quiesce(false) {
             return Err(EventPeerKeepaliveIntoConnectionError::Connection {
                 error,

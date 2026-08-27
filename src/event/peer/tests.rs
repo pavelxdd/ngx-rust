@@ -5,7 +5,8 @@ use alloc::boxed::Box;
 use core::ffi::{c_int, c_void};
 use core::mem::{self, offset_of, size_of};
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::io::Write;
 use std::net::TcpListener;
 use std::sync::MutexGuard;
 
@@ -13,23 +14,28 @@ use super::{
     EVENT_PEER_MIN_POOL_SIZE, EventPeer, EventPeerAddress, EventPeerAddressError,
     EventPeerAttachError, EventPeerBuildError, EventPeerBuilder, EventPeerCallbacks,
     EventPeerConnectError, EventPeerConnectResult, EventPeerConnectStatus,
-    EventPeerConnectionError, EventPeerConnectionState, EventPeerHandlers, EventPeerKeepaliveState,
-    EventPeerLogError, EventPeerPreparation, EventPeerReleaseState, inert_event_handler,
+    EventPeerConnectionError, EventPeerConnectionState, EventPeerHandlers, EventPeerKeepalive,
+    EventPeerKeepaliveIntoConnectionError, EventPeerKeepaliveState,
+    EventPeerKeepaliveTransferError, EventPeerLogError, EventPeerPreparation,
+    EventPeerReleaseState, inert_event_handler,
 };
 use crate::core::{ConnectionError, SocketAddressError, SocketType};
 use crate::event::EventError;
 #[cfg(unix)]
 use crate::ffi::sockaddr_un;
 use crate::ffi::{
-    NGX_AGAIN, NGX_BUSY, NGX_DECLINED, NGX_DONE, NGX_ERROR, NGX_OK, ngx_addr_t, ngx_atomic_t,
-    ngx_close_connection, ngx_connection_counter, ngx_connection_t, ngx_current_msec, ngx_cycle,
-    ngx_cycle_t, ngx_event_actions, ngx_event_actions_t, ngx_event_connect_peer, ngx_event_flags,
-    ngx_event_handler_pt, ngx_event_t, ngx_event_timer_init, ngx_int_t, ngx_log_t,
-    ngx_peer_connection_t, ngx_pool_t, ngx_str_t, ngx_uint_t, sockaddr_in, sockaddr_in6,
+    NGX_AGAIN, NGX_BUSY, NGX_DECLINED, NGX_DONE, NGX_ERROR, NGX_OK, NGX_USE_CLEAR_EVENT,
+    ngx_addr_t, ngx_atomic_t, ngx_close_connection, ngx_connection_counter, ngx_connection_t,
+    ngx_current_msec, ngx_cycle, ngx_cycle_t, ngx_event_actions, ngx_event_actions_t,
+    ngx_event_connect_peer, ngx_event_flags, ngx_event_handler_pt, ngx_event_t,
+    ngx_event_timer_init, ngx_int_t, ngx_log_t, ngx_peer_connection_t, ngx_pool_t, ngx_str_t,
+    ngx_uint_t, sockaddr_in, sockaddr_in6,
 };
 use crate::log::LogRef;
 
 static EVENT_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static EVENT_ADD_CALLS: AtomicUsize = AtomicUsize::new(0);
+static IDLE_PEEK_RESULT: AtomicIsize = AtomicIsize::new(-2);
 
 type EventAdd = unsafe extern "C" fn(*mut ngx_event_t, ngx_int_t, ngx_uint_t) -> ngx_int_t;
 type PeerGet = unsafe extern "C" fn(*mut ngx_peer_connection_t, *mut c_void) -> ngx_int_t;
@@ -75,7 +81,8 @@ impl PeerGlobals {
             ngx_cycle = &raw mut *cycle;
             ngx_event_actions = mem::zeroed();
             ngx_event_actions.add = Some(add);
-            ngx_event_flags = 0;
+            ngx_event_actions.del = Some(delete_event_ok);
+            ngx_event_flags = NGX_USE_CLEAR_EVENT as _;
             ngx_connection_counter = &raw mut *counter;
         }
 
@@ -251,10 +258,12 @@ unsafe extern "C" fn record_save_session(_peer: *mut ngx_peer_connection_t, data
 }
 
 unsafe extern "C" fn add_event_ok(
-    _event: *mut ngx_event_t,
+    event: *mut ngx_event_t,
     _kind: ngx_int_t,
     _flags: ngx_uint_t,
 ) -> ngx_int_t {
+    unsafe { (*event).set_active(1) };
+    EVENT_ADD_CALLS.fetch_add(1, Ordering::Relaxed);
     NGX_OK as _
 }
 
@@ -264,6 +273,15 @@ unsafe extern "C" fn add_event_error(
     _flags: ngx_uint_t,
 ) -> ngx_int_t {
     NGX_ERROR as _
+}
+
+unsafe extern "C" fn delete_event_ok(
+    event: *mut ngx_event_t,
+    _kind: ngx_int_t,
+    _flags: ngx_uint_t,
+) -> ngx_int_t {
+    unsafe { (*event).set_active(0) };
+    NGX_OK as _
 }
 
 unsafe extern "C" fn active_read_handler(_event: *mut ngx_event_t) {
@@ -282,6 +300,15 @@ unsafe extern "C" fn idle_write_handler(_event: *mut ngx_event_t) {
     EVENT_HANDLER_CALLS.fetch_add(1, Ordering::Relaxed);
 }
 
+unsafe extern "C" fn idle_peek_handler(event: *mut ngx_event_t) {
+    let connection = unsafe { (*event).data.cast::<ngx_connection_t>().as_ref() }.unwrap();
+    let mut byte = 0_u8;
+    let result = unsafe {
+        libc::recv(connection.fd, (&raw mut byte).cast(), 1, libc::MSG_DONTWAIT | libc::MSG_PEEK)
+    };
+    IDLE_PEEK_RESULT.store(result as _, Ordering::Relaxed);
+}
+
 fn test_event_handlers(
     read: unsafe extern "C" fn(*mut ngx_event_t),
     write: unsafe extern "C" fn(*mut ngx_event_t),
@@ -289,6 +316,14 @@ fn test_event_handlers(
     // SAFETY: test handlers accept every fixture event, ignore event data, and do not unwind or
     // invalidate their fixture owner.
     unsafe { EventPeerHandlers::new(read, write) }
+}
+
+fn test_keepalive_preparation<'log>(log: LogRef<'log>) -> EventPeerPreparation<'log> {
+    EventPeerPreparation::new(
+        log,
+        test_event_handlers(idle_read_handler, idle_write_handler),
+        EVENT_PEER_MIN_POOL_SIZE,
+    )
 }
 
 fn same_event_handler(
@@ -301,6 +336,24 @@ fn same_event_handler(
 fn wait_for_writable_socket(fd: c_int) {
     let mut descriptor = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
     assert_eq!(unsafe { libc::poll(&raw mut descriptor, 1, 1_000) }, 1);
+}
+
+fn wait_for_readable_socket(fd: c_int) {
+    let mut descriptor = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    assert_eq!(unsafe { libc::poll(&raw mut descriptor, 1, 1_000) }, 1);
+}
+
+fn reject_keepalive_reuse<'address>(
+    keepalive: EventPeerKeepalive<'address>,
+    expected: EventPeerConnectionError,
+) -> EventPeerKeepalive<'address> {
+    match keepalive.into_connection() {
+        Err(EventPeerKeepaliveIntoConnectionError::Connection { error, keepalive }) => {
+            assert_eq!(error, expected);
+            keepalive
+        }
+        Ok(connection) => panic!("reused a terminal keepalive connection: {connection:?}"),
+    }
 }
 
 fn build_peer<'peer>(
@@ -933,11 +986,11 @@ fn connected_peer_prepares_transfers_and_closes_socket_pool_and_events() {
     assert!(unsafe { raw.read.as_ref().unwrap().timer_set() != 0 });
     assert!(unsafe { raw.write.as_ref().unwrap().timer_set() != 0 });
 
-    let mut keepalive = connection.into_keepalive().unwrap();
-    assert!(unsafe { raw.read.as_ref().unwrap().timer_set() == 0 });
-    assert!(unsafe { raw.write.as_ref().unwrap().timer_set() == 0 });
-    assert!(raw.data.is_null());
-
+    unsafe {
+        raw.read.as_mut().unwrap().set_active(0);
+        raw.read.as_mut().unwrap().set_ready(0);
+    }
+    let add_calls = EVENT_ADD_CALLS.load(Ordering::Relaxed);
     let idle_preparation = unsafe {
         EventPeerPreparation::new(
             LogRef::from_raw((&raw const idle_log).cast_mut()).unwrap(),
@@ -945,9 +998,12 @@ fn connected_peer_prepares_transfers_and_closes_socket_pool_and_events() {
             0,
         )
         .data((&raw mut idle_data).cast())
-        .idle(true)
     };
-    keepalive.prepare(idle_preparation).unwrap();
+    let mut keepalive = connection.into_keepalive(idle_preparation).unwrap();
+    assert_eq!(EVENT_ADD_CALLS.load(Ordering::Relaxed), add_calls + 1);
+    assert!(unsafe { raw.read.as_ref().unwrap().timer_set() == 0 });
+    assert!(unsafe { raw.write.as_ref().unwrap().timer_set() == 0 });
+    assert!(unsafe { raw.read.as_ref().unwrap().active() != 0 });
     assert_eq!(raw.log, (&raw const idle_log).cast_mut());
     assert_eq!(unsafe { (*raw.pool).log }, (&raw const idle_log).cast_mut());
     assert_eq!(raw.data, (&raw mut idle_data).cast());
@@ -992,8 +1048,16 @@ fn keepalive_validation_rejects_error_eof_and_readable_connections() {
         .socket_type(SocketType::Datagram)
         .build()
         .unwrap();
-    let keepalive =
-        peer.connect().unwrap().into_peer().into_connection().unwrap().into_keepalive().unwrap();
+    let keepalive = peer
+        .connect()
+        .unwrap()
+        .into_peer()
+        .into_connection()
+        .unwrap()
+        .into_keepalive(test_keepalive_preparation(unsafe {
+            LogRef::from_raw((&raw const log).cast_mut()).unwrap()
+        }))
+        .unwrap();
     let raw = keepalive.peer.raw.connection;
     let raw = unsafe { raw.as_mut() }.unwrap();
 
@@ -1012,6 +1076,60 @@ fn keepalive_validation_rejects_error_eof_and_readable_connections() {
 }
 
 #[test]
+fn keepalive_reuse_rejects_every_terminal_flag_without_advisory_validation() {
+    let _globals = PeerGlobals::new(true, add_event_ok);
+    let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let peer = EventPeerBuilder::new(remote.peer_address())
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
+        .callbacks(EventPeerCallbacks::direct())
+        .socket_type(SocketType::Datagram)
+        .build()
+        .unwrap();
+    let mut keepalive = peer
+        .connect()
+        .unwrap()
+        .into_peer()
+        .into_connection()
+        .unwrap()
+        .into_keepalive(test_keepalive_preparation(unsafe {
+            LogRef::from_raw((&raw const log).cast_mut()).unwrap()
+        }))
+        .unwrap();
+    let raw = keepalive.peer.raw.connection;
+
+    unsafe { (*raw).set_error(1) };
+    keepalive = reject_keepalive_reuse(keepalive, EventPeerConnectionError::StaleConnectionError);
+    unsafe { (*raw).set_error(0) };
+
+    unsafe { (*raw).read.as_mut().unwrap().set_eof(1) };
+    keepalive = reject_keepalive_reuse(keepalive, EventPeerConnectionError::StaleReadEndOfFile);
+    unsafe { (*raw).read.as_mut().unwrap().set_eof(0) };
+
+    unsafe { (*raw).read.as_mut().unwrap().set_error(1) };
+    keepalive = reject_keepalive_reuse(keepalive, EventPeerConnectionError::StaleReadError);
+    unsafe { (*raw).read.as_mut().unwrap().set_error(0) };
+
+    unsafe { (*raw).read.as_mut().unwrap().set_timedout(1) };
+    keepalive = reject_keepalive_reuse(keepalive, EventPeerConnectionError::StaleReadTimedOut);
+    unsafe { (*raw).read.as_mut().unwrap().set_timedout(0) };
+
+    unsafe { (*raw).write.as_mut().unwrap().set_error(1) };
+    keepalive = reject_keepalive_reuse(keepalive, EventPeerConnectionError::StaleWriteError);
+    unsafe { (*raw).write.as_mut().unwrap().set_error(0) };
+
+    unsafe { (*raw).write.as_mut().unwrap().set_timedout(1) };
+    keepalive = reject_keepalive_reuse(keepalive, EventPeerConnectionError::StaleWriteTimedOut);
+    unsafe { (*raw).write.as_mut().unwrap().set_timedout(0) };
+
+    unsafe { (*raw).read.as_mut().unwrap().set_ready(1) };
+    keepalive = reject_keepalive_reuse(keepalive, EventPeerConnectionError::StaleReadReady);
+    unsafe { (*raw).read.as_mut().unwrap().set_ready(0) };
+
+    keepalive.into_connection().unwrap();
+}
+
+#[test]
 fn keepalive_stale_state_reports_all_native_bits() {
     let _globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
@@ -1022,22 +1140,147 @@ fn keepalive_stale_state_reports_all_native_bits() {
         .socket_type(SocketType::Datagram)
         .build()
         .unwrap();
-    let keepalive =
-        peer.connect().unwrap().into_peer().into_connection().unwrap().into_keepalive().unwrap();
+    let keepalive = peer
+        .connect()
+        .unwrap()
+        .into_peer()
+        .into_connection()
+        .unwrap()
+        .into_keepalive(test_keepalive_preparation(unsafe {
+            LogRef::from_raw((&raw const log).cast_mut()).unwrap()
+        }))
+        .unwrap();
     let raw = keepalive.peer.raw.connection;
     let raw = unsafe { raw.as_mut() }.unwrap();
 
     raw.set_error(1);
     unsafe {
         raw.read.as_mut().unwrap().set_eof(1);
+        raw.read.as_mut().unwrap().set_error(1);
+        raw.read.as_mut().unwrap().set_timedout(1);
         raw.read.as_mut().unwrap().set_ready(1);
+        raw.write.as_mut().unwrap().set_error(1);
+        raw.write.as_mut().unwrap().set_timedout(1);
     }
 
     assert_eq!(
         keepalive.stale_state(),
-        Ok(EventPeerKeepaliveState { connection_error: true, read_eof: true, read_ready: true })
+        Ok(EventPeerKeepaliveState {
+            connection_error: true,
+            read_eof: true,
+            read_error: true,
+            read_timed_out: true,
+            write_error: true,
+            write_timed_out: true,
+            read_ready: true,
+        })
     );
     assert_eq!(keepalive.validate(), Err(EventPeerConnectionError::StaleConnectionError));
+}
+
+#[test]
+fn keepalive_storage_rejects_terminal_state_before_publication() {
+    let _globals = PeerGlobals::new(true, add_event_ok);
+    let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let peer = EventPeerBuilder::new(remote.peer_address())
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
+        .callbacks(EventPeerCallbacks::direct())
+        .socket_type(SocketType::Datagram)
+        .build()
+        .unwrap();
+    let connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
+    let raw = connection.peer.raw.connection;
+    unsafe { (*raw).write.as_mut().unwrap().set_timedout(1) };
+
+    match connection.into_keepalive(test_keepalive_preparation(unsafe {
+        LogRef::from_raw((&raw const log).cast_mut()).unwrap()
+    })) {
+        Err(EventPeerKeepaliveTransferError::Connection { error, connection }) => {
+            assert_eq!(error, EventPeerConnectionError::StaleWriteTimedOut);
+            assert_eq!(connection.state(), EventPeerConnectionState::Connected);
+            assert_eq!(unsafe { (*raw).idle() }, 0);
+        }
+        result => panic!("unexpected keepalive storage result: {result:?}"),
+    }
+}
+
+#[test]
+fn keepalive_read_registration_failure_rolls_back_to_active_owner() {
+    let _globals = PeerGlobals::new(true, add_event_ok);
+    let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let mut idle_data = 1_u8;
+    let peer = EventPeerBuilder::new(remote.peer_address())
+        .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
+        .callbacks(EventPeerCallbacks::direct())
+        .socket_type(SocketType::Datagram)
+        .build()
+        .unwrap();
+    let connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
+    let raw = connection.peer.raw.connection;
+    unsafe {
+        (*raw).read.as_mut().unwrap().set_active(0);
+        (*raw).read.as_mut().unwrap().set_ready(0);
+        ngx_event_actions.add = Some(add_event_error);
+    }
+    let preparation = unsafe {
+        test_keepalive_preparation(LogRef::from_raw((&raw const log).cast_mut()).unwrap())
+            .data((&raw mut idle_data).cast())
+    };
+
+    match connection.into_keepalive(preparation) {
+        Err(EventPeerKeepaliveTransferError::Connection { error, connection }) => {
+            assert_eq!(error, EventPeerConnectionError::ReadEventRegistration);
+            assert_eq!(connection.state(), EventPeerConnectionState::Connected);
+            assert_eq!(unsafe { (*raw).idle() }, 0);
+            assert!(unsafe { (*raw).data.is_null() });
+            assert!(same_event_handler(unsafe { (*(*raw).read).handler }, inert_event_handler,));
+            assert!(same_event_handler(unsafe { (*(*raw).write).handler }, inert_event_handler,));
+        }
+        result => panic!("unexpected keepalive registration result: {result:?}"),
+    }
+}
+
+#[test]
+fn registered_idle_handler_observes_real_unread_data_and_eof() {
+    let _globals = PeerGlobals::new(true, add_event_ok);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let remote = TestAddress::ipv4([127, 0, 0, 1], listener.local_addr().unwrap().port());
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
+    let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
+    let fd = unsafe { (*connection.peer.raw.connection).fd };
+    if connection.state() == EventPeerConnectionState::Pending {
+        wait_for_writable_socket(fd);
+        connection.complete_connect().unwrap();
+    }
+    let (mut server, _) = listener.accept().unwrap();
+    let preparation = EventPeerPreparation::new(
+        unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
+        test_event_handlers(idle_peek_handler, idle_write_handler),
+        EVENT_PEER_MIN_POOL_SIZE,
+    );
+    IDLE_PEEK_RESULT.store(-2, Ordering::Relaxed);
+    let keepalive = connection.into_keepalive(preparation).unwrap();
+    let read = unsafe { (*keepalive.peer.raw.connection).read };
+    assert_ne!(unsafe { (*read).active() }, 0);
+
+    server.write_all(b"x").unwrap();
+    wait_for_readable_socket(fd);
+    unsafe { (*read).handler.unwrap()(read) };
+    assert_eq!(IDLE_PEEK_RESULT.load(Ordering::Relaxed), 1);
+
+    let mut byte = 0_u8;
+    assert_eq!(unsafe { libc::recv(fd, (&raw mut byte).cast(), 1, 0) }, 1);
+    drop(server);
+    wait_for_readable_socket(fd);
+    unsafe { (*read).handler.unwrap()(read) };
+    assert_eq!(IDLE_PEEK_RESULT.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -1107,7 +1350,12 @@ fn pending_peer_stays_owned_until_completed_or_closed() {
     let connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     assert_eq!(connection.state(), EventPeerConnectionState::Pending);
 
-    let connection = connection.into_keepalive().unwrap_err().into_connection();
+    let connection = connection
+        .into_keepalive(test_keepalive_preparation(unsafe {
+            LogRef::from_raw((&raw const log).cast_mut()).unwrap()
+        }))
+        .unwrap_err()
+        .into_connection();
     drop(connection);
     assert_eq!(globals.free_connection_n(), 1);
     drop(listener);
