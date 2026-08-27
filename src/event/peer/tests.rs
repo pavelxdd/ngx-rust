@@ -1257,7 +1257,8 @@ fn registered_idle_handler_observes_real_unread_data_and_eof() {
     let fd = unsafe { (*connection.peer.raw.connection).fd };
     if connection.state() == EventPeerConnectionState::Pending {
         wait_for_writable_socket(fd);
-        connection.complete_connect().unwrap();
+        unsafe { (*connection.peer.raw.connection).write.as_mut().unwrap().set_ready(1) };
+        connection.connect_ready().unwrap().complete().unwrap();
     }
     let (mut server, _) = listener.accept().unwrap();
     let preparation = EventPeerPreparation::new(
@@ -1284,6 +1285,27 @@ fn registered_idle_handler_observes_real_unread_data_and_eof() {
 }
 
 #[test]
+fn pending_peer_rejects_completion_before_native_readiness() {
+    let globals = PeerGlobals::new(true, add_event_ok);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let remote = TestAddress::ipv4([127, 0, 0, 1], listener.local_addr().unwrap().port());
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
+    let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
+    assert_eq!(connection.state(), EventPeerConnectionState::Pending);
+
+    assert!(matches!(connection.connect_ready(), Err(EventPeerConnectionError::NotReady)));
+    assert_eq!(connection.state(), EventPeerConnectionState::Pending);
+
+    drop(connection);
+    assert_eq!(globals.free_connection_n(), 1);
+}
+
+#[test]
 fn pending_peer_checks_connect_completion() {
     let globals = PeerGlobals::new(true, add_event_ok);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1296,9 +1318,11 @@ fn pending_peer_checks_connect_completion() {
     );
     let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
     assert_eq!(connection.state(), EventPeerConnectionState::Pending);
-    let fd = unsafe { connection.peer.raw.connection.as_ref().unwrap().fd };
+    let raw = connection.peer.raw.connection;
+    let fd = unsafe { raw.as_ref().unwrap().fd };
     wait_for_writable_socket(fd);
-    connection.complete_connect().unwrap();
+    unsafe { raw.as_ref().unwrap().write.as_mut().unwrap().set_ready(1) };
+    connection.connect_ready().unwrap().complete().unwrap();
     assert_eq!(connection.state(), EventPeerConnectionState::Connected);
 
     drop(connection);
@@ -1324,14 +1348,13 @@ fn pending_peer_reports_refused_and_invalid_socket_completion() {
     let raw = connection.peer.raw.connection;
     let fd = unsafe { raw.as_ref().unwrap().fd };
     wait_for_writable_socket(fd);
-    assert!(matches!(connection.complete_connect(), Err(EventPeerConnectionError::Connect(_))));
-
-    unsafe { raw.as_mut().unwrap().fd = -1 };
+    unsafe { raw.as_ref().unwrap().write.as_mut().unwrap().set_ready(1) };
     assert!(matches!(
-        connection.complete_connect(),
-        Err(EventPeerConnectionError::SocketOption(_))
+        connection.connect_ready().unwrap().complete(),
+        Err(EventPeerConnectionError::Connect(_))
     ));
-    unsafe { raw.as_mut().unwrap().fd = fd };
+    assert!(matches!(connection.connect_ready(), Err(EventPeerConnectionError::NotPending)));
+    assert_eq!(connection.state(), EventPeerConnectionState::Failed);
     drop(connection);
     assert_eq!(globals.free_connection_n(), 1);
 }
