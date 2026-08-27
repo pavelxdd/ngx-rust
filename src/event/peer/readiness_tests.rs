@@ -17,7 +17,8 @@ use crate::async_::{Readiness, ReadinessError};
 use crate::event::EventError;
 use crate::ffi::{
     NGX_OK, NGX_USE_CLEAR_EVENT, ngx_add_timer, ngx_current_msec, ngx_del_timer,
-    ngx_event_expire_timers, ngx_event_timer_init, ngx_msec_int_t, ngx_msec_t,
+    ngx_event_expire_timers, ngx_event_process_posted, ngx_event_timer_init, ngx_msec_int_t,
+    ngx_msec_t, ngx_posted_events, ngx_queue_init,
 };
 
 #[derive(Default)]
@@ -304,6 +305,43 @@ fn readiness_wakes_for_delayed_read_and_restores_handler() {
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Ready(Ok(Readiness::Read)));
     assert!(same_event_handler(unsafe { (*read).handler }, active_read_handler));
     assert_eq!(unsafe { (*read).data }, data);
+    assert_eq!(unsafe { (*read).posted() }, 0);
+}
+
+#[test]
+fn readiness_repoll_consumes_a_delivered_callback_before_cancellation() {
+    let _globals = PeerGlobals::new(true, add_event_ok);
+    unsafe { ngx_queue_init(&raw mut ngx_posted_events) };
+    let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
+    let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
+    connection
+        .prepare(EventPeerPreparation::new(
+            unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
+            EventPeerHandlers::new(active_read_handler, active_write_handler),
+            128,
+        ))
+        .unwrap();
+    let raw = connection.peer.raw.connection;
+    let read = unsafe { raw.as_ref().unwrap().read };
+    unsafe { (*read).set_ready(0) };
+
+    let (waker, state) = recording_waker();
+    let mut readiness = Box::pin(connection.wait_read(None));
+    let mut context = Context::from_waker(&waker);
+    assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
+    invoke_event_handler(read);
+    assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
+    assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
+    drop(readiness);
+
+    assert!(same_event_handler(unsafe { (*read).handler }, active_read_handler));
+    assert_eq!(unsafe { (*read).posted() }, 0);
 }
 
 #[test]
@@ -634,9 +672,10 @@ fn readiness_restores_the_handler_when_native_registration_fails() {
 }
 
 #[test]
-fn readiness_drop_cancels_timeout_and_leaves_no_late_waker() {
-    let globals = PeerGlobals::new(true, add_event_ok);
+fn readiness_drop_forwards_a_delivered_edge_and_leaves_no_late_waker() {
+    let mut globals = PeerGlobals::new(true, add_event_ok);
     reset_timer_tree();
+    unsafe { ngx_queue_init(&raw mut ngx_posted_events) };
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
     let peer = build_peer(
@@ -661,23 +700,65 @@ fn readiness_drop_cancels_timeout_and_leaves_no_late_waker() {
     let mut readiness = Box::pin(connection.wait_read(Some(Duration::from_millis(5))));
     let mut context = Context::from_waker(&waker);
     assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
+    unsafe { (*read).set_ready(1) };
     invoke_event_handler(read);
     assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
+    assert_eq!(EVENT_HANDLER_CALLS.load(Ordering::Relaxed), 0);
     drop(readiness);
 
     assert!(same_event_handler(unsafe { (*read).handler }, active_read_handler));
     advance_to(5);
     assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
-    unsafe { (*read).set_ready(1) };
-    invoke_event_handler(read);
+    assert_eq!(EVENT_HANDLER_CALLS.load(Ordering::Relaxed), 0);
+    unsafe {
+        ngx_event_process_posted(&raw mut *globals.cycle, &raw mut ngx_posted_events);
+    }
     assert_eq!(EVENT_HANDLER_CALLS.load(Ordering::Relaxed), 1);
     assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
     assert_eq!(globals.free_connection_n(), 0);
 
     connection.close();
-    invoke_event_handler(read);
-    assert_eq!(state.wakes.load(Ordering::Relaxed), 1);
     assert_eq!(globals.free_connection_n(), 1);
+}
+
+#[test]
+fn readiness_close_cancels_a_delivered_handoff_before_dispatch() {
+    let mut globals = PeerGlobals::new(true, add_event_ok);
+    unsafe { ngx_queue_init(&raw mut ngx_posted_events) };
+    let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
+    let log: ngx_log_t = unsafe { mem::zeroed() };
+    let peer = build_peer(
+        remote.peer_address(),
+        (&raw const log).cast_mut(),
+        EventPeerCallbacks::direct(),
+    );
+    let mut connection = peer.connect().unwrap().into_peer().into_connection().unwrap();
+    connection
+        .prepare(EventPeerPreparation::new(
+            unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
+            EventPeerHandlers::new(active_read_handler, active_write_handler),
+            128,
+        ))
+        .unwrap();
+    let raw = connection.peer.raw.connection;
+    let read = unsafe { raw.as_ref().unwrap().read };
+    unsafe { (*read).set_ready(0) };
+    EVENT_HANDLER_CALLS.store(0, Ordering::Relaxed);
+
+    let mut readiness = Box::pin(connection.wait_read(None));
+    let mut context = Context::from_waker(Waker::noop());
+    assert_eq!(Pin::as_mut(&mut readiness).poll(&mut context), Poll::Pending);
+    unsafe { (*read).set_ready(1) };
+    invoke_event_handler(read);
+    drop(readiness);
+    assert_ne!(unsafe { (*read).posted() }, 0);
+
+    connection.close();
+    assert_eq!(globals.free_connection_n(), 1);
+    unsafe {
+        ngx_event_process_posted(&raw mut *globals.cycle, &raw mut ngx_posted_events);
+    }
+    assert_eq!(EVENT_HANDLER_CALLS.load(Ordering::Relaxed), 0);
 }
 
 #[test]
