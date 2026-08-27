@@ -279,11 +279,14 @@ fn same_handler(
 /// ```
 ///
 /// ```compile_fail
-/// use ngx::event::EventPeerConnection;
+/// use ngx::event::{EventPeerConnection, EventPeerPreparation};
 ///
-/// fn reject(mut connection: EventPeerConnection<'_>) {
+/// fn reject(
+///     mut connection: EventPeerConnection<'_>,
+///     preparation: EventPeerPreparation<'_>,
+/// ) {
 ///     let wait = connection.wait_read(None);
-///     let keepalive = connection.into_keepalive();
+///     let keepalive = connection.into_keepalive(preparation);
 ///     drop((wait, keepalive));
 /// }
 /// ```
