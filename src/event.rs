@@ -3,7 +3,7 @@
 use core::marker::{PhantomData, PhantomPinned};
 use core::mem;
 use core::pin::Pin;
-use core::ptr::NonNull;
+use core::ptr::{self, NonNull};
 
 use crate::allocator::AllocError;
 use crate::core::{Pool, PoolValue};
@@ -295,8 +295,9 @@ pub enum TimerError {
 /// ```
 pub struct Timer<'log, T, F> {
     event: ngx_event_t,
-    state: T,
-    callback: F,
+    state: mem::ManuallyDrop<T>,
+    callback: mem::ManuallyDrop<F>,
+    callback_alive: *mut bool,
     _log: PhantomData<LogRef<'log>>,
     _pin: PhantomPinned,
     _not_thread_safe: PhantomData<*mut ()>,
@@ -306,8 +307,21 @@ pub struct Timer<'log, T, F> {
 ///
 /// A value is created for each timer callback and cannot safely outlive that callback.
 pub struct TimerCallback<'callback, T> {
-    event: EventRef<'callback>,
+    control: &'callback mut TimerCallbackControl,
     state: &'callback mut T,
+}
+
+struct TimerCallbackControl {
+    armed: bool,
+    timed_out: bool,
+    cancelable: bool,
+    action: TimerCallbackAction,
+}
+
+enum TimerCallbackAction {
+    None,
+    Cancel,
+    Rearm(ngx_msec_t),
 }
 
 impl<'log, T, F> Timer<'log, T, F>
@@ -326,8 +340,9 @@ where
 
         Self {
             event,
-            state,
-            callback,
+            state: mem::ManuallyDrop::new(state),
+            callback: mem::ManuallyDrop::new(callback),
+            callback_alive: ptr::null_mut(),
             _log: PhantomData,
             _pin: PhantomPinned,
             _not_thread_safe: PhantomData,
@@ -450,46 +465,52 @@ impl<T> TimerCallback<'_, T> {
 
     /// Returns whether nginx has armed this timer.
     pub fn is_armed(&self) -> bool {
-        self.event.is_timer_set()
+        self.control.armed
     }
 
     /// Returns whether nginx has delivered this timer expiry.
     pub fn is_timed_out(&self) -> bool {
-        self.event.is_timedout()
+        self.control.timed_out
     }
 
     /// Observes and clears a delivered timer expiry.
     pub fn take_timeout(&mut self) -> bool {
-        if !self.event.is_timedout() {
+        if !self.control.timed_out {
             return false;
         }
 
-        self.event.clear_timedout();
+        self.control.timed_out = false;
         true
     }
 
     /// Replaces the current timeout, if any, with a fresh timeout.
     pub fn rearm(&mut self, timeout: ngx_msec_t) {
-        self.event.delete_timer();
-        self.event.clear_timedout();
-        self.event.add_timer(timeout);
+        self.control.armed = true;
+        self.control.timed_out = false;
+        self.control.action = TimerCallbackAction::Rearm(timeout);
     }
 
     /// Cancels the timer when it is armed.
     ///
     /// Returns whether a timeout was removed. Repeated cancellation is harmless.
     pub fn cancel(&mut self) -> bool {
-        self.event.delete_timer()
+        if !self.control.armed {
+            return false;
+        }
+
+        self.control.armed = false;
+        self.control.action = TimerCallbackAction::Cancel;
+        true
     }
 
     /// Returns whether nginx may cancel this timer during graceful worker shutdown.
     pub fn is_cancelable(&self) -> bool {
-        unsafe { self.event.raw.as_ref().cancelable() != 0 }
+        self.control.cancelable
     }
 
     /// Marks whether nginx may cancel this timer during graceful worker shutdown.
     pub fn set_cancelable(&mut self, cancelable: bool) {
-        unsafe { self.event.raw.as_mut().set_cancelable(u32::from(cancelable)) };
+        self.control.cancelable = cancelable;
     }
 }
 
@@ -501,17 +522,70 @@ where
         return;
     };
     let timer = ngx_container_of!(event.as_ptr(), Timer<'_, T, F>, event);
-    let timer = unsafe { &mut *timer };
-    let callback = &mut timer.callback;
-    let state = &mut timer.state;
+    let mut control = TimerCallbackControl {
+        armed: event.is_timer_set(),
+        timed_out: event.is_timedout(),
+        cancelable: unsafe { event.raw.as_ref().cancelable() != 0 },
+        action: TimerCallbackAction::None,
+    };
 
-    callback(TimerCallback { event, state });
+    // Keep callback-owned values outside the allocation so reentrant Drop cannot invalidate them.
+    let mut alive = true;
+    unsafe { (*timer).callback_alive = &raw mut alive };
+    let mut callback = unsafe { ptr::read(&raw const (*timer).callback) };
+    let mut state = unsafe { ptr::read(&raw const (*timer).state) };
+
+    (*callback)(TimerCallback { control: &mut control, state: &mut state });
+
+    if !alive {
+        unsafe {
+            mem::ManuallyDrop::drop(&mut state);
+            mem::ManuallyDrop::drop(&mut callback);
+        }
+        return;
+    }
+
+    let timer = unsafe { &mut *timer };
+    timer.callback_alive = ptr::null_mut();
+    unsafe {
+        ptr::write(&raw mut timer.callback, callback);
+        ptr::write(&raw mut timer.state, state);
+    }
+    timer.event.set_timedout(u32::from(control.timed_out));
+    timer.event.set_cancelable(u32::from(control.cancelable));
+    match control.action {
+        TimerCallbackAction::None => {}
+        TimerCallbackAction::Cancel => {
+            if timer.event.timer_set() != 0 {
+                unsafe { ngx_del_timer(&raw mut timer.event) };
+            }
+        }
+        TimerCallbackAction::Rearm(timeout) => {
+            if timer.event.timer_set() != 0 {
+                unsafe { ngx_del_timer(&raw mut timer.event) };
+            }
+            unsafe { ngx_add_timer(&raw mut timer.event, timeout) };
+        }
+    }
 }
 
 impl<T, F> Drop for Timer<'_, T, F> {
     fn drop(&mut self) {
+        if !self.callback_alive.is_null() {
+            // The active handler owns the moved state and callback until it returns.
+            unsafe { *self.callback_alive = false };
+            if self.event.timer_set() != 0 {
+                unsafe { ngx_del_timer(&raw mut self.event) };
+            }
+            return;
+        }
+
         if self.event.timer_set() != 0 {
             unsafe { ngx_del_timer(&raw mut self.event) };
+        }
+        unsafe {
+            mem::ManuallyDrop::drop(&mut self.state);
+            mem::ManuallyDrop::drop(&mut self.callback);
         }
     }
 }
@@ -579,9 +653,10 @@ pub enum PostedEventError {
 /// ```
 pub struct PostedEvent<'log, T, F> {
     event: ngx_event_t,
-    state: T,
-    callback: F,
+    state: mem::ManuallyDrop<T>,
+    callback: mem::ManuallyDrop<F>,
     stopped: bool,
+    callback_alive: *mut bool,
     _log: PhantomData<LogRef<'log>>,
     _pin: PhantomPinned,
     _not_thread_safe: PhantomData<*mut ()>,
@@ -591,9 +666,20 @@ pub struct PostedEvent<'log, T, F> {
 ///
 /// A value is created for each posted-event callback and cannot safely outlive that callback.
 pub struct PostedEventCallback<'callback, T> {
-    event: EventRef<'callback>,
+    control: &'callback mut PostedEventCallbackControl,
     state: &'callback mut T,
-    stopped: &'callback mut bool,
+}
+
+struct PostedEventCallbackControl {
+    posted: bool,
+    stopped: bool,
+    action: PostedEventCallbackAction,
+}
+
+enum PostedEventCallbackAction {
+    None,
+    Cancel,
+    Post(PostedQueue),
 }
 
 impl<'log, T, F> PostedEvent<'log, T, F>
@@ -612,9 +698,10 @@ where
 
         Self {
             event,
-            state,
-            callback,
+            state: mem::ManuallyDrop::new(state),
+            callback: mem::ManuallyDrop::new(callback),
             stopped: false,
+            callback_alive: ptr::null_mut(),
             _log: PhantomData,
             _pin: PhantomPinned,
             _not_thread_safe: PhantomData,
@@ -701,37 +788,48 @@ impl<T> PostedEventCallback<'_, T> {
 
     /// Returns whether nginx has this event on a posted-event queue.
     pub fn is_posted(&self) -> bool {
-        self.event.is_posted()
+        self.control.posted
     }
 
     /// Returns whether this event has been shut down permanently.
     pub fn is_shutdown(&self) -> bool {
-        *self.stopped
+        self.control.stopped
     }
 
     /// Posts this event to the selected nginx queue.
     ///
     /// Returns `Ok(false)` when nginx has already queued the event.
     pub fn post(&mut self, queue: PostedQueue) -> Result<bool, PostedEventError> {
-        // SAFETY: EventRef owns exclusive callback-scoped access to this live event.
-        let event = unsafe { self.event.raw.as_mut() };
-        post_owned_event(event, *self.stopped, queue)
+        if self.control.stopped {
+            return Err(PostedEventError::Shutdown);
+        }
+        if self.control.posted {
+            return Ok(false);
+        }
+
+        self.control.posted = true;
+        self.control.action = PostedEventCallbackAction::Post(queue);
+        Ok(true)
     }
 
     /// Removes this event from its posted queue when it is queued.
     ///
     /// Returns whether a queue entry was removed. Repeated cancellation is harmless.
     pub fn cancel(&mut self) -> bool {
-        // SAFETY: EventRef owns exclusive callback-scoped access to this live event.
-        let event = unsafe { self.event.raw.as_mut() };
-        cancel_owned_event(event)
+        if !self.control.posted {
+            return false;
+        }
+
+        self.control.posted = false;
+        self.control.action = PostedEventCallbackAction::Cancel;
+        true
     }
 
     /// Permanently stops this event and cancels a pending queue entry.
     ///
     /// Returns whether a queue entry was removed. Repeated shutdown is harmless.
     pub fn shutdown(&mut self) -> bool {
-        *self.stopped = true;
+        self.control.stopped = true;
         self.cancel()
     }
 }
@@ -775,17 +873,60 @@ where
         return;
     };
     let posted = ngx_container_of!(event.as_ptr(), PostedEvent<'_, T, F>, event);
-    let posted = unsafe { &mut *posted };
-    let callback = &mut posted.callback;
-    let state = &mut posted.state;
-    let stopped = &mut posted.stopped;
+    let mut control = PostedEventCallbackControl {
+        posted: event.is_posted(),
+        stopped: unsafe { (*posted).stopped },
+        action: PostedEventCallbackAction::None,
+    };
 
-    callback(PostedEventCallback { event, state, stopped });
+    // Keep callback-owned values outside the allocation so reentrant Drop cannot invalidate them.
+    let mut alive = true;
+    unsafe { (*posted).callback_alive = &raw mut alive };
+    let mut callback = unsafe { ptr::read(&raw const (*posted).callback) };
+    let mut state = unsafe { ptr::read(&raw const (*posted).state) };
+
+    (*callback)(PostedEventCallback { control: &mut control, state: &mut state });
+
+    if !alive {
+        unsafe {
+            mem::ManuallyDrop::drop(&mut state);
+            mem::ManuallyDrop::drop(&mut callback);
+        }
+        return;
+    }
+
+    let posted = unsafe { &mut *posted };
+    posted.callback_alive = ptr::null_mut();
+    unsafe {
+        ptr::write(&raw mut posted.callback, callback);
+        ptr::write(&raw mut posted.state, state);
+    }
+    posted.stopped = control.stopped;
+    match control.action {
+        PostedEventCallbackAction::None => {}
+        PostedEventCallbackAction::Cancel => {
+            cancel_owned_event(&mut posted.event);
+        }
+        PostedEventCallbackAction::Post(queue) => {
+            let _ = post_owned_event(&mut posted.event, posted.stopped, queue);
+        }
+    }
 }
 
 impl<T, F> Drop for PostedEvent<'_, T, F> {
     fn drop(&mut self) {
+        if !self.callback_alive.is_null() {
+            // The active handler owns the moved state and callback until it returns.
+            unsafe { *self.callback_alive = false };
+            cancel_owned_event(&mut self.event);
+            return;
+        }
+
         cancel_owned_event(&mut self.event);
+        unsafe {
+            mem::ManuallyDrop::drop(&mut self.state);
+            mem::ManuallyDrop::drop(&mut self.callback);
+        }
     }
 }
 
@@ -906,6 +1047,7 @@ mod event_tests {
     use alloc::boxed::Box;
     use alloc::rc::Rc;
     use alloc::vec::Vec;
+    use core::any::Any;
     use core::cell::{Cell, RefCell, UnsafeCell};
     use core::mem::MaybeUninit;
     use core::ptr;
@@ -1014,6 +1156,11 @@ mod event_tests {
     }
 
     fn log_ref(log: &mut ngx_log_t) -> LogRef<'_> {
+        unsafe { LogRef::from_raw(log) }.expect("test logger")
+    }
+
+    fn static_log_ref() -> LogRef<'static> {
+        let log = Box::leak(Box::new(unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() }));
         unsafe { LogRef::from_raw(log) }.expect("test logger")
     }
 
@@ -1383,6 +1530,31 @@ mod event_tests {
     }
 
     #[test]
+    fn posted_callback_can_drop_its_owner_without_invalidating_callback_state() {
+        let _globals = EventGlobals::lock();
+        let owner_slot: Rc<RefCell<Option<Box<dyn Any>>>> = Rc::new(RefCell::new(None));
+        let callback_owner = owner_slot.clone();
+        let callback_finished = Rc::new(Cell::new(false));
+        let finished = callback_finished.clone();
+        let drops = Rc::new(Cell::new(0));
+        let mut posted =
+            Box::pin(PostedEvent::new(static_log_ref(), DropState(drops.clone()), move |event| {
+                assert_eq!(event.state().0.get(), 0);
+                drop(callback_owner.borrow_mut().take());
+                finished.set(true);
+            }));
+        let raw = unsafe { &raw mut posted.as_mut().get_unchecked_mut().event };
+        let handler = unsafe { (*raw).handler }.expect("posted event handler");
+        *owner_slot.borrow_mut() = Some(Box::new(posted));
+
+        unsafe { handler(raw) };
+
+        assert!(owner_slot.borrow().is_none());
+        assert!(callback_finished.get());
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
     fn pool_posted_owner_cancels_queued_callback_before_pool_cleanup_drops_state() {
         let _globals = EventGlobals::lock();
         let owner = TestPool::new();
@@ -1677,6 +1849,34 @@ mod event_tests {
         }
 
         assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn timer_callback_can_drop_its_owner_without_invalidating_callback_state() {
+        let _globals = EventGlobals::lock();
+        let owner_slot: Rc<RefCell<Option<Box<dyn Any>>>> = Rc::new(RefCell::new(None));
+        let callback_owner = owner_slot.clone();
+        let callback_finished = Rc::new(Cell::new(false));
+        let finished = callback_finished.clone();
+        let drops = Rc::new(Cell::new(0));
+        let mut timer =
+            Box::pin(Timer::new(static_log_ref(), DropState(drops.clone()), move |mut timer| {
+                assert!(timer.take_timeout());
+                drop(callback_owner.borrow_mut().take());
+                assert_eq!(timer.state().0.get(), 0);
+                timer.set_cancelable(true);
+                finished.set(true);
+            }));
+        let raw = unsafe { &raw mut timer.as_mut().get_unchecked_mut().event };
+        unsafe { (*raw).set_timedout(1) };
+        let handler = unsafe { (*raw).handler }.expect("timer handler");
+        *owner_slot.borrow_mut() = Some(Box::new(timer));
+
+        unsafe { handler(raw) };
+
+        assert!(owner_slot.borrow().is_none());
+        assert!(callback_finished.get());
+        assert_eq!(drops.get(), 1);
     }
 
     #[test]
