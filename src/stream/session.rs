@@ -560,6 +560,8 @@ mod tests {
         NGX_STREAM_MODULE, ngx_connection_t, ngx_create_pool, ngx_current_msec, ngx_destroy_pool,
         ngx_event_expire_timers, ngx_event_timer_init, ngx_log_t, ngx_pool_t, ngx_uint_t,
     };
+    #[cfg(feature = "test-link")]
+    use crate::log::LogRef;
     use crate::stream::{
         StreamConfigError, StreamModule, StreamModuleMainConf, StreamModuleServerConf, StreamPhase,
     };
@@ -790,10 +792,6 @@ mod tests {
             assert!(!raw.is_null());
             Self { raw, log }
         }
-
-        fn log(&mut self) -> NonNull<ngx_log_t> {
-            NonNull::from(&mut *self.log)
-        }
     }
 
     #[cfg(feature = "test-link")]
@@ -902,8 +900,14 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     struct TimerContext {
-        timer: Timer<(), TimerContextCallback>,
+        timer: Timer<'static, (), TimerContextCallback>,
         _drop: TimerContextDrop,
+    }
+
+    #[cfg(feature = "test-link")]
+    fn static_log_ref() -> LogRef<'static> {
+        let log = Box::leak(Box::new(unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() }));
+        unsafe { LogRef::from_raw(log) }.expect("test logger")
     }
 
     #[cfg(feature = "test-link")]
@@ -1097,7 +1101,7 @@ mod tests {
         TIMER_CONTEXT_DROPS.store(0, Ordering::Relaxed);
         TIMER_CONTEXT_CALLBACKS.store(0, Ordering::Relaxed);
         let mut owner = TestPool::new();
-        let log = owner.log();
+        let log = static_log_ref();
         let mut connection =
             Box::new(unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() });
         connection.pool = owner.raw;

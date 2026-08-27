@@ -2,14 +2,14 @@ use core::cell::RefCell;
 use core::future::Future;
 use core::mem;
 use core::pin::Pin;
-use core::ptr::NonNull;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
-use nginx_sys::{ngx_log_t, ngx_msec_int_t, ngx_msec_t};
+use nginx_sys::{ngx_msec_int_t, ngx_msec_t};
 use pin_project_lite::pin_project;
 
 use crate::event::{Timer, TimerCallback};
+use crate::log::LogRef;
 use crate::ngx_log_debug;
 
 const MILLISECONDS_PER_SECOND: u128 = 1_000;
@@ -40,11 +40,9 @@ fn timer_step(remaining: u128) -> Option<(u128, ngx_msec_t)> {
 }
 
 /// Puts the current task to sleep for at least the specified amount of time.
-///
-/// The function is a shorthand for [Sleep::new] using the global logger for debug output.
 #[inline]
-pub fn sleep(duration: Duration) -> Sleep {
-    Sleep::new(duration, crate::log::ngx_cycle_log())
+pub fn sleep(duration: Duration, log: LogRef<'_>) -> Sleep<'_> {
+    Sleep::new(duration, log)
 }
 
 pin_project! {
@@ -54,16 +52,16 @@ pin_project! {
 ///
 /// ```compile_fail
 /// fn assert_send<T: Send>() {}
-/// assert_send::<ngx::async_::Sleep>();
+/// assert_send::<ngx::async_::Sleep<'static>>();
 /// ```
 ///
 /// ```compile_fail
 /// fn assert_unpin<T: Unpin>() {}
-/// assert_unpin::<ngx::async_::Sleep>();
+/// assert_unpin::<ngx::async_::Sleep<'static>>();
 /// ```
-pub struct Sleep {
+pub struct Sleep<'log> {
     #[pin]
-    timer: Timer<SleepTimerState, SleepTimerCallback>,
+    timer: Timer<'log, SleepTimerState, SleepTimerCallback>,
     remaining_milliseconds: u128,
     armed_milliseconds: u128,
 }
@@ -99,9 +97,9 @@ fn sleep_timer_callback(timer: TimerCallback<'_, SleepTimerState>) {
     }
 }
 
-impl Sleep {
+impl<'log> Sleep<'log> {
     /// Creates a new Sleep with the specified duration and logger for debug messages.
-    pub fn new(duration: Duration, log: NonNull<ngx_log_t>) -> Self {
+    pub fn new(duration: Duration, log: LogRef<'log>) -> Self {
         ngx_log_debug!(log.as_ptr(), "async: sleep for {duration:?}");
 
         Sleep {
@@ -116,7 +114,7 @@ impl Sleep {
     }
 }
 
-impl Future for Sleep {
+impl Future for Sleep<'_> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -216,6 +214,7 @@ mod tests {
         ngx_current_msec, ngx_event_expire_timers, ngx_event_no_timers_left, ngx_event_timer_init,
         ngx_log_t, ngx_msec_int_t, ngx_msec_t,
     };
+    use crate::log::LogRef;
 
     struct TimerGlobals {
         _guard: MutexGuard<'static, ()>,
@@ -249,7 +248,11 @@ mod tests {
         }
     }
 
-    fn poll_sleep(sleep: Pin<&mut Sleep>, waker: &Waker) -> Poll<()> {
+    fn log_ref(log: &mut ngx_log_t) -> LogRef<'_> {
+        unsafe { LogRef::from_raw(log) }.expect("test logger")
+    }
+
+    fn poll_sleep(sleep: Pin<&mut Sleep<'_>>, waker: &Waker) -> Poll<()> {
         let mut context = Context::from_waker(waker);
         sleep.poll(&mut context)
     }
@@ -294,7 +297,7 @@ mod tests {
     fn zero_duration_is_ready_without_arming_a_timer() {
         let _globals = TimerGlobals::new();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-        let mut sleep = Box::pin(Sleep::new(Duration::ZERO, (&mut log).into()));
+        let mut sleep = Box::pin(Sleep::new(Duration::ZERO, log_ref(&mut log)));
         let (waker, state) = recording_waker();
 
         assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Ready(()));
@@ -306,7 +309,7 @@ mod tests {
     fn positive_submillisecond_duration_rounds_up_to_one_millisecond() {
         let _globals = TimerGlobals::new();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-        let mut sleep = Box::pin(Sleep::new(Duration::from_nanos(1), (&mut log).into()));
+        let mut sleep = Box::pin(Sleep::new(Duration::from_nanos(1), log_ref(&mut log)));
         let (waker, state) = recording_waker();
 
         assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
@@ -321,7 +324,7 @@ mod tests {
     fn one_millisecond_duration_waits_for_one_millisecond() {
         let _globals = TimerGlobals::new();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), (&mut log).into()));
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), log_ref(&mut log)));
         let (waker, state) = recording_waker();
 
         assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
@@ -337,7 +340,7 @@ mod tests {
         let _globals = TimerGlobals::new();
         let maximum = maximum_timer_step();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(maximum), (&mut log).into()));
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(maximum), log_ref(&mut log)));
         let (waker, state) = recording_waker();
 
         assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
@@ -355,7 +358,7 @@ mod tests {
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
         let mut sleep = Box::pin(Sleep::new(
             Duration::from_millis(maximum.checked_add(1).unwrap()),
-            (&mut log).into(),
+            log_ref(&mut log),
         ));
         let (waker, state) = recording_waker();
 
@@ -375,7 +378,7 @@ mod tests {
         let second = maximum.checked_mul(2).unwrap();
         let total = second.checked_add(1).unwrap();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(total), (&mut log).into()));
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(total), log_ref(&mut log)));
         let (waker, state) = recording_waker();
 
         assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
@@ -392,7 +395,7 @@ mod tests {
     fn repeated_poll_replaces_the_pending_waker() {
         let _globals = TimerGlobals::new();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), (&mut log).into()));
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), log_ref(&mut log)));
         let (first, first_state) = recording_waker();
         let (second, second_state) = recording_waker();
 
@@ -409,7 +412,7 @@ mod tests {
     fn expiry_wakes_once_until_the_executor_repolls() {
         let _globals = TimerGlobals::new();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), (&mut log).into()));
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), log_ref(&mut log)));
         let (waker, state) = recording_waker();
         let mut polls = 0;
 
@@ -428,7 +431,7 @@ mod tests {
     fn dropping_pending_sleep_cancels_the_timer_before_waker_state_is_destroyed() {
         let _globals = TimerGlobals::new();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), (&mut log).into()));
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), log_ref(&mut log)));
         let (waker, state) = recording_waker();
 
         assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
@@ -444,7 +447,7 @@ mod tests {
     fn dropping_sleep_after_expiry_leaves_no_timer_callback() {
         let _globals = TimerGlobals::new();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), (&mut log).into()));
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), log_ref(&mut log)));
         let (waker, state) = recording_waker();
 
         assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);
@@ -459,7 +462,7 @@ mod tests {
     fn sleep_timer_is_cancelable_during_worker_shutdown() {
         let _globals = TimerGlobals::new();
         let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), (&mut log).into()));
+        let mut sleep = Box::pin(Sleep::new(Duration::from_millis(1), log_ref(&mut log)));
         let (waker, _) = recording_waker();
 
         assert_eq!(poll_sleep(sleep.as_mut(), &waker), Poll::Pending);

@@ -1005,9 +1005,9 @@ impl<'address> EventPeerConnection<'address> {
     }
 
     #[cfg(feature = "async")]
-    pub(crate) fn readiness_log(&self) -> NonNull<ngx_log_t> {
-        // EventPeerBuilder validates the logger before constructing this owner.
-        unsafe { NonNull::new_unchecked(self.peer.raw.log) }
+    pub(crate) fn readiness_log(&self) -> LogRef<'address> {
+        // EventPeerBuilder validates the logger and retains its lifetime in this owner.
+        unsafe { LogRef::from_raw(self.peer.raw.log) }.expect("validated peer logger")
     }
 
     /// Checks `SO_ERROR` after nginx reports readiness for a pending connect.

@@ -8,7 +8,6 @@ use core::future::Future;
 use core::mem;
 use core::panic::AssertUnwindSafe;
 use core::pin::Pin;
-use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::panic::catch_unwind;
@@ -18,7 +17,8 @@ use std::thread::{self, ThreadId};
 use async_task::{Runnable, ScheduleInfo, Task as RawTask, WithInfo};
 
 use crate::event::{NotifyError, PostedEvent, PostedEventCallback, PostedQueue, notify};
-use crate::ffi::{ngx_event_t, ngx_log_t};
+use crate::ffi::ngx_event_t;
+use crate::log::LogRef;
 
 static ACTIVE_SCHEDULER: OnceLock<Mutex<Option<Arc<Scheduler>>>> = OnceLock::new();
 
@@ -331,7 +331,7 @@ pub(crate) struct AttachedTask<T> {
 }
 
 type SchedulerPostedCallback = for<'callback> fn(PostedEventCallback<'callback, Arc<Scheduler>>);
-type SchedulerPostedEvent = PostedEvent<Arc<Scheduler>, SchedulerPostedCallback>;
+type SchedulerPostedEvent = PostedEvent<'static, Arc<Scheduler>, SchedulerPostedCallback>;
 
 struct RegisteredTask {
     control: Arc<TaskControl>,
@@ -346,7 +346,8 @@ struct WorkerScheduler {
 }
 
 impl WorkerScheduler {
-    fn new(log: NonNull<ngx_log_t>, scheduler: Arc<Scheduler>) -> Self {
+    unsafe fn new(log: LogRef<'_>, scheduler: Arc<Scheduler>) -> Self {
+        let log = unsafe { LogRef::from_raw(log.as_ptr()) }.expect("validated worker logger");
         Self {
             posted: Box::pin(PostedEvent::new(
                 log,
@@ -930,7 +931,11 @@ fn clear_active_scheduler(scheduler: &Arc<Scheduler>) {
 /// Call this from the module's process-start hook before calling [`spawn`]. The selected nginx
 /// event module must accept the notification callback so cloned wakers can safely wake from a
 /// foreign thread.
-pub fn init_worker(log: NonNull<ngx_log_t>) -> Result<(), SchedulerInitError> {
+///
+/// # Safety
+///
+/// `log` must remain live and usable on this event-loop thread until [`shutdown_worker`] completes.
+pub unsafe fn init_worker(log: LogRef<'_>) -> Result<(), SchedulerInitError> {
     let stopped = WORKER_SCHEDULER.with(|worker| match worker.borrow().as_ref() {
         None => Ok(false),
         Some(worker) if worker.scheduler.is_stopped() => Ok(true),
@@ -961,7 +966,7 @@ pub fn init_worker(log: NonNull<ngx_log_t>) -> Result<(), SchedulerInitError> {
         *active = Some(Arc::clone(&scheduler));
     }
     WORKER_SCHEDULER.with(|worker| {
-        *worker.borrow_mut() = Some(WorkerScheduler::new(log, scheduler));
+        *worker.borrow_mut() = Some(unsafe { WorkerScheduler::new(log, scheduler) });
     });
 
     if let Err(error) = unsafe { notify(notification_handler) } {
@@ -1164,7 +1169,8 @@ mod worker_tests {
         }
 
         fn init(&mut self) -> Result<(), SchedulerInitError> {
-            init_worker(NonNull::from(&mut self.cycle.log))
+            let log = unsafe { LogRef::from_raw(&raw mut self.cycle.log) }.expect("test logger");
+            unsafe { init_worker(log) }
         }
 
         fn process_posted(&mut self) {
@@ -1919,7 +1925,8 @@ mod worker_tests {
 
         let result = thread::spawn(|| {
             let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
-            let init = init_worker(NonNull::from(&mut log));
+            let log = unsafe { LogRef::from_raw(&raw mut log) }.expect("test logger");
+            let init = unsafe { init_worker(log) };
             let shutdown = shutdown_worker();
             (init, shutdown)
         })
