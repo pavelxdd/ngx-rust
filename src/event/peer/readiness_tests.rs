@@ -281,7 +281,7 @@ fn readiness_wakes_for_delayed_read_and_restores_handler() {
     connection
         .prepare(EventPeerPreparation::new(
             unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
-            EventPeerHandlers::new(active_read_handler, active_write_handler),
+            test_event_handlers(active_read_handler, active_write_handler),
             128,
         ))
         .unwrap();
@@ -323,7 +323,7 @@ fn readiness_repoll_consumes_a_delivered_callback_before_cancellation() {
     connection
         .prepare(EventPeerPreparation::new(
             unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
-            EventPeerHandlers::new(active_read_handler, active_write_handler),
+            test_event_handlers(active_read_handler, active_write_handler),
             128,
         ))
         .unwrap();
@@ -364,7 +364,7 @@ fn readiness_rearms_after_a_partial_write_cycle() {
     connection
         .prepare(EventPeerPreparation::new(
             unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
-            EventPeerHandlers::new(active_read_handler, active_write_handler),
+            test_event_handlers(active_read_handler, active_write_handler),
             128,
         ))
         .unwrap();
@@ -510,7 +510,7 @@ fn readiness_times_out_without_installing_for_zero_duration() {
     connection
         .prepare(EventPeerPreparation::new(
             unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
-            EventPeerHandlers::new(active_read_handler, active_write_handler),
+            test_event_handlers(active_read_handler, active_write_handler),
             128,
         ))
         .unwrap();
@@ -542,7 +542,7 @@ fn readiness_rounds_a_submillisecond_timeout_up_to_one_millisecond() {
     connection
         .prepare(EventPeerPreparation::new(
             unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
-            EventPeerHandlers::new(active_read_handler, active_write_handler),
+            test_event_handlers(active_read_handler, active_write_handler),
             128,
         ))
         .unwrap();
@@ -613,7 +613,7 @@ fn readiness_rejects_an_event_timer_owned_by_another_handler() {
     connection
         .prepare(EventPeerPreparation::new(
             unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
-            EventPeerHandlers::new(active_read_handler, active_write_handler),
+            test_event_handlers(active_read_handler, active_write_handler),
             128,
         ))
         .unwrap();
@@ -649,7 +649,7 @@ fn readiness_restores_the_handler_when_native_registration_fails() {
     connection
         .prepare(EventPeerPreparation::new(
             unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
-            EventPeerHandlers::new(active_read_handler, active_write_handler),
+            test_event_handlers(active_read_handler, active_write_handler),
             128,
         ))
         .unwrap();
@@ -687,7 +687,7 @@ fn readiness_drop_forwards_a_delivered_edge_and_leaves_no_late_waker() {
     connection
         .prepare(EventPeerPreparation::new(
             unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
-            EventPeerHandlers::new(active_read_handler, active_write_handler),
+            test_event_handlers(active_read_handler, active_write_handler),
             128,
         ))
         .unwrap();
@@ -736,7 +736,7 @@ fn readiness_close_cancels_a_delivered_handoff_before_dispatch() {
     connection
         .prepare(EventPeerPreparation::new(
             unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
-            EventPeerHandlers::new(active_read_handler, active_write_handler),
+            test_event_handlers(active_read_handler, active_write_handler),
             128,
         ))
         .unwrap();
@@ -864,7 +864,7 @@ fn dropping_an_unpolled_readiness_future_does_not_change_peer_ownership() {
     connection
         .prepare(EventPeerPreparation::new(
             unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() },
-            EventPeerHandlers::new(active_read_handler, active_write_handler),
+            test_event_handlers(active_read_handler, active_write_handler),
             128,
         ))
         .unwrap();

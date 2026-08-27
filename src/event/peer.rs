@@ -147,11 +147,32 @@ pub struct EventPeerCallbacks {
 impl EventPeerCallbacks {
     /// Uses nginx's direct selector for a preselected address.
     pub fn direct() -> Self {
-        Self::default().get(ngx_event_get_peer)
+        Self { get: Some(ngx_event_get_peer), ..Self::default() }
     }
 
     /// Installs the required peer selector.
-    pub fn get(
+    ///
+    /// ```compile_fail
+    /// use core::ffi::c_void;
+    /// use ngx::event::EventPeerCallbacks;
+    /// use ngx::ffi::{ngx_int_t, ngx_peer_connection_t};
+    ///
+    /// unsafe extern "C" fn get(
+    ///     _peer: *mut ngx_peer_connection_t,
+    ///     _data: *mut c_void,
+    /// ) -> ngx_int_t {
+    ///     0
+    /// }
+    ///
+    /// let _ = EventPeerCallbacks::default().get(get);
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// `callback` must accept the builder's `data` and a live peer pointer, uphold nginx's
+    /// selection contract for its returned status and any published connection, and not unwind.
+    /// Its required data and owner state must remain valid through the call to `connect`.
+    pub unsafe fn get(
         mut self,
         callback: unsafe extern "C" fn(*mut ngx_peer_connection_t, *mut c_void) -> ngx_int_t,
     ) -> Self {
@@ -160,7 +181,13 @@ impl EventPeerCallbacks {
     }
 
     /// Installs the optional peer-release callback.
-    pub fn free(
+    ///
+    /// # Safety
+    ///
+    /// `callback` must accept the builder's `data` and live peer pointer after every successful
+    /// selection, support exactly one invocation with native release flags, and not unwind. Any
+    /// state it accesses must remain valid until the selection is released.
+    pub unsafe fn free(
         mut self,
         callback: unsafe extern "C" fn(*mut ngx_peer_connection_t, *mut c_void, ngx_uint_t),
     ) -> Self {
@@ -169,7 +196,12 @@ impl EventPeerCallbacks {
     }
 
     /// Installs the optional peer-notification callback.
-    pub fn notify(
+    ///
+    /// # Safety
+    ///
+    /// `callback` must accept the builder's `data`, live selected peer pointer, and every
+    /// notification value supplied by the caller, and must not unwind or invalidate the owner.
+    pub unsafe fn notify(
         mut self,
         callback: unsafe extern "C" fn(*mut ngx_peer_connection_t, *mut c_void, ngx_uint_t),
     ) -> Self {
@@ -178,8 +210,13 @@ impl EventPeerCallbacks {
     }
 
     /// Installs the optional SSL session lookup callback.
+    ///
+    /// # Safety
+    ///
+    /// `callback` must accept the builder's `data` and live selected peer pointer, obey nginx's
+    /// SSL session lookup contract, and not unwind or invalidate the owner.
     #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
-    pub fn set_session(
+    pub unsafe fn set_session(
         mut self,
         callback: unsafe extern "C" fn(*mut ngx_peer_connection_t, *mut c_void) -> ngx_int_t,
     ) -> Self {
@@ -188,8 +225,13 @@ impl EventPeerCallbacks {
     }
 
     /// Installs the optional SSL session save callback.
+    ///
+    /// # Safety
+    ///
+    /// `callback` must accept the builder's `data` and live selected peer pointer, obey nginx's
+    /// SSL session save contract, and not unwind or invalidate the owner.
     #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
-    pub fn save_session(
+    pub unsafe fn save_session(
         mut self,
         callback: unsafe extern "C" fn(*mut ngx_peer_connection_t, *mut c_void),
     ) -> Self {
@@ -231,7 +273,23 @@ pub struct EventPeerHandlers {
 
 impl EventPeerHandlers {
     /// Creates a handler pair for the connection read and write events.
-    pub fn new(
+    ///
+    /// ```compile_fail
+    /// use ngx::event::EventPeerHandlers;
+    /// use ngx::ffi::ngx_event_t;
+    ///
+    /// unsafe extern "C" fn handler(_event: *mut ngx_event_t) {}
+    ///
+    /// let _ = EventPeerHandlers::new(handler, handler);
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// Both handlers must accept every event on which this pair is installed and must not unwind.
+    /// Their event, logger, connection, and `connection.data` preconditions must be satisfied from
+    /// publication until the handlers are replaced or the connection is closed. They must not
+    /// invalidate event or owner storage during dispatch.
+    pub unsafe fn new(
         read: unsafe extern "C" fn(*mut ngx_event_t),
         write: unsafe extern "C" fn(*mut ngx_event_t),
     ) -> Self {
