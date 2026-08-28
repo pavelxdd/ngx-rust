@@ -154,7 +154,7 @@ where
                 if let Ok(Some(log)) = request.log() {
                     ngx_log_error!(
                         crate::ffi::NGX_LOG_ERR,
-                        log.as_ptr(),
+                        log,
                         "async handler {} context removal failed",
                         H::name()
                     );
@@ -175,6 +175,8 @@ where
                 Err(_) => return NGX_ERROR as ngx_int_t,
             };
             let pool_raw = pool.as_ptr();
+            // SAFETY: the continuation is owned and cancelled by this request pool, which also
+            // owns the connection logger.
             let log = unsafe { LogRef::from_raw(log.as_ptr()) }.expect("request logger");
             let continuation = match unsafe {
                 AsyncContinuation::allocate_in_pool(
@@ -188,7 +190,7 @@ where
                 Err(_) => {
                     ngx_log_error!(
                         crate::ffi::NGX_LOG_ERR,
-                        log.as_ptr(),
+                        log,
                         "async handler {} continuation allocation failed",
                         H::name()
                     );
@@ -208,7 +210,7 @@ where
             let _ = unsafe { pool.remove_cleanup(continuation) };
             ngx_log_error!(
                 crate::ffi::NGX_LOG_ERR,
-                log.as_ptr(),
+                log,
                 "async handler {} context allocation failed",
                 H::name()
             );
@@ -226,7 +228,7 @@ where
             if !matches!(request.remove_module_context::<H::Module>(), Ok(true)) {
                 ngx_log_error!(
                     crate::ffi::NGX_LOG_ERR,
-                    log.as_ptr(),
+                    log,
                     "async handler {} context removal after startup failed",
                     H::name()
                 );
