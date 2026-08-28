@@ -2244,14 +2244,19 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn variable_index_rejects_empty_names_and_allocation_failure() {
+    fn variable_index_rejects_empty_names() {
         let mut fixture = VariableFixture::new();
 
         assert_eq!(
             get_variable_index(&mut fixture.configuration(), NgxStr::from_bytes(b"")),
             Err(HttpVariableIndexError::Registration)
         );
+    }
 
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn post_push_variable_index_name_allocation_failure_rolls_back_definition() {
+        let mut fixture = VariableFixture::new();
         let name = NgxStr::from_bytes(b"ngx_rs_index_allocation_failure");
         add_variable::<IndexedVariable>(
             &mut fixture.configuration(),
@@ -2261,16 +2266,20 @@ mod tests {
         )
         .unwrap();
 
+        let variable_count = fixture.configuration.main.variables.nelts;
+        assert!(fixture.configuration.main.variables.elts.is_null());
+
         unsafe {
             (*fixture.pool.raw).max = 0;
             ngx_rs_test_fail_allocations_after(1);
         }
-        let variable_count = fixture.configuration.main.variables.nelts;
         let result = get_variable_index(&mut fixture.configuration(), name);
         unsafe { ngx_rs_test_reset_allocation_failures() };
 
         assert_eq!(result, Err(HttpVariableIndexError::Registration));
         assert_eq!(fixture.configuration.main.variables.nelts, variable_count);
+        assert!(!fixture.configuration.main.variables.elts.is_null());
+        assert!(fixture.configuration.main.variables.nalloc > variable_count);
 
         let index = get_variable_index(&mut fixture.configuration(), name).unwrap();
         assert_eq!(index.index, variable_count);
@@ -2656,9 +2665,12 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn prefix_name_allocation_failure_does_not_publish_a_partial_entry() {
+    fn post_push_prefix_name_allocation_failure_rolls_back_entry() {
         let mut fixture = VariableFixture::new();
         let prefix_count = fixture.configuration.prefix_variables().len();
+        let prefix_capacity = fixture.configuration.main.prefix_variables.nalloc;
+        let prefix_storage = fixture.configuration.main.prefix_variables.elts;
+        assert!(prefix_count < prefix_capacity);
 
         unsafe {
             (*fixture.pool.raw).max = 0;
@@ -2673,6 +2685,8 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(fixture.configuration.prefix_variables().len(), prefix_count);
+        assert_eq!(fixture.configuration.main.prefix_variables.nalloc, prefix_capacity);
+        assert_eq!(fixture.configuration.main.prefix_variables.elts, prefix_storage);
 
         add_prefix_variable::<CountingPrefixVariable>(
             &mut fixture.configuration(),
