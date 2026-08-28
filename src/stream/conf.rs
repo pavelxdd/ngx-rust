@@ -1,9 +1,10 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
+use crate::core::ModuleDescriptor;
 use crate::ffi::{
-    NGX_STREAM_MODULE, ngx_conf_t, ngx_cycle_t, ngx_module_t, ngx_stream_conf_ctx_t,
-    ngx_stream_session_t, ngx_uint_t,
+    NGX_STREAM_MODULE, ngx_conf_t, ngx_cycle_t, ngx_stream_conf_ctx_t, ngx_stream_session_t,
+    ngx_uint_t,
 };
 use crate::stream::StreamModule;
 
@@ -48,11 +49,12 @@ fn usize_index(index: ngx_uint_t, unset: StreamConfigError) -> Result<usize, Str
 }
 
 fn module_indexes(
-    module: &ngx_module_t,
+    module: ModuleDescriptor,
     module_slots: usize,
     stream_slots: usize,
 ) -> Result<ModuleIndexes, StreamConfigError> {
-    if module.type_ != NGX_STREAM_MODULE as ngx_uint_t {
+    let module = unsafe { module.snapshot() };
+    if module.module_type != NGX_STREAM_MODULE as ngx_uint_t {
         return Err(StreamConfigError::WrongModuleType);
     }
 
@@ -61,7 +63,7 @@ fn module_indexes(
         return Err(StreamConfigError::ModuleIndexOutOfBounds);
     }
 
-    let context_index = usize_index(module.ctx_index, StreamConfigError::UnsetContextIndex)?;
+    let context_index = usize_index(module.context_index, StreamConfigError::UnsetContextIndex)?;
     if context_index >= stream_slots {
         return Err(StreamConfigError::ContextIndexOutOfBounds);
     }
@@ -77,7 +79,7 @@ fn live_stream_slot_count() -> usize {
     unsafe { nginx_sys::ngx_stream_max_module }
 }
 
-fn live_module_indexes(module: &ngx_module_t) -> Result<ModuleIndexes, StreamConfigError> {
+fn live_module_indexes(module: ModuleDescriptor) -> Result<ModuleIndexes, StreamConfigError> {
     module_indexes(module, live_module_slot_count(), live_stream_slot_count())
 }
 
@@ -94,7 +96,7 @@ unsafe fn conf_slot<T>(
 
 fn main_conf_slot<T>(
     slots: *mut *mut c_void,
-    module: &ngx_module_t,
+    module: ModuleDescriptor,
 ) -> Result<Option<NonNull<T>>, StreamConfigError> {
     let indexes = live_module_indexes(module)?;
     Ok(unsafe { conf_slot(slots, indexes.context, indexes.stream_slots) })
@@ -102,26 +104,26 @@ fn main_conf_slot<T>(
 
 fn server_conf_slot<T>(
     slots: *mut *mut c_void,
-    module: &ngx_module_t,
+    module: ModuleDescriptor,
 ) -> Result<Option<NonNull<T>>, StreamConfigError> {
     let indexes = live_module_indexes(module)?;
     Ok(unsafe { conf_slot(slots, indexes.context, indexes.stream_slots) })
 }
 
-pub(crate) fn session_context_index(module: &ngx_module_t) -> Result<usize, StreamConfigError> {
+pub(crate) fn session_context_index(module: ModuleDescriptor) -> Result<usize, StreamConfigError> {
     Ok(live_module_indexes(module)?.context)
 }
 
 pub(crate) fn session_main_conf_slot<T>(
     session: &ngx_stream_session_t,
-    module: &ngx_module_t,
+    module: ModuleDescriptor,
 ) -> Result<Option<NonNull<T>>, StreamConfigError> {
     main_conf_slot(session.main_conf, module)
 }
 
 pub(crate) fn session_server_conf_slot<T>(
     session: &ngx_stream_session_t,
-    module: &ngx_module_t,
+    module: ModuleDescriptor,
 ) -> Result<Option<NonNull<T>>, StreamConfigError> {
     server_conf_slot(session.srv_conf, module)
 }
@@ -208,7 +210,7 @@ impl StreamConfigurationParser<'_> {
         Ok(Some(context))
     }
 
-    fn main_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, StreamConfigError> {
+    fn main_conf<T>(&self, module: ModuleDescriptor) -> Result<Option<&T>, StreamConfigError> {
         let Some(context) = self.context()? else {
             return Ok(None);
         };
@@ -218,7 +220,7 @@ impl StreamConfigurationParser<'_> {
 
     fn main_conf_mut<T>(
         &mut self,
-        module: &ngx_module_t,
+        module: ModuleDescriptor,
     ) -> Result<Option<&mut T>, StreamConfigError> {
         let Some(context) = self.context()? else {
             return Ok(None);
@@ -227,7 +229,7 @@ impl StreamConfigurationParser<'_> {
             .map(|mut value| unsafe { value.as_mut() }))
     }
 
-    fn server_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, StreamConfigError> {
+    fn server_conf<T>(&self, module: ModuleDescriptor) -> Result<Option<&T>, StreamConfigError> {
         let Some(context) = self.context()? else {
             return Ok(None);
         };
@@ -237,7 +239,7 @@ impl StreamConfigurationParser<'_> {
 
     fn server_conf_mut<T>(
         &mut self,
-        module: &ngx_module_t,
+        module: ModuleDescriptor,
     ) -> Result<Option<&mut T>, StreamConfigError> {
         let Some(context) = self.context()? else {
             return Ok(None);
@@ -327,10 +329,13 @@ pub unsafe trait StreamModuleMainConf: StreamModule {
         stream_slot_count: usize,
     ) -> Result<Option<&Self::MainConf>, StreamConfigError> {
         let indexes = module_indexes(Self::module(), live_module_slot_count(), stream_slot_count)?;
-        let stream_index = usize_index(
-            unsafe { nginx_sys::ngx_stream_module.index },
-            StreamConfigError::UnsetStreamModuleIndex,
-        )?;
+        let stream_module = unsafe {
+            ModuleDescriptor::from_raw(&raw mut nginx_sys::ngx_stream_module)
+                .expect("ngx_stream_module descriptor")
+                .snapshot()
+        };
+        let stream_index =
+            usize_index(stream_module.index, StreamConfigError::UnsetStreamModuleIndex)?;
         if stream_index >= indexes.module_slots {
             return Err(StreamConfigError::StreamModuleIndexOutOfBounds);
         }
@@ -432,8 +437,9 @@ mod core_module {
     pub struct NgxStreamCoreModule;
 
     unsafe impl StreamModule for NgxStreamCoreModule {
-        fn module() -> &'static crate::ffi::ngx_module_t {
-            unsafe { &*core::ptr::addr_of!(ngx_stream_core_module) }
+        fn module() -> crate::core::ModuleDescriptor {
+            unsafe { crate::core::ModuleDescriptor::from_raw(&raw mut ngx_stream_core_module) }
+                .expect("ngx_stream_core_module descriptor")
         }
     }
 
@@ -497,8 +503,9 @@ mod ssl {
     pub struct NgxStreamSslModule;
 
     unsafe impl StreamModule for NgxStreamSslModule {
-        fn module() -> &'static crate::ffi::ngx_module_t {
-            unsafe { &*core::ptr::addr_of!(ngx_stream_ssl_module) }
+        fn module() -> crate::core::ModuleDescriptor {
+            unsafe { crate::core::ModuleDescriptor::from_raw(&raw mut ngx_stream_ssl_module) }
+                .expect("ngx_stream_ssl_module descriptor")
         }
     }
 
@@ -520,8 +527,9 @@ mod upstream {
     pub struct NgxStreamUpstreamModule;
 
     unsafe impl StreamModule for NgxStreamUpstreamModule {
-        fn module() -> &'static crate::ffi::ngx_module_t {
-            unsafe { &*core::ptr::addr_of!(ngx_stream_upstream_module) }
+        fn module() -> crate::core::ModuleDescriptor {
+            unsafe { crate::core::ModuleDescriptor::from_raw(&raw mut ngx_stream_upstream_module) }
+                .expect("ngx_stream_upstream_module descriptor")
         }
     }
 
@@ -538,9 +546,6 @@ pub use upstream::NgxStreamUpstreamModule;
 
 #[cfg(test)]
 mod tests {
-    extern crate alloc;
-
-    use alloc::boxed::Box;
     #[cfg(feature = "test-link")]
     use core::ffi::c_void;
     #[cfg(feature = "test-link")]
@@ -554,6 +559,7 @@ mod tests {
         StreamConfigError, StreamConfigurationParser, StreamModuleMainConf, StreamModuleServerConf,
         module_indexes,
     };
+    use crate::core::ModuleDescriptor;
     use crate::ffi::{NGX_STREAM_MODULE, ngx_module_t, ngx_uint_t};
     #[cfg(feature = "test-link")]
     use crate::ffi::{ngx_conf_t, ngx_stream_conf_ctx_t};
@@ -571,65 +577,78 @@ mod tests {
     fn stream_module_type_is_required() {
         let module = ngx_module_t::default();
 
-        assert!(matches!(module_indexes(&module, 2, 1), Err(StreamConfigError::WrongModuleType)));
+        assert!(matches!(
+            module_indexes(ModuleDescriptor::from_test(module), 2, 1),
+            Err(StreamConfigError::WrongModuleType)
+        ));
     }
 
     #[test]
     fn module_index_requires_assignment_and_available_global_slot() {
         let mut module = stream_module(ngx_uint_t::MAX, 0);
 
-        assert!(matches!(module_indexes(&module, 2, 1), Err(StreamConfigError::UnsetModuleIndex)));
+        assert!(matches!(
+            module_indexes(ModuleDescriptor::from_test(module), 2, 1),
+            Err(StreamConfigError::UnsetModuleIndex)
+        ));
 
         module.index = 2;
         assert!(matches!(
-            module_indexes(&module, 2, 1),
+            module_indexes(ModuleDescriptor::from_test(module), 2, 1),
             Err(StreamConfigError::ModuleIndexOutOfBounds)
         ));
 
         module.index = 3;
         assert!(matches!(
-            module_indexes(&module, 2, 1),
+            module_indexes(ModuleDescriptor::from_test(module), 2, 1),
             Err(StreamConfigError::ModuleIndexOutOfBounds)
         ));
 
         module.index = 0;
-        assert!(module_indexes(&module, 1, 1).is_ok());
+        assert!(module_indexes(ModuleDescriptor::from_test(module), 1, 1).is_ok());
     }
 
     #[test]
     fn context_index_requires_assignment_and_available_stream_slot() {
         let mut module = stream_module(0, ngx_uint_t::MAX);
 
-        assert!(matches!(module_indexes(&module, 1, 1), Err(StreamConfigError::UnsetContextIndex)));
+        assert!(matches!(
+            module_indexes(ModuleDescriptor::from_test(module), 1, 1),
+            Err(StreamConfigError::UnsetContextIndex)
+        ));
 
         module.ctx_index = 1;
         assert!(matches!(
-            module_indexes(&module, 1, 1),
+            module_indexes(ModuleDescriptor::from_test(module), 1, 1),
             Err(StreamConfigError::ContextIndexOutOfBounds)
         ));
 
         module.ctx_index = 2;
         assert!(matches!(
-            module_indexes(&module, 1, 1),
+            module_indexes(ModuleDescriptor::from_test(module), 1, 1),
             Err(StreamConfigError::ContextIndexOutOfBounds)
         ));
 
         module.ctx_index = 0;
-        assert!(module_indexes(&module, 1, 1).is_ok());
+        assert!(module_indexes(ModuleDescriptor::from_test(module), 1, 1).is_ok());
     }
 
-    fn test_module() -> &'static ngx_module_t {
-        Box::leak(Box::new(stream_module(1, 0)))
+    fn test_module() -> ModuleDescriptor {
+        ModuleDescriptor::from_test(stream_module(1, 0))
     }
 
-    fn wrong_type_module() -> &'static ngx_module_t {
-        Box::leak(Box::new(ngx_module_t { index: 1, ctx_index: 0, ..ngx_module_t::default() }))
+    fn wrong_type_module() -> ModuleDescriptor {
+        ModuleDescriptor::from_test(ngx_module_t {
+            index: 1,
+            ctx_index: 0,
+            ..ngx_module_t::default()
+        })
     }
 
     struct TestStreamModule;
 
     unsafe impl StreamModule for TestStreamModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -645,7 +664,7 @@ mod tests {
     struct WrongTypeModule;
 
     unsafe impl StreamModule for WrongTypeModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             wrong_type_module()
         }
     }

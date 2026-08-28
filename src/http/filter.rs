@@ -263,9 +263,6 @@ where
 
 #[cfg(all(test, feature = "test-link"))]
 mod tests {
-    extern crate alloc;
-
-    use alloc::boxed::Box;
     use core::ffi::c_int;
     use core::mem::MaybeUninit;
     use core::ptr;
@@ -277,7 +274,7 @@ mod tests {
         BodyFilter, HeaderFilter, HttpFilter, HttpFilterError, HttpFilterSlot, body_filter,
         filter_postconfiguration, header_filter,
     };
-    use crate::core::{ChainMut, ConnectionError, Pool, Status};
+    use crate::core::{ChainMut, ConnectionError, ModuleDescriptor, Pool, Status};
     use crate::ffi::{
         NGX_HTTP_MODULE, ngx_buf_t, ngx_chain_t, ngx_conf_t, ngx_connection_t, ngx_cycle_t,
         ngx_http_output_body_filter_pt, ngx_http_output_header_filter_pt, ngx_http_request_t,
@@ -364,8 +361,8 @@ mod tests {
         }
     }
 
-    fn module() -> &'static ngx_module_t {
-        Box::leak(Box::new(ngx_module_t::default()))
+    fn module() -> ModuleDescriptor {
+        ModuleDescriptor::from_test(ngx_module_t::default())
     }
 
     fn request() -> ngx_http_request_t {
@@ -393,7 +390,7 @@ mod tests {
     static PASS_THROUGH_SLOT: HttpFilterSlot<PassThroughFilter> = HttpFilterSlot::new();
 
     unsafe impl HttpModule for PassThroughFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -425,7 +422,7 @@ mod tests {
     static CONSUMING_SLOT: HttpFilterSlot<ConsumingFilter> = HttpFilterSlot::new();
 
     unsafe impl HttpModule for ConsumingFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -468,7 +465,7 @@ mod tests {
     static NULL_CHAIN_SLOT: HttpFilterSlot<NullChainFilter> = HttpFilterSlot::new();
 
     unsafe impl HttpModule for NullChainFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -523,7 +520,7 @@ mod tests {
     static DELAYED_SLOT: HttpFilterSlot<DelayedFilter> = HttpFilterSlot::new();
 
     unsafe impl HttpModule for DelayedFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -552,7 +549,7 @@ mod tests {
     static CONTINUATION_SLOT: HttpFilterSlot<ContinuationFilter> = HttpFilterSlot::new();
 
     unsafe impl HttpModule for ContinuationFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -580,7 +577,7 @@ mod tests {
         HttpFilterSlot::new();
 
     unsafe impl HttpModule for FailingContinuationFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -608,7 +605,7 @@ mod tests {
         HttpFilterSlot::new();
 
     unsafe impl HttpModule for InvalidContinuationFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -659,7 +656,7 @@ mod tests {
     static FIRST_SLOT: HttpFilterSlot<FirstFilter> = HttpFilterSlot::new();
 
     unsafe impl HttpModule for FirstFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -688,7 +685,7 @@ mod tests {
     static SECOND_SLOT: HttpFilterSlot<SecondFilter> = HttpFilterSlot::new();
 
     unsafe impl HttpModule for SecondFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -717,7 +714,7 @@ mod tests {
     static REPEATED_SLOT: HttpFilterSlot<RepeatedFilter> = HttpFilterSlot::new();
 
     unsafe impl HttpModule for RepeatedFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -744,7 +741,7 @@ mod tests {
     static PARTIAL_SLOT: HttpFilterSlot<PartialFilter> = HttpFilterSlot::new();
 
     unsafe impl HttpModule for PartialFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -771,7 +768,7 @@ mod tests {
     static MISSING_NEXT_SLOT: HttpFilterSlot<MissingNextFilter> = HttpFilterSlot::new();
 
     unsafe impl HttpModule for MissingNextFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -798,7 +795,7 @@ mod tests {
     static SELF_POINTER_SLOT: HttpFilterSlot<SelfPointerFilter> = HttpFilterSlot::new();
 
     unsafe impl HttpModule for SelfPointerFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -828,7 +825,7 @@ mod tests {
         HttpFilterSlot::new();
 
     unsafe impl HttpModule for FailedPostconfigurationFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
 
@@ -867,7 +864,7 @@ mod tests {
 
     #[cfg(feature = "std")]
     unsafe impl HttpModule for PanicPostconfigurationFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
 
@@ -903,7 +900,7 @@ mod tests {
 
     #[cfg(feature = "std")]
     unsafe impl HttpModule for PanicFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }
@@ -931,7 +928,7 @@ mod tests {
     static RELOAD_SLOT: HttpFilterSlot<ReloadFilter> = HttpFilterSlot::new();
 
     unsafe impl HttpModule for ReloadFilter {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             module()
         }
     }

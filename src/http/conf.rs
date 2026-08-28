@@ -1,9 +1,10 @@
 use ::core::ffi::c_void;
 use ::core::ptr::NonNull;
 
+use crate::core::ModuleDescriptor;
 use crate::ffi::{
     NGX_CORE_MODULE, NGX_HTTP_MODULE, ngx_conf_t, ngx_cycle_t, ngx_http_conf_ctx_t,
-    ngx_http_request_t, ngx_http_upstream_srv_conf_t, ngx_module_t, ngx_uint_t,
+    ngx_http_request_t, ngx_http_upstream_srv_conf_t, ngx_uint_t,
 };
 use crate::http::HttpModule;
 
@@ -49,11 +50,12 @@ fn usize_index(index: ngx_uint_t, unset: HttpConfigError) -> Result<usize, HttpC
 }
 
 fn module_indexes(
-    module: &ngx_module_t,
+    module: ModuleDescriptor,
     module_slots: usize,
     http_slots: usize,
 ) -> Result<ModuleIndexes, HttpConfigError> {
-    if module.type_ != NGX_HTTP_MODULE as ngx_uint_t {
+    let module = unsafe { module.snapshot() };
+    if module.module_type != NGX_HTTP_MODULE as ngx_uint_t {
         return Err(HttpConfigError::WrongModuleType);
     }
 
@@ -62,7 +64,7 @@ fn module_indexes(
         return Err(HttpConfigError::ModuleIndexOutOfBounds);
     }
 
-    let context_index = usize_index(module.ctx_index, HttpConfigError::UnsetContextIndex)?;
+    let context_index = usize_index(module.context_index, HttpConfigError::UnsetContextIndex)?;
     if context_index >= http_slots {
         return Err(HttpConfigError::ContextIndexOutOfBounds);
     }
@@ -82,8 +84,12 @@ unsafe fn cycle_http_context(
     cycle: &ngx_cycle_t,
     module_slots: usize,
 ) -> Result<Option<&ngx_http_conf_ctx_t>, HttpConfigError> {
-    let http_module = unsafe { &*::core::ptr::addr_of!(nginx_sys::ngx_http_module) };
-    if http_module.type_ != NGX_CORE_MODULE as ngx_uint_t {
+    let http_module = unsafe {
+        ModuleDescriptor::from_raw(&raw mut nginx_sys::ngx_http_module)
+            .expect("ngx_http_module descriptor")
+            .snapshot()
+    };
+    if http_module.module_type != NGX_CORE_MODULE as ngx_uint_t {
         return Err(HttpConfigError::WrongHttpModuleType);
     }
 
@@ -105,11 +111,11 @@ unsafe fn cycle_http_context(
     Ok(Some(unsafe { context.as_ref() }))
 }
 
-unsafe fn main_conf_from_cycle<'cycle, T>(
-    cycle: &'cycle ngx_cycle_t,
-    module: &ngx_module_t,
+unsafe fn main_conf_from_cycle<T>(
+    cycle: &ngx_cycle_t,
+    module: ModuleDescriptor,
     http_slot_count: usize,
-) -> Result<Option<&'cycle T>, HttpConfigError> {
+) -> Result<Option<&T>, HttpConfigError> {
     let module_slots = live_module_slot_count();
     let Some(context) = (unsafe { cycle_http_context(cycle, module_slots)? }) else {
         return Ok(None);
@@ -122,11 +128,11 @@ unsafe fn main_conf_from_cycle<'cycle, T>(
     })
 }
 
-fn live_module_indexes(module: &ngx_module_t) -> Result<ModuleIndexes, HttpConfigError> {
+fn live_module_indexes(module: ModuleDescriptor) -> Result<ModuleIndexes, HttpConfigError> {
     module_indexes(module, live_module_slot_count(), live_http_slot_count())
 }
 
-pub(crate) fn request_context_index(module: &ngx_module_t) -> Result<usize, HttpConfigError> {
+pub(crate) fn request_context_index(module: ModuleDescriptor) -> Result<usize, HttpConfigError> {
     Ok(live_module_indexes(module)?.context)
 }
 
@@ -152,7 +158,7 @@ unsafe fn conf_slot<T>(
 
 fn main_conf_slot<T>(
     slots: *mut *mut c_void,
-    module: &ngx_module_t,
+    module: ModuleDescriptor,
 ) -> Result<Option<NonNull<T>>, HttpConfigError> {
     let indexes = live_module_indexes(module)?;
     Ok(unsafe { conf_slot(slots, indexes.context, indexes.http_slots) })
@@ -160,7 +166,7 @@ fn main_conf_slot<T>(
 
 pub(crate) fn server_conf_slot<T>(
     slots: *mut *mut c_void,
-    module: &ngx_module_t,
+    module: ModuleDescriptor,
 ) -> Result<Option<NonNull<T>>, HttpConfigError> {
     let indexes = live_module_indexes(module)?;
     Ok(unsafe { conf_slot(slots, indexes.context, indexes.http_slots) })
@@ -168,7 +174,7 @@ pub(crate) fn server_conf_slot<T>(
 
 fn location_conf_slot<T>(
     slots: *mut *mut c_void,
-    module: &ngx_module_t,
+    module: ModuleDescriptor,
 ) -> Result<Option<NonNull<T>>, HttpConfigError> {
     let indexes = live_module_indexes(module)?;
     Ok(unsafe { conf_slot(slots, indexes.context, indexes.http_slots) })
@@ -256,7 +262,7 @@ impl HttpConfigurationParser<'_> {
         Ok(Some(context))
     }
 
-    fn main_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, HttpConfigError> {
+    fn main_conf<T>(&self, module: ModuleDescriptor) -> Result<Option<&T>, HttpConfigError> {
         let Some(context) = self.context()? else {
             return Ok(None);
         };
@@ -266,7 +272,7 @@ impl HttpConfigurationParser<'_> {
 
     fn main_conf_mut<T>(
         &mut self,
-        module: &ngx_module_t,
+        module: ModuleDescriptor,
     ) -> Result<Option<&mut T>, HttpConfigError> {
         let Some(context) = self.context()? else {
             return Ok(None);
@@ -275,7 +281,7 @@ impl HttpConfigurationParser<'_> {
             .map(|mut value| unsafe { value.as_mut() }))
     }
 
-    fn server_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, HttpConfigError> {
+    fn server_conf<T>(&self, module: ModuleDescriptor) -> Result<Option<&T>, HttpConfigError> {
         let Some(context) = self.context()? else {
             return Ok(None);
         };
@@ -285,7 +291,7 @@ impl HttpConfigurationParser<'_> {
 
     fn server_conf_mut<T>(
         &mut self,
-        module: &ngx_module_t,
+        module: ModuleDescriptor,
     ) -> Result<Option<&mut T>, HttpConfigError> {
         let Some(context) = self.context()? else {
             return Ok(None);
@@ -294,7 +300,7 @@ impl HttpConfigurationParser<'_> {
             .map(|mut value| unsafe { value.as_mut() }))
     }
 
-    fn location_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, HttpConfigError> {
+    fn location_conf<T>(&self, module: ModuleDescriptor) -> Result<Option<&T>, HttpConfigError> {
         let Some(context) = self.context()? else {
             return Ok(None);
         };
@@ -304,7 +310,7 @@ impl HttpConfigurationParser<'_> {
 
     fn location_conf_mut<T>(
         &mut self,
-        module: &ngx_module_t,
+        module: ModuleDescriptor,
     ) -> Result<Option<&mut T>, HttpConfigError> {
         let Some(context) = self.context()? else {
             return Ok(None);
@@ -326,28 +332,28 @@ impl HttpConfigurationParser<'_> {
 
 pub(crate) fn request_main_conf_slot<T>(
     request: &ngx_http_request_t,
-    module: &ngx_module_t,
+    module: ModuleDescriptor,
 ) -> Result<Option<NonNull<T>>, HttpConfigError> {
     main_conf_slot(request.main_conf, module)
 }
 
 pub(crate) fn request_server_conf_slot<T>(
     request: &ngx_http_request_t,
-    module: &ngx_module_t,
+    module: ModuleDescriptor,
 ) -> Result<Option<NonNull<T>>, HttpConfigError> {
     server_conf_slot(request.srv_conf, module)
 }
 
 pub(crate) fn request_location_conf_slot<T>(
     request: &ngx_http_request_t,
-    module: &ngx_module_t,
+    module: ModuleDescriptor,
 ) -> Result<Option<NonNull<T>>, HttpConfigError> {
     location_conf_slot(request.loc_conf, module)
 }
 
 pub(crate) fn upstream_server_conf_slot<T>(
     upstream: &ngx_http_upstream_srv_conf_t,
-    module: &ngx_module_t,
+    module: ModuleDescriptor,
 ) -> Result<Option<NonNull<T>>, HttpConfigError> {
     server_conf_slot(upstream.srv_conf, module)
 }
@@ -544,8 +550,9 @@ mod core {
     pub struct NgxHttpCoreModule;
 
     unsafe impl crate::http::HttpModule for NgxHttpCoreModule {
-        fn module() -> &'static crate::ffi::ngx_module_t {
-            unsafe { &*::core::ptr::addr_of!(ngx_http_core_module) }
+        fn module() -> crate::core::ModuleDescriptor {
+            unsafe { crate::core::ModuleDescriptor::from_raw(&raw mut ngx_http_core_module) }
+                .expect("ngx_http_core_module descriptor")
         }
     }
     unsafe impl crate::http::HttpModuleMainConf for NgxHttpCoreModule {
@@ -630,8 +637,9 @@ mod ssl {
     pub struct NgxHttpSslModule;
 
     unsafe impl crate::http::HttpModule for NgxHttpSslModule {
-        fn module() -> &'static crate::ffi::ngx_module_t {
-            unsafe { &*::core::ptr::addr_of!(ngx_http_ssl_module) }
+        fn module() -> crate::core::ModuleDescriptor {
+            unsafe { crate::core::ModuleDescriptor::from_raw(&raw mut ngx_http_ssl_module) }
+                .expect("ngx_http_ssl_module descriptor")
         }
     }
     unsafe impl crate::http::HttpModuleServerConf for NgxHttpSslModule {
@@ -650,8 +658,9 @@ mod upstream {
     pub struct NgxHttpUpstreamModule;
 
     unsafe impl crate::http::HttpModule for NgxHttpUpstreamModule {
-        fn module() -> &'static crate::ffi::ngx_module_t {
-            unsafe { &*::core::ptr::addr_of!(ngx_http_upstream_module) }
+        fn module() -> crate::core::ModuleDescriptor {
+            unsafe { crate::core::ModuleDescriptor::from_raw(&raw mut ngx_http_upstream_module) }
+                .expect("ngx_http_upstream_module descriptor")
         }
     }
     unsafe impl crate::http::HttpModuleMainConf for NgxHttpUpstreamModule {
@@ -672,8 +681,9 @@ mod http_v2 {
     pub struct NgxHttpV2Module;
 
     unsafe impl crate::http::HttpModule for NgxHttpV2Module {
-        fn module() -> &'static crate::ffi::ngx_module_t {
-            unsafe { &*::core::ptr::addr_of!(ngx_http_v2_module) }
+        fn module() -> crate::core::ModuleDescriptor {
+            unsafe { crate::core::ModuleDescriptor::from_raw(&raw mut ngx_http_v2_module) }
+                .expect("ngx_http_v2_module descriptor")
         }
     }
     unsafe impl crate::http::HttpModuleServerConf for NgxHttpV2Module {
@@ -692,8 +702,9 @@ mod http_v3 {
     pub struct NgxHttpV3Module;
 
     unsafe impl crate::http::HttpModule for NgxHttpV3Module {
-        fn module() -> &'static crate::ffi::ngx_module_t {
-            unsafe { &*::core::ptr::addr_of!(ngx_http_v3_module) }
+        fn module() -> crate::core::ModuleDescriptor {
+            unsafe { crate::core::ModuleDescriptor::from_raw(&raw mut ngx_http_v3_module) }
+                .expect("ngx_http_v3_module descriptor")
         }
     }
     unsafe impl crate::http::HttpModuleServerConf for NgxHttpV3Module {
@@ -706,14 +717,11 @@ pub use http_v3::NgxHttpV3Module;
 
 #[cfg(test)]
 mod tests {
-    extern crate alloc;
-
     use ::core::ffi::c_void;
     #[cfg(feature = "test-link")]
     use ::core::mem;
     #[cfg(feature = "test-link")]
     use ::core::ptr;
-    use alloc::boxed::Box;
     #[cfg(feature = "test-link")]
     use core::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(feature = "test-link")]
@@ -723,7 +731,7 @@ mod tests {
         HttpConfigError, HttpConfigurationParser, HttpModuleLocationConf, HttpModuleMainConf,
         HttpModuleServerConf, module_indexes,
     };
-    use crate::core::Status;
+    use crate::core::{ModuleDescriptor, Status};
     use crate::ffi::{
         NGX_CORE_MODULE, NGX_HTTP_MODULE, ngx_http_conf_ctx_t, ngx_module_t, ngx_uint_t,
     };
@@ -743,61 +751,70 @@ mod tests {
     fn http_module_type_is_required() {
         let module = ngx_module_t::default();
 
-        assert!(matches!(module_indexes(&module, 2, 1), Err(HttpConfigError::WrongModuleType)));
+        assert!(matches!(
+            module_indexes(ModuleDescriptor::from_test(module), 2, 1),
+            Err(HttpConfigError::WrongModuleType)
+        ));
     }
 
     #[test]
     fn module_index_requires_assignment_and_available_global_slot() {
         let mut module = http_module(ngx_uint_t::MAX, 0);
 
-        assert!(matches!(module_indexes(&module, 2, 1), Err(HttpConfigError::UnsetModuleIndex)));
+        assert!(matches!(
+            module_indexes(ModuleDescriptor::from_test(module), 2, 1),
+            Err(HttpConfigError::UnsetModuleIndex)
+        ));
 
         module.index = 2;
         assert!(matches!(
-            module_indexes(&module, 2, 1),
+            module_indexes(ModuleDescriptor::from_test(module), 2, 1),
             Err(HttpConfigError::ModuleIndexOutOfBounds)
         ));
 
         module.index = 3;
         assert!(matches!(
-            module_indexes(&module, 2, 1),
+            module_indexes(ModuleDescriptor::from_test(module), 2, 1),
             Err(HttpConfigError::ModuleIndexOutOfBounds)
         ));
 
         module.index = 0;
-        assert!(module_indexes(&module, 1, 1).is_ok());
+        assert!(module_indexes(ModuleDescriptor::from_test(module), 1, 1).is_ok());
     }
 
     #[test]
     fn context_index_requires_assignment_and_available_http_slot() {
         let mut module = http_module(0, ngx_uint_t::MAX);
 
-        assert!(matches!(module_indexes(&module, 1, 1), Err(HttpConfigError::UnsetContextIndex)));
+        assert!(matches!(
+            module_indexes(ModuleDescriptor::from_test(module), 1, 1),
+            Err(HttpConfigError::UnsetContextIndex)
+        ));
 
         module.ctx_index = 1;
         assert!(matches!(
-            module_indexes(&module, 1, 1),
+            module_indexes(ModuleDescriptor::from_test(module), 1, 1),
             Err(HttpConfigError::ContextIndexOutOfBounds)
         ));
 
         module.ctx_index = 2;
         assert!(matches!(
-            module_indexes(&module, 1, 1),
+            module_indexes(ModuleDescriptor::from_test(module), 1, 1),
             Err(HttpConfigError::ContextIndexOutOfBounds)
         ));
 
         module.ctx_index = 0;
-        assert!(module_indexes(&module, 1, 1).is_ok());
+        assert!(module_indexes(ModuleDescriptor::from_test(module), 1, 1).is_ok());
     }
 
-    fn test_module() -> &'static ngx_module_t {
-        Box::leak(Box::new(http_module(1, 0)))
+    fn test_module() -> ModuleDescriptor {
+        ModuleDescriptor::from_test(http_module(1, 0))
     }
 
     struct TestHttpModule;
 
     unsafe impl HttpModule for TestHttpModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -824,7 +841,7 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     unsafe impl HttpModule for ProcessModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
 
@@ -851,14 +868,18 @@ mod tests {
         type MainConf = u32;
     }
 
-    fn wrong_type_module() -> &'static ngx_module_t {
-        Box::leak(Box::new(ngx_module_t { index: 0, ctx_index: 0, ..ngx_module_t::default() }))
+    fn wrong_type_module() -> ModuleDescriptor {
+        ModuleDescriptor::from_test(ngx_module_t {
+            index: 0,
+            ctx_index: 0,
+            ..ngx_module_t::default()
+        })
     }
 
     struct WrongTypeModule;
 
     unsafe impl HttpModule for WrongTypeModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             wrong_type_module()
         }
     }

@@ -3,7 +3,7 @@ use core::mem;
 use core::ptr;
 
 use libc::sockaddr_storage;
-use ngx::core::{NgxStr, Pool, SocketType, Status};
+use ngx::core::{ModuleDescriptor, NgxStr, Pool, SocketType, Status};
 use ngx::ffi::{
     NGX_HTTP_MODULE, in_port_t, ngx_http_module_t, ngx_inet_get_port, ngx_int_t, ngx_module_t,
     ngx_sock_ntop, ngx_str_t, sockaddr,
@@ -273,8 +273,9 @@ impl HttpVariableHandler for OrigDstPortVariable {
 struct Module;
 
 unsafe impl HttpModule for Module {
-    fn module() -> &'static ngx_module_t {
-        unsafe { &*::core::ptr::addr_of!(ngx_http_orig_dst_module) }
+    fn module() -> ModuleDescriptor {
+        unsafe { ModuleDescriptor::from_raw(&raw mut ngx_http_orig_dst_module) }
+            .expect("ngx_http_orig_dst_module descriptor")
     }
 
     fn preconfigure(parser: &mut http::HttpConfigurationParser<'_>) -> ngx_int_t {

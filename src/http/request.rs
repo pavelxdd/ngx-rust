@@ -1913,7 +1913,7 @@ impl RequestRef<'_> {
 
     fn module_context_slot(
         &self,
-        module: &ngx_module_t,
+        module: ModuleDescriptor,
     ) -> Result<NonNull<*mut c_void>, RequestContextError> {
         let index = conf::request_context_index(module)?;
         let slots = NonNull::new(unsafe { self.raw.as_ref().ctx })
@@ -2310,12 +2310,12 @@ impl<'callback> RequestRefMut<'callback> {
     /// ```compile_fail
     /// use core::marker::PhantomPinned;
     /// use core::pin::Pin;
-    /// use ngx::ffi::ngx_module_t;
+    /// use ngx::core::ModuleDescriptor;
     /// use ngx::http::{HttpModule, HttpModuleRequestContext, RequestRefMut};
     ///
     /// struct Module;
     /// unsafe impl HttpModule for Module {
-    ///     fn module() -> &'static ngx_module_t {
+    ///     fn module() -> ModuleDescriptor {
     ///         unreachable!()
     ///     }
     /// }
@@ -2332,12 +2332,12 @@ impl<'callback> RequestRefMut<'callback> {
     /// ```
     ///
     /// ```compile_fail
-    /// use ngx::ffi::ngx_module_t;
+    /// use ngx::core::ModuleDescriptor;
     /// use ngx::http::{HttpModule, HttpModuleRequestContext, RequestRef, RequestRefMut};
     ///
     /// struct Module;
     /// unsafe impl HttpModule for Module {
-    ///     fn module() -> &'static ngx_module_t {
+    ///     fn module() -> ModuleDescriptor {
     ///         unreachable!()
     ///     }
     /// }
@@ -3355,13 +3355,13 @@ mod tests {
     struct TestContextModule;
 
     unsafe impl HttpModule for TestContextModule {
-        fn module() -> &'static ngx_module_t {
-            Box::leak(Box::new(ngx_module_t {
+        fn module() -> ModuleDescriptor {
+            ModuleDescriptor::from_test(ngx_module_t {
                 type_: NGX_HTTP_MODULE as _,
                 index: 0,
                 ctx_index: 0,
                 ..ngx_module_t::default()
-            }))
+            })
         }
     }
 
@@ -3424,13 +3424,13 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     unsafe impl HttpModule for PinnedContextModule {
-        fn module() -> &'static ngx_module_t {
-            Box::leak(Box::new(ngx_module_t {
+        fn module() -> ModuleDescriptor {
+            ModuleDescriptor::from_test(ngx_module_t {
                 type_: NGX_HTTP_MODULE as _,
                 index: 0,
                 ctx_index: 0,
                 ..ngx_module_t::default()
-            }))
+            })
         }
     }
 
@@ -3484,13 +3484,13 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     unsafe impl HttpModule for EventContextModule {
-        fn module() -> &'static ngx_module_t {
-            Box::leak(Box::new(ngx_module_t {
+        fn module() -> ModuleDescriptor {
+            ModuleDescriptor::from_test(ngx_module_t {
                 type_: NGX_HTTP_MODULE as _,
                 index: 0,
                 ctx_index: 0,
                 ..ngx_module_t::default()
-            }))
+            })
         }
     }
 
