@@ -13,7 +13,7 @@ use crate::allocator::Allocator;
 use crate::core::{ConnectionError, NgxStr, Pool};
 use crate::ffi::{
     NGX_ERROR, NGX_OK, NGX_STREAM_VAR_CHANGEABLE, NGX_STREAM_VAR_NOCACHEABLE,
-    NGX_STREAM_VAR_NOHASH, NGX_STREAM_VAR_PREFIX, NGX_STREAM_VAR_WEAK, ngx_int_t,
+    NGX_STREAM_VAR_NOHASH, NGX_STREAM_VAR_PREFIX, NGX_STREAM_VAR_WEAK, ngx_int_t, ngx_str_t,
     ngx_stream_add_variable, ngx_stream_session_t, ngx_uint_t, ngx_variable_value_t,
 };
 use crate::stream::{
@@ -33,7 +33,7 @@ bitflags::bitflags! {
         const NOHASH = NGX_STREAM_VAR_NOHASH as _;
         /// Lets a later non-weak definition replace this variable.
         const WEAK = NGX_STREAM_VAR_WEAK as _;
-        /// Treats the name as a prefix matched against variable names.
+        /// Native prefix marker applied automatically by [`add_prefix_variable`].
         const PREFIX = NGX_STREAM_VAR_PREFIX as _;
     }
 }
@@ -349,9 +349,23 @@ pub trait StreamVariableHandler {
     ) -> Self::Output;
 }
 
-/// Registers a typed read-only Stream variable.
+/// Typed getter for a prefix-matched Stream variable.
+pub trait StreamPrefixVariableHandler {
+    /// Getter result converted into an nginx status.
+    type Output: IntoHandlerStatus;
+
+    /// Evaluates the variable for one active session and the full queried variable name.
+    fn get(
+        session: &mut Session<'_>,
+        value: &mut StreamVariableOutput<'_>,
+        name: &NgxStr,
+    ) -> Self::Output;
+}
+
+/// Registers a typed read-only exact Stream variable.
 ///
 /// Call this function from the module's preconfiguration callback. `name` does not include `$`.
+/// Use [`add_prefix_variable`] instead of passing [`StreamVariableFlags::PREFIX`].
 pub fn add_variable<H>(
     parser: &mut StreamConfigurationParser<'_>,
     name: &NgxStr,
@@ -361,33 +375,63 @@ pub fn add_variable<H>(
 where
     H: StreamVariableHandler,
 {
-    if flags.bits() & !StreamVariableFlags::all().bits() != 0 {
+    if flags.bits() & !StreamVariableFlags::all().bits() != 0
+        || flags.contains(StreamVariableFlags::PREFIX)
+    {
         return Err(VariableRegistrationError);
     }
-
-    let prefix_nelts = if flags.contains(StreamVariableFlags::PREFIX) {
-        let main = NgxStreamCoreModule::main_conf_mut(parser)
-            .ok()
-            .flatten()
-            .ok_or(VariableRegistrationError)?;
-        let original = main.prefix_variables.nelts;
-        Some((&raw mut main.prefix_variables.nelts, original))
-    } else {
-        None
-    };
 
     let mut name = name.as_ngx_str();
     let Some(mut variable) = NonNull::new(unsafe {
         ngx_stream_add_variable(parser.as_raw(), &raw mut name, flags.bits())
     }) else {
-        if let Some((nelts, original)) = prefix_nelts {
-            unsafe { nelts.write(original) };
-        }
         return Err(VariableRegistrationError);
     };
     let variable = unsafe { variable.as_mut() };
     variable.get_handler = Some(raw_get_handler::<H>);
     variable.data = data;
+    Ok(())
+}
+
+/// Registers a typed prefix-matched Stream variable.
+///
+/// Call this function from the module's preconfiguration callback. `prefix` does not include `$`.
+/// The full queried variable name is passed to the handler when nginx finds this prefix. `flags`
+/// must not include [`StreamVariableFlags::PREFIX`], which this function applies automatically.
+pub fn add_prefix_variable<H>(
+    parser: &mut StreamConfigurationParser<'_>,
+    prefix: &NgxStr,
+    flags: StreamVariableFlags,
+) -> Result<(), VariableRegistrationError>
+where
+    H: StreamPrefixVariableHandler,
+{
+    if flags.bits() & !StreamVariableFlags::all().bits() != 0
+        || flags.contains(StreamVariableFlags::PREFIX)
+    {
+        return Err(VariableRegistrationError);
+    }
+
+    let main = NgxStreamCoreModule::main_conf_mut(parser)
+        .ok()
+        .flatten()
+        .ok_or(VariableRegistrationError)?;
+    let original_nelts = main.prefix_variables.nelts;
+    let prefix_nelts = &raw mut main.prefix_variables.nelts;
+    let mut prefix = prefix.as_ngx_str();
+    let Some(mut variable) = NonNull::new(unsafe {
+        ngx_stream_add_variable(
+            parser.as_raw(),
+            &raw mut prefix,
+            flags.bits() | StreamVariableFlags::PREFIX.bits(),
+        )
+    }) else {
+        unsafe { prefix_nelts.write(original_nelts) };
+        return Err(VariableRegistrationError);
+    };
+    let variable = unsafe { variable.as_mut() };
+    variable.get_handler = Some(raw_prefix_get_handler::<H>);
+    variable.data = 0;
     Ok(())
 }
 
@@ -433,10 +477,65 @@ where
     .unwrap_or(NGX_ERROR as _)
 }
 
+unsafe fn prefix_name_from_data<'callback>(data: usize) -> Option<&'callback NgxStr> {
+    let name = NonNull::new(ptr::with_exposed_provenance_mut::<ngx_str_t>(data))?;
+    if !name.as_ptr().is_aligned() {
+        return None;
+    }
+
+    let name = unsafe { name.as_ptr().read() };
+    if name.len == 0 || name.len > isize::MAX as usize || name.data.is_null() {
+        return None;
+    }
+
+    Some(unsafe { NgxStr::from_ngx_str(name) })
+}
+
+/// C-compatible adapter for a typed prefix-matched Stream variable getter.
+///
+/// # Safety
+/// `session` and `value` must be valid pointers supplied by nginx for this callback, and `data`
+/// must encode the live `ngx_str_t` full-name descriptor used by nginx's prefix dispatch.
+pub(crate) unsafe extern "C" fn raw_prefix_get_handler<H>(
+    session: *mut ngx_stream_session_t,
+    value: *mut ngx_variable_value_t,
+    data: usize,
+) -> ngx_int_t
+where
+    H: StreamPrefixVariableHandler,
+{
+    unsafe {
+        Session::with_raw(session, |mut session| {
+            let Some(mut value) = StreamVariableOutput::from_raw(value) else {
+                return NGX_ERROR as _;
+            };
+            let Some(name) = prefix_name_from_data(data) else {
+                return NGX_ERROR as _;
+            };
+
+            #[cfg(feature = "std")]
+            let status = catch_unwind(AssertUnwindSafe(|| {
+                H::get(&mut session, &mut value, name).into_handler_status(&session)
+            }))
+            .unwrap_or(NGX_ERROR as _);
+
+            #[cfg(not(feature = "std"))]
+            let status = H::get(&mut session, &mut value, name).into_handler_status(&session);
+
+            if status == NGX_OK as _ {
+                value.publish_success();
+            }
+
+            status
+        })
+    }
+    .unwrap_or(NGX_ERROR as _)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "test-link")]
-    use alloc::boxed::Box;
+    use alloc::{boxed::Box, vec::Vec};
     #[cfg(feature = "test-link")]
     use core::ffi::c_void;
     use core::mem::MaybeUninit;
@@ -449,8 +548,9 @@ mod tests {
     #[cfg(feature = "test-link")]
     use super::StreamVariablePoolBytes;
     use super::{
-        StreamVariableFlags, StreamVariableHandler, StreamVariableOutput,
-        StreamVariableOutputError, add_variable, raw_get_handler,
+        StreamPrefixVariableHandler, StreamVariableFlags, StreamVariableHandler,
+        StreamVariableOutput, StreamVariableOutputError, add_prefix_variable, add_variable,
+        raw_get_handler, raw_prefix_get_handler,
     };
     use crate::core::{NgxStr, Status};
     use crate::ffi::{
@@ -461,8 +561,9 @@ mod tests {
         NGX_OK, NGX_STREAM_MODULE, NGX_STREAM_VAR_INDEXED, ngx_array_t, ngx_conf_t,
         ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_hash_key_lc, ngx_hash_key_t,
         ngx_log_t, ngx_pool_t, ngx_stream_conf_ctx_t, ngx_stream_core_main_conf_t,
-        ngx_stream_get_variable, ngx_stream_get_variable_pt, ngx_stream_variable_t,
-        ngx_stream_variables_add_core_vars, ngx_stream_variables_init_vars, ngx_uint_t,
+        ngx_stream_get_indexed_variable, ngx_stream_get_variable, ngx_stream_get_variable_index,
+        ngx_stream_get_variable_pt, ngx_stream_variable_t, ngx_stream_variables_add_core_vars,
+        ngx_stream_variables_init_vars, ngx_uint_t,
     };
     use crate::stream::{Session, StreamConfigurationParser};
 
@@ -475,6 +576,7 @@ mod tests {
     struct TestVariable;
 
     static TEST_VARIABLE_VALUE: &[u8] = b"detected";
+    static PREFIX_VARIABLE_VALUE: &[u8] = b"prefix";
     static RAW_VARIABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RAW_VARIABLE_DATA: AtomicUsize = AtomicUsize::new(0);
 
@@ -507,6 +609,62 @@ mod tests {
             RAW_VARIABLE_DATA.store(data, Ordering::Relaxed);
             value.set_empty();
             Status::NGX_DECLINED
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    static PREFIX_VARIABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(feature = "test-link")]
+    struct PrefixVariable;
+
+    #[cfg(feature = "test-link")]
+    impl StreamPrefixVariableHandler for PrefixVariable {
+        type Output = Status;
+
+        fn get(
+            _session: &mut Session<'_>,
+            value: &mut StreamVariableOutput<'_>,
+            name: &NgxStr,
+        ) -> Self::Output {
+            assert_eq!(name.as_bytes(), b"ngx_rs_native_prefix_suffix");
+            PREFIX_VARIABLE_CALLS.fetch_add(1, Ordering::Relaxed);
+            value.set_static(PREFIX_VARIABLE_VALUE).unwrap();
+            Status::NGX_OK
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    struct CountingPrefixVariable;
+
+    #[cfg(feature = "test-link")]
+    impl StreamPrefixVariableHandler for CountingPrefixVariable {
+        type Output = Status;
+
+        fn get(
+            _session: &mut Session<'_>,
+            value: &mut StreamVariableOutput<'_>,
+            _name: &NgxStr,
+        ) -> Self::Output {
+            value.set_empty();
+            Status::NGX_OK
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    struct DataPrefixVariable;
+
+    #[cfg(feature = "test-link")]
+    impl StreamPrefixVariableHandler for DataPrefixVariable {
+        type Output = Status;
+
+        fn get(
+            _session: &mut Session<'_>,
+            value: &mut StreamVariableOutput<'_>,
+            _name: &NgxStr,
+        ) -> Self::Output {
+            value.set_empty();
+            Status::NGX_OK
         }
     }
 
@@ -930,6 +1088,10 @@ mod tests {
         }
 
         fn with_session<R>(&mut self, f: impl for<'scope> FnOnce(&mut Session<'scope>) -> R) -> R {
+            let mut values = Vec::with_capacity(self.main.variables.nelts);
+            for _ in 0..self.main.variables.nelts {
+                values.push(unsafe { MaybeUninit::<ngx_variable_value_t>::zeroed().assume_init() });
+            }
             let mut connection =
                 Box::new(unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() });
             connection.pool = self._pool.raw;
@@ -937,6 +1099,7 @@ mod tests {
             let mut raw = unsafe { MaybeUninit::<ngx_stream_session_t>::zeroed().assume_init() };
             raw.connection = &raw mut *connection;
             raw.main_conf = self._main_conf.as_mut_ptr();
+            raw.variables = values.as_mut_ptr();
 
             unsafe { Session::with_raw(&raw mut raw, |mut session| f(&mut session)) }.unwrap()
         }
@@ -991,6 +1154,14 @@ mod tests {
     {
         assert!(same_handler(variable.get_handler, Some(raw_get_handler::<H>)));
         assert_eq!(variable.data, data);
+    }
+
+    #[cfg(feature = "test-link")]
+    fn assert_prefix_handler<H>(variable: &ngx_stream_variable_t)
+    where
+        H: StreamPrefixVariableHandler,
+    {
+        assert!(same_handler(variable.get_handler, Some(raw_prefix_get_handler::<H>)));
     }
 
     #[cfg(feature = "test-link")]
@@ -1079,17 +1250,36 @@ mod tests {
             assert_handler::<CountingVariable>(variable, data);
         }
 
-        let prefix_flags = StreamVariableFlags::PREFIX | StreamVariableFlags::CHANGEABLE;
-        add_variable::<CountingVariable>(
+        add_prefix_variable::<CountingPrefixVariable>(
             &mut fixture.configuration(),
             NgxStr::from_bytes(b"NgX_Rs_PrEfIx_"),
-            prefix_flags,
-            32,
+            StreamVariableFlags::CHANGEABLE,
         )
         .unwrap();
         let prefix = fixture.prefix_variable(b"ngx_rs_prefix_");
-        assert_eq!(prefix.flags, prefix_flags.bits());
-        assert_handler::<CountingVariable>(prefix, 32);
+        assert_eq!(
+            prefix.flags,
+            (StreamVariableFlags::PREFIX | StreamVariableFlags::CHANGEABLE).bits()
+        );
+        assert_prefix_handler::<CountingPrefixVariable>(prefix);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn exact_registration_rejects_prefix_flags() {
+        let mut fixture = VariableFixture::new();
+        let prefix_count = fixture.prefix_variables().len();
+
+        assert!(
+            add_variable::<CountingVariable>(
+                &mut fixture.configuration(),
+                NgxStr::from_bytes(b"ngx_rs_rejected_prefix_"),
+                StreamVariableFlags::PREFIX,
+                1,
+            )
+            .is_err()
+        );
+        assert_eq!(fixture.prefix_variables().len(), prefix_count);
     }
 
     #[cfg(feature = "test-link")]
@@ -1227,28 +1417,25 @@ mod tests {
             (*fixture._pool.raw).max = 0;
             ngx_rs_test_fail_allocations_after(0);
         }
-        let result = add_variable::<DataVariable>(
+        let result = add_prefix_variable::<DataPrefixVariable>(
             &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_prefix_allocation_failure_"),
-            StreamVariableFlags::PREFIX,
-            1,
+            StreamVariableFlags::empty(),
         );
         unsafe { ngx_rs_test_reset_allocation_failures() };
 
         assert!(result.is_err());
         assert_eq!(fixture.prefix_variables().len(), prefix_count);
 
-        add_variable::<CountingVariable>(
+        add_prefix_variable::<CountingPrefixVariable>(
             &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_prefix_allocation_failure_"),
-            StreamVariableFlags::PREFIX,
-            2,
+            StreamVariableFlags::empty(),
         )
         .unwrap();
         assert_eq!(fixture.prefix_variables().len(), prefix_count + 1);
-        assert_handler::<CountingVariable>(
+        assert_prefix_handler::<CountingPrefixVariable>(
             fixture.prefix_variable(b"ngx_rs_prefix_allocation_failure_"),
-            2,
         );
         fixture.finalize_variables();
     }
@@ -1294,18 +1481,16 @@ mod tests {
         assert_handler::<TestVariable>(variable, usize::MAX);
 
         let prefix_name = b"ngx_rs_prefix_weak_";
-        add_variable::<CountingVariable>(
+        add_prefix_variable::<CountingPrefixVariable>(
             &mut fixture.configuration(),
             NgxStr::from_bytes(prefix_name),
-            weak_flags | StreamVariableFlags::PREFIX,
-            4,
+            weak_flags,
         )
         .unwrap();
-        add_variable::<DataVariable>(
+        add_prefix_variable::<DataPrefixVariable>(
             &mut fixture.configuration(),
             NgxStr::from_bytes(b"NgX_Rs_PrEfIx_WeAk_"),
-            StreamVariableFlags::CHANGEABLE | StreamVariableFlags::PREFIX,
-            5,
+            StreamVariableFlags::CHANGEABLE,
         )
         .unwrap();
         let prefix = fixture.prefix_variable(prefix_name);
@@ -1313,7 +1498,7 @@ mod tests {
             prefix.flags,
             (StreamVariableFlags::CHANGEABLE | StreamVariableFlags::PREFIX).bits()
         );
-        assert_handler::<DataVariable>(prefix, 5);
+        assert_prefix_handler::<DataPrefixVariable>(prefix);
     }
 
     #[test]
@@ -1436,6 +1621,7 @@ mod tests {
                 true,
                 TEST_VARIABLE_VALUE.as_ptr().cast_mut(),
             );
+            assert_eq!(unsafe { (*session.as_ptr()).status }, NGX_STREAM_OK as _);
 
             let mut not_found_name = not_found_name.as_ngx_str();
             let not_found = unsafe {
@@ -1458,6 +1644,69 @@ mod tests {
             };
             assert!(error.is_null());
         });
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn native_prefix_lookups_pass_the_full_queried_name() {
+        let mut fixture = VariableFixture::new();
+        let prefix = NgxStr::from_bytes(b"ngx_rs_native_prefix_");
+        let full_name = NgxStr::from_bytes(b"ngx_rs_native_prefix_suffix");
+        add_prefix_variable::<PrefixVariable>(
+            &mut fixture.configuration(),
+            prefix,
+            StreamVariableFlags::empty(),
+        )
+        .unwrap();
+        let mut indexed_name = full_name.as_ngx_str();
+        let index =
+            unsafe { ngx_stream_get_variable_index(&raw mut *fixture.cf, &raw mut indexed_name) };
+        assert_ne!(index, NGX_ERROR as _);
+        fixture.finalize_variables();
+        PREFIX_VARIABLE_CALLS.store(0, Ordering::Relaxed);
+
+        fixture.with_session(|session| {
+            let mut name = full_name.as_ngx_str();
+            let value = unsafe {
+                ngx_stream_get_variable(
+                    session.as_ptr(),
+                    &raw mut name,
+                    ngx_hash_key_lc(name.data, name.len),
+                )
+            };
+            assert!(!value.is_null());
+            assert_found(
+                unsafe { &*value },
+                PREFIX_VARIABLE_VALUE,
+                true,
+                PREFIX_VARIABLE_VALUE.as_ptr().cast_mut(),
+            );
+
+            let value = unsafe { ngx_stream_get_indexed_variable(session.as_ptr(), index as _) };
+            assert!(!value.is_null());
+            assert_found(
+                unsafe { &*value },
+                PREFIX_VARIABLE_VALUE,
+                true,
+                PREFIX_VARIABLE_VALUE.as_ptr().cast_mut(),
+            );
+        });
+
+        assert_eq!(PREFIX_VARIABLE_CALLS.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn raw_prefix_handler_rejects_an_invalid_name_descriptor() {
+        let mut session = unsafe { MaybeUninit::<ngx_stream_session_t>::zeroed().assume_init() };
+        let mut value = MaybeUninit::<ngx_variable_value_t>::uninit();
+
+        assert_eq!(
+            unsafe {
+                raw_prefix_get_handler::<PrefixVariable>(&raw mut session, value.as_mut_ptr(), 0)
+            },
+            NGX_ERROR as _
+        );
     }
 
     #[cfg(feature = "test-link")]
