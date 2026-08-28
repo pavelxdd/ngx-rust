@@ -6,12 +6,9 @@ use core::ptr::NonNull;
 
 use super::conf;
 use crate::core::{
-    ConnectionError, ConnectionRef, ConnectionRefMut, ModuleDescriptor, NgxStr, Pool, Status,
+    ConnectionError, ConnectionRef, ConnectionRefMut, ModuleDescriptor, Pool, Status,
 };
-use crate::ffi::{
-    NGX_ERROR, NGX_OK, ngx_int_t, ngx_log_t, ngx_str_t, ngx_stream_complex_value,
-    ngx_stream_complex_value_t, ngx_stream_session_t,
-};
+use crate::ffi::{NGX_ERROR, ngx_int_t, ngx_log_t, ngx_stream_session_t};
 use crate::stream::{
     StreamConfigError, StreamModule, StreamModuleMainConf, StreamModuleServerConf,
 };
@@ -467,25 +464,6 @@ impl Session<'_> {
             unsafe { *slot.as_ptr() = context.as_ptr().cast() };
             Ok(None)
         }
-    }
-
-    /// Evaluates a compiled Stream complex value for this session.
-    pub fn complex_value<'a>(
-        &'a mut self,
-        complex: &ngx_stream_complex_value_t,
-    ) -> Option<&'a NgxStr> {
-        let mut value = ngx_str_t::default();
-        let status = unsafe {
-            ngx_stream_complex_value(
-                self.raw.as_ptr(),
-                (complex as *const ngx_stream_complex_value_t).cast_mut(),
-                &raw mut value,
-            )
-        };
-        if status != NGX_OK as ngx_int_t {
-            return None;
-        }
-        unsafe { Some(NgxStr::from_ngx_str(value)) }
     }
 }
 
