@@ -357,6 +357,8 @@ pub enum RequestContinuationError {
     Hold(RequestHoldError),
     /// The continuation has already completed or been cancelled.
     Consumed,
+    /// The status resumes nginx processing without consuming the retained request reference.
+    NonConsumingStatus,
     /// The saved header filter has already been called for this continuation.
     HeaderAlreadyContinued,
     /// The saved body filter has already been called for this continuation.
@@ -406,25 +408,26 @@ impl From<RequestError> for RequestPhaseResumeError {
 
 /// One explicit reference retained by a delayed HTTP request context.
 ///
-/// Store this in the pinned request context that owns the delayed operation. Dropping it does not
-/// call nginx; cleanup must cancel it explicitly when no terminal continuation can run.
-#[must_use = "a request hold must be consumed or cancelled explicitly"]
+/// Store this in the pinned request context that owns the delayed operation. Dropping or cancelling
+/// an active hold releases its retained main-request reference. Request-pool cleanup must instead
+/// disarm it explicitly because nginx already owns the teardown transition.
+#[must_use = "a request hold retains the request until it is transferred, released, or disarmed by cleanup"]
 pub struct RequestHold {
     request: NonNull<ngx_http_request_t>,
     main: NonNull<ngx_http_request_t>,
+    active: bool,
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
 /// Exclusive terminal owner for a request hold removed from its context.
 ///
 /// The hold is removed before the owner performs a terminal nginx operation, so reentry cannot
-/// resume or finalize the request a second time. This owner takes the callback-scoped request
-/// borrow, and terminal operations consume it before nginx may invalidate the request. Dropping
-/// this value never invokes nginx.
-#[must_use = "a request continuation must complete or cancel its terminal operation explicitly"]
+/// resume or finalize the request a second time. Fallible operations borrow this owner and leave it
+/// active on error. Dropping an active continuation releases its retained request reference.
+#[must_use = "a request continuation retains the request until it completes or is cancelled"]
 pub struct RequestContinuation<'callback> {
     request: RequestRefMut<'callback>,
-    _hold: RequestHold,
+    hold: Option<RequestHold>,
     consumed: bool,
     header_continued: bool,
     body_continued: bool,
@@ -2181,7 +2184,12 @@ impl<'callback> RequestRefMut<'callback> {
     /// Call this only after nginx reports that work will continue asynchronously; synchronous
     /// completion leaves `hold` empty. The hold is installed only after the main request count
     /// can be incremented.
-    pub fn hold(&mut self, hold: &mut Option<RequestHold>) -> Result<(), RequestHoldError> {
+    ///
+    /// # Safety
+    ///
+    /// `hold` must belong to pinned request-owned state whose pool cleanup calls
+    /// [`RequestHold::disarm_for_cleanup`] before that state or the native request is destroyed.
+    pub unsafe fn hold(&mut self, hold: &mut Option<RequestHold>) -> Result<(), RequestHoldError> {
         if hold.is_some() {
             return Err(RequestHoldError::AlreadyHeld);
         }
@@ -2196,7 +2204,12 @@ impl<'callback> RequestRefMut<'callback> {
         }
 
         unsafe { main.as_mut().set_count(count + 1) };
-        *hold = Some(RequestHold { request: self.raw, main, _not_thread_safe: PhantomData });
+        *hold = Some(RequestHold {
+            request: self.raw,
+            main,
+            active: true,
+            _not_thread_safe: PhantomData,
+        });
         Ok(())
     }
 
@@ -2819,25 +2832,66 @@ impl RequestHold {
         let hold = hold.take().ok_or(RequestHoldError::Missing)?;
         Ok(RequestContinuation {
             request,
-            _hold: hold,
+            hold: Some(hold),
             consumed: false,
             header_continued: false,
             body_continued: false,
         })
     }
 
-    /// Clears a context-owned hold after request cleanup made terminal continuation impossible.
-    ///
-    /// This only removes module-local ownership; it never finalizes or resumes nginx.
+    /// Cancels a delayed operation and releases its retained request reference.
     pub fn cancel(hold: &mut Option<Self>) -> bool {
         hold.take().is_some()
+    }
+
+    /// Disarms a hold while nginx is already tearing down its request pool.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be running from request-pool cleanup after nginx made every terminal
+    /// continuation impossible and assumed ownership of request reference-count teardown. Calling
+    /// this during normal request processing leaks the retained reference.
+    pub unsafe fn disarm_for_cleanup(hold: &mut Option<Self>) -> bool {
+        let Some(mut hold) = hold.take() else {
+            return false;
+        };
+        hold.active = false;
+        true
+    }
+
+    fn release(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+
+        let count = unsafe { self.main.as_ref().count() };
+        if count > 1 {
+            let mut main = self.main;
+            unsafe { main.as_mut().set_count(count - 1) };
+        } else if count == 1 {
+            unsafe { ngx_http_finalize_request(self.request.as_ptr(), NGX_DONE as _) };
+        }
     }
 
     #[cfg(feature = "async")]
     pub(crate) fn resume_phase(hold: &mut Option<Self>) -> Result<(), RequestContinuationError> {
         let request = hold.as_ref().ok_or(RequestHoldError::Missing)?.request;
         let request = unsafe { RequestRefMut::from_raw(request.as_ptr()) }?;
-        Self::take(hold, request)?.resume_phase()
+        let mut continuation = Self::take(hold, request)?;
+        match continuation.resume_phase() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                continuation.restore(hold);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for RequestHold {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -2851,29 +2905,41 @@ impl RequestContinuation<'_> {
     }
 
     fn ensure_releasable_hold(&self) -> Result<(), RequestHoldError> {
-        if unsafe { self._hold.main.as_ref().count() } <= 1 {
+        let hold = self.hold.as_ref().expect("active continuation owns its request hold");
+        if unsafe { hold.main.as_ref().count() } <= 1 {
             return Err(RequestHoldError::InactiveMain);
         }
 
         Ok(())
     }
 
-    fn release_hold(hold: &mut RequestHold) {
+    fn release_for_resume(&mut self) {
+        let mut hold = self.hold.take().expect("active continuation owns its request hold");
         let mut main = hold.main;
         let count = unsafe { main.as_ref().count() };
         debug_assert!(count > 1);
         unsafe { main.as_mut().set_count(count - 1) };
+        hold.active = false;
+        self.consumed = true;
     }
 
-    /// Cancels this terminal owner after request cleanup made continuation impossible.
-    ///
-    /// Cancellation never invokes nginx and makes later terminal operations fail.
-    pub fn cancel(&mut self) -> Result<(), RequestContinuationError> {
-        if self.consumed {
-            return Err(RequestContinuationError::Consumed);
-        }
-
+    fn transfer_to_nginx(&mut self) {
+        let mut hold = self.hold.take().expect("active continuation owns its request hold");
+        hold.active = false;
         self.consumed = true;
+    }
+
+    fn restore(&mut self, slot: &mut Option<RequestHold>) {
+        debug_assert!(slot.is_none());
+        *slot = self.hold.take();
+        self.consumed = true;
+    }
+
+    /// Cancels this terminal owner and releases its retained request reference.
+    pub fn cancel(&mut self) -> Result<(), RequestContinuationError> {
+        self.ensure_active()?;
+        self.consumed = true;
+        self.hold.take();
         Ok(())
     }
 
@@ -2931,44 +2997,41 @@ impl RequestContinuation<'_> {
         Ok(Status(status))
     }
 
-    /// Finalizes the request and consumes this terminal continuation before entering nginx.
+    /// Finalizes the request and transfers the retained reference to nginx.
     ///
-    /// nginx consumes the hold's retained main-request reference during finalization.
-    ///
-    /// ```compile_fail
-    /// use ngx::http::{HTTPStatus, RequestContinuation};
-    ///
-    /// fn finalize_then_cancel(continuation: RequestContinuation<'_>) {
-    ///     let _ = continuation.finalize(HTTPStatus::BAD_REQUEST);
-    ///     let _ = continuation.cancel();
-    /// }
-    /// ```
-    pub fn finalize(mut self, status: impl Into<Status>) -> Result<(), RequestContinuationError> {
+    /// Validation errors leave this continuation active for retry or explicit cancellation.
+    /// `NGX_DECLINED` is rejected because nginx resumes phases without consuming the reference.
+    pub fn finalize(&mut self, status: impl Into<Status>) -> Result<(), RequestContinuationError> {
         self.ensure_active()?;
         self.request.validate_terminal_operation()?;
-        self.consumed = true;
         let status = status.into();
+        if status.0 == NGX_DECLINED as _ {
+            return Err(RequestContinuationError::NonConsumingStatus);
+        }
+        self.transfer_to_nginx();
         unsafe { ngx_http_finalize_request(self.request.raw.as_ptr(), status.0) };
         Ok(())
     }
 
-    /// Resumes PREACCESS processing and consumes this terminal continuation before entering nginx.
-    pub fn resume_preaccess(mut self) -> Result<(), RequestContinuationError> {
+    /// Resumes PREACCESS processing and releases the retained reference before entering nginx.
+    ///
+    /// Validation errors leave this continuation active for retry or explicit cancellation.
+    pub fn resume_preaccess(&mut self) -> Result<(), RequestContinuationError> {
         self.ensure_active()?;
         self.ensure_releasable_hold()?;
         self.request.prepare_preaccess_resume()?;
-        Self::release_hold(&mut self._hold);
-        self.consumed = true;
+        self.release_for_resume();
         unsafe { ngx_http_core_run_phases(self.request.raw.as_ptr()) };
         Ok(())
     }
 
     #[cfg(feature = "async")]
-    fn resume_phase(mut self) -> Result<(), RequestContinuationError> {
+    fn resume_phase(&mut self) -> Result<(), RequestContinuationError> {
         self.ensure_active()?;
         self.ensure_releasable_hold()?;
         {
-            let (request, hold) = (&mut self.request, &mut self._hold);
+            let request = &mut self.request;
+            let hold = self.hold.as_mut().expect("active continuation owns its request hold");
             request.validate_terminal_operation()?;
             let original_handler = unsafe { request.raw.as_ref().write_event_handler };
             unsafe { request.raw.as_mut().write_event_handler = Some(ngx_http_core_run_phases) };
@@ -2986,7 +3049,11 @@ impl RequestContinuation<'_> {
                     return Err(RequestError::Allocation);
                 }
 
-                Self::release_hold(hold);
+                let mut main = hold.main;
+                let count = unsafe { main.as_ref().count() };
+                debug_assert!(count > 1);
+                unsafe { main.as_mut().set_count(count - 1) };
+                hold.active = false;
                 // SAFETY: nginx owns the connection write event through next-cycle dispatch; the
                 // request is current or was queued before releasing its hold.
                 unsafe { event.post(PostedQueue::Next) };
@@ -2997,6 +3064,7 @@ impl RequestContinuation<'_> {
                 return Err(error.into());
             }
         }
+        self.hold.take();
         self.consumed = true;
         Ok(())
     }
@@ -3794,7 +3862,8 @@ mod tests {
         }
 
         fn hold(&mut self, hold: &mut Option<RequestHold>) {
-            request_from(&mut self.request).hold(hold).unwrap();
+            // SAFETY: this fixture keeps the hold with its request and explicitly finishes it.
+            unsafe { request_from(&mut self.request).hold(hold) }.unwrap();
         }
 
         fn disarm_nginx_pools(&mut self) {
@@ -5737,9 +5806,9 @@ mod tests {
         let mut request = request_from(&mut raw);
         assert!(hold.is_none());
         assert_eq!(main.count(), 1);
-        request.hold(&mut hold).unwrap();
+        unsafe { request.hold(&mut hold) }.unwrap();
         assert_eq!(main.count(), 2);
-        assert_eq!(request.hold(&mut hold), Err(RequestHoldError::AlreadyHeld));
+        assert_eq!(unsafe { request.hold(&mut hold) }, Err(RequestHoldError::AlreadyHeld));
 
         let continuation = RequestHold::take(&mut hold, request).unwrap();
         assert!(hold.is_none());
@@ -5747,7 +5816,7 @@ mod tests {
 
         let request = request_from(&mut raw);
         assert!(matches!(RequestHold::take(&mut hold, request), Err(RequestHoldError::Missing)));
-        assert_eq!(main.count(), 2);
+        assert_eq!(main.count(), 1);
     }
 
     #[test]
@@ -5761,11 +5830,11 @@ mod tests {
         let mut hold = None;
         let mut request = request_from(&mut raw);
 
-        assert_eq!(request.hold(&mut hold), Err(RequestHoldError::InactiveMain));
+        assert_eq!(unsafe { request.hold(&mut hold) }, Err(RequestHoldError::InactiveMain));
         assert!(hold.is_none());
 
         main.set_count(u16::MAX.into());
-        assert_eq!(request.hold(&mut hold), Err(RequestHoldError::CountOverflow));
+        assert_eq!(unsafe { request.hold(&mut hold) }, Err(RequestHoldError::CountOverflow));
         assert!(hold.is_none());
         assert_eq!(main.count(), u16::MAX.into());
     }
@@ -5785,7 +5854,7 @@ mod tests {
         let mut hold = None;
 
         let mut first = request_from(&mut first);
-        first.hold(&mut hold).unwrap();
+        unsafe { first.hold(&mut hold) }.unwrap();
         let second = request_from(&mut second);
         assert!(matches!(
             RequestHold::take(&mut hold, second),
@@ -5803,7 +5872,7 @@ mod tests {
         fixture.hold(&mut hold);
         fixture.request.set_count(1);
 
-        let continuation =
+        let mut continuation =
             RequestHold::take(&mut hold, request_from(&mut fixture.request)).unwrap();
         continuation
             .finalize(Status::NGX_DONE)
@@ -5823,15 +5892,16 @@ mod tests {
         let mut hold = None;
         {
             let mut request = request_from(&mut raw);
-            request.hold(&mut hold).unwrap();
+            unsafe { request.hold(&mut hold) }.unwrap();
         }
         main.set_count(1);
 
-        let continuation = RequestHold::take(&mut hold, request_from(&mut raw)).unwrap();
+        let mut continuation = RequestHold::take(&mut hold, request_from(&mut raw)).unwrap();
         assert_eq!(
             continuation.resume_preaccess(),
             Err(RequestContinuationError::Hold(RequestHoldError::InactiveMain))
         );
+        core::mem::forget(continuation);
     }
 
     #[test]
@@ -5846,7 +5916,7 @@ mod tests {
         let mut hold = None;
         {
             let mut request = request_from(&mut raw);
-            request.hold(&mut hold).unwrap();
+            unsafe { request.hold(&mut hold) }.unwrap();
         }
         main.set_count(0);
 
@@ -5870,16 +5940,16 @@ mod tests {
         let mut hold = None;
 
         let mut request = request_from(&mut raw);
-        request.hold(&mut hold).unwrap();
+        unsafe { request.hold(&mut hold) }.unwrap();
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
 
         assert_eq!(continuation.cancel(), Ok(()));
         assert_eq!(continuation.cancel(), Err(RequestContinuationError::Consumed));
-        assert_eq!(main.count(), 2);
+        assert_eq!(main.count(), 1);
     }
 
     #[test]
-    fn request_hold_cleanup_cancels_once_without_finalizing() {
+    fn request_hold_cleanup_disarms_once_without_releasing() {
         let mut main = zeroed_request();
         initialize_request(&mut main);
         main.set_count(1);
@@ -5889,10 +5959,10 @@ mod tests {
         raw.parent = &raw mut main;
         let mut hold = None;
         let mut request = request_from(&mut raw);
-        request.hold(&mut hold).unwrap();
+        unsafe { request.hold(&mut hold) }.unwrap();
 
-        assert!(RequestHold::cancel(&mut hold));
-        assert!(!RequestHold::cancel(&mut hold));
+        assert!(unsafe { RequestHold::disarm_for_cleanup(&mut hold) });
+        assert!(!unsafe { RequestHold::disarm_for_cleanup(&mut hold) });
         assert_eq!(main.count(), 2);
     }
 
@@ -5910,7 +5980,7 @@ mod tests {
         let mut output_pool = zeroed_pool();
         let output_pool = unsafe { Pool::from_raw(&raw mut output_pool).unwrap() };
         let mut request = request_from(&mut raw);
-        request.hold(&mut hold).unwrap();
+        unsafe { request.hold(&mut hold) }.unwrap();
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
         continuation.cancel().unwrap();
 
@@ -5923,7 +5993,7 @@ mod tests {
             continuation.finalize(HTTPStatus::BAD_REQUEST),
             Err(RequestContinuationError::Consumed)
         );
-        assert_eq!(main.count(), 2);
+        assert_eq!(main.count(), 1);
 
         let mut resume_main = zeroed_request();
         initialize_request(&mut resume_main);
@@ -5933,7 +6003,7 @@ mod tests {
         resume_raw.parent = &raw mut resume_main;
         let mut resume_hold = None;
         let mut request = request_from(&mut resume_raw);
-        request.hold(&mut resume_hold).unwrap();
+        unsafe { request.hold(&mut resume_hold) }.unwrap();
         let mut continuation = RequestHold::take(&mut resume_hold, request).unwrap();
         continuation.cancel().unwrap();
 
@@ -5976,13 +6046,16 @@ mod tests {
         let mut hold = None;
         let expected = RequestError::Connection(ConnectionError::NullConnection);
         let mut request = request_from(&mut raw);
-        request.hold(&mut hold).unwrap();
-        let continuation = RequestHold::take(&mut hold, request).unwrap();
+        unsafe { request.hold(&mut hold) }.unwrap();
+        let mut continuation = RequestHold::take(&mut hold, request).unwrap();
 
         assert_eq!(
             continuation.finalize(HTTPStatus::BAD_REQUEST),
             Err(RequestContinuationError::Request(expected))
         );
+        assert_eq!(main.count(), 2);
+        continuation.cancel().unwrap();
+        assert_eq!(main.count(), 1);
 
         let mut resume_main = zeroed_request();
         initialize_request(&mut resume_main);
@@ -5992,13 +6065,40 @@ mod tests {
         resume_raw.parent = &raw mut resume_main;
         let mut resume_hold = None;
         let mut request = request_from(&mut resume_raw);
-        request.hold(&mut resume_hold).unwrap();
-        let continuation = RequestHold::take(&mut resume_hold, request).unwrap();
+        unsafe { request.hold(&mut resume_hold) }.unwrap();
+        let mut continuation = RequestHold::take(&mut resume_hold, request).unwrap();
 
         assert_eq!(
             continuation.resume_preaccess(),
             Err(RequestContinuationError::Phase(RequestPhaseResumeError::Request(expected)))
         );
+        assert_eq!(resume_main.count(), 2);
+        continuation.cancel().unwrap();
+        assert_eq!(resume_main.count(), 1);
+    }
+
+    #[test]
+    fn continuation_rejects_nonconsuming_finalization_without_losing_ownership() {
+        let mut main = zeroed_request();
+        initialize_request(&mut main);
+        main.set_count(1);
+        let mut connection = unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() };
+        let mut raw = zeroed_request();
+        raw.main = &raw mut main;
+        raw.parent = &raw mut main;
+        raw.connection = &raw mut connection;
+        let mut hold = None;
+        let mut request = request_from(&mut raw);
+        unsafe { request.hold(&mut hold) }.unwrap();
+        let mut continuation = RequestHold::take(&mut hold, request).unwrap();
+
+        assert_eq!(
+            continuation.finalize(Status::NGX_DECLINED),
+            Err(RequestContinuationError::NonConsumingStatus)
+        );
+        assert_eq!(main.count(), 2);
+        continuation.cancel().unwrap();
+        assert_eq!(main.count(), 1);
     }
 
     #[test]

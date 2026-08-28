@@ -114,7 +114,9 @@ where
             state.output.take();
         }
         unsafe { Pin::new_unchecked(&mut *continuation) }.shutdown();
-        RequestHold::cancel(&mut continuation.state().borrow_mut().hold);
+        // SAFETY: this context is dropped only by request-pool cleanup after nginx has made the
+        // delayed phase continuation impossible and assumed ownership of count teardown.
+        unsafe { RequestHold::disarm_for_cleanup(&mut continuation.state().borrow_mut().hold) };
     }
 }
 
@@ -220,7 +222,9 @@ where
             Ok(task) => {
                 let mut state = unsafe { continuation.as_ref() }.state().borrow_mut();
                 state.task = Some(task.into_attached());
-                request.hold(&mut state.hold).is_ok()
+                // SAFETY: AsyncHandlerContext is pinned in this request pool and its cleanup
+                // disarms the hold before nginx destroys the request.
+                unsafe { request.hold(&mut state.hold) }.is_ok()
             }
             Err(_) => false,
         };

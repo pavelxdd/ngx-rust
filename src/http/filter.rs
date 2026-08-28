@@ -1151,7 +1151,7 @@ mod tests {
         raw.set_count(1);
         let mut hold = None;
         let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
-        request.hold(&mut hold).unwrap();
+        unsafe { request.hold(&mut hold) }.unwrap();
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
         let chain = unsafe { ChainMut::from_raw(ptr::null_mut()).unwrap() };
 
@@ -1196,7 +1196,7 @@ mod tests {
         raw.set_count(1);
         let mut hold = None;
         let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
-        request.hold(&mut hold).unwrap();
+        unsafe { request.hold(&mut hold) }.unwrap();
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
         let chain = unsafe { ChainMut::from_raw(ptr::null_mut()).unwrap() };
 
@@ -1231,7 +1231,7 @@ mod tests {
         raw.set_count(1);
         let mut hold = None;
         let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
-        request.hold(&mut hold).unwrap();
+        unsafe { request.hold(&mut hold) }.unwrap();
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
         let chain = unsafe { ChainMut::from_raw(ptr::null_mut()).unwrap() };
 
@@ -1265,7 +1265,7 @@ mod tests {
         raw.set_count(1);
         let mut hold = None;
         let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
-        request.hold(&mut hold).unwrap();
+        unsafe { request.hold(&mut hold) }.unwrap();
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
         let chain = unsafe { ChainMut::from_raw(ptr::null_mut()).unwrap() };
 
@@ -1329,7 +1329,7 @@ mod tests {
         raw.set_count(1);
         let mut hold = None;
         let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
-        request.hold(&mut hold).unwrap();
+        unsafe { request.hold(&mut hold) }.unwrap();
         let mut continuation = RequestHold::take(&mut hold, request).unwrap();
 
         NEXT_HEADER_CALLS.store(0, Ordering::Relaxed);
