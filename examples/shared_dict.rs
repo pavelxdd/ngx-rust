@@ -20,8 +20,9 @@ use ngx::core::{
     NGX_CONF_ERROR, NGX_CONF_OK, NgxStr, NgxString, Pool, SlabGuard, SlabPool, SlabRegion, Status,
 };
 use ngx::http::{
-    HttpModule, HttpModuleMainConf, HttpVariableFlags, HttpVariableHandler, HttpVariableSetter,
-    HttpVariableValue, HttpVariableValueRef, RequestRefMut, add_variable_with_setter,
+    HttpConfigurationParser, HttpModule, HttpModuleMainConf, HttpVariableFlags,
+    HttpVariableHandler, HttpVariableSetter, HttpVariableValue, HttpVariableValueRef,
+    RequestRefMut, add_variable_with_setter,
 };
 use ngx::{ngx_conf_log_error, ngx_log_debug, ngx_string};
 
@@ -32,9 +33,9 @@ unsafe impl HttpModule for HttpSharedDictModule {
         unsafe { &*ptr::addr_of!(ngx_http_shared_dict_module) }
     }
 
-    fn preconfigure(cf: &mut ngx_conf_t) -> ngx_int_t {
+    fn preconfigure(parser: &mut HttpConfigurationParser<'_>) -> ngx_int_t {
         if add_variable_with_setter::<SharedDictEntriesVariable, SharedDictEntriesVariable>(
-            cf,
+            parser,
             NgxStr::from_bytes(b"shared_dict_entries"),
             HttpVariableFlags::CHANGEABLE | HttpVariableFlags::NOCACHEABLE,
             0,
@@ -699,14 +700,17 @@ extern "C" fn ngx_http_shared_dict_add_variable(
     };
 
     let name = unsafe { NgxStr::from_ngx_str(name) };
-    if add_variable_with_setter::<SharedDictVariable, SharedDictVariable>(
-        cf,
-        name,
-        HttpVariableFlags::CHANGEABLE | HttpVariableFlags::NOCACHEABLE,
-        key as usize,
-    )
-    .is_err()
-    {
+    let registration = unsafe {
+        HttpConfigurationParser::with_raw(cf, |parser| {
+            add_variable_with_setter::<SharedDictVariable, SharedDictVariable>(
+                parser,
+                name,
+                HttpVariableFlags::CHANGEABLE | HttpVariableFlags::NOCACHEABLE,
+                key as usize,
+            )
+        })
+    };
+    if !matches!(registration, Ok(Ok(()))) {
         return NGX_CONF_ERROR;
     }
 
@@ -730,7 +734,7 @@ impl HttpVariableHandler for SharedDictVariable {
             return Status::NGX_ERROR;
         }
 
-        let Ok(Some(smcf)) = HttpSharedDictModule::main_conf(&*request) else {
+        let Ok(Some(smcf)) = request.main_conf::<HttpSharedDictModule>() else {
             return Status::NGX_ERROR;
         };
         let Some(shm_zone) = smcf.shm_zone() else {
@@ -777,7 +781,7 @@ impl HttpVariableSetter for SharedDictVariable {
             return;
         }
 
-        let Ok(Some(smcf)) = HttpSharedDictModule::main_conf(&*request) else {
+        let Ok(Some(smcf)) = request.main_conf::<HttpSharedDictModule>() else {
             return;
         };
         let Some(shm_zone) = smcf.shm_zone() else {
@@ -822,7 +826,7 @@ impl HttpVariableHandler for SharedDictEntriesVariable {
         output: &mut HttpVariableValue<'_>,
         _data: usize,
     ) -> Self::Output {
-        let Ok(Some(smcf)) = HttpSharedDictModule::main_conf(&*request) else {
+        let Ok(Some(smcf)) = request.main_conf::<HttpSharedDictModule>() else {
             return Status::NGX_ERROR;
         };
 
@@ -854,7 +858,7 @@ impl HttpVariableHandler for SharedDictEntriesVariable {
 
 impl HttpVariableSetter for SharedDictEntriesVariable {
     fn set(request: &mut RequestRefMut<'_>, _value: HttpVariableValueRef<'_>, _data: usize) {
-        let Ok(Some(smcf)) = HttpSharedDictModule::main_conf(&*request) else {
+        let Ok(Some(smcf)) = request.main_conf::<HttpSharedDictModule>() else {
             return;
         };
         let Some(shm_zone) = smcf.shm_zone() else {

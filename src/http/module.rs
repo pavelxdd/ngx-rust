@@ -13,7 +13,8 @@ use std::panic::catch_unwind;
 use crate::core::{NGX_CONF_ERROR, Pool, Status};
 use crate::ffi::{NGX_LOG_EMERG, ngx_conf_t, ngx_cycle_t, ngx_int_t, ngx_module_t};
 use crate::http::{
-    HttpConfigError, HttpModuleLocationConf, HttpModuleMainConf, HttpModuleServerConf,
+    HttpConfigError, HttpConfigurationParser, HttpModuleLocationConf, HttpModuleMainConf,
+    HttpModuleServerConf,
 };
 
 /// Error returned when child configuration cannot be merged with its parent.
@@ -194,7 +195,7 @@ impl ProcessCycle<'_> {
     where
         M: HttpModuleMainConf,
     {
-        M::main_conf(self)
+        unsafe { M::main_conf_from_cycle(self.raw(), nginx_sys::ngx_http_max_module) }
     }
 }
 
@@ -235,21 +236,35 @@ fn process_exit_callback(
 }
 
 pub(crate) fn configuration_callback_status(
-    cf: *mut ngx_conf_t,
-    callback: impl FnOnce(&mut ngx_conf_t) -> ngx_int_t,
+    configuration: *mut ngx_conf_t,
+    callback: impl for<'scope> FnOnce(&mut HttpConfigurationParser<'scope>) -> ngx_int_t,
 ) -> ngx_int_t {
-    let Some(cf) = (unsafe { checked_mut(cf) }) else {
-        return Status::NGX_ERROR.0;
-    };
-
     #[cfg(feature = "std")]
     {
-        catch_unwind(AssertUnwindSafe(|| callback(cf))).unwrap_or(Status::NGX_ERROR.0)
+        match catch_unwind(AssertUnwindSafe(|| unsafe {
+            HttpConfigurationParser::with_raw(configuration, callback)
+        })) {
+            Ok(Ok(status)) => status,
+            Ok(Err(_)) => Status::NGX_ERROR.0,
+            Err(_) => {
+                if let Some(configuration) = unsafe { checked_mut(configuration) }
+                    && !configuration.log.is_null()
+                {
+                    crate::ngx_conf_log_error!(
+                        NGX_LOG_EMERG,
+                        configuration,
+                        "Rust HTTP configuration callback panicked"
+                    );
+                }
+                Status::NGX_ERROR.0
+            }
+        }
     }
 
     #[cfg(not(feature = "std"))]
     {
-        callback(cf)
+        unsafe { HttpConfigurationParser::with_raw(configuration, callback) }
+            .unwrap_or(Status::NGX_ERROR.0)
     }
 }
 
@@ -317,8 +332,9 @@ pub unsafe extern "C" fn phase_handler_postconfiguration<H>(cf: *mut ngx_conf_t)
 where
     H: crate::http::HttpRequestHandler,
 {
-    configuration_callback_status(cf, |cf| {
-        crate::http::add_phase_handler::<H>(cf).map_or(Status::NGX_ERROR.0, |_| Status::NGX_OK.0)
+    configuration_callback_status(cf, |parser| {
+        crate::http::add_phase_handler::<H>(parser)
+            .map_or(Status::NGX_ERROR.0, |_| Status::NGX_OK.0)
     })
 }
 
@@ -448,14 +464,14 @@ pub unsafe trait HttpModule {
     /// Runs before nginx parses the HTTP configuration block.
     ///
     /// The module descriptor must use [`preconfiguration`] as its FFI callback.
-    fn preconfigure(_cf: &mut ngx_conf_t) -> ngx_int_t {
+    fn preconfigure(_parser: &mut HttpConfigurationParser<'_>) -> ngx_int_t {
         Status::NGX_OK.0
     }
 
     /// Runs after nginx parses the HTTP configuration block.
     ///
     /// The module descriptor must use [`postconfiguration`] as its FFI callback.
-    fn postconfigure(_cf: &mut ngx_conf_t) -> ngx_int_t {
+    fn postconfigure(_parser: &mut HttpConfigurationParser<'_>) -> ngx_int_t {
         Status::NGX_OK.0
     }
 
@@ -655,7 +671,7 @@ mod tests {
             test_module()
         }
 
-        fn postconfigure(_cf: &mut ngx_conf_t) -> ngx_int_t {
+        fn postconfigure(_parser: &mut crate::http::HttpConfigurationParser<'_>) -> ngx_int_t {
             panic!("configuration callback panic");
         }
     }

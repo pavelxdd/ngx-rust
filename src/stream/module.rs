@@ -5,7 +5,7 @@ use core::ptr::{self, NonNull};
 
 use crate::core::{NGX_CONF_ERROR, Pool, Status};
 use crate::ffi::{ngx_conf_t, ngx_int_t, ngx_module_t};
-use crate::stream::{StreamModuleMainConf, StreamModuleServerConf};
+use crate::stream::{StreamConfigurationParser, StreamModuleMainConf, StreamModuleServerConf};
 
 /// Error returned when child configuration cannot be merged with its parent.
 #[derive(Debug)]
@@ -91,6 +91,14 @@ where
         .cast()
 }
 
+fn configuration_callback_status(
+    configuration: *mut ngx_conf_t,
+    callback: impl for<'scope> FnOnce(&mut StreamConfigurationParser<'scope>) -> ngx_int_t,
+) -> ngx_int_t {
+    unsafe { StreamConfigurationParser::with_raw(configuration, callback) }
+        .unwrap_or(Status::NGX_ERROR.0)
+}
+
 /// Defines a concrete NGINX Stream module and its configuration lifecycle.
 ///
 /// # Safety
@@ -101,27 +109,29 @@ pub unsafe trait StreamModule {
     fn module() -> &'static ngx_module_t;
 
     /// Runs before nginx parses the Stream configuration block.
-    ///
-    /// # Safety
-    /// `cf` must point to a valid nginx configuration parser state.
-    unsafe extern "C" fn preconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
-        if cf.is_null() {
-            return Status::NGX_ERROR.into();
-        }
-
-        Status::NGX_OK.into()
+    fn preconfigure(_parser: &mut StreamConfigurationParser<'_>) -> ngx_int_t {
+        Status::NGX_OK.0
     }
 
     /// Runs after nginx parses the Stream configuration block.
+    fn postconfigure(_parser: &mut StreamConfigurationParser<'_>) -> ngx_int_t {
+        Status::NGX_OK.0
+    }
+
+    /// C-compatible adapter for [`Self::preconfigure`].
     ///
     /// # Safety
-    /// `cf` must point to a valid nginx configuration parser state.
-    unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
-        if cf.is_null() {
-            return Status::NGX_ERROR.into();
-        }
+    /// `configuration` must point to the live nginx Stream parser state for this callback.
+    unsafe extern "C" fn preconfiguration(configuration: *mut ngx_conf_t) -> ngx_int_t {
+        configuration_callback_status(configuration, Self::preconfigure)
+    }
 
-        Status::NGX_OK.into()
+    /// C-compatible adapter for [`Self::postconfigure`].
+    ///
+    /// # Safety
+    /// `configuration` must point to the live nginx Stream parser state for this callback.
+    unsafe extern "C" fn postconfiguration(configuration: *mut ngx_conf_t) -> ngx_int_t {
+        configuration_callback_status(configuration, Self::postconfigure)
     }
 
     /// Allocates the module's main configuration in nginx's configuration pool.

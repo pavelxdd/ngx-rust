@@ -13,10 +13,10 @@ use crate::allocator::Allocator;
 use crate::core::{ConnectionError, NgxStr, Pool};
 use crate::ffi::{
     NGX_ERROR, NGX_STREAM_VAR_CHANGEABLE, NGX_STREAM_VAR_NOCACHEABLE, NGX_STREAM_VAR_NOHASH,
-    NGX_STREAM_VAR_PREFIX, NGX_STREAM_VAR_WEAK, ngx_conf_t, ngx_int_t, ngx_stream_add_variable,
+    NGX_STREAM_VAR_PREFIX, NGX_STREAM_VAR_WEAK, ngx_int_t, ngx_stream_add_variable,
     ngx_stream_session_t, ngx_uint_t, ngx_variable_value_t,
 };
-use crate::stream::{IntoHandlerStatus, Session};
+use crate::stream::{IntoHandlerStatus, Session, StreamConfigurationParser};
 
 bitflags::bitflags! {
     /// Flags controlling Stream variable registration and caching.
@@ -402,7 +402,7 @@ pub trait StreamVariableHandler {
 ///
 /// Call this function from the module's preconfiguration callback. `name` does not include `$`.
 pub fn add_variable<H>(
-    cf: &mut ngx_conf_t,
+    parser: &mut StreamConfigurationParser<'_>,
     name: &NgxStr,
     flags: StreamVariableFlags,
     data: usize,
@@ -415,9 +415,10 @@ where
     }
 
     let mut name = name.as_ngx_str();
-    let mut variable =
-        NonNull::new(unsafe { ngx_stream_add_variable(cf, &raw mut name, flags.bits()) })
-            .ok_or(VariableRegistrationError)?;
+    let mut variable = NonNull::new(unsafe {
+        ngx_stream_add_variable(parser.as_raw(), &raw mut name, flags.bits())
+    })
+    .ok_or(VariableRegistrationError)?;
     let variable = unsafe { variable.as_mut() };
     variable.get_handler = Some(raw_get_handler::<H>);
     variable.data = data;
@@ -492,7 +493,7 @@ mod tests {
         ngx_stream_conf_ctx_t, ngx_stream_core_main_conf_t, ngx_stream_get_variable_pt,
         ngx_stream_variable_t, ngx_stream_variables_add_core_vars, ngx_uint_t,
     };
-    use crate::stream::Session;
+    use crate::stream::{Session, StreamConfigurationParser};
 
     #[cfg(feature = "test-link")]
     unsafe extern "C" {
@@ -898,8 +899,6 @@ mod tests {
             cf.temp_pool = pool.raw;
             cf.log = &raw mut *pool._log;
             cf.ctx = (&raw mut *context).cast();
-            cf.module_type = NGX_STREAM_MODULE as _;
-
             assert_eq!(unsafe { ngx_stream_variables_add_core_vars(&raw mut *cf) }, NGX_OK as _);
 
             Self {
@@ -912,8 +911,8 @@ mod tests {
             }
         }
 
-        fn configuration(&mut self) -> &mut ngx_conf_t {
-            &mut self.cf
+        fn configuration(&mut self) -> StreamConfigurationParser<'_> {
+            StreamConfigurationParser::from_test_callback(&mut self.cf)
         }
 
         fn exact_variables(&self) -> &[ngx_hash_key_t] {
@@ -1039,7 +1038,7 @@ mod tests {
 
         for (name, lower_name, flags, data) in cases {
             add_variable::<CountingVariable>(
-                fixture.configuration(),
+                &mut fixture.configuration(),
                 NgxStr::from_bytes(name),
                 flags,
                 data,
@@ -1052,7 +1051,7 @@ mod tests {
 
         let prefix_flags = StreamVariableFlags::PREFIX | StreamVariableFlags::CHANGEABLE;
         add_variable::<CountingVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"NgX_Rs_PrEfIx_"),
             prefix_flags,
             32,
@@ -1071,7 +1070,7 @@ mod tests {
 
         for (index, name) in names.iter().enumerate() {
             add_variable::<CountingVariable>(
-                fixture.configuration(),
+                &mut fixture.configuration(),
                 NgxStr::from_bytes(name),
                 StreamVariableFlags::empty(),
                 index,
@@ -1099,7 +1098,7 @@ mod tests {
         let mut fixture = VariableFixture::new();
         let name = b"ngx_rs_rejected";
         add_variable::<CountingVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(name),
             StreamVariableFlags::empty(),
             0,
@@ -1114,7 +1113,7 @@ mod tests {
 
         assert!(
             add_variable::<DataVariable>(
-                fixture.configuration(),
+                &mut fixture.configuration(),
                 NgxStr::from_bytes(b"NgX_Rs_ReJeCtEd"),
                 StreamVariableFlags::empty(),
                 usize::MAX,
@@ -1130,7 +1129,7 @@ mod tests {
 
         assert!(
             add_variable::<DataVariable>(
-                fixture.configuration(),
+                &mut fixture.configuration(),
                 NgxStr::from_bytes(b""),
                 StreamVariableFlags::empty(),
                 1,
@@ -1143,7 +1142,7 @@ mod tests {
         let internal = StreamVariableFlags::from_bits_retain(NGX_STREAM_VAR_INDEXED as _);
         assert!(
             add_variable::<DataVariable>(
-                fixture.configuration(),
+                &mut fixture.configuration(),
                 NgxStr::from_bytes(b"ngx_rs_internal"),
                 internal,
                 2,
@@ -1153,7 +1152,7 @@ mod tests {
         let unknown = StreamVariableFlags::from_bits_retain(1_usize << (usize::BITS - 1));
         assert!(
             add_variable::<DataVariable>(
-                fixture.configuration(),
+                &mut fixture.configuration(),
                 NgxStr::from_bytes(b"ngx_rs_unknown"),
                 unknown,
                 3,
@@ -1176,7 +1175,7 @@ mod tests {
             ngx_rs_test_fail_allocations_after(0);
         }
         let result = add_variable::<DataVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_allocation_failure"),
             StreamVariableFlags::empty(),
             1,
@@ -1196,7 +1195,7 @@ mod tests {
         let weak_flags = StreamVariableFlags::CHANGEABLE | StreamVariableFlags::WEAK;
 
         add_variable::<CountingVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(exact_name),
             weak_flags,
             1,
@@ -1207,7 +1206,7 @@ mod tests {
         assert_handler::<CountingVariable>(variable, 1);
 
         add_variable::<DataVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"NgX_Rs_ChAnGeAbLe_WeAk"),
             weak_flags,
             2,
@@ -1218,7 +1217,7 @@ mod tests {
         assert_handler::<DataVariable>(variable, 2);
 
         add_variable::<TestVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(exact_name),
             StreamVariableFlags::CHANGEABLE,
             usize::MAX,
@@ -1230,14 +1229,14 @@ mod tests {
 
         let prefix_name = b"ngx_rs_prefix_weak_";
         add_variable::<CountingVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(prefix_name),
             weak_flags | StreamVariableFlags::PREFIX,
             4,
         )
         .unwrap();
         add_variable::<DataVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"NgX_Rs_PrEfIx_WeAk_"),
             StreamVariableFlags::CHANGEABLE | StreamVariableFlags::PREFIX,
             5,

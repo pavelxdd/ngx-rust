@@ -20,12 +20,9 @@ unsafe impl StreamModule for Module {
         unsafe { &*ptr::addr_of!(ngx_stream_probe_module) }
     }
 
-    unsafe extern "C" fn preconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
-        let Some(cf) = (unsafe { cf.as_mut() }) else {
-            return Status::NGX_ERROR.0;
-        };
+    fn preconfigure(parser: &mut ngx::stream::StreamConfigurationParser<'_>) -> ngx_int_t {
         add_variable::<ProbeVariable>(
-            cf,
+            parser,
             NgxStr::from_bytes(b"stream_probe"),
             StreamVariableFlags::empty(),
             0,
@@ -34,11 +31,10 @@ unsafe impl StreamModule for Module {
         .0
     }
 
-    unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
-        let Some(cf) = (unsafe { cf.as_mut() }) else {
-            return Status::NGX_ERROR.0;
-        };
-        add_phase_handler::<ProbeHandler>(cf).map_or(Status::NGX_ERROR, |_| Status::NGX_OK).0
+    fn postconfigure(parser: &mut ngx::stream::StreamConfigurationParser<'_>) -> ngx_int_t {
+        add_phase_handler::<ProbeHandler>(parser)
+            .map_or(Status::NGX_ERROR, |_| Status::NGX_OK)
+            .0
     }
 }
 

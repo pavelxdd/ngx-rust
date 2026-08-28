@@ -3,15 +3,19 @@ use ::core::ptr::NonNull;
 
 use crate::ffi::{
     NGX_CORE_MODULE, NGX_HTTP_MODULE, ngx_conf_t, ngx_cycle_t, ngx_http_conf_ctx_t,
-    ngx_http_connection_t, ngx_http_core_srv_conf_t, ngx_http_request_t,
-    ngx_http_upstream_srv_conf_t, ngx_module_t, ngx_uint_t,
+    ngx_http_request_t, ngx_http_upstream_srv_conf_t, ngx_module_t, ngx_uint_t,
 };
 use crate::http::HttpModule;
-use crate::http::module::ProcessCycle;
 
 /// Failure while resolving a typed HTTP configuration slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpConfigError {
+    /// The configuration callback received a null parser pointer.
+    NullConfiguration,
+    /// The configuration callback received a misaligned parser pointer.
+    MisalignedConfiguration,
+    /// The parser contains a misaligned HTTP context pointer.
+    MisalignedContext,
     /// The module descriptor is not an HTTP module.
     WrongModuleType,
     /// Nginx has not assigned the module's global index.
@@ -22,8 +26,6 @@ pub enum HttpConfigError {
     ModuleIndexOutOfBounds,
     /// The module's HTTP configuration index is outside the configured slot array.
     ContextIndexOutOfBounds,
-    /// The configuration parser is not in an HTTP context.
-    WrongConfigurationContext,
     /// The HTTP core module does not have a usable global index.
     UnsetHttpModuleIndex,
     /// The HTTP core module index is outside the configured module array.
@@ -156,7 +158,7 @@ fn main_conf_slot<T>(
     Ok(unsafe { conf_slot(slots, indexes.context, indexes.http_slots) })
 }
 
-fn server_conf_slot<T>(
+pub(crate) fn server_conf_slot<T>(
     slots: *mut *mut c_void,
     module: &ngx_module_t,
 ) -> Result<Option<NonNull<T>>, HttpConfigError> {
@@ -172,511 +174,182 @@ fn location_conf_slot<T>(
     Ok(unsafe { conf_slot(slots, indexes.context, indexes.http_slots) })
 }
 
-pub(crate) mod sealed {
-    pub trait MainConfSource {}
-    pub trait MainConfSourceMut: MainConfSource {}
-    pub trait ServerConfSource {}
-    pub trait ServerConfSourceMut: ServerConfSource {}
-    pub trait LocationConfSource {}
-    pub trait LocationConfSourceMut: LocationConfSource {}
-}
-
-/// Source of an HTTP module's main configuration.
+/// Checked HTTP configuration parser for one nginx callback invocation.
 ///
-/// This trait is sealed because its implementations carry the nginx-owned slot-array invariant.
-/// Use [`HttpModuleMainConf::main_conf`] instead of calling it directly.
-pub trait HttpModuleMainConfExt: sealed::MainConfSource {
-    /// Resolves a checked typed main-configuration slot.
-    ///
-    /// # Safety
-    /// `T` must be the main-configuration type stored for `module`.
-    ///
-    /// ```compile_fail
-    /// # use ngx::ffi::{ngx_http_conf_ctx_t, ngx_module_t};
-    /// # use ngx::http::HttpModuleMainConfExt;
-    /// fn unchecked(source: &ngx_http_conf_ctx_t, module: &ngx_module_t) {
-    ///     let _ = source.http_main_conf::<u32>(module);
-    /// }
-    /// ```
-    #[doc(hidden)]
-    unsafe fn http_main_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError>;
-}
-
-/// Exclusive source of an HTTP module's main configuration.
-pub trait HttpModuleMainConfMutExt: HttpModuleMainConfExt + sealed::MainConfSourceMut {
-    /// Resolves a checked exclusive main-configuration slot.
-    ///
-    /// # Safety
-    /// `T` must be the main-configuration type stored for `module`.
-    #[doc(hidden)]
-    unsafe fn http_main_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError>;
-}
-
-/// Source of an HTTP module's server configuration.
+/// The callback-scoped capability cannot be retained after its FFI adapter returns.
 ///
-/// This trait is sealed because its implementations carry the nginx-owned slot-array invariant.
-/// Use [`HttpModuleServerConf::server_conf`] instead of calling it directly.
-pub trait HttpModuleServerConfExt: sealed::ServerConfSource {
-    /// Resolves a checked typed server-configuration slot.
-    ///
-    /// # Safety
-    /// `T` must be the server-configuration type stored for `module`.
-    #[doc(hidden)]
-    unsafe fn http_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError>;
-}
-
-/// Exclusive source of an HTTP module's server configuration.
-pub trait HttpModuleServerConfMutExt:
-    HttpModuleServerConfExt + sealed::ServerConfSourceMut
-{
-    /// Resolves a checked exclusive server-configuration slot.
-    ///
-    /// # Safety
-    /// `T` must be the server-configuration type stored for `module`.
-    #[doc(hidden)]
-    unsafe fn http_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError>;
-}
-
-/// Source of an HTTP module's location configuration.
+/// ```compile_fail
+/// use core::marker::PhantomData;
+/// use core::ptr::NonNull;
+/// use ngx::ffi::ngx_conf_t;
+/// use ngx::http::HttpConfigurationParser;
 ///
-/// This trait is sealed because its implementations carry the nginx-owned slot-array invariant.
-/// Use [`HttpModuleLocationConf::location_conf`] instead of calling it directly.
-pub trait HttpModuleLocationConfExt: sealed::LocationConfSource {
-    /// Resolves a checked typed location-configuration slot.
+/// fn forge(raw: NonNull<ngx_conf_t>) -> HttpConfigurationParser<'static> {
+///     HttpConfigurationParser {
+///         raw,
+///         _callback: PhantomData,
+///         _not_thread_safe: PhantomData,
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_conf_t;
+/// use ngx::http::HttpConfigurationParser;
+///
+/// unsafe fn escape(
+///     raw: *mut ngx_conf_t,
+/// ) -> &'static mut HttpConfigurationParser<'static> {
+///     unsafe { HttpConfigurationParser::with_raw(raw, |parser| parser) }.unwrap()
+/// }
+/// ```
+pub struct HttpConfigurationParser<'callback> {
+    raw: NonNull<ngx_conf_t>,
+    _callback: ::core::marker::PhantomData<&'callback mut ngx_conf_t>,
+    _not_thread_safe: ::core::marker::PhantomData<*mut ()>,
+}
+
+#[cfg(test)]
+impl<'callback> HttpConfigurationParser<'callback> {
+    pub(crate) fn from_test_callback(configuration: &'callback mut ngx_conf_t) -> Self {
+        Self {
+            raw: NonNull::from(configuration),
+            _callback: ::core::marker::PhantomData,
+            _not_thread_safe: ::core::marker::PhantomData,
+        }
+    }
+}
+
+impl HttpConfigurationParser<'_> {
+    /// Invokes a closure with a checked parser capability that cannot escape the callback.
     ///
     /// # Safety
-    /// `T` must be the location-configuration type stored for `module`.
-    #[doc(hidden)]
-    unsafe fn http_location_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError>;
-}
+    ///
+    /// `configuration` must point to the live nginx HTTP parser state for this callback. Its
+    /// context and configuration slots must remain valid and exclusively mutable until the
+    /// closure returns.
+    pub unsafe fn with_raw<R>(
+        configuration: *mut ngx_conf_t,
+        callback: impl for<'scope> FnOnce(&mut HttpConfigurationParser<'scope>) -> R,
+    ) -> Result<R, HttpConfigError> {
+        let raw = NonNull::new(configuration).ok_or(HttpConfigError::NullConfiguration)?;
+        if !configuration.is_aligned() {
+            return Err(HttpConfigError::MisalignedConfiguration);
+        }
 
-/// Exclusive source of an HTTP module's location configuration.
-pub trait HttpModuleLocationConfMutExt:
-    HttpModuleLocationConfExt + sealed::LocationConfSourceMut
-{
-    /// Resolves a checked exclusive location-configuration slot.
+        let mut parser = HttpConfigurationParser {
+            raw,
+            _callback: ::core::marker::PhantomData,
+            _not_thread_safe: ::core::marker::PhantomData,
+        };
+        Ok(callback(&mut parser))
+    }
+
+    fn context(&self) -> Result<Option<NonNull<ngx_http_conf_ctx_t>>, HttpConfigError> {
+        let context = unsafe { self.raw.as_ref().ctx.cast::<ngx_http_conf_ctx_t>() };
+        let Some(context) = NonNull::new(context) else {
+            return Ok(None);
+        };
+        if !context.as_ptr().is_aligned() {
+            return Err(HttpConfigError::MisalignedContext);
+        }
+        Ok(Some(context))
+    }
+
+    fn main_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, HttpConfigError> {
+        let Some(context) = self.context()? else {
+            return Ok(None);
+        };
+        Ok(main_conf_slot(unsafe { context.as_ref().main_conf }, module)?
+            .map(|value| unsafe { value.as_ref() }))
+    }
+
+    fn main_conf_mut<T>(
+        &mut self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&mut T>, HttpConfigError> {
+        let Some(context) = self.context()? else {
+            return Ok(None);
+        };
+        Ok(main_conf_slot(unsafe { context.as_ref().main_conf }, module)?
+            .map(|mut value| unsafe { value.as_mut() }))
+    }
+
+    fn server_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, HttpConfigError> {
+        let Some(context) = self.context()? else {
+            return Ok(None);
+        };
+        Ok(server_conf_slot(unsafe { context.as_ref().srv_conf }, module)?
+            .map(|value| unsafe { value.as_ref() }))
+    }
+
+    fn server_conf_mut<T>(
+        &mut self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&mut T>, HttpConfigError> {
+        let Some(context) = self.context()? else {
+            return Ok(None);
+        };
+        Ok(server_conf_slot(unsafe { context.as_ref().srv_conf }, module)?
+            .map(|mut value| unsafe { value.as_mut() }))
+    }
+
+    fn location_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, HttpConfigError> {
+        let Some(context) = self.context()? else {
+            return Ok(None);
+        };
+        Ok(location_conf_slot(unsafe { context.as_ref().loc_conf }, module)?
+            .map(|value| unsafe { value.as_ref() }))
+    }
+
+    fn location_conf_mut<T>(
+        &mut self,
+        module: &ngx_module_t,
+    ) -> Result<Option<&mut T>, HttpConfigError> {
+        let Some(context) = self.context()? else {
+            return Ok(None);
+        };
+        Ok(location_conf_slot(unsafe { context.as_ref().loc_conf }, module)?
+            .map(|mut value| unsafe { value.as_mut() }))
+    }
+
+    /// Returns the native parser pointer for an explicit FFI operation.
     ///
     /// # Safety
-    /// `T` must be the location-configuration type stored for `module`.
-    #[doc(hidden)]
-    unsafe fn http_location_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError>;
-}
-
-impl sealed::MainConfSource for ngx_http_conf_ctx_t {}
-impl sealed::MainConfSourceMut for ngx_http_conf_ctx_t {}
-impl sealed::ServerConfSource for ngx_http_conf_ctx_t {}
-impl sealed::ServerConfSourceMut for ngx_http_conf_ctx_t {}
-impl sealed::LocationConfSource for ngx_http_conf_ctx_t {}
-impl sealed::LocationConfSourceMut for ngx_http_conf_ctx_t {}
-
-impl HttpModuleMainConfExt for ngx_http_conf_ctx_t {
-    unsafe fn http_main_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        Ok(main_conf_slot(self.main_conf, module)?.map(|value| unsafe { value.as_ref() }))
+    ///
+    /// The pointer must not be retained beyond this callback, and the target nginx API must not
+    /// violate the parser capability's exclusive access to configuration state.
+    pub unsafe fn as_raw(&mut self) -> *mut ngx_conf_t {
+        self.raw.as_ptr()
     }
 }
 
-impl HttpModuleMainConfMutExt for ngx_http_conf_ctx_t {
-    unsafe fn http_main_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        Ok(main_conf_slot(self.main_conf, module)?.map(|mut value| unsafe { value.as_mut() }))
-    }
+pub(crate) fn request_main_conf_slot<T>(
+    request: &ngx_http_request_t,
+    module: &ngx_module_t,
+) -> Result<Option<NonNull<T>>, HttpConfigError> {
+    main_conf_slot(request.main_conf, module)
 }
 
-impl sealed::MainConfSource for ProcessCycle<'_> {}
-
-impl HttpModuleMainConfExt for ProcessCycle<'_> {
-    unsafe fn http_main_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        unsafe { main_conf_from_cycle(self.raw(), module, live_http_slot_count()) }
-    }
+pub(crate) fn request_server_conf_slot<T>(
+    request: &ngx_http_request_t,
+    module: &ngx_module_t,
+) -> Result<Option<NonNull<T>>, HttpConfigError> {
+    server_conf_slot(request.srv_conf, module)
 }
 
-impl HttpModuleServerConfExt for ngx_http_conf_ctx_t {
-    unsafe fn http_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        Ok(server_conf_slot(self.srv_conf, module)?.map(|value| unsafe { value.as_ref() }))
-    }
+pub(crate) fn request_location_conf_slot<T>(
+    request: &ngx_http_request_t,
+    module: &ngx_module_t,
+) -> Result<Option<NonNull<T>>, HttpConfigError> {
+    location_conf_slot(request.loc_conf, module)
 }
 
-impl HttpModuleServerConfMutExt for ngx_http_conf_ctx_t {
-    unsafe fn http_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        Ok(server_conf_slot(self.srv_conf, module)?.map(|mut value| unsafe { value.as_mut() }))
-    }
-}
-
-impl HttpModuleLocationConfExt for ngx_http_conf_ctx_t {
-    unsafe fn http_location_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        Ok(location_conf_slot(self.loc_conf, module)?.map(|value| unsafe { value.as_ref() }))
-    }
-}
-
-impl HttpModuleLocationConfMutExt for ngx_http_conf_ctx_t {
-    unsafe fn http_location_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        Ok(location_conf_slot(self.loc_conf, module)?.map(|mut value| unsafe { value.as_mut() }))
-    }
-}
-
-fn http_context(cf: &ngx_conf_t) -> Result<Option<NonNull<ngx_http_conf_ctx_t>>, HttpConfigError> {
-    if cf.module_type != NGX_HTTP_MODULE as ngx_uint_t {
-        return Err(HttpConfigError::WrongConfigurationContext);
-    }
-
-    Ok(checked_pointer(cf.ctx.cast()))
-}
-
-impl sealed::MainConfSource for ngx_conf_t {}
-impl sealed::MainConfSourceMut for ngx_conf_t {}
-impl sealed::ServerConfSource for ngx_conf_t {}
-impl sealed::ServerConfSourceMut for ngx_conf_t {}
-impl sealed::LocationConfSource for ngx_conf_t {}
-impl sealed::LocationConfSourceMut for ngx_conf_t {}
-
-impl HttpModuleMainConfExt for ngx_conf_t {
-    unsafe fn http_main_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        let Some(context) = http_context(self)? else {
-            return Ok(None);
-        };
-        unsafe { context.as_ref().http_main_conf(module) }
-    }
-}
-
-impl HttpModuleMainConfMutExt for ngx_conf_t {
-    unsafe fn http_main_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        let Some(mut context) = http_context(self)? else {
-            return Ok(None);
-        };
-        unsafe { context.as_mut().http_main_conf_mut(module) }
-    }
-}
-
-impl HttpModuleServerConfExt for ngx_conf_t {
-    unsafe fn http_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        let Some(context) = http_context(self)? else {
-            return Ok(None);
-        };
-        unsafe { context.as_ref().http_server_conf(module) }
-    }
-}
-
-impl HttpModuleServerConfMutExt for ngx_conf_t {
-    unsafe fn http_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        let Some(mut context) = http_context(self)? else {
-            return Ok(None);
-        };
-        unsafe { context.as_mut().http_server_conf_mut(module) }
-    }
-}
-
-impl HttpModuleLocationConfExt for ngx_conf_t {
-    unsafe fn http_location_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        let Some(context) = http_context(self)? else {
-            return Ok(None);
-        };
-        unsafe { context.as_ref().http_location_conf(module) }
-    }
-}
-
-impl HttpModuleLocationConfMutExt for ngx_conf_t {
-    unsafe fn http_location_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        let Some(mut context) = http_context(self)? else {
-            return Ok(None);
-        };
-        unsafe { context.as_mut().http_location_conf_mut(module) }
-    }
-}
-
-impl sealed::MainConfSource for ngx_http_connection_t {}
-impl sealed::MainConfSourceMut for ngx_http_connection_t {}
-impl sealed::ServerConfSource for ngx_http_connection_t {}
-impl sealed::ServerConfSourceMut for ngx_http_connection_t {}
-impl sealed::LocationConfSource for ngx_http_connection_t {}
-impl sealed::LocationConfSourceMut for ngx_http_connection_t {}
-
-impl HttpModuleMainConfExt for ngx_http_connection_t {
-    unsafe fn http_main_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        let Some(context) = checked_pointer(self.conf_ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_ref().http_main_conf(module) }
-    }
-}
-
-impl HttpModuleMainConfMutExt for ngx_http_connection_t {
-    unsafe fn http_main_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        let Some(mut context) = checked_pointer(self.conf_ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_mut().http_main_conf_mut(module) }
-    }
-}
-
-impl HttpModuleServerConfExt for ngx_http_connection_t {
-    unsafe fn http_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        let Some(context) = checked_pointer(self.conf_ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_ref().http_server_conf(module) }
-    }
-}
-
-impl HttpModuleServerConfMutExt for ngx_http_connection_t {
-    unsafe fn http_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        let Some(mut context) = checked_pointer(self.conf_ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_mut().http_server_conf_mut(module) }
-    }
-}
-
-impl HttpModuleLocationConfExt for ngx_http_connection_t {
-    unsafe fn http_location_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        let Some(context) = checked_pointer(self.conf_ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_ref().http_location_conf(module) }
-    }
-}
-
-impl HttpModuleLocationConfMutExt for ngx_http_connection_t {
-    unsafe fn http_location_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        let Some(mut context) = checked_pointer(self.conf_ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_mut().http_location_conf_mut(module) }
-    }
-}
-
-impl sealed::MainConfSource for ngx_http_core_srv_conf_t {}
-impl sealed::MainConfSourceMut for ngx_http_core_srv_conf_t {}
-impl sealed::ServerConfSource for ngx_http_core_srv_conf_t {}
-impl sealed::ServerConfSourceMut for ngx_http_core_srv_conf_t {}
-impl sealed::LocationConfSource for ngx_http_core_srv_conf_t {}
-impl sealed::LocationConfSourceMut for ngx_http_core_srv_conf_t {}
-
-impl HttpModuleMainConfExt for ngx_http_core_srv_conf_t {
-    unsafe fn http_main_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        let Some(context) = checked_pointer(self.ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_ref().http_main_conf(module) }
-    }
-}
-
-impl HttpModuleMainConfMutExt for ngx_http_core_srv_conf_t {
-    unsafe fn http_main_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        let Some(mut context) = checked_pointer(self.ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_mut().http_main_conf_mut(module) }
-    }
-}
-
-impl HttpModuleServerConfExt for ngx_http_core_srv_conf_t {
-    unsafe fn http_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        let Some(context) = checked_pointer(self.ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_ref().http_server_conf(module) }
-    }
-}
-
-impl HttpModuleServerConfMutExt for ngx_http_core_srv_conf_t {
-    unsafe fn http_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        let Some(mut context) = checked_pointer(self.ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_mut().http_server_conf_mut(module) }
-    }
-}
-
-impl HttpModuleLocationConfExt for ngx_http_core_srv_conf_t {
-    unsafe fn http_location_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        let Some(context) = checked_pointer(self.ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_ref().http_location_conf(module) }
-    }
-}
-
-impl HttpModuleLocationConfMutExt for ngx_http_core_srv_conf_t {
-    unsafe fn http_location_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        let Some(mut context) = checked_pointer(self.ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_mut().http_location_conf_mut(module) }
-    }
-}
-
-impl sealed::MainConfSource for ngx_http_request_t {}
-impl sealed::MainConfSourceMut for ngx_http_request_t {}
-impl sealed::ServerConfSource for ngx_http_request_t {}
-impl sealed::ServerConfSourceMut for ngx_http_request_t {}
-impl sealed::LocationConfSource for ngx_http_request_t {}
-impl sealed::LocationConfSourceMut for ngx_http_request_t {}
-
-impl HttpModuleMainConfExt for ngx_http_request_t {
-    unsafe fn http_main_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        Ok(main_conf_slot(self.main_conf, module)?.map(|value| unsafe { value.as_ref() }))
-    }
-}
-
-impl HttpModuleMainConfMutExt for ngx_http_request_t {
-    unsafe fn http_main_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        Ok(main_conf_slot(self.main_conf, module)?.map(|mut value| unsafe { value.as_mut() }))
-    }
-}
-
-impl HttpModuleServerConfExt for ngx_http_request_t {
-    unsafe fn http_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        Ok(server_conf_slot(self.srv_conf, module)?.map(|value| unsafe { value.as_ref() }))
-    }
-}
-
-impl HttpModuleServerConfMutExt for ngx_http_request_t {
-    unsafe fn http_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        Ok(server_conf_slot(self.srv_conf, module)?.map(|mut value| unsafe { value.as_mut() }))
-    }
-}
-
-impl HttpModuleLocationConfExt for ngx_http_request_t {
-    unsafe fn http_location_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        Ok(location_conf_slot(self.loc_conf, module)?.map(|value| unsafe { value.as_ref() }))
-    }
-}
-
-impl HttpModuleLocationConfMutExt for ngx_http_request_t {
-    unsafe fn http_location_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        Ok(location_conf_slot(self.loc_conf, module)?.map(|mut value| unsafe { value.as_mut() }))
-    }
-}
-
-impl sealed::ServerConfSource for ngx_http_upstream_srv_conf_t {}
-impl sealed::ServerConfSourceMut for ngx_http_upstream_srv_conf_t {}
-
-impl HttpModuleServerConfExt for ngx_http_upstream_srv_conf_t {
-    unsafe fn http_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        Ok(server_conf_slot(self.srv_conf, module)?.map(|value| unsafe { value.as_ref() }))
-    }
-}
-
-impl HttpModuleServerConfMutExt for ngx_http_upstream_srv_conf_t {
-    unsafe fn http_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        Ok(server_conf_slot(self.srv_conf, module)?.map(|mut value| unsafe { value.as_mut() }))
-    }
+pub(crate) fn upstream_server_conf_slot<T>(
+    upstream: &ngx_http_upstream_srv_conf_t,
+    module: &ngx_module_t,
+) -> Result<Option<NonNull<T>>, HttpConfigError> {
+    server_conf_slot(upstream.srv_conf, module)
 }
 
 /// Associates an HTTP module with its main-configuration type.
@@ -688,6 +361,13 @@ pub unsafe trait HttpModuleMainConf: HttpModule {
     type MainConf: 'static;
 
     /// Gets the module's main configuration from a checked nginx-owned source.
+    ///
+    /// ```compile_fail
+    /// # use ngx::http::{HttpConfigurationParser, HttpModuleMainConf};
+    /// fn wrong_slot_type<M: HttpModuleMainConf>(parser: &HttpConfigurationParser<'_>) {
+    ///     let _: &u8 = M::main_conf(parser).unwrap().unwrap();
+    /// }
+    /// ```
     ///
     /// ```compile_fail
     /// # use ngx::ffi::ngx_conf_t;
@@ -704,10 +384,10 @@ pub unsafe trait HttpModuleMainConf: HttpModule {
     ///     unsafe { M::main_conf_from_cycle(cycle, 0).unwrap().unwrap() }
     /// }
     /// ```
-    fn main_conf(
-        source: &impl HttpModuleMainConfExt,
-    ) -> Result<Option<&Self::MainConf>, HttpConfigError> {
-        unsafe { source.http_main_conf(Self::module()) }
+    fn main_conf<'a>(
+        parser: &'a HttpConfigurationParser<'_>,
+    ) -> Result<Option<&'a Self::MainConf>, HttpConfigError> {
+        parser.main_conf(Self::module())
     }
 
     /// Gets exclusive access to the module's main configuration.
@@ -719,10 +399,23 @@ pub unsafe trait HttpModuleMainConf: HttpModule {
     /// let _ = M::main_conf_mut(cf);
     /// # }
     /// ```
-    fn main_conf_mut(
-        source: &mut impl HttpModuleMainConfMutExt,
-    ) -> Result<Option<&mut Self::MainConf>, HttpConfigError> {
-        unsafe { source.http_main_conf_mut(Self::module()) }
+    fn main_conf_mut<'a>(
+        parser: &'a mut HttpConfigurationParser<'_>,
+    ) -> Result<Option<&'a mut Self::MainConf>, HttpConfigError> {
+        parser.main_conf_mut(Self::module())
+    }
+
+    /// Resolves shared main configuration from a native HTTP context.
+    ///
+    /// # Safety
+    ///
+    /// `context` must be the live initialized context selected by nginx for the current callback.
+    /// Its slot arrays must remain valid and must contain the current HTTP module slot count.
+    unsafe fn main_conf_from_context(
+        context: &ngx_http_conf_ctx_t,
+    ) -> Result<Option<&Self::MainConf>, HttpConfigError> {
+        Ok(main_conf_slot(context.main_conf, Self::module())?
+            .map(|value| unsafe { value.as_ref() }))
     }
 
     /// Resolves configuration from an explicitly selected live cycle.
@@ -774,10 +467,10 @@ pub unsafe trait HttpModuleServerConf: HttpModule {
     ///     M::server_conf(source).unwrap().unwrap()
     /// }
     /// ```
-    fn server_conf(
-        source: &impl HttpModuleServerConfExt,
-    ) -> Result<Option<&Self::ServerConf>, HttpConfigError> {
-        unsafe { source.http_server_conf(Self::module()) }
+    fn server_conf<'a>(
+        parser: &'a HttpConfigurationParser<'_>,
+    ) -> Result<Option<&'a Self::ServerConf>, HttpConfigError> {
+        parser.server_conf(Self::module())
     }
 
     /// Gets exclusive access to the module's server configuration.
@@ -789,10 +482,10 @@ pub unsafe trait HttpModuleServerConf: HttpModule {
     /// let _ = M::server_conf_mut(cf);
     /// # }
     /// ```
-    fn server_conf_mut(
-        source: &mut impl HttpModuleServerConfMutExt,
-    ) -> Result<Option<&mut Self::ServerConf>, HttpConfigError> {
-        unsafe { source.http_server_conf_mut(Self::module()) }
+    fn server_conf_mut<'a>(
+        parser: &'a mut HttpConfigurationParser<'_>,
+    ) -> Result<Option<&'a mut Self::ServerConf>, HttpConfigError> {
+        parser.server_conf_mut(Self::module())
     }
 }
 
@@ -813,10 +506,10 @@ pub unsafe trait HttpModuleLocationConf: HttpModule {
     ///     M::location_conf(source).unwrap().unwrap()
     /// }
     /// ```
-    fn location_conf(
-        source: &impl HttpModuleLocationConfExt,
-    ) -> Result<Option<&Self::LocationConf>, HttpConfigError> {
-        unsafe { source.http_location_conf(Self::module()) }
+    fn location_conf<'a>(
+        parser: &'a HttpConfigurationParser<'_>,
+    ) -> Result<Option<&'a Self::LocationConf>, HttpConfigError> {
+        parser.location_conf(Self::module())
     }
 
     /// Gets exclusive access to the module's location configuration.
@@ -828,10 +521,10 @@ pub unsafe trait HttpModuleLocationConf: HttpModule {
     /// let _ = M::location_conf_mut(cf);
     /// # }
     /// ```
-    fn location_conf_mut(
-        source: &mut impl HttpModuleLocationConfMutExt,
-    ) -> Result<Option<&mut Self::LocationConf>, HttpConfigError> {
-        unsafe { source.http_location_conf_mut(Self::module()) }
+    fn location_conf_mut<'a>(
+        parser: &'a mut HttpConfigurationParser<'_>,
+    ) -> Result<Option<&'a mut Self::LocationConf>, HttpConfigError> {
+        parser.location_conf_mut(Self::module())
     }
 }
 
@@ -843,7 +536,7 @@ mod core {
             ngx_http_core_loc_conf_t, ngx_http_core_main_conf_t, ngx_http_core_module,
             ngx_http_core_srv_conf_t,
         },
-        http::{HttpModuleMainConf, HttpRequestHandler},
+        http::{HttpConfigurationParser, HttpModuleMainConf, HttpRequestHandler},
         ngx_conf_log_error,
     };
 
@@ -896,13 +589,14 @@ mod core {
 
     /// Register a request handler for a specified phase.
     /// This function must be called from the module's `postconfiguration()` function.
-    pub fn add_phase_handler<H>(cf: &mut nginx_sys::ngx_conf_t) -> Result<(), AllocError>
+    pub fn add_phase_handler<H>(parser: &mut HttpConfigurationParser<'_>) -> Result<(), AllocError>
     where
         H: HttpRequestHandler,
     {
         let result = (|| {
-            let main =
-                NgxHttpCoreModule::main_conf_mut(cf).map_err(|_| AllocError)?.ok_or(AllocError)?;
+            let main = NgxHttpCoreModule::main_conf_mut(parser)
+                .map_err(|_| AllocError)?
+                .ok_or(AllocError)?;
             let phase = main.phases.get_mut(H::PHASE as usize).ok_or(AllocError)?;
             let handlers = unsafe {
                 NgxArray::<nginx_sys::ngx_http_handler_pt>::from_ngx_array_mut(&mut phase.handlers)
@@ -912,7 +606,8 @@ mod core {
             handlers.push(Some(crate::http::raw_handler::<H>)).map(|_| ())
         })();
 
-        if result.is_err() && !cf.log.is_null() {
+        let cf = unsafe { parser.as_raw() };
+        if result.is_err() && !unsafe { (*cf).log }.is_null() {
             ngx_conf_log_error!(
                 nginx_sys::NGX_LOG_EMERG,
                 cf,
@@ -1025,21 +720,16 @@ mod tests {
     use std::sync::MutexGuard;
 
     use super::{
-        HttpConfigError, HttpModuleLocationConf, HttpModuleMainConf, HttpModuleServerConf,
-        module_indexes,
+        HttpConfigError, HttpConfigurationParser, HttpModuleLocationConf, HttpModuleMainConf,
+        HttpModuleServerConf, module_indexes,
     };
     use crate::core::Status;
     use crate::ffi::{
         NGX_CORE_MODULE, NGX_HTTP_MODULE, ngx_http_conf_ctx_t, ngx_module_t, ngx_uint_t,
     };
     #[cfg(feature = "test-link")]
-    use crate::ffi::{
-        ngx_conf_t, ngx_cycle_t, ngx_http_connection_t, ngx_http_core_srv_conf_t,
-        ngx_http_request_t, ngx_http_upstream_srv_conf_t, ngx_int_t,
-    };
-    use crate::http::{
-        HttpModule, HttpModuleMainConfExt, ProcessCycle, RequestRefMut, exit_process, init_process,
-    };
+    use crate::ffi::{ngx_conf_t, ngx_cycle_t, ngx_http_request_t, ngx_int_t};
+    use crate::http::{HttpModule, ProcessCycle, RequestRefMut, exit_process, init_process};
 
     fn http_module(index: ngx_uint_t, context_index: ngx_uint_t) -> ngx_module_t {
         let mut module = ngx_module_t::default();
@@ -1177,19 +867,6 @@ mod tests {
         type MainConf = u32;
     }
 
-    #[test]
-    fn wrong_module_type_does_not_read_a_http_configuration_slot() {
-        let mut value = 42_u32;
-        let mut slots: [*mut c_void; 1] = [(&raw mut value).cast()];
-        let context = ngx_http_conf_ctx_t {
-            main_conf: slots.as_mut_ptr(),
-            srv_conf: ::core::ptr::null_mut(),
-            loc_conf: ::core::ptr::null_mut(),
-        };
-
-        assert_eq!(WrongTypeModule::main_conf(&context), Err(HttpConfigError::WrongModuleType));
-    }
-
     #[cfg(feature = "test-link")]
     struct GlobalState {
         cycle: *mut ngx_cycle_t,
@@ -1310,91 +987,63 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn null_and_misaligned_http_configuration_slots_return_none() {
-        let _globals = HttpGlobals::new(2, 1);
+    fn parser_rejects_wrong_module_type_before_reading_a_slot() {
+        let _globals = HttpGlobals::new(1, 1);
+        let mut value = 42_u32;
+        let mut slots: [*mut c_void; 1] = [(&raw mut value).cast()];
         let mut context = ngx_http_conf_ctx_t {
-            main_conf: ptr::null_mut(),
+            main_conf: slots.as_mut_ptr(),
             srv_conf: ptr::null_mut(),
             loc_conf: ptr::null_mut(),
         };
+        let mut configuration = unsafe { mem::zeroed::<ngx_conf_t>() };
+        configuration.ctx = (&raw mut context).cast();
+        let parser = HttpConfigurationParser::from_test_callback(&mut configuration);
 
-        assert_eq!(TestHttpModule::main_conf(&context).map(|value| value.copied()), Ok(None));
-        assert_eq!(TestHttpModule::server_conf(&context).map(|value| value.copied()), Ok(None));
-        assert_eq!(TestHttpModule::location_conf(&context).map(|value| value.copied()), Ok(None));
-
-        context.main_conf = ptr::without_provenance_mut(1);
-        context.srv_conf = ptr::without_provenance_mut(1);
-        context.loc_conf = ptr::without_provenance_mut(1);
-        assert_eq!(TestHttpModule::main_conf(&context).map(|value| value.copied()), Ok(None));
-        assert_eq!(TestHttpModule::server_conf(&context).map(|value| value.copied()), Ok(None));
-        assert_eq!(TestHttpModule::location_conf(&context).map(|value| value.copied()), Ok(None));
-
-        let mut slots = [ptr::without_provenance_mut::<c_void>(1)];
-        context.main_conf = slots.as_mut_ptr();
-        context.srv_conf = slots.as_mut_ptr();
-        context.loc_conf = slots.as_mut_ptr();
-        assert_eq!(TestHttpModule::main_conf(&context).map(|value| value.copied()), Ok(None));
-        assert_eq!(TestHttpModule::server_conf(&context).map(|value| value.copied()), Ok(None));
-        assert_eq!(TestHttpModule::location_conf(&context).map(|value| value.copied()), Ok(None));
-
-        let mut connection = unsafe { mem::zeroed::<ngx_http_connection_t>() };
-        assert_eq!(TestHttpModule::main_conf(&connection).map(|value| value.copied()), Ok(None));
-        connection.conf_ctx = ptr::without_provenance_mut(1);
-        assert_eq!(TestHttpModule::main_conf(&connection).map(|value| value.copied()), Ok(None));
-
-        let mut core_server = unsafe { mem::zeroed::<ngx_http_core_srv_conf_t>() };
-        assert_eq!(TestHttpModule::server_conf(&core_server).map(|value| value.copied()), Ok(None));
-        core_server.ctx = ptr::without_provenance_mut(1);
-        assert_eq!(TestHttpModule::server_conf(&core_server).map(|value| value.copied()), Ok(None));
-
-        let mut request = unsafe { mem::zeroed::<ngx_http_request_t>() };
-        assert_eq!(TestHttpModule::location_conf(&request).map(|value| value.copied()), Ok(None));
-        request.loc_conf = ptr::without_provenance_mut(1);
-        assert_eq!(TestHttpModule::location_conf(&request).map(|value| value.copied()), Ok(None));
-
-        let mut upstream = unsafe { mem::zeroed::<ngx_http_upstream_srv_conf_t>() };
-        assert_eq!(TestHttpModule::server_conf(&upstream).map(|value| value.copied()), Ok(None));
-        upstream.srv_conf = ptr::without_provenance_mut(1);
-        assert_eq!(TestHttpModule::server_conf(&upstream).map(|value| value.copied()), Ok(None));
+        assert_eq!(WrongTypeModule::main_conf(&parser), Err(HttpConfigError::WrongModuleType));
     }
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn parser_context_requires_http_type_and_checked_context_pointer() {
+    fn parser_checks_callback_pointer_and_http_context() {
+        assert_eq!(
+            unsafe { HttpConfigurationParser::with_raw(ptr::null_mut(), |_| Status::NGX_OK.0) },
+            Err(HttpConfigError::NullConfiguration)
+        );
+        assert_eq!(
+            unsafe {
+                HttpConfigurationParser::with_raw(ptr::without_provenance_mut(1), |_| {
+                    Status::NGX_OK.0
+                })
+            },
+            Err(HttpConfigError::MisalignedConfiguration)
+        );
+
         let _globals = HttpGlobals::new(2, 1);
         let mut configuration = unsafe { mem::zeroed::<ngx_conf_t>() };
-
         assert_eq!(
-            TestHttpModule::main_conf(&configuration),
-            Err(HttpConfigError::WrongConfigurationContext)
-        );
-
-        configuration.module_type = NGX_HTTP_MODULE as _;
-        assert_eq!(TestHttpModule::main_conf(&configuration).map(|value| value.copied()), Ok(None));
-        assert_eq!(
-            TestHttpModule::server_conf(&configuration).map(|value| value.copied()),
-            Ok(None)
-        );
-        assert_eq!(
-            TestHttpModule::location_conf(&configuration).map(|value| value.copied()),
-            Ok(None)
+            unsafe {
+                HttpConfigurationParser::with_raw(&raw mut configuration, |parser| {
+                    TestHttpModule::main_conf(parser).map(|value| value.copied())
+                })
+            },
+            Ok(Ok(None))
         );
 
         configuration.ctx = ptr::without_provenance_mut(1);
-        assert_eq!(TestHttpModule::main_conf(&configuration).map(|value| value.copied()), Ok(None));
         assert_eq!(
-            TestHttpModule::server_conf(&configuration).map(|value| value.copied()),
-            Ok(None)
-        );
-        assert_eq!(
-            TestHttpModule::location_conf(&configuration).map(|value| value.copied()),
-            Ok(None)
+            unsafe {
+                HttpConfigurationParser::with_raw(&raw mut configuration, |parser| {
+                    TestHttpModule::main_conf(parser).map(|value| value.copied())
+                })
+            },
+            Ok(Err(HttpConfigError::MisalignedContext))
         );
     }
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn typed_http_configuration_access_follows_each_source_borrow() {
+    fn parser_owns_mutable_configuration_access_and_runtime_request_is_shared() {
         let _globals = HttpGlobals::new(2, 1);
         let mut main = 42_u32;
         let mut server = 99_u32;
@@ -1407,95 +1056,56 @@ mod tests {
             srv_conf: server_slots.as_mut_ptr(),
             loc_conf: location_slots.as_mut_ptr(),
         };
+        let mut configuration = unsafe { mem::zeroed::<ngx_conf_t>() };
+        configuration.ctx = (&raw mut context).cast();
 
-        assert_eq!(TestHttpModule::main_conf(&context).map(|value| value.copied()), Ok(Some(42)));
-        assert_eq!(TestHttpModule::server_conf(&context).map(|value| value.copied()), Ok(Some(99)));
-        assert_eq!(
-            TestHttpModule::location_conf(&context).map(|value| value.copied()),
-            Ok(Some(7))
-        );
-
-        if let Some(value) = TestHttpModule::main_conf_mut(&mut context).unwrap() {
-            *value = 1;
+        unsafe {
+            HttpConfigurationParser::with_raw(&raw mut configuration, |parser| {
+                assert_eq!(
+                    TestHttpModule::main_conf(parser).map(|value| value.copied()),
+                    Ok(Some(42))
+                );
+                assert_eq!(
+                    TestHttpModule::server_conf(parser).map(|value| value.copied()),
+                    Ok(Some(99))
+                );
+                assert_eq!(
+                    TestHttpModule::location_conf(parser).map(|value| value.copied()),
+                    Ok(Some(7))
+                );
+                *TestHttpModule::main_conf_mut(parser).unwrap().unwrap() = 1;
+                *TestHttpModule::server_conf_mut(parser).unwrap().unwrap() = 2;
+                *TestHttpModule::location_conf_mut(parser).unwrap().unwrap() = 3;
+            })
         }
-        if let Some(value) = TestHttpModule::server_conf_mut(&mut context).unwrap() {
-            *value = 2;
-        }
-        if let Some(value) = TestHttpModule::location_conf_mut(&mut context).unwrap() {
-            *value = 3;
-        }
-
-        assert_eq!((main, server, location), (1, 2, 3));
-
-        let mut parser = unsafe { mem::zeroed::<ngx_conf_t>() };
-        parser.module_type = NGX_HTTP_MODULE as _;
-        parser.ctx = (&raw mut context).cast();
-        assert_eq!(TestHttpModule::main_conf(&parser).map(|value| value.copied()), Ok(Some(1)));
-        assert_eq!(TestHttpModule::server_conf(&parser).map(|value| value.copied()), Ok(Some(2)));
-        assert_eq!(TestHttpModule::location_conf(&parser).map(|value| value.copied()), Ok(Some(3)));
-        if let Some(value) = TestHttpModule::main_conf_mut(&mut parser).unwrap() {
-            *value = 4;
-        }
-
-        let mut connection = unsafe { mem::zeroed::<ngx_http_connection_t>() };
-        connection.conf_ctx = &raw mut context;
-        assert_eq!(
-            TestHttpModule::location_conf(&connection).map(|value| value.copied()),
-            Ok(Some(3))
-        );
-        if let Some(value) = TestHttpModule::location_conf_mut(&mut connection).unwrap() {
-            *value = 5;
-        }
-
-        let mut core_server = unsafe { mem::zeroed::<ngx_http_core_srv_conf_t>() };
-        core_server.ctx = &raw mut context;
-        assert_eq!(
-            TestHttpModule::server_conf(&core_server).map(|value| value.copied()),
-            Ok(Some(2))
-        );
-        if let Some(value) = TestHttpModule::server_conf_mut(&mut core_server).unwrap() {
-            *value = 6;
-        }
+        .unwrap();
 
         let mut request = ngx_http_request_t {
+            signature: NGX_HTTP_MODULE as _,
             main_conf: main_slots.as_mut_ptr(),
             srv_conf: server_slots.as_mut_ptr(),
             loc_conf: location_slots.as_mut_ptr(),
             ..unsafe { mem::zeroed() }
         };
-        assert_eq!(TestHttpModule::main_conf(&request).map(|value| value.copied()), Ok(Some(4)));
-        assert_eq!(TestHttpModule::server_conf(&request).map(|value| value.copied()), Ok(Some(6)));
-        assert_eq!(
-            TestHttpModule::location_conf(&request).map(|value| value.copied()),
-            Ok(Some(5))
-        );
-        if let Some(value) = TestHttpModule::location_conf_mut(&mut request).unwrap() {
-            *value = 7;
-        }
-
-        request.signature = NGX_HTTP_MODULE as _;
         request.main = &raw mut request;
-        let mut request = unsafe { RequestRefMut::from_raw(&raw mut request).unwrap() };
-        assert_eq!(TestHttpModule::main_conf(&request).map(|value| value.copied()), Ok(Some(4)));
-        assert_eq!(TestHttpModule::server_conf(&request).map(|value| value.copied()), Ok(Some(6)));
-        assert_eq!(
-            TestHttpModule::location_conf(&request).map(|value| value.copied()),
-            Ok(Some(7))
-        );
-        if let Some(value) = TestHttpModule::location_conf_mut(&mut request).unwrap() {
-            *value = 8;
+        unsafe {
+            RequestRefMut::with_raw(&raw mut request, |request| {
+                let request = request.view();
+                assert_eq!(
+                    request.main_conf::<TestHttpModule>().map(|value| value.copied()),
+                    Ok(Some(1))
+                );
+                assert_eq!(
+                    request.server_conf::<TestHttpModule>().map(|value| value.copied()),
+                    Ok(Some(2))
+                );
+                assert_eq!(
+                    request.location_conf::<TestHttpModule>().map(|value| value.copied()),
+                    Ok(Some(3))
+                );
+            })
         }
-
-        let mut upstream = ngx_http_upstream_srv_conf_t {
-            srv_conf: server_slots.as_mut_ptr(),
-            ..unsafe { mem::zeroed() }
-        };
-        assert_eq!(TestHttpModule::server_conf(&upstream).map(|value| value.copied()), Ok(Some(6)));
-        if let Some(value) = TestHttpModule::server_conf_mut(&mut upstream).unwrap() {
-            *value = 9;
-        }
-
-        assert_eq!((main, server, location), (4, 9, 8));
+        .unwrap();
     }
 
     #[cfg(feature = "test-link")]
@@ -1628,45 +1238,6 @@ mod tests {
                 })
             },
             Ok(Ok(Some(42)))
-        );
-
-        let unset_module = http_module(ngx_uint_t::MAX, 0);
-        assert_eq!(
-            unsafe {
-                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
-                    cycle.http_main_conf::<u32>(&unset_module).map(|value| value.is_some())
-                })
-            },
-            Ok(Err(HttpConfigError::UnsetModuleIndex))
-        );
-        let out_of_range_module = http_module(2, 0);
-        assert_eq!(
-            unsafe {
-                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
-                    cycle.http_main_conf::<u32>(&out_of_range_module).map(|value| value.is_some())
-                })
-            },
-            Ok(Err(HttpConfigError::ModuleIndexOutOfBounds))
-        );
-        let unset_context_module = http_module(1, ngx_uint_t::MAX);
-        assert_eq!(
-            unsafe {
-                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
-                    cycle.http_main_conf::<u32>(&unset_context_module).map(|value| value.is_some())
-                })
-            },
-            Ok(Err(HttpConfigError::UnsetContextIndex))
-        );
-        let out_of_range_context_module = http_module(1, 1);
-        assert_eq!(
-            unsafe {
-                ProcessCycle::with_raw(&raw mut cycle, |cycle| {
-                    cycle
-                        .http_main_conf::<u32>(&out_of_range_context_module)
-                        .map(|value| value.is_some())
-                })
-            },
-            Ok(Err(HttpConfigError::ContextIndexOutOfBounds))
         );
 
         globals.set_http_module_type(NGX_HTTP_MODULE as _);

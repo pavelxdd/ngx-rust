@@ -21,7 +21,8 @@ use crate::ffi::*;
 use crate::http::status::*;
 use crate::http::{
     HttpConfigError, HttpFilter, HttpFilterError, HttpFilterSlot, HttpModuleLocationConf,
-    HttpModuleRequestContext, HttpPhase, NgxHttpCoreModule, conf,
+    HttpModuleMainConf, HttpModuleRequestContext, HttpModuleServerConf, HttpPhase,
+    NgxHttpCoreModule,  conf,
 };
 
 /// Define a static request handler.
@@ -1078,7 +1079,9 @@ impl<'callback> RequestTempFile<'callback> {
 impl RequestTempFileState {
     fn new(request: &RequestRefMut<'_>) -> Result<Self, RequestTempFileError> {
         let pool = request.pool()?;
-        let location = NgxHttpCoreModule::location_conf(request)?
+        let request_view = request.view();
+        let location = request_view
+            .location_conf::<NgxHttpCoreModule>()?
             .ok_or(RequestTempFileError::MissingCoreLocationConfiguration)?;
         let path = NonNull::new(location.client_body_temp_path)
             .ok_or(RequestTempFileError::MissingTempPath)?;
@@ -1756,6 +1759,33 @@ impl RequestRef<'_> {
         self.raw.as_ptr()
     }
 
+    /// Shared main configuration for module `M`.
+    pub fn main_conf<M>(&self) -> Result<Option<&M::MainConf>, HttpConfigError>
+    where
+        M: HttpModuleMainConf,
+    {
+        Ok(conf::request_main_conf_slot(unsafe { self.raw.as_ref() }, M::module())?
+            .map(|value| unsafe { value.as_ref() }))
+    }
+
+    /// Shared server configuration for module `M`.
+    pub fn server_conf<M>(&self) -> Result<Option<&M::ServerConf>, HttpConfigError>
+    where
+        M: HttpModuleServerConf,
+    {
+        Ok(conf::request_server_conf_slot(unsafe { self.raw.as_ref() }, M::module())?
+            .map(|value| unsafe { value.as_ref() }))
+    }
+
+    /// Shared location configuration for module `M`.
+    pub fn location_conf<M>(&self) -> Result<Option<&M::LocationConf>, HttpConfigError>
+    where
+        M: HttpModuleLocationConf,
+    {
+        Ok(conf::request_location_conf_slot(unsafe { self.raw.as_ref() }, M::module())?
+            .map(|value| unsafe { value.as_ref() }))
+    }
+
     fn main_raw(&self) -> Result<NonNull<ngx_http_request_t>, RequestError> {
         let main =
             NonNull::new(unsafe { self.raw.as_ref().main }).ok_or(RequestError::MissingMain)?;
@@ -2095,6 +2125,40 @@ impl<'callback> RequestRefMut<'callback> {
     /// Returns a shared reborrow of this request.
     pub fn view(&self) -> RequestRef<'_> {
         RequestRef { raw: self.raw, _callback: PhantomData, _not_thread_safe: PhantomData }
+    }
+
+    /// Shared main configuration for module `M`.
+    pub fn main_conf<M>(&self) -> Result<Option<&'callback M::MainConf>, HttpConfigError>
+    where
+        M: HttpModuleMainConf,
+    {
+        Ok(conf::request_main_conf_slot(unsafe { self.raw.as_ref() }, M::module())?
+            .map(|value| unsafe { value.as_ref() }))
+    }
+
+    /// Shared server configuration for module `M`.
+    pub fn server_conf<M>(&self) -> Result<Option<&'callback M::ServerConf>, HttpConfigError>
+    where
+        M: HttpModuleServerConf,
+    {
+        Ok(conf::request_server_conf_slot(unsafe { self.raw.as_ref() }, M::module())?
+            .map(|value| unsafe { value.as_ref() }))
+    }
+
+    /// Shared location configuration for module `M`.
+    ///
+    /// ```compile_fail
+    /// # use ngx::http::{HttpModuleLocationConf, RequestRefMut};
+    /// # fn mutable<M: HttpModuleLocationConf>(request: &mut RequestRefMut<'_>) {
+    /// let _ = request.location_conf_mut::<M>();
+    /// # }
+    /// ```
+    pub fn location_conf<M>(&self) -> Result<Option<&'callback M::LocationConf>, HttpConfigError>
+    where
+        M: HttpModuleLocationConf,
+    {
+        Ok(conf::request_location_conf_slot(unsafe { self.raw.as_ref() }, M::module())?
+            .map(|value| unsafe { value.as_ref() }))
     }
 
     /// Retains the main request while a context delays its terminal HTTP operation.
@@ -2955,143 +3019,6 @@ where
             })
         }
         .unwrap_or(NGX_ERROR as _)
-    }
-}
-
-impl conf::sealed::MainConfSource for RequestRef<'_> {}
-impl conf::sealed::ServerConfSource for RequestRef<'_> {}
-impl conf::sealed::LocationConfSource for RequestRef<'_> {}
-
-impl crate::http::HttpModuleMainConfExt for RequestRef<'_> {
-    unsafe fn http_main_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        unsafe {
-            <ngx_http_request_t as crate::http::HttpModuleMainConfExt>::http_main_conf(
-                self.raw.as_ref(),
-                module,
-            )
-        }
-    }
-}
-
-impl crate::http::HttpModuleServerConfExt for RequestRef<'_> {
-    unsafe fn http_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        unsafe {
-            <ngx_http_request_t as crate::http::HttpModuleServerConfExt>::http_server_conf(
-                self.raw.as_ref(),
-                module,
-            )
-        }
-    }
-}
-
-impl crate::http::HttpModuleLocationConfExt for RequestRef<'_> {
-    unsafe fn http_location_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        unsafe {
-            <ngx_http_request_t as crate::http::HttpModuleLocationConfExt>::http_location_conf(
-                self.raw.as_ref(),
-                module,
-            )
-        }
-    }
-}
-
-impl conf::sealed::MainConfSource for RequestRefMut<'_> {}
-impl conf::sealed::MainConfSourceMut for RequestRefMut<'_> {}
-impl conf::sealed::ServerConfSource for RequestRefMut<'_> {}
-impl conf::sealed::ServerConfSourceMut for RequestRefMut<'_> {}
-impl conf::sealed::LocationConfSource for RequestRefMut<'_> {}
-impl conf::sealed::LocationConfSourceMut for RequestRefMut<'_> {}
-
-impl crate::http::HttpModuleMainConfExt for RequestRefMut<'_> {
-    unsafe fn http_main_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        unsafe {
-            <ngx_http_request_t as crate::http::HttpModuleMainConfExt>::http_main_conf(
-                self.raw.as_ref(),
-                module,
-            )
-        }
-    }
-}
-
-impl crate::http::HttpModuleMainConfMutExt for RequestRefMut<'_> {
-    unsafe fn http_main_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        unsafe {
-            <ngx_http_request_t as crate::http::HttpModuleMainConfMutExt>::http_main_conf_mut(
-                self.raw.as_mut(),
-                module,
-            )
-        }
-    }
-}
-
-impl crate::http::HttpModuleServerConfExt for RequestRefMut<'_> {
-    unsafe fn http_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        unsafe {
-            <ngx_http_request_t as crate::http::HttpModuleServerConfExt>::http_server_conf(
-                self.raw.as_ref(),
-                module,
-            )
-        }
-    }
-}
-
-impl crate::http::HttpModuleServerConfMutExt for RequestRefMut<'_> {
-    unsafe fn http_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        unsafe {
-            <ngx_http_request_t as crate::http::HttpModuleServerConfMutExt>::http_server_conf_mut(
-                self.raw.as_mut(),
-                module,
-            )
-        }
-    }
-}
-
-impl crate::http::HttpModuleLocationConfExt for RequestRefMut<'_> {
-    unsafe fn http_location_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, HttpConfigError> {
-        unsafe {
-            <ngx_http_request_t as crate::http::HttpModuleLocationConfExt>::http_location_conf(
-                self.raw.as_ref(),
-                module,
-            )
-        }
-    }
-}
-
-impl crate::http::HttpModuleLocationConfMutExt for RequestRefMut<'_> {
-    unsafe fn http_location_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, HttpConfigError> {
-        unsafe {
-            <ngx_http_request_t as crate::http::HttpModuleLocationConfMutExt>::http_location_conf_mut(
-                self.raw.as_mut(),
-                module,
-            )
-        }
     }
 }
 
@@ -5166,7 +5093,7 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn temp_file_writer_lazily_writes_memory_with_clean_pool_cleanup() {
+    fn temp_file_writer_reuses_stable_metadata_with_clean_pool_cleanup() {
         let deleted_path;
         #[cfg(unix)]
         let fd;
@@ -5198,7 +5125,7 @@ mod tests {
                 assert_eq!(output_file.end(), 4);
                 assert_eq!(unsafe { (*output_file.file_ptr()).fd }, native.file.fd);
                 let native_file = unsafe { &raw mut (*temp.as_ptr()).file };
-                assert_ne!(output_file.file_ptr(), native_file);
+                assert_eq!(output_file.file_ptr(), native_file);
                 assert!(output.iter().nth(1).is_none());
 
                 let path = temp_file_path(native);
@@ -6191,7 +6118,7 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn request_body_builder_copies_file_metadata_and_keeps_control_links() {
+    fn request_body_builder_keeps_file_metadata_and_control_links() {
         let owner = TestPool::new();
         let mut raw = zeroed_request();
         raw.pool = owner.raw;
@@ -6228,7 +6155,7 @@ mod tests {
             BufferView::File(view) => {
                 assert_eq!(view.start(), 3);
                 assert_eq!(view.end(), 6);
-                assert!(!ptr::eq(view.file_ptr(), &raw mut file));
+                assert!(ptr::eq(view.file_ptr(), &raw mut file));
             }
             other => panic!("expected file buffer, got {other:?}"),
         }
