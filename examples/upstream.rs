@@ -10,7 +10,7 @@ use core::ffi::{c_char, c_void};
 use core::ptr::{self, NonNull};
 
 use ngx::collections::NgxArray;
-use ngx::core::Status;
+use ngx::core::{ModuleDescriptor, Status};
 use ngx::ffi::{
     NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_ERROR, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF_OFFSET,
     NGX_HTTP_UPS_CONF, NGX_LOG_EMERG, ngx_atoi, ngx_command_t, ngx_conf_t, ngx_http_module_t,
@@ -240,8 +240,9 @@ unsafe extern "C" fn ngx_http_upstream_commands_set_custom(
 struct Module;
 
 unsafe impl HttpModule for Module {
-    fn module() -> &'static ngx_module_t {
-        unsafe { &*::core::ptr::addr_of!(ngx_http_upstream_custom_module) }
+    fn module() -> ModuleDescriptor {
+        unsafe { ModuleDescriptor::from_raw(&raw mut ngx_http_upstream_custom_module) }
+            .expect("ngx_http_upstream_custom_module descriptor")
     }
 }
 

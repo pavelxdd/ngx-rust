@@ -337,6 +337,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::core::ModuleDescriptor;
     use crate::ffi::{
         NGX_DECLINED, NGX_DONE, NGX_ERROR, NGX_HTTP_MODULE, NGX_OK, NGX_USE_CLEAR_EVENT,
         ngx_array_t, ngx_conf_t, ngx_connection_t, ngx_create_pool, ngx_cycle, ngx_cycle_t,
@@ -356,7 +357,7 @@ mod tests {
         POSTED_REQUEST.store(request as usize, Ordering::Relaxed);
     }
 
-    fn test_module() -> &'static ngx_module_t {
+    fn test_module() -> ModuleDescriptor {
         TEST_MODULE_INIT.call_once(|| unsafe {
             (&raw mut TEST_MODULE).cast::<ngx_module_t>().write(ngx_module_t {
                 type_: NGX_HTTP_MODULE as _,
@@ -365,7 +366,8 @@ mod tests {
                 ..ngx_module_t::default()
             });
         });
-        unsafe { &*(&raw const TEST_MODULE).cast::<ngx_module_t>() }
+        unsafe { ModuleDescriptor::from_raw((&raw mut TEST_MODULE).cast::<ngx_module_t>()) }
+            .unwrap()
     }
 
     fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -400,7 +402,7 @@ mod tests {
     struct ReadyModule;
 
     unsafe impl HttpModule for ReadyModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -448,7 +450,7 @@ mod tests {
     struct DeclinedModule;
 
     unsafe impl HttpModule for DeclinedModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -477,7 +479,7 @@ mod tests {
     struct ErrorModule;
 
     unsafe impl HttpModule for ErrorModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -506,7 +508,7 @@ mod tests {
     struct PendingModule;
 
     unsafe impl HttpModule for PendingModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -599,7 +601,7 @@ mod tests {
     struct ForeignModule;
 
     unsafe impl HttpModule for ForeignModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -693,7 +695,7 @@ mod tests {
     where
         H: AsyncHttpRequestHandler,
     {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }

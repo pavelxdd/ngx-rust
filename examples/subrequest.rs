@@ -8,7 +8,7 @@ use nginx_sys::{
     ngx_http_complex_value_t, ngx_http_module_t, ngx_http_send_response, ngx_int_t, ngx_module_t,
     ngx_str_t, ngx_uint_t,
 };
-use ngx::core::{BufferView, ChainRef, Status};
+use ngx::core::{BufferView, ChainRef, ModuleDescriptor, Status};
 use ngx::http::subrequest::{SubRequestBuilder, SubRequestError};
 use ngx::http::{
     HTTPStatus, HttpModule, HttpModuleLocationConf, HttpModuleRequestContext, HttpPhase,
@@ -20,8 +20,9 @@ use ngx::{ngx_log_error, ngx_string};
 struct Module;
 
 unsafe impl HttpModule for Module {
-    fn module() -> &'static ngx_module_t {
-        unsafe { &*ptr::addr_of!(ngx_http_subrequest_module) }
+    fn module() -> ModuleDescriptor {
+        unsafe { ModuleDescriptor::from_raw(&raw mut ngx_http_subrequest_module) }
+            .expect("ngx_http_subrequest_module descriptor")
     }
 }
 
