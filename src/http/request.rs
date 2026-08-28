@@ -24,6 +24,7 @@ use crate::http::{
     HttpModuleMainConf, HttpModuleRequestContext, HttpModuleServerConf, HttpPhase,
     NgxHttpCoreModule, UpstreamStateError, UpstreamStates, conf,
 };
+use crate::log::LogRef;
 
 /// Define a static request handler.
 ///
@@ -1094,7 +1095,7 @@ impl RequestTempFileState {
             request: request.raw,
             pool: pool.as_ptr(),
             path,
-            log,
+            log: NonNull::new(log.as_ptr()).expect("request logger"),
             temp_file: None,
             _not_thread_safe: PhantomData,
         })
@@ -1722,7 +1723,7 @@ pub struct RequestRef<'callback> {
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
-impl RequestRef<'_> {
+impl<'callback> RequestRef<'callback> {
     /// Creates a checked shared request view from an nginx callback pointer.
     ///
     /// # Safety
@@ -1863,8 +1864,21 @@ impl RequestRef<'_> {
     }
 
     /// Logger associated with the client connection, when nginx configured one.
-    pub fn log(&self) -> Result<Option<NonNull<ngx_log_t>>, RequestError> {
-        self.connection()?.log().map_err(Into::into)
+    ///
+    /// ```compile_fail
+    /// use ngx::ffi::ngx_http_request_t;
+    /// use ngx::http::RequestRef;
+    /// use ngx::log::LogRef;
+    ///
+    /// unsafe fn escape(raw: *const ngx_http_request_t) -> LogRef<'static> {
+    ///     unsafe { RequestRef::with_raw(raw, |request| request.log().unwrap().unwrap()) }.unwrap()
+    /// }
+    /// ```
+    pub fn log(&self) -> Result<Option<LogRef<'callback>>, RequestError> {
+        let connection =
+            unsafe { ConnectionRef::<'callback>::from_raw(self.raw.as_ref().connection) }
+                .map_err(RequestError::from)?;
+        connection.log().map_err(Into::into)
     }
 
     /// Seconds since the Unix epoch when nginx created the request.
@@ -2208,8 +2222,11 @@ impl<'callback> RequestRefMut<'callback> {
     }
 
     /// Logger associated with the client connection, when nginx configured one.
-    pub fn log(&self) -> Result<Option<NonNull<ngx_log_t>>, RequestError> {
-        self.view().log()
+    pub fn log(&self) -> Result<Option<LogRef<'callback>>, RequestError> {
+        let connection =
+            unsafe { ConnectionRef::<'callback>::from_raw(self.raw.as_ref().connection) }
+                .map_err(RequestError::from)?;
+        connection.log().map_err(Into::into)
     }
 
     /// Seconds since the Unix epoch when nginx created the request.

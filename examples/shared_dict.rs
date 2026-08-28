@@ -758,13 +758,15 @@ impl HttpVariableHandler for SharedDictVariable {
             Ok(Some(value)) => value,
         };
 
-        ngx_log_debug!(
-            unsafe { (*(*request.as_ptr()).connection).log },
-            "shared dict: get \"{}\" w:{} p:{}",
-            key,
-            unsafe { nginx_sys::ngx_worker },
-            unsafe { nginx_sys::ngx_pid },
-        );
+        if let Ok(Some(log)) = request.log() {
+            ngx_log_debug!(
+                log,
+                "shared dict: get \"{}\" w:{} p:{}",
+                key,
+                unsafe { nginx_sys::ngx_worker },
+                unsafe { nginx_sys::ngx_pid },
+            );
+        }
 
         let value = unsafe { NgxStr::from_ngx_str(value) };
         output
@@ -793,13 +795,15 @@ impl HttpVariableSetter for SharedDictVariable {
 
         if unsafe { (*request.as_ptr()).method } == NGX_HTTP_DELETE as _ {
             if shared_dict_delete_value(shm_zone, key.as_bytes()).is_ok() {
-                ngx_log_debug!(
-                    unsafe { (*(*request.as_ptr()).connection).log },
-                    "shared dict: delete \"{}\" w:{} p:{}",
-                    key,
-                    unsafe { nginx_sys::ngx_worker },
-                    unsafe { nginx_sys::ngx_pid },
-                );
+                if let Ok(Some(log)) = request.log() {
+                    ngx_log_debug!(
+                        log,
+                        "shared dict: delete \"{}\" w:{} p:{}",
+                        key,
+                        unsafe { nginx_sys::ngx_worker },
+                        unsafe { nginx_sys::ngx_pid },
+                    );
+                }
             }
             return;
         }
@@ -807,13 +811,15 @@ impl HttpVariableSetter for SharedDictVariable {
         if shared_dict_set_value(shm_zone, key.as_bytes(), value.bytes().unwrap_or_default())
             .is_ok()
         {
-            ngx_log_debug!(
-                unsafe { (*(*request.as_ptr()).connection).log },
-                "shared dict: set \"{}\" w:{} p:{}",
-                key,
-                unsafe { nginx_sys::ngx_worker },
-                unsafe { nginx_sys::ngx_pid },
-            );
+            if let Ok(Some(log)) = request.log() {
+                ngx_log_debug!(
+                    log,
+                    "shared dict: set \"{}\" w:{} p:{}",
+                    key,
+                    unsafe { nginx_sys::ngx_worker },
+                    unsafe { nginx_sys::ngx_pid },
+                );
+            }
         }
     }
 }
@@ -845,10 +851,9 @@ impl HttpVariableHandler for SharedDictEntriesVariable {
             Ok(value) => value,
         };
 
-        ngx_log_debug!(
-            unsafe { (*(*request.as_ptr()).connection).log },
-            "shared dict: get all entries"
-        );
+        if let Ok(Some(log)) = request.log() {
+            ngx_log_debug!(log, "shared dict: get all entries");
+        }
 
         let value = unsafe { NgxStr::from_ngx_str(value) };
         output
@@ -867,8 +872,10 @@ impl HttpVariableSetter for SharedDictEntriesVariable {
             return;
         };
 
-        if shared_dict_clear(shm_zone).is_ok() {
-            ngx_log_debug!(unsafe { (*(*request.as_ptr()).connection).log }, "shared dict: clear");
+        if shared_dict_clear(shm_zone).is_ok()
+            && let Ok(Some(log)) = request.log()
+        {
+            ngx_log_debug!(log, "shared dict: clear");
         }
     }
 }

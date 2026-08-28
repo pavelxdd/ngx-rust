@@ -13,10 +13,11 @@ use crate::ffi::sockaddr_un;
 use crate::ffi::{
     NGX_AGAIN, NGX_DECLINED, NGX_ERROR, NGX_OK, NGX_PROXY_PROTOCOL_MAX_HEADER, in_addr, in6_addr,
     in6_addr__bindgen_ty_1, ngx_buf_t, ngx_chain_t, ngx_connection_local_sockaddr,
-    ngx_connection_t, ngx_int_t, ngx_listening_t, ngx_log_t, ngx_proxy_protocol_lookup_tlv,
+    ngx_connection_t, ngx_int_t, ngx_listening_t, ngx_proxy_protocol_lookup_tlv,
     ngx_proxy_protocol_t, ngx_sin_addr_t, ngx_sock_ntop, ngx_str_t, off_t, sa_family_t, sockaddr,
     sockaddr_in, sockaddr_in6, socklen_t,
 };
+use crate::log::LogRef;
 
 /// Failure returned while validating a native socket address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -554,7 +555,11 @@ impl<'callback> ProxyProtocolRef<'callback> {
         &self,
         type_: u8,
     ) -> Result<ProxyProtocolTlvLookup<'callback>, ProxyProtocolError> {
-        if connection_log(self.connection).map_err(ProxyProtocolError::Connection)?.is_none() {
+        // SAFETY: this checked PROXY protocol owner keeps the connection logger live for
+        // `'callback`.
+        let log: Option<LogRef<'callback>> =
+            unsafe { connection_log(self.connection) }.map_err(ProxyProtocolError::Connection)?;
+        if log.is_none() {
             return Err(ProxyProtocolError::MissingConnectionLog);
         }
 
@@ -654,8 +659,20 @@ impl<'callback> ConnectionRef<'callback> {
     }
 
     /// Returns the connection logger when nginx configured one.
-    pub fn log(&self) -> Result<Option<NonNull<ngx_log_t>>, ConnectionError> {
-        connection_log(self.raw)
+    ///
+    /// ```compile_fail
+    /// use ngx::core::ConnectionRef;
+    /// use ngx::ffi::ngx_connection_t;
+    /// use ngx::log::LogRef;
+    ///
+    /// unsafe fn escape(raw: *const ngx_connection_t) -> LogRef<'static> {
+    ///     unsafe { ConnectionRef::with_raw(raw, |connection| connection.log().unwrap().unwrap()) }
+    ///         .unwrap()
+    /// }
+    /// ```
+    pub fn log(&self) -> Result<Option<LogRef<'callback>>, ConnectionError> {
+        // SAFETY: this checked connection owner keeps its logger live for `'callback`.
+        unsafe { connection_log(self.raw) }
     }
 
     /// Returns the client connection's sent-byte counter.
@@ -787,8 +804,9 @@ impl<'callback> ConnectionRefMut<'callback> {
     }
 
     /// Returns the connection logger when nginx configured one.
-    pub fn log(&self) -> Result<Option<NonNull<ngx_log_t>>, ConnectionError> {
-        connection_log(self.raw)
+    pub fn log(&self) -> Result<Option<LogRef<'callback>>, ConnectionError> {
+        // SAFETY: this checked connection owner keeps its logger live for `'callback`.
+        unsafe { connection_log(self.raw) }
     }
 
     /// Returns the client connection's sent-byte counter.
@@ -1101,17 +1119,15 @@ fn connection_pool<'callback>(
     unsafe { Pool::from_raw(pool) }.ok_or(ConnectionError::MisalignedPool)
 }
 
-fn connection_log(
+// SAFETY: the connection logger must remain live for `'log`.
+unsafe fn connection_log<'log>(
     connection: NonNull<ngx_connection_t>,
-) -> Result<Option<NonNull<ngx_log_t>>, ConnectionError> {
+) -> Result<Option<LogRef<'log>>, ConnectionError> {
     let log = unsafe { connection.as_ref().log };
-    let Some(log) = NonNull::new(log) else {
+    if log.is_null() {
         return Ok(None);
-    };
-    if !log.as_ptr().is_aligned() {
-        return Err(ConnectionError::MisalignedLog);
     }
-    Ok(Some(log))
+    unsafe { LogRef::from_raw(log) }.map(Some).ok_or(ConnectionError::MisalignedLog)
 }
 
 fn connection_socket_type(

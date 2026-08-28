@@ -39,6 +39,18 @@ impl LogRef<'_> {
         Some(Self { raw, _lifetime: PhantomData, _not_thread_safe: PhantomData })
     }
 
+    /// Returns whether this logger accepts the requested level.
+    #[doc(hidden)]
+    pub fn level_enabled(self, level: ngx_uint_t) -> bool {
+        level <= unsafe { self.raw.as_ref().log_level }
+    }
+
+    /// Returns whether this logger accepts the requested debug mask.
+    #[doc(hidden)]
+    pub fn debug_enabled(self, mask: DebugMask) -> bool {
+        DEBUG && check_mask(mask, unsafe { self.raw.as_ref().log_level })
+    }
+
     /// Returns the native logger pointer.
     pub fn as_ptr(self) -> *mut ngx_log_t {
         self.raw.as_ptr()
@@ -133,16 +145,25 @@ pub unsafe fn log_debug(log: *mut ngx_log_t, err: ngx_err_t, buf: &[u8]) {
 ///
 /// See [Logging](https://nginx.org/en/docs/dev/development_guide.html#logging)
 /// for available log levels.
+///
+/// ```compile_fail
+/// use core::ptr::NonNull;
+/// use ngx::ffi::{NGX_LOG_ERR, ngx_log_t};
+/// use ngx::ngx_log_error;
+///
+/// let log = NonNull::<ngx_log_t>::dangling().as_ptr();
+/// ngx_log_error!(NGX_LOG_ERR, log, "invalid logger");
+/// ```
 #[macro_export]
 macro_rules! ngx_log_error {
     ( $level:expr, $log:expr, $($arg:tt)+ ) => {
-        let log = $log;
+        let log: $crate::log::LogRef<'_> = $log;
         let level = $level as $crate::ffi::ngx_uint_t;
-        if level <= unsafe { (*log).log_level } {
+        if log.level_enabled(level) {
             let mut buf =
                 [const { ::core::mem::MaybeUninit::<u8>::uninit() }; $crate::log::LOG_BUFFER_SIZE];
             let message = $crate::log::write_fmt(&mut buf, format_args!($($arg)+));
-            unsafe { $crate::log::log_error(level, log, 0, message) };
+            unsafe { $crate::log::log_error(level, log.as_ptr(), 0, message) };
         }
     }
 }
@@ -175,12 +196,12 @@ macro_rules! ngx_conf_log_error {
 #[macro_export]
 macro_rules! ngx_log_debug {
     ( mask: $mask:expr, $log:expr, $($arg:tt)+ ) => {
-        let log = $log;
-        if $crate::log::DEBUG && $crate::log::check_mask($mask, unsafe { (*log).log_level }) {
+        let log: $crate::log::LogRef<'_> = $log;
+        if log.debug_enabled($mask) {
             let mut buf =
                 [const { ::core::mem::MaybeUninit::<u8>::uninit() }; $crate::log::LOG_BUFFER_SIZE];
             let message = $crate::log::write_fmt(&mut buf, format_args!($($arg)+));
-            unsafe { $crate::log::log_debug(log, 0, message) };
+            unsafe { $crate::log::log_debug(log.as_ptr(), 0, message) };
         }
     };
     ( $log:expr, $($arg:tt)+ ) => {
@@ -195,7 +216,7 @@ macro_rules! ngx_log_debug {
 macro_rules! ngx_log_debug_http {
     ( $request:expr, $($arg:tt)+ ) => {
         if let Ok(Some(log)) = $request.log() {
-            $crate::ngx_log_debug!(mask: $crate::log::DebugMask::Http, log.as_ptr(), $($arg)+);
+            $crate::ngx_log_debug!(mask: $crate::log::DebugMask::Http, log, $($arg)+);
         }
     }
 }

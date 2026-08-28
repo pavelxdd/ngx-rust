@@ -8,7 +8,8 @@ use super::conf;
 use crate::core::{
     ConnectionError, ConnectionRef, ConnectionRefMut, ModuleDescriptor, Pool, Status,
 };
-use crate::ffi::{NGX_ERROR, ngx_int_t, ngx_log_t, ngx_stream_session_t};
+use crate::ffi::{NGX_ERROR, ngx_int_t, ngx_stream_session_t};
+use crate::log::LogRef;
 use crate::stream::{
     StreamConfigError, StreamModule, StreamModuleMainConf, StreamModuleServerConf,
 };
@@ -211,7 +212,7 @@ pub struct Session<'callback> {
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
-impl Session<'_> {
+impl<'callback> Session<'callback> {
     /// Creates a checked exclusive session view from an nginx callback pointer.
     ///
     /// # Safety
@@ -268,8 +269,20 @@ impl Session<'_> {
     }
 
     /// Logger associated with the client connection.
-    pub fn log(&self) -> Result<Option<NonNull<ngx_log_t>>, ConnectionError> {
-        self.connection()?.log()
+    ///
+    /// ```compile_fail
+    /// use ngx::ffi::ngx_stream_session_t;
+    /// use ngx::log::LogRef;
+    /// use ngx::stream::Session;
+    ///
+    /// unsafe fn escape(raw: *mut ngx_stream_session_t) -> LogRef<'static> {
+    ///     unsafe { Session::with_raw(raw, |session| session.log().unwrap().unwrap()) }.unwrap()
+    /// }
+    /// ```
+    pub fn log(&self) -> Result<Option<LogRef<'callback>>, ConnectionError> {
+        let connection =
+            unsafe { ConnectionRef::<'callback>::from_raw(self.raw.as_ref().connection) }?;
+        connection.log()
     }
 
     /// Shared main configuration for module `M`.

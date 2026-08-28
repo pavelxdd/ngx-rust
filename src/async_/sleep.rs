@@ -110,7 +110,7 @@ impl<'log> Sleep<'log> {
     /// The future must be polled and dropped on the initialized nginx event-loop thread that owns
     /// the timer tree.
     pub unsafe fn new(duration: Duration, log: LogRef<'log>) -> Self {
-        ngx_log_debug!(log.as_ptr(), "async: sleep for {duration:?}");
+        ngx_log_debug!(log, "async: sleep for {duration:?}");
 
         Sleep {
             timer: Timer::new(
