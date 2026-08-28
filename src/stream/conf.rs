@@ -547,7 +547,7 @@ pub use upstream::NgxStreamUpstreamModule;
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "test-link")]
-    use core::ffi::c_void;
+    use core::ffi::{c_int, c_void};
     #[cfg(feature = "test-link")]
     use core::mem;
     #[cfg(feature = "test-link")]
@@ -562,10 +562,17 @@ mod tests {
     use crate::core::ModuleDescriptor;
     #[cfg(feature = "test-link")]
     use crate::core::Status;
-    use crate::ffi::{NGX_STREAM_MODULE, ngx_module_t, ngx_uint_t};
     #[cfg(feature = "test-link")]
-    use crate::ffi::{ngx_conf_t, ngx_int_t, ngx_stream_conf_ctx_t};
+    use crate::ffi::{NGX_OK, ngx_conf_t, ngx_cycle_t, ngx_int_t, ngx_stream_conf_ctx_t};
+    use crate::ffi::{NGX_STREAM_MODULE, ngx_module_t, ngx_uint_t};
     use crate::stream::StreamModule;
+
+    #[cfg(feature = "test-link")]
+    unsafe extern "C" {
+        fn fork() -> c_int;
+        fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+        fn _exit(status: c_int) -> !;
+    }
 
     fn stream_module(index: ngx_uint_t, context_index: ngx_uint_t) -> ngx_module_t {
         let mut module = ngx_module_t::default();
@@ -583,6 +590,70 @@ mod tests {
             module_indexes(ModuleDescriptor::from_test(module), 2, 1),
             Err(StreamConfigError::WrongModuleType)
         ));
+    }
+
+    #[cfg(feature = "test-link")]
+    fn native_stream_module_lifecycle_succeeds() -> bool {
+        let raw = core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module);
+        let Some(descriptor) = (unsafe { ModuleDescriptor::from_raw(raw) }) else {
+            return false;
+        };
+        if !matches!(
+            module_indexes(descriptor, usize::MAX, usize::MAX),
+            Err(StreamConfigError::UnsetModuleIndex)
+        ) {
+            return false;
+        }
+        if unsafe { nginx_sys::ngx_preinit_modules() } != NGX_OK as ngx_int_t {
+            return false;
+        }
+
+        let mut modules = [raw, ptr::null_mut()];
+        let mut first_cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+        first_cycle.modules = modules.as_mut_ptr();
+        let stream_slots = unsafe {
+            nginx_sys::ngx_count_modules(&raw mut first_cycle, NGX_STREAM_MODULE as ngx_uint_t)
+        };
+        let Ok(stream_slots) = usize::try_from(stream_slots) else {
+            return false;
+        };
+        let module_slots = unsafe { nginx_sys::ngx_max_module };
+        let first = unsafe { descriptor.snapshot() };
+        if module_indexes(descriptor, module_slots, stream_slots).is_err() {
+            return false;
+        }
+
+        let mut reload_modules = [raw, ptr::null_mut()];
+        let mut reload_cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+        reload_cycle.modules = reload_modules.as_mut_ptr();
+        reload_cycle.old_cycle = &raw mut first_cycle;
+        let reload_slots = unsafe {
+            nginx_sys::ngx_count_modules(&raw mut reload_cycle, NGX_STREAM_MODULE as ngx_uint_t)
+        };
+        let Ok(reload_slots) = usize::try_from(reload_slots) else {
+            return false;
+        };
+        let reloaded = unsafe { descriptor.snapshot() };
+
+        reload_slots == stream_slots
+            && first.index == reloaded.index
+            && first.context_index == reloaded.context_index
+            && module_indexes(descriptor, module_slots, reload_slots).is_ok()
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn native_assignment_keeps_the_opaque_stream_descriptor_reload_safe() {
+        let _guard = crate::TEST_NGINX_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
+        let child = unsafe { fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe { _exit(if native_stream_module_lifecycle_succeeds() { 0 } else { 1 }) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { waitpid(child, &raw mut status, 0) }, child);
+        assert_eq!(status, 0);
     }
 
     #[test]
