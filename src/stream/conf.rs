@@ -560,9 +560,11 @@ mod tests {
         module_indexes,
     };
     use crate::core::ModuleDescriptor;
+    #[cfg(feature = "test-link")]
+    use crate::core::Status;
     use crate::ffi::{NGX_STREAM_MODULE, ngx_module_t, ngx_uint_t};
     #[cfg(feature = "test-link")]
-    use crate::ffi::{ngx_conf_t, ngx_stream_conf_ctx_t};
+    use crate::ffi::{ngx_conf_t, ngx_int_t, ngx_stream_conf_ctx_t};
     use crate::stream::StreamModule;
 
     fn stream_module(index: ngx_uint_t, context_index: ngx_uint_t) -> ngx_module_t {
@@ -671,6 +673,46 @@ mod tests {
 
     unsafe impl StreamModuleMainConf for WrongTypeModule {
         type MainConf = u32;
+    }
+
+    #[cfg(feature = "test-link")]
+    struct PreconfigurationModule;
+
+    #[cfg(feature = "test-link")]
+    unsafe impl StreamModule for PreconfigurationModule {
+        fn module() -> ModuleDescriptor {
+            test_module()
+        }
+
+        fn preconfigure(parser: &mut StreamConfigurationParser<'_>) -> ngx_int_t {
+            match Self::main_conf(parser) {
+                Ok(Some(42)) => Status::NGX_OK.0,
+                Ok(Some(_)) | Ok(None) | Err(_) => Status::NGX_ERROR.0,
+            }
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    unsafe impl StreamModuleMainConf for PreconfigurationModule {
+        type MainConf = u32;
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn preconfiguration_reads_main_conf_before_the_module_type_switch() {
+        let _globals = StreamGlobals::new(2, 1);
+        let mut value = 42_u32;
+        let mut slots: [*mut c_void; 1] = [(&raw mut value).cast()];
+        let mut context =
+            ngx_stream_conf_ctx_t { main_conf: slots.as_mut_ptr(), srv_conf: ptr::null_mut() };
+        let mut configuration = unsafe { mem::zeroed::<ngx_conf_t>() };
+        configuration.ctx = (&raw mut context).cast();
+
+        assert_eq!(configuration.module_type, 0);
+        assert_eq!(
+            unsafe { PreconfigurationModule::preconfiguration(&raw mut configuration) },
+            Status::NGX_OK.0
+        );
     }
 
     #[cfg(feature = "test-link")]
