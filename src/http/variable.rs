@@ -832,9 +832,10 @@ mod tests {
     #[cfg(feature = "test-link")]
     use crate::ffi::{
         NGX_CORE_MODULE, NGX_HTTP_VAR_INDEXED, NGX_OK, ngx_array_t, ngx_connection_t,
-        ngx_create_pool, ngx_destroy_pool, ngx_hash_key_t, ngx_http_conf_ctx_t,
-        ngx_http_get_variable_pt, ngx_http_variable_t, ngx_http_variables_add_core_vars,
-        ngx_http_variables_init_vars, ngx_log_t, ngx_pool_t, ngx_uint_t,
+        ngx_create_pool, ngx_destroy_pool, ngx_hash_key_lc, ngx_hash_key_t, ngx_http_conf_ctx_t,
+        ngx_http_get_variable, ngx_http_get_variable_pt, ngx_http_variable_t,
+        ngx_http_variables_add_core_vars, ngx_http_variables_init_vars, ngx_log_t, ngx_pool_t,
+        ngx_uint_t,
     };
 
     #[cfg(feature = "test-link")]
@@ -961,6 +962,8 @@ mod tests {
 
     struct TestVariable;
 
+    static TEST_VARIABLE_VALUE: &[u8] = b"detected";
+
     impl HttpVariableHandler for TestVariable {
         type Output = Status;
 
@@ -970,7 +973,7 @@ mod tests {
             data: usize,
         ) -> Self::Output {
             unsafe { (*request.as_ptr()).headers_out.status = data as _ };
-            value.set_static(b"detected").unwrap();
+            value.set_static(TEST_VARIABLE_VALUE).unwrap();
             Status::NGX_OK
         }
     }
@@ -1622,7 +1625,12 @@ mod tests {
 
         assert_eq!(status, Status::NGX_OK.0);
         assert_eq!(request.headers_out.status, Status::NGX_OK.0 as _);
-        assert_found(&raw_value, b"detected", true, b"detected".as_ptr().cast_mut());
+        assert_found(
+            &raw_value,
+            TEST_VARIABLE_VALUE,
+            true,
+            TEST_VARIABLE_VALUE.as_ptr().cast_mut(),
+        );
     }
 
     #[test]
@@ -1680,6 +1688,76 @@ mod tests {
 
         let raw = unsafe { raw.assume_init() };
         assert_found(&raw, b"", true, ptr::null_mut());
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn native_exact_lookup_initializes_found_and_not_found_outputs() {
+        let mut fixture = VariableFixture::new();
+        let found_name = NgxStr::from_bytes(b"ngx_rs_native_found");
+        let not_found_name = NgxStr::from_bytes(b"ngx_rs_native_not_found");
+        let error_name = NgxStr::from_bytes(b"ngx_rs_native_error");
+        add_variable::<TestVariable>(
+            &mut fixture.configuration(),
+            found_name,
+            HttpVariableFlags::empty(),
+            Status::NGX_OK.0 as _,
+        )
+        .unwrap();
+        add_variable::<SuccessfulMissingVariable>(
+            &mut fixture.configuration(),
+            not_found_name,
+            HttpVariableFlags::empty(),
+            0,
+        )
+        .unwrap();
+        add_variable::<DataVariable>(
+            &mut fixture.configuration(),
+            error_name,
+            HttpVariableFlags::empty(),
+            0,
+        )
+        .unwrap();
+        fixture.configuration.finalize_variables();
+
+        fixture.configuration.with_request(|request| {
+            let mut found_name = found_name.as_ngx_str();
+            let found = unsafe {
+                ngx_http_get_variable(
+                    request.as_ptr(),
+                    &raw mut found_name,
+                    ngx_hash_key_lc(found_name.data, found_name.len),
+                )
+            };
+            assert!(!found.is_null());
+            assert_found(
+                unsafe { &*found },
+                TEST_VARIABLE_VALUE,
+                true,
+                TEST_VARIABLE_VALUE.as_ptr().cast_mut(),
+            );
+
+            let mut not_found_name = not_found_name.as_ngx_str();
+            let not_found = unsafe {
+                ngx_http_get_variable(
+                    request.as_ptr(),
+                    &raw mut not_found_name,
+                    ngx_hash_key_lc(not_found_name.data, not_found_name.len),
+                )
+            };
+            assert!(!not_found.is_null());
+            assert_not_found(unsafe { &*not_found });
+
+            let mut error_name = error_name.as_ngx_str();
+            let error = unsafe {
+                ngx_http_get_variable(
+                    request.as_ptr(),
+                    &raw mut error_name,
+                    ngx_hash_key_lc(error_name.data, error_name.len),
+                )
+            };
+            assert!(error.is_null());
+        });
     }
 
     #[cfg(feature = "test-link")]

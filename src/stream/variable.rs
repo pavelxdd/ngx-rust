@@ -459,10 +459,10 @@ mod tests {
     #[cfg(feature = "test-link")]
     use crate::ffi::{
         NGX_OK, NGX_STREAM_MODULE, NGX_STREAM_VAR_INDEXED, ngx_array_t, ngx_conf_t,
-        ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_hash_key_t, ngx_log_t, ngx_pool_t,
-        ngx_stream_conf_ctx_t, ngx_stream_core_main_conf_t, ngx_stream_get_variable_pt,
-        ngx_stream_variable_t, ngx_stream_variables_add_core_vars, ngx_stream_variables_init_vars,
-        ngx_uint_t,
+        ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_hash_key_lc, ngx_hash_key_t,
+        ngx_log_t, ngx_pool_t, ngx_stream_conf_ctx_t, ngx_stream_core_main_conf_t,
+        ngx_stream_get_variable, ngx_stream_get_variable_pt, ngx_stream_variable_t,
+        ngx_stream_variables_add_core_vars, ngx_stream_variables_init_vars, ngx_uint_t,
     };
     use crate::stream::{Session, StreamConfigurationParser};
 
@@ -474,6 +474,7 @@ mod tests {
 
     struct TestVariable;
 
+    static TEST_VARIABLE_VALUE: &[u8] = b"detected";
     static RAW_VARIABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RAW_VARIABLE_DATA: AtomicUsize = AtomicUsize::new(0);
 
@@ -928,6 +929,18 @@ mod tests {
             assert_eq!(unsafe { ngx_stream_variables_init_vars(&raw mut *self.cf) }, NGX_OK as _);
         }
 
+        fn with_session<R>(&mut self, f: impl for<'scope> FnOnce(&mut Session<'scope>) -> R) -> R {
+            let mut connection =
+                Box::new(unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() });
+            connection.pool = self._pool.raw;
+            connection.log = self.cf.log;
+            let mut raw = unsafe { MaybeUninit::<ngx_stream_session_t>::zeroed().assume_init() };
+            raw.connection = &raw mut *connection;
+            raw.main_conf = self._main_conf.as_mut_ptr();
+
+            unsafe { Session::with_raw(&raw mut raw, |mut session| f(&mut session)) }.unwrap()
+        }
+
         fn exact_variables(&self) -> &[ngx_hash_key_t] {
             let variables_keys = self.main.variables_keys;
             assert!(!variables_keys.is_null());
@@ -1003,7 +1016,7 @@ mod tests {
             data: usize,
         ) -> Self::Output {
             unsafe { (*session.as_ptr()).status = data as _ };
-            value.set_static(b"detected").unwrap();
+            value.set_static(TEST_VARIABLE_VALUE).unwrap();
             Status::NGX_OK
         }
     }
@@ -1023,7 +1036,12 @@ mod tests {
 
         assert_eq!(status, Status::NGX_OK.0);
         assert_eq!(session.status, NGX_STREAM_OK as _);
-        assert_found(&raw_value, b"detected", true, b"detected".as_ptr().cast_mut());
+        assert_found(
+            &raw_value,
+            TEST_VARIABLE_VALUE,
+            true,
+            TEST_VARIABLE_VALUE.as_ptr().cast_mut(),
+        );
     }
 
     #[cfg(feature = "test-link")]
@@ -1370,6 +1388,76 @@ mod tests {
 
         let raw = unsafe { raw.assume_init() };
         assert_found(&raw, b"", true, ptr::null_mut());
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn native_exact_lookup_initializes_found_and_not_found_outputs() {
+        let mut fixture = VariableFixture::new();
+        let found_name = NgxStr::from_bytes(b"ngx_rs_native_found");
+        let not_found_name = NgxStr::from_bytes(b"ngx_rs_native_not_found");
+        let error_name = NgxStr::from_bytes(b"ngx_rs_native_error");
+        add_variable::<TestVariable>(
+            &mut fixture.configuration(),
+            found_name,
+            StreamVariableFlags::empty(),
+            NGX_STREAM_OK as _,
+        )
+        .unwrap();
+        add_variable::<SuccessfulMissingVariable>(
+            &mut fixture.configuration(),
+            not_found_name,
+            StreamVariableFlags::empty(),
+            0,
+        )
+        .unwrap();
+        add_variable::<DataVariable>(
+            &mut fixture.configuration(),
+            error_name,
+            StreamVariableFlags::empty(),
+            0,
+        )
+        .unwrap();
+        fixture.finalize_variables();
+
+        fixture.with_session(|session| {
+            let mut found_name = found_name.as_ngx_str();
+            let found = unsafe {
+                ngx_stream_get_variable(
+                    session.as_ptr(),
+                    &raw mut found_name,
+                    ngx_hash_key_lc(found_name.data, found_name.len),
+                )
+            };
+            assert!(!found.is_null());
+            assert_found(
+                unsafe { &*found },
+                TEST_VARIABLE_VALUE,
+                true,
+                TEST_VARIABLE_VALUE.as_ptr().cast_mut(),
+            );
+
+            let mut not_found_name = not_found_name.as_ngx_str();
+            let not_found = unsafe {
+                ngx_stream_get_variable(
+                    session.as_ptr(),
+                    &raw mut not_found_name,
+                    ngx_hash_key_lc(not_found_name.data, not_found_name.len),
+                )
+            };
+            assert!(!not_found.is_null());
+            assert_not_found(unsafe { &*not_found });
+
+            let mut error_name = error_name.as_ngx_str();
+            let error = unsafe {
+                ngx_stream_get_variable(
+                    session.as_ptr(),
+                    &raw mut error_name,
+                    ngx_hash_key_lc(error_name.data, error_name.len),
+                )
+            };
+            assert!(error.is_null());
+        });
     }
 
     #[cfg(feature = "test-link")]
