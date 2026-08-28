@@ -682,9 +682,27 @@ fn register_variable(
         return Err(HttpVariableRegistrationError);
     }
 
+    let prefix_nelts = if flags.contains(HttpVariableFlags::PREFIX) {
+        let main = NgxHttpCoreModule::main_conf_mut(parser)
+            .ok()
+            .flatten()
+            .ok_or(HttpVariableRegistrationError)?;
+        let original = main.prefix_variables.nelts;
+        Some((&raw mut main.prefix_variables.nelts, original))
+    } else {
+        None
+    };
+
     let mut name = name.as_ngx_str();
-    NonNull::new(unsafe { ngx_http_add_variable(parser.as_raw(), &raw mut name, flags.bits()) })
-        .ok_or(HttpVariableRegistrationError)
+    let variable = NonNull::new(unsafe {
+        ngx_http_add_variable(parser.as_raw(), &raw mut name, flags.bits())
+    });
+    if variable.is_none()
+        && let Some((nelts, original)) = prefix_nelts
+    {
+        unsafe { nelts.write(original) };
+    }
+    variable.ok_or(HttpVariableRegistrationError)
 }
 
 /// Creates an opaque index for an HTTP variable.
@@ -695,12 +713,15 @@ pub fn get_variable_index(
     parser: &mut HttpConfigurationParser<'_>,
     name: &NgxStr,
 ) -> Result<HttpVariableIndex, HttpVariableIndexError> {
-    let core_main = NgxHttpCoreModule::main_conf(parser)?
+    let core_main = NgxHttpCoreModule::main_conf_mut(parser)?
         .ok_or(HttpVariableIndexError::MissingCoreMainConfiguration)?;
+    let original_nelts = core_main.variables.nelts;
+    let variables_nelts = &raw mut core_main.variables.nelts;
     let core_main = NonNull::from(core_main);
     let mut name = name.as_ngx_str();
     let index = unsafe { ngx_http_get_variable_index(parser.as_raw(), &raw mut name) };
     if index == NGX_ERROR as _ {
+        unsafe { variables_nelts.write(original_nelts) };
         return Err(HttpVariableIndexError::Registration);
     }
     let index = ngx_uint_t::try_from(index).map_err(|_| HttpVariableIndexError::Registration)?;
@@ -1895,17 +1916,33 @@ mod tests {
             Err(HttpVariableIndexError::Registration)
         );
 
+        let name = NgxStr::from_bytes(b"ngx_rs_index_allocation_failure");
+        add_variable::<IndexedVariable>(
+            &mut fixture.configuration(),
+            name,
+            HttpVariableFlags::empty(),
+            0,
+        )
+        .unwrap();
+
         unsafe {
             (*fixture.pool.raw).max = 0;
-            ngx_rs_test_fail_allocations_after(0);
+            ngx_rs_test_fail_allocations_after(1);
         }
-        let result = get_variable_index(
-            &mut fixture.configuration(),
-            NgxStr::from_bytes(b"ngx_rs_index_allocation_failure"),
-        );
+        let variable_count = fixture.configuration.main.variables.nelts;
+        let result = get_variable_index(&mut fixture.configuration(), name);
         unsafe { ngx_rs_test_reset_allocation_failures() };
 
         assert_eq!(result, Err(HttpVariableIndexError::Registration));
+        assert_eq!(fixture.configuration.main.variables.nelts, variable_count);
+
+        let index = get_variable_index(&mut fixture.configuration(), name).unwrap();
+        assert_eq!(index.index, variable_count);
+        assert_eq!(fixture.configuration.main.variables.nelts, variable_count + 1);
+        fixture.configuration.finalize_variables();
+        fixture.configuration.with_request(|request| {
+            assert_eq!(index.get_cached(request).unwrap().bytes(), Some(&b"indexed"[..]));
+        });
     }
 
     #[cfg(feature = "test-link")]
@@ -2278,6 +2315,50 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(fixture.configuration.exact_variables().len(), exact_count);
         assert_eq!(fixture.configuration.prefix_variables().len(), prefix_count);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn prefix_name_allocation_failure_does_not_publish_a_partial_entry() {
+        let mut fixture = VariableFixture::new();
+        let prefix_count = fixture.configuration.prefix_variables().len();
+
+        unsafe {
+            (*fixture.pool.raw).max = 0;
+            ngx_rs_test_fail_allocations_after(0);
+        }
+        let result = add_variable::<DataVariable>(
+            &mut fixture.configuration(),
+            NgxStr::from_bytes(b"ngx_rs_prefix_allocation_failure_"),
+            HttpVariableFlags::PREFIX,
+            1,
+        );
+        unsafe { ngx_rs_test_reset_allocation_failures() };
+
+        assert!(result.is_err());
+        assert_eq!(fixture.configuration.prefix_variables().len(), prefix_count);
+
+        add_variable::<CountingVariable>(
+            &mut fixture.configuration(),
+            NgxStr::from_bytes(b"ngx_rs_prefix_allocation_failure_"),
+            HttpVariableFlags::PREFIX,
+            2,
+        )
+        .unwrap();
+        let index = get_variable_index(
+            &mut fixture.configuration(),
+            NgxStr::from_bytes(b"ngx_rs_prefix_allocation_failure_suffix"),
+        )
+        .unwrap();
+        assert_eq!(fixture.configuration.prefix_variables().len(), prefix_count + 1);
+        assert_handler::<CountingVariable>(
+            fixture.configuration.prefix_variable(b"ngx_rs_prefix_allocation_failure_"),
+            2,
+        );
+        fixture.configuration.finalize_variables();
+        fixture.configuration.with_request(|request| {
+            assert_eq!(index.get_cached(request).unwrap().bytes(), Some(&b""[..]));
+        });
     }
 
     #[cfg(feature = "test-link")]

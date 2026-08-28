@@ -16,7 +16,10 @@ use crate::ffi::{
     NGX_STREAM_VAR_NOHASH, NGX_STREAM_VAR_PREFIX, NGX_STREAM_VAR_WEAK, ngx_int_t,
     ngx_stream_add_variable, ngx_stream_session_t, ngx_uint_t, ngx_variable_value_t,
 };
-use crate::stream::{IntoHandlerStatus, Session, StreamConfigurationParser};
+use crate::stream::{
+    IntoHandlerStatus, NgxStreamCoreModule, Session, StreamConfigurationParser,
+    StreamModuleMainConf,
+};
 
 bitflags::bitflags! {
     /// Flags controlling Stream variable registration and caching.
@@ -362,11 +365,26 @@ where
         return Err(VariableRegistrationError);
     }
 
+    let prefix_nelts = if flags.contains(StreamVariableFlags::PREFIX) {
+        let main = NgxStreamCoreModule::main_conf_mut(parser)
+            .ok()
+            .flatten()
+            .ok_or(VariableRegistrationError)?;
+        let original = main.prefix_variables.nelts;
+        Some((&raw mut main.prefix_variables.nelts, original))
+    } else {
+        None
+    };
+
     let mut name = name.as_ngx_str();
-    let mut variable = NonNull::new(unsafe {
+    let Some(mut variable) = NonNull::new(unsafe {
         ngx_stream_add_variable(parser.as_raw(), &raw mut name, flags.bits())
-    })
-    .ok_or(VariableRegistrationError)?;
+    }) else {
+        if let Some((nelts, original)) = prefix_nelts {
+            unsafe { nelts.write(original) };
+        }
+        return Err(VariableRegistrationError);
+    };
     let variable = unsafe { variable.as_mut() };
     variable.get_handler = Some(raw_get_handler::<H>);
     variable.data = data;
@@ -443,7 +461,8 @@ mod tests {
         NGX_OK, NGX_STREAM_MODULE, NGX_STREAM_VAR_INDEXED, ngx_array_t, ngx_conf_t,
         ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_hash_key_t, ngx_log_t, ngx_pool_t,
         ngx_stream_conf_ctx_t, ngx_stream_core_main_conf_t, ngx_stream_get_variable_pt,
-        ngx_stream_variable_t, ngx_stream_variables_add_core_vars, ngx_uint_t,
+        ngx_stream_variable_t, ngx_stream_variables_add_core_vars, ngx_stream_variables_init_vars,
+        ngx_uint_t,
     };
     use crate::stream::{Session, StreamConfigurationParser};
 
@@ -787,6 +806,7 @@ mod tests {
     struct VariableGlobalState {
         max_module: ngx_uint_t,
         stream_max_module: ngx_uint_t,
+        cacheline_size: ngx_uint_t,
         stream_module_index: ngx_uint_t,
         stream_core_module_type: ngx_uint_t,
         stream_core_module_index: ngx_uint_t,
@@ -807,6 +827,7 @@ mod tests {
                 VariableGlobalState {
                     max_module: nginx_sys::ngx_max_module,
                     stream_max_module: nginx_sys::ngx_stream_max_module,
+                    cacheline_size: nginx_sys::ngx_cacheline_size,
                     stream_module_index: (*core::ptr::addr_of!(nginx_sys::ngx_stream_module)).index,
                     stream_core_module_type: (*core::ptr::addr_of!(
                         nginx_sys::ngx_stream_core_module
@@ -826,6 +847,7 @@ mod tests {
             unsafe {
                 nginx_sys::ngx_max_module = 1;
                 nginx_sys::ngx_stream_max_module = 1;
+                nginx_sys::ngx_cacheline_size = 64;
                 (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_module)).index = 0;
                 (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).type_ =
                     NGX_STREAM_MODULE as _;
@@ -843,6 +865,7 @@ mod tests {
             unsafe {
                 nginx_sys::ngx_max_module = self.previous.max_module;
                 nginx_sys::ngx_stream_max_module = self.previous.stream_max_module;
+                nginx_sys::ngx_cacheline_size = self.previous.cacheline_size;
                 (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_module)).index =
                     self.previous.stream_module_index;
                 (*core::ptr::addr_of_mut!(nginx_sys::ngx_stream_core_module)).type_ =
@@ -873,6 +896,8 @@ mod tests {
             let mut main = Box::new(unsafe {
                 MaybeUninit::<ngx_stream_core_main_conf_t>::zeroed().assume_init()
             });
+            main.variables_hash_max_size = 1024;
+            main.variables_hash_bucket_size = 64;
             let mut main_conf: Box<[*mut c_void; 1]> = Box::new([(&raw mut *main).cast()]);
             let mut context = Box::new(ngx_stream_conf_ctx_t {
                 main_conf: main_conf.as_mut_ptr(),
@@ -897,6 +922,10 @@ mod tests {
 
         fn configuration(&mut self) -> StreamConfigurationParser<'_> {
             StreamConfigurationParser::from_test_callback(&mut self.cf)
+        }
+
+        fn finalize_variables(&mut self) {
+            assert_eq!(unsafe { ngx_stream_variables_init_vars(&raw mut *self.cf) }, NGX_OK as _);
         }
 
         fn exact_variables(&self) -> &[ngx_hash_key_t] {
@@ -1168,6 +1197,42 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(fixture.exact_variables().len(), exact_count);
         assert_eq!(fixture.prefix_variables().len(), prefix_count);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn prefix_name_allocation_failure_does_not_publish_a_partial_entry() {
+        let mut fixture = VariableFixture::new();
+        let prefix_count = fixture.prefix_variables().len();
+
+        unsafe {
+            (*fixture._pool.raw).max = 0;
+            ngx_rs_test_fail_allocations_after(0);
+        }
+        let result = add_variable::<DataVariable>(
+            &mut fixture.configuration(),
+            NgxStr::from_bytes(b"ngx_rs_prefix_allocation_failure_"),
+            StreamVariableFlags::PREFIX,
+            1,
+        );
+        unsafe { ngx_rs_test_reset_allocation_failures() };
+
+        assert!(result.is_err());
+        assert_eq!(fixture.prefix_variables().len(), prefix_count);
+
+        add_variable::<CountingVariable>(
+            &mut fixture.configuration(),
+            NgxStr::from_bytes(b"ngx_rs_prefix_allocation_failure_"),
+            StreamVariableFlags::PREFIX,
+            2,
+        )
+        .unwrap();
+        assert_eq!(fixture.prefix_variables().len(), prefix_count + 1);
+        assert_handler::<CountingVariable>(
+            fixture.prefix_variable(b"ngx_rs_prefix_allocation_failure_"),
+            2,
+        );
+        fixture.finalize_variables();
     }
 
     #[cfg(feature = "test-link")]
