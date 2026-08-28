@@ -10,8 +10,8 @@ use core::panic::AssertUnwindSafe;
 #[cfg(feature = "std")]
 use std::panic::catch_unwind;
 
-use crate::core::{NGX_CONF_ERROR, Pool, Status};
-use crate::ffi::{NGX_LOG_EMERG, ngx_conf_t, ngx_cycle_t, ngx_int_t, ngx_module_t};
+use crate::core::{ModuleDescriptor, NGX_CONF_ERROR, Pool, Status};
+use crate::ffi::{NGX_LOG_EMERG, ngx_conf_t, ngx_cycle_t, ngx_int_t};
 use crate::http::{
     HttpConfigError, HttpConfigurationParser, HttpModuleLocationConf, HttpModuleMainConf,
     HttpModuleServerConf,
@@ -458,8 +458,8 @@ where
 /// initialized its module and context indexes before any typed configuration access. Callback
 /// implementations must not unwind across nginx's C ABI.
 pub unsafe trait HttpModule {
-    /// Returns the global module descriptor.
-    fn module() -> &'static ngx_module_t;
+    /// Returns the opaque identity of the global module descriptor.
+    fn module() -> ModuleDescriptor;
 
     /// Runs before nginx parses the HTTP configuration block.
     ///
@@ -607,7 +607,7 @@ mod tests {
         HttpModule, InitMainConf, Merge, MergeConfigError, ProcessCycle, exit_process,
         init_process, postconfiguration, preconfiguration,
     };
-    use crate::core::{NGX_CONF_ERROR, Status};
+    use crate::core::{ModuleDescriptor, NGX_CONF_ERROR, Status};
     use crate::ffi::{ngx_conf_t, ngx_cycle_t, ngx_int_t, ngx_module_t};
     #[cfg(feature = "test-link")]
     use crate::ffi::{ngx_create_pool, ngx_destroy_pool, ngx_log_t, ngx_pool_t, ngx_uint_t};
@@ -619,8 +619,8 @@ mod tests {
         fn ngx_rs_test_reset_allocation_failures();
     }
 
-    fn test_module() -> &'static ngx_module_t {
-        Box::leak(Box::new(ngx_module_t::default()))
+    fn test_module() -> ModuleDescriptor {
+        ModuleDescriptor::from_test(ngx_module_t::default())
     }
 
     #[derive(Default)]
@@ -659,7 +659,7 @@ mod tests {
     struct TestHttpModule;
 
     unsafe impl HttpModule for TestHttpModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -667,7 +667,7 @@ mod tests {
     struct PanicConfigurationModule;
 
     unsafe impl HttpModule for PanicConfigurationModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
 
@@ -682,7 +682,7 @@ mod tests {
     struct ProcessModule;
 
     unsafe impl HttpModule for ProcessModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
 
@@ -699,7 +699,7 @@ mod tests {
     struct FailingProcessModule;
 
     unsafe impl HttpModule for FailingProcessModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
 
@@ -713,7 +713,7 @@ mod tests {
 
     #[cfg(feature = "std")]
     unsafe impl HttpModule for PanicProcessModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
 
@@ -1002,7 +1002,7 @@ mod tests {
     struct RejectMainModule;
 
     unsafe impl HttpModule for RejectMainModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -1035,7 +1035,7 @@ mod tests {
     struct RejectServerModule;
 
     unsafe impl HttpModule for RejectServerModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -1055,7 +1055,7 @@ mod tests {
     struct RejectLocationModule;
 
     unsafe impl HttpModule for RejectLocationModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -1149,7 +1149,7 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     unsafe impl HttpModule for AllocationHttpModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -1239,7 +1239,7 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     unsafe impl HttpModule for OverAlignedHttpModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -1311,7 +1311,7 @@ mod tests {
 
     #[cfg(all(feature = "std", feature = "test-link"))]
     unsafe impl HttpModule for PanicDefaultModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -1347,7 +1347,7 @@ mod tests {
 
     #[cfg(feature = "std")]
     unsafe impl HttpModule for PanicInitModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -1386,7 +1386,7 @@ mod tests {
 
     #[cfg(feature = "std")]
     unsafe impl HttpModule for PanicMergeModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }

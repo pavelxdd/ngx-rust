@@ -17,7 +17,8 @@ use nginx_sys::{
 };
 use ngx::collections::{SlabQueue, SlabQueueEntry, SlabRbTree, SlabRbTreeEntry};
 use ngx::core::{
-    NGX_CONF_ERROR, NGX_CONF_OK, NgxStr, NgxString, Pool, SlabGuard, SlabPool, SlabRegion, Status,
+    ModuleDescriptor, NGX_CONF_ERROR, NGX_CONF_OK, NgxStr, NgxString, Pool, SlabGuard, SlabPool,
+    SlabRegion, Status,
 };
 use ngx::http::{
     HttpConfigurationParser, HttpModule, HttpModuleMainConf, HttpVariableFlags,
@@ -29,8 +30,9 @@ use ngx::{ngx_conf_log_error, ngx_log_debug, ngx_string};
 struct HttpSharedDictModule;
 
 unsafe impl HttpModule for HttpSharedDictModule {
-    fn module() -> &'static ngx_module_t {
-        unsafe { &*ptr::addr_of!(ngx_http_shared_dict_module) }
+    fn module() -> ModuleDescriptor {
+        unsafe { ModuleDescriptor::from_raw(&raw mut ngx_http_shared_dict_module) }
+            .expect("ngx_http_shared_dict_module descriptor")
     }
 
     fn preconfigure(parser: &mut HttpConfigurationParser<'_>) -> ngx_int_t {

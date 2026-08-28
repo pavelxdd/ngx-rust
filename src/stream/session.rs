@@ -5,9 +5,11 @@ use core::pin::Pin;
 use core::ptr::NonNull;
 
 use super::conf;
-use crate::core::{ConnectionError, ConnectionRef, ConnectionRefMut, NgxStr, Pool, Status};
+use crate::core::{
+    ConnectionError, ConnectionRef, ConnectionRefMut, ModuleDescriptor, NgxStr, Pool, Status,
+};
 use crate::ffi::{
-    NGX_ERROR, NGX_OK, ngx_int_t, ngx_log_t, ngx_module_t, ngx_str_t, ngx_stream_complex_value,
+    NGX_ERROR, NGX_OK, ngx_int_t, ngx_log_t, ngx_str_t, ngx_stream_complex_value,
     ngx_stream_complex_value_t, ngx_stream_session_t,
 };
 use crate::stream::{
@@ -300,7 +302,7 @@ impl Session<'_> {
 
     fn module_context_slot(
         &self,
-        module: &ngx_module_t,
+        module: ModuleDescriptor,
     ) -> Result<Option<NonNull<*mut c_void>>, SessionContextError> {
         let index = conf::session_context_index(module)?;
         let slots = unsafe { self.raw.as_ref().ctx };
@@ -400,12 +402,12 @@ impl Session<'_> {
     /// ```compile_fail
     /// use core::marker::PhantomPinned;
     /// use core::pin::Pin;
-    /// use ngx::ffi::ngx_module_t;
+    /// use ngx::core::ModuleDescriptor;
     /// use ngx::stream::{Session, StreamModule, StreamModuleSessionContext};
     ///
     /// struct Module;
     /// unsafe impl StreamModule for Module {
-    ///     fn module() -> &'static ngx_module_t {
+    ///     fn module() -> ModuleDescriptor {
     ///         unreachable!()
     ///     }
     /// }
@@ -514,7 +516,7 @@ mod tests {
         IntoHandlerStatus, Session, SessionContextError, SessionError, StreamModuleSessionContext,
         StreamSessionHandler, raw_handler,
     };
-    use crate::core::{ConnectionError, Status};
+    use crate::core::{ConnectionError, ModuleDescriptor, Status};
     #[cfg(feature = "test-link")]
     use crate::event::{Timer, TimerCallback};
     use crate::ffi::{NGX_ERROR, ngx_module_t, ngx_stream_session_t};
@@ -532,12 +534,12 @@ mod tests {
     struct TestContextModule;
 
     unsafe impl StreamModule for TestContextModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             let mut module = ngx_module_t::default();
             module.type_ = NGX_STREAM_MODULE as _;
             module.index = 0;
             module.ctx_index = 0;
-            Box::leak(Box::new(module))
+            ModuleDescriptor::from_test(module)
         }
     }
 
@@ -769,12 +771,12 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     unsafe impl StreamModule for PoolContextModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             let mut module = ngx_module_t::default();
             module.type_ = NGX_STREAM_MODULE as _;
             module.index = 0;
             module.ctx_index = 0;
-            Box::leak(Box::new(module))
+            ModuleDescriptor::from_test(module)
         }
     }
 
@@ -788,12 +790,12 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     unsafe impl StreamModule for OutOfBoundsContextModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             let mut module = ngx_module_t::default();
             module.type_ = NGX_STREAM_MODULE as _;
             module.index = 1;
             module.ctx_index = 0;
-            Box::leak(Box::new(module))
+            ModuleDescriptor::from_test(module)
         }
     }
 
@@ -823,12 +825,12 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     unsafe impl StreamModule for PinnedContextModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             let mut module = ngx_module_t::default();
             module.type_ = NGX_STREAM_MODULE as _;
             module.index = 0;
             module.ctx_index = 0;
-            Box::leak(Box::new(module))
+            ModuleDescriptor::from_test(module)
         }
     }
 
@@ -878,12 +880,12 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     unsafe impl StreamModule for TimerContextModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             let mut module = ngx_module_t::default();
             module.type_ = NGX_STREAM_MODULE as _;
             module.index = 0;
             module.ctx_index = 0;
-            Box::leak(Box::new(module))
+            ModuleDescriptor::from_test(module)
         }
     }
 

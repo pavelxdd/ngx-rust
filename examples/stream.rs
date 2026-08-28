@@ -1,7 +1,7 @@
 use core::ffi::{c_char, c_void};
 use core::ptr;
 
-use ngx::core::{NGX_CONF_ERROR, NgxStr, Status};
+use ngx::core::{ModuleDescriptor, NGX_CONF_ERROR, NgxStr, Status};
 use ngx::ffi::{
     NGX_CONF_TAKE1, NGX_STREAM_MODULE, NGX_STREAM_SRV_CONF, NGX_STREAM_SRV_CONF_OFFSET,
     ngx_command_t, ngx_conf_t, ngx_int_t, ngx_module_t, ngx_stream_module_t, ngx_uint_t,
@@ -16,8 +16,9 @@ use ngx::stream::{
 struct Module;
 
 unsafe impl StreamModule for Module {
-    fn module() -> &'static ngx_module_t {
-        unsafe { &*ptr::addr_of!(ngx_stream_probe_module) }
+    fn module() -> ModuleDescriptor {
+        unsafe { ModuleDescriptor::from_raw(&raw mut ngx_stream_probe_module) }
+            .expect("ngx_stream_probe_module descriptor")
     }
 
     fn preconfigure(parser: &mut ngx::stream::StreamConfigurationParser<'_>) -> ngx_int_t {

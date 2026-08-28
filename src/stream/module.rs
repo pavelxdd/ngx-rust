@@ -3,8 +3,8 @@ use core::ffi::{CStr, c_char, c_void};
 use core::fmt;
 use core::ptr::{self, NonNull};
 
-use crate::core::{NGX_CONF_ERROR, Pool, Status};
-use crate::ffi::{ngx_conf_t, ngx_int_t, ngx_module_t};
+use crate::core::{ModuleDescriptor, NGX_CONF_ERROR, Pool, Status};
+use crate::ffi::{ngx_conf_t, ngx_int_t};
 use crate::stream::{StreamConfigurationParser, StreamModuleMainConf, StreamModuleServerConf};
 
 /// Error returned when child configuration cannot be merged with its parent.
@@ -105,8 +105,8 @@ fn configuration_callback_status(
 /// `module()` must return this type's real live global module descriptor. Nginx must have
 /// initialized its module and context indexes before any typed configuration or session access.
 pub unsafe trait StreamModule {
-    /// Returns the global module descriptor.
-    fn module() -> &'static ngx_module_t;
+    /// Returns the opaque identity of the global module descriptor.
+    fn module() -> ModuleDescriptor;
 
     /// Runs before nginx parses the Stream configuration block.
     fn preconfigure(_parser: &mut StreamConfigurationParser<'_>) -> ngx_int_t {
@@ -218,14 +218,14 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{InitMainConf, Merge, MergeConfigError, StreamModule};
-    use crate::core::{NGX_CONF_ERROR, Status};
+    use crate::core::{ModuleDescriptor, NGX_CONF_ERROR, Status};
     use crate::ffi::ngx_module_t;
     #[cfg(feature = "test-link")]
     use crate::ffi::{ngx_conf_t, ngx_create_pool, ngx_destroy_pool, ngx_log_t, ngx_pool_t};
     use crate::stream::{StreamModuleMainConf, StreamModuleServerConf};
 
-    fn test_module() -> &'static ngx_module_t {
-        Box::leak(Box::new(ngx_module_t::default()))
+    fn test_module() -> ModuleDescriptor {
+        ModuleDescriptor::from_test(ngx_module_t::default())
     }
 
     #[derive(Default)]
@@ -253,7 +253,7 @@ mod tests {
     struct TestStreamModule;
 
     unsafe impl StreamModule for TestStreamModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -338,7 +338,7 @@ mod tests {
     struct RejectMainModule;
 
     unsafe impl StreamModule for RejectMainModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -370,7 +370,7 @@ mod tests {
     struct RejectStreamModule;
 
     unsafe impl StreamModule for RejectStreamModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -406,7 +406,7 @@ mod tests {
     struct StaticRejectStreamModule;
 
     unsafe impl StreamModule for StaticRejectStreamModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -474,7 +474,7 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     unsafe impl StreamModule for AllocationStreamModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }
@@ -554,7 +554,7 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     unsafe impl StreamModule for OverAlignedStreamModule {
-        fn module() -> &'static ngx_module_t {
+        fn module() -> ModuleDescriptor {
             test_module()
         }
     }

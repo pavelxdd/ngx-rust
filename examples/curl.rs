@@ -6,8 +6,9 @@ use ngx::http::prelude::*;
 struct Module;
 
 unsafe impl HttpModule for Module {
-    fn module() -> &'static ngx_module_t {
-        unsafe { &*::core::ptr::addr_of!(ngx_http_curl_module) }
+    fn module() -> ModuleDescriptor {
+        unsafe { ModuleDescriptor::from_raw(&raw mut ngx_http_curl_module) }
+            .expect("ngx_http_curl_module descriptor")
     }
 }
 

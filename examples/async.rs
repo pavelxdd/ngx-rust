@@ -6,7 +6,7 @@ use core::ptr;
 use core::time::Duration;
 use std::time::Instant;
 
-use ngx::core::Status;
+use ngx::core::{ModuleDescriptor, Status};
 use ngx::ffi::{
     NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MODULE, NGX_LOG_EMERG,
     ngx_command_t, ngx_conf_t, ngx_http_module_t, ngx_int_t, ngx_module_t, ngx_str_t, ngx_uint_t,
@@ -21,8 +21,9 @@ use ngx::{async_ as ngx_async, ngx_conf_log_error, ngx_log_debug_http, ngx_strin
 struct Module;
 
 unsafe impl http::HttpModule for Module {
-    fn module() -> &'static ngx_module_t {
-        unsafe { &*::core::ptr::addr_of!(ngx_http_async_module) }
+    fn module() -> ModuleDescriptor {
+        unsafe { ModuleDescriptor::from_raw(&raw mut ngx_http_async_module) }
+            .expect("ngx_http_async_module descriptor")
     }
 
     fn postconfigure(parser: &mut http::HttpConfigurationParser<'_>) -> ngx_int_t {

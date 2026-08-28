@@ -1,14 +1,15 @@
 use core::ptr::NonNull;
 
-use crate::ffi::{ngx_core_conf_t, ngx_module_t};
+use crate::core::ModuleDescriptor;
+use crate::ffi::ngx_core_conf_t;
 
 /// Trait for core-style modules.
 ///
 /// This is the foundational trait that identifies a type as representing a
 /// concrete NGINX core module.
 pub trait CoreModule {
-    /// Returns the global `ngx_module_t` describing this module.
-    fn module() -> &'static ngx_module_t;
+    /// Returns the opaque identity of this module's native descriptor.
+    fn module() -> ModuleDescriptor;
 }
 
 /// Raw access to core module main configuration slots.
@@ -26,14 +27,15 @@ pub trait CoreModuleConfExt {
     /// Caller must ensure that type `T` matches the configuration type for the specified module.
     /// Supplying the wrong type will produce an invalid typed pointer.
     #[inline]
-    unsafe fn core_main_conf_unchecked<T>(&self, _module: &ngx_module_t) -> Option<NonNull<T>> {
+    unsafe fn core_main_conf_unchecked<T>(&self, _module: ModuleDescriptor) -> Option<NonNull<T>> {
         None
     }
 }
 
 impl CoreModuleConfExt for crate::ffi::ngx_cycle_t {
     #[inline]
-    unsafe fn core_main_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
+    unsafe fn core_main_conf_unchecked<T>(&self, module: ModuleDescriptor) -> Option<NonNull<T>> {
+        let module = unsafe { module.snapshot() };
         let conf_ctx = NonNull::new(self.conf_ctx)?;
         let conf = unsafe { *conf_ctx.as_ptr().add(module.index) };
         NonNull::new(conf.cast())
@@ -42,7 +44,7 @@ impl CoreModuleConfExt for crate::ffi::ngx_cycle_t {
 
 impl CoreModuleConfExt for crate::ffi::ngx_conf_t {
     #[inline]
-    unsafe fn core_main_conf_unchecked<T>(&self, module: &ngx_module_t) -> Option<NonNull<T>> {
+    unsafe fn core_main_conf_unchecked<T>(&self, module: ModuleDescriptor) -> Option<NonNull<T>> {
         unsafe { self.cycle.as_ref()?.core_main_conf_unchecked(module) }
     }
 }
@@ -87,8 +89,9 @@ pub unsafe trait CoreModuleMainConf: CoreModule {
 pub struct NgxCoreModule;
 
 impl CoreModule for NgxCoreModule {
-    fn module() -> &'static ngx_module_t {
-        unsafe { &*core::ptr::addr_of!(nginx_sys::ngx_core_module) }
+    fn module() -> ModuleDescriptor {
+        unsafe { ModuleDescriptor::from_raw(&raw mut nginx_sys::ngx_core_module) }
+            .expect("ngx_core_module descriptor")
     }
 }
 
@@ -106,21 +109,22 @@ mod tests {
     use core::mem::MaybeUninit;
 
     use super::{CoreModule, CoreModuleConfExt, CoreModuleMainConf};
+    use crate::core::ModuleDescriptor;
     use crate::ffi::{ngx_conf_t, ngx_cycle_t, ngx_module_t};
 
     type CoreConfSlot = *mut *mut *mut c_void;
 
-    fn module_with_index(index: usize) -> ngx_module_t {
-        let mut module = ngx_module_t::default();
+    fn module_with_index(index: usize) -> ModuleDescriptor {
+        let mut module = Box::new(ngx_module_t::default());
         module.index = index;
-        module
+        unsafe { ModuleDescriptor::from_raw(Box::into_raw(module)) }.unwrap()
     }
 
     #[test]
     fn null_conf_ctx_returns_none() {
         let cycle: ngx_cycle_t = unsafe { MaybeUninit::zeroed().assume_init() };
         let module = module_with_index(0);
-        assert!(unsafe { cycle.core_main_conf_unchecked::<u32>(&module) }.is_none());
+        assert!(unsafe { cycle.core_main_conf_unchecked::<u32>(module) }.is_none());
     }
 
     #[test]
@@ -130,7 +134,7 @@ mod tests {
         cycle.conf_ctx = slots.as_mut_ptr();
 
         let module = module_with_index(1);
-        assert!(unsafe { cycle.core_main_conf_unchecked::<u32>(&module) }.is_none());
+        assert!(unsafe { cycle.core_main_conf_unchecked::<u32>(module) }.is_none());
     }
 
     #[test]
@@ -146,11 +150,11 @@ mod tests {
 
         let module = module_with_index(0);
 
-        let got = unsafe { conf.core_main_conf_unchecked::<u32>(&module).map(|v| *v.as_ref()) };
+        let got = unsafe { conf.core_main_conf_unchecked::<u32>(module).map(|v| *v.as_ref()) };
         assert_eq!(got, Some(42));
 
         let got_mut =
-            unsafe { conf.core_main_conf_unchecked::<u32>(&module).map(|mut v| v.as_mut()) };
+            unsafe { conf.core_main_conf_unchecked::<u32>(module).map(|mut v| v.as_mut()) };
         assert!(got_mut.is_some());
         if let Some(v) = got_mut {
             *v = 99;
@@ -161,8 +165,8 @@ mod tests {
     struct TestCoreModule;
 
     impl CoreModule for TestCoreModule {
-        fn module() -> &'static ngx_module_t {
-            Box::leak(Box::new(module_with_index(0)))
+        fn module() -> ModuleDescriptor {
+            module_with_index(0)
         }
     }
 

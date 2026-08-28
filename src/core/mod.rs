@@ -2,6 +2,7 @@ mod buffer;
 mod command;
 mod conf;
 mod connection;
+mod module;
 mod pool;
 /// Imports commonly needed by nginx modules.
 pub mod prelude;
@@ -14,6 +15,7 @@ pub use buffer::*;
 pub use command::*;
 pub use conf::*;
 pub use connection::*;
+pub use module::*;
 pub use pool::*;
 pub use slab::{SlabError, SlabGuard, SlabPool, SlabRegion, SlabRegionInitError};
 pub use status::*;
