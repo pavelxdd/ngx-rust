@@ -304,13 +304,13 @@ where
 /// [`crate::async_::init_worker`] from its process-start hook and
 /// [`crate::async_::shutdown_worker`] from its process-exit hook.
 pub fn add_async_phase_handler<H>(
-    cf: &mut crate::ffi::ngx_conf_t,
+    parser: &mut crate::http::HttpConfigurationParser<'_>,
 ) -> Result<(), AsyncHandlerRegistrationError>
 where
     H: AsyncHttpRequestHandler,
 {
     validate_async_phase(H::PHASE)?;
-    add_phase_handler::<AsyncPhaseHandler<H>>(cf)
+    add_phase_handler::<AsyncPhaseHandler<H>>(parser)
         .map_err(|_| AsyncHandlerRegistrationError::Allocation)
 }
 
@@ -338,20 +338,18 @@ mod tests {
 
     use super::*;
     use crate::ffi::{
-        NGX_DECLINED, NGX_DONE, NGX_ERROR, NGX_HTTP_MODULE, NGX_OK, ngx_array_t, ngx_conf_t,
-        ngx_connection_t, ngx_create_pool, ngx_cycle_t, ngx_delete_posted_event, ngx_destroy_pool,
-        ngx_event_actions, ngx_event_handler_pt, ngx_event_move_posted_next,
-        ngx_event_process_posted, ngx_event_t, ngx_http_conf_ctx_t, ngx_http_core_main_conf_t,
-        ngx_http_handler_pt, ngx_http_log_ctx_t, ngx_http_request_t, ngx_http_run_posted_requests,
-        ngx_int_t, ngx_log_t, ngx_module_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events,
-        ngx_queue_init, ngx_uint_t,
+        NGX_DECLINED, NGX_DONE, NGX_ERROR, NGX_HTTP_MODULE, NGX_OK, NGX_USE_CLEAR_EVENT,
+        ngx_array_t, ngx_conf_t, ngx_connection_t, ngx_create_pool, ngx_cycle, ngx_cycle_t,
+        ngx_delete_posted_event, ngx_destroy_pool, ngx_event_actions, ngx_event_actions_t,
+        ngx_event_flags, ngx_event_move_posted_next, ngx_event_process_posted, ngx_event_t,
+        ngx_http_conf_ctx_t, ngx_http_core_main_conf_t, ngx_http_handler_pt, ngx_http_log_ctx_t,
+        ngx_http_request_t, ngx_http_run_posted_requests, ngx_int_t, ngx_log_t, ngx_module_t,
+        ngx_pool_t, ngx_posted_events, ngx_posted_next_events, ngx_queue_init, ngx_uint_t,
     };
     use crate::http::{HttpModule, HttpModuleRequestContext};
 
     static mut TEST_MODULE: MaybeUninit<ngx_module_t> = MaybeUninit::uninit();
     static TEST_MODULE_INIT: Once = Once::new();
-    static NOTIFIED_HANDLER: Mutex<ngx_event_handler_pt> = Mutex::new(None);
-    static NOTIFY_CALLS: AtomicUsize = AtomicUsize::new(0);
     static POSTED_REQUEST: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "C" fn record_posted_request(request: *mut ngx_http_request_t) {
@@ -374,9 +372,21 @@ mod tests {
         mutex.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    unsafe extern "C" fn test_notify(handler: ngx_event_handler_pt) -> ngx_int_t {
-        NOTIFY_CALLS.fetch_add(1, Ordering::Relaxed);
-        *lock(&NOTIFIED_HANDLER) = handler;
+    unsafe extern "C" fn test_add_event(
+        event: *mut ngx_event_t,
+        _event_type: ngx_int_t,
+        _flags: ngx_uint_t,
+    ) -> ngx_int_t {
+        unsafe { (*event).set_active(1) };
+        NGX_OK as _
+    }
+
+    unsafe extern "C" fn test_delete_event(
+        event: *mut ngx_event_t,
+        _event_type: ngx_int_t,
+        _flags: ngx_uint_t,
+    ) -> ngx_int_t {
+        unsafe { (*event).set_active(0) };
         NGX_OK as _
     }
 
@@ -733,7 +743,9 @@ mod tests {
         core_module_type: ngx_uint_t,
         core_module_index: ngx_uint_t,
         core_module_context_index: ngx_uint_t,
-        notify: Option<unsafe extern "C" fn(ngx_event_handler_pt) -> ngx_int_t>,
+        cycle: *mut ngx_cycle_t,
+        event_actions: ngx_event_actions_t,
+        event_flags: ngx_uint_t,
     }
 
     struct TestGlobals {
@@ -755,7 +767,9 @@ mod tests {
                     core_module_type: (*core).type_,
                     core_module_index: (*core).index,
                     core_module_context_index: (*core).ctx_index,
-                    notify: ngx_event_actions.notify,
+                    cycle: ngx_cycle,
+                    event_actions: ngx_event_actions,
+                    event_flags: ngx_event_flags,
                 }
             };
             unsafe {
@@ -765,11 +779,8 @@ mod tests {
                 (*core).type_ = NGX_HTTP_MODULE as _;
                 (*core).index = 0;
                 (*core).ctx_index = 0;
-                ngx_event_actions.notify = Some(test_notify);
             }
             reset_event_globals();
-            NOTIFY_CALLS.store(0, Ordering::Relaxed);
-            *lock(&NOTIFIED_HANDLER) = None;
             Self { _nginx: nginx, _scheduler: scheduler, previous }
         }
     }
@@ -785,9 +796,10 @@ mod tests {
                 (*core).type_ = self.previous.core_module_type;
                 (*core).index = self.previous.core_module_index;
                 (*core).ctx_index = self.previous.core_module_context_index;
-                ngx_event_actions.notify = self.previous.notify;
+                ngx_cycle = self.previous.cycle;
+                ngx_event_actions = self.previous.event_actions;
+                ngx_event_flags = self.previous.event_flags;
             }
-            *lock(&NOTIFIED_HANDLER) = None;
         }
     }
 
@@ -813,6 +825,9 @@ mod tests {
 
     struct TestCycle {
         cycle: ngx_cycle_t,
+        connection: ngx_connection_t,
+        read: ngx_event_t,
+        write: ngx_event_t,
         log: ngx_log_t,
     }
 
@@ -820,6 +835,11 @@ mod tests {
         fn new() -> Box<Self> {
             let mut cycle = Box::new(unsafe { MaybeUninit::<Self>::zeroed().assume_init() });
             cycle.cycle.log = &raw mut cycle.log;
+            cycle.cycle.connection_n = 1;
+            cycle.cycle.free_connection_n = 1;
+            cycle.cycle.free_connections = &raw mut cycle.connection;
+            cycle.connection.read = &raw mut cycle.read;
+            cycle.connection.write = &raw mut cycle.write;
             cycle
         }
 
@@ -835,7 +855,16 @@ mod tests {
 
     impl TestWorker {
         fn new() -> Self {
-            Self { _globals: TestGlobals::new(), cycle: TestCycle::new() }
+            let globals = TestGlobals::new();
+            let mut cycle = TestCycle::new();
+            unsafe {
+                ngx_cycle = cycle.raw();
+                ngx_event_actions = mem::zeroed();
+                ngx_event_actions.add = Some(test_add_event);
+                ngx_event_actions.del = Some(test_delete_event);
+                ngx_event_flags = NGX_USE_CLEAR_EVENT as _;
+            }
+            Self { _globals: globals, cycle }
         }
 
         fn init(&mut self) {
@@ -850,9 +879,9 @@ mod tests {
             }
         }
 
-        fn deliver_notification(&self) {
-            let handler = lock(&NOTIFIED_HANDLER).expect("notification handler was not registered");
-            unsafe { handler(ptr::null_mut()) };
+        fn deliver_notification(&mut self) {
+            let handler = self.cycle.read.handler.expect("notification handler");
+            unsafe { handler(&raw mut self.cycle.read) };
         }
     }
 
@@ -1024,6 +1053,10 @@ mod tests {
             }
         }
 
+        fn configuration(&mut self) -> crate::http::HttpConfigurationParser<'_> {
+            crate::http::HttpConfigurationParser::from_test_callback(&mut self.cf)
+        }
+
         fn phase_handlers(&mut self, phase: HttpPhase) -> &mut ngx_array_t {
             &mut self.main.phases[phase as usize].handlers
         }
@@ -1049,12 +1082,30 @@ mod tests {
     fn registers_each_supported_async_phase() {
         let mut fixture = PhaseFixture::new();
 
-        assert_eq!(add_async_phase_handler::<PostReadRegistration>(&mut fixture.cf), Ok(()));
-        assert_eq!(add_async_phase_handler::<ServerRewriteRegistration>(&mut fixture.cf), Ok(()));
-        assert_eq!(add_async_phase_handler::<RewriteRegistration>(&mut fixture.cf), Ok(()));
-        assert_eq!(add_async_phase_handler::<PreaccessRegistration>(&mut fixture.cf), Ok(()));
-        assert_eq!(add_async_phase_handler::<AccessRegistration>(&mut fixture.cf), Ok(()));
-        assert_eq!(add_async_phase_handler::<PreContentRegistration>(&mut fixture.cf), Ok(()));
+        assert_eq!(
+            add_async_phase_handler::<PostReadRegistration>(&mut fixture.configuration()),
+            Ok(())
+        );
+        assert_eq!(
+            add_async_phase_handler::<ServerRewriteRegistration>(&mut fixture.configuration()),
+            Ok(())
+        );
+        assert_eq!(
+            add_async_phase_handler::<RewriteRegistration>(&mut fixture.configuration()),
+            Ok(())
+        );
+        assert_eq!(
+            add_async_phase_handler::<PreaccessRegistration>(&mut fixture.configuration()),
+            Ok(())
+        );
+        assert_eq!(
+            add_async_phase_handler::<AccessRegistration>(&mut fixture.configuration()),
+            Ok(())
+        );
+        assert_eq!(
+            add_async_phase_handler::<PreContentRegistration>(&mut fixture.configuration()),
+            Ok(())
+        );
 
         for phase in [
             HttpPhase::PostRead,
@@ -1072,7 +1123,7 @@ mod tests {
     fn content_registration_returns_a_typed_error_without_panicking() {
         let mut fixture = PhaseFixture::new();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            add_async_phase_handler::<ContentRegistration>(&mut fixture.cf)
+            add_async_phase_handler::<ContentRegistration>(&mut fixture.configuration())
         }));
 
         assert_eq!(result.unwrap(), Err(AsyncHandlerRegistrationError::ContentPhase));
@@ -1083,7 +1134,7 @@ mod tests {
     fn log_registration_returns_a_typed_error_without_panicking() {
         let mut fixture = PhaseFixture::new();
         let result = catch_unwind(AssertUnwindSafe(|| {
-            add_async_phase_handler::<LogRegistration>(&mut fixture.cf)
+            add_async_phase_handler::<LogRegistration>(&mut fixture.configuration())
         }));
 
         assert_eq!(result.unwrap(), Err(AsyncHandlerRegistrationError::LogPhase));
@@ -1096,7 +1147,7 @@ mod tests {
         fixture.phase_handlers(HttpPhase::Access).nalloc = 0;
 
         assert_eq!(
-            add_async_phase_handler::<AccessRegistration>(&mut fixture.cf),
+            add_async_phase_handler::<AccessRegistration>(&mut fixture.configuration()),
             Err(AsyncHandlerRegistrationError::Allocation)
         );
         assert_eq!(fixture.phase_handlers(HttpPhase::Access).nelts, 0);
@@ -1260,7 +1311,6 @@ mod tests {
         start_handler::<ForeignHandler>(&mut request);
         worker.process_posted();
         assert_eq!(state.polls.load(Ordering::Relaxed), 1);
-        let notifications = NOTIFY_CALLS.load(Ordering::Relaxed);
 
         let foreign = Arc::clone(&state);
         thread::spawn(move || {
@@ -1269,7 +1319,6 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), notifications + 1);
 
         worker.deliver_notification();
         worker.process_posted();

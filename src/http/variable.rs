@@ -9,14 +9,13 @@ use crate::allocator::Allocator;
 use crate::core::{NgxStr, Pool};
 use crate::ffi::{
     NGX_ERROR, NGX_HTTP_VAR_CHANGEABLE, NGX_HTTP_VAR_NOCACHEABLE, NGX_HTTP_VAR_NOHASH,
-    NGX_HTTP_VAR_PREFIX, NGX_HTTP_VAR_WEAK, ngx_conf_t, ngx_http_add_variable,
-    ngx_http_core_main_conf_t, ngx_http_get_flushed_variable, ngx_http_get_indexed_variable,
-    ngx_http_get_variable_index, ngx_http_request_t, ngx_http_variable_t, ngx_int_t, ngx_uint_t,
-    ngx_variable_value_t,
+    NGX_HTTP_VAR_PREFIX, NGX_HTTP_VAR_WEAK, ngx_http_add_variable, ngx_http_core_main_conf_t,
+    ngx_http_get_flushed_variable, ngx_http_get_indexed_variable, ngx_http_get_variable_index,
+    ngx_http_request_t, ngx_http_variable_t, ngx_int_t, ngx_uint_t, ngx_variable_value_t,
 };
 use crate::http::{
-    HttpConfigError, HttpModuleMainConf, IntoHandlerStatus, NgxHttpCoreModule, RequestError,
-    RequestRefMut, request_callback_status,
+    HttpConfigError, HttpConfigurationParser, HttpModuleMainConf, IntoHandlerStatus,
+    NgxHttpCoreModule, RequestError, RequestRefMut, request_callback_status,
 };
 
 bitflags::bitflags! {
@@ -573,7 +572,9 @@ impl HttpVariableIndex {
         let index = self.index;
 
         {
-            let core_main = NgxHttpCoreModule::main_conf(&*request)?
+            let request_view = request.view();
+            let core_main = request_view
+                .main_conf::<NgxHttpCoreModule>()?
                 .ok_or(HttpVariableLookupError::MissingCoreMainConfiguration)?;
             if !ptr::eq(core_main, self.core_main.as_ptr()) {
                 return Err(HttpVariableLookupError::ForeignConfiguration);
@@ -642,7 +643,7 @@ pub trait HttpVariableSetter {
 ///
 /// Call this function from the module's preconfiguration callback. `name` does not include `$`.
 pub fn add_variable<H>(
-    cf: &mut ngx_conf_t,
+    parser: &mut HttpConfigurationParser<'_>,
     name: &NgxStr,
     flags: HttpVariableFlags,
     data: usize,
@@ -650,7 +651,7 @@ pub fn add_variable<H>(
 where
     H: HttpVariableHandler,
 {
-    let mut variable = register_variable(cf, name, flags)?;
+    let mut variable = register_variable(parser, name, flags)?;
     let variable = unsafe { variable.as_mut() };
     variable.get_handler = Some(raw_get_handler::<H>);
     variable.set_handler = None;
@@ -662,7 +663,7 @@ where
 ///
 /// Call this function from the module's preconfiguration callback. `name` does not include `$`.
 pub fn add_variable_with_setter<H, S>(
-    cf: &mut ngx_conf_t,
+    parser: &mut HttpConfigurationParser<'_>,
     name: &NgxStr,
     flags: HttpVariableFlags,
     data: usize,
@@ -671,7 +672,7 @@ where
     H: HttpVariableHandler,
     S: HttpVariableSetter,
 {
-    let mut variable = register_variable(cf, name, flags)?;
+    let mut variable = register_variable(parser, name, flags)?;
     let variable = unsafe { variable.as_mut() };
     variable.get_handler = Some(raw_get_handler::<H>);
     variable.set_handler = Some(raw_set_handler::<S>);
@@ -680,7 +681,7 @@ where
 }
 
 fn register_variable(
-    cf: &mut ngx_conf_t,
+    parser: &mut HttpConfigurationParser<'_>,
     name: &NgxStr,
     flags: HttpVariableFlags,
 ) -> Result<NonNull<ngx_http_variable_t>, HttpVariableRegistrationError> {
@@ -689,7 +690,7 @@ fn register_variable(
     }
 
     let mut name = name.as_ngx_str();
-    NonNull::new(unsafe { ngx_http_add_variable(cf, &raw mut name, flags.bits()) })
+    NonNull::new(unsafe { ngx_http_add_variable(parser.as_raw(), &raw mut name, flags.bits()) })
         .ok_or(HttpVariableRegistrationError)
 }
 
@@ -698,14 +699,14 @@ fn register_variable(
 /// Call this function during the same configuration pass that registers the variable. The index
 /// can later be used only with requests from that HTTP core configuration.
 pub fn get_variable_index(
-    cf: &mut ngx_conf_t,
+    parser: &mut HttpConfigurationParser<'_>,
     name: &NgxStr,
 ) -> Result<HttpVariableIndex, HttpVariableIndexError> {
-    let core_main = NgxHttpCoreModule::main_conf(&*cf)?
+    let core_main = NgxHttpCoreModule::main_conf(parser)?
         .ok_or(HttpVariableIndexError::MissingCoreMainConfiguration)?;
     let core_main = NonNull::from(core_main);
     let mut name = name.as_ngx_str();
-    let index = unsafe { ngx_http_get_variable_index(cf, &raw mut name) };
+    let index = unsafe { ngx_http_get_variable_index(parser.as_raw(), &raw mut name) };
     if index == NGX_ERROR as _ {
         return Err(HttpVariableIndexError::Registration);
     }
@@ -786,7 +787,7 @@ mod tests {
         NGX_ERROR, NGX_HTTP_MODULE, ngx_conf_t, ngx_http_core_main_conf_t, ngx_http_request_t,
         ngx_int_t, ngx_variable_value_t,
     };
-    use crate::http::{HttpConfigError, RequestRefMut};
+    use crate::http::{HttpConfigurationParser, RequestRefMut};
 
     #[cfg(feature = "test-link")]
     use crate::ffi::{
@@ -1183,15 +1184,13 @@ mod tests {
             cf.temp_pool = pool.raw;
             cf.log = &raw mut *pool.log;
             cf.ctx = (&raw mut *context).cast();
-            cf.module_type = NGX_HTTP_MODULE as _;
-
             assert_eq!(unsafe { ngx_http_variables_add_core_vars(&raw mut *cf) }, NGX_OK as _);
 
             Self { main, main_conf, _context: context, cf }
         }
 
-        fn configuration(&mut self) -> &mut ngx_conf_t {
-            &mut self.cf
+        fn configuration(&mut self) -> HttpConfigurationParser<'_> {
+            HttpConfigurationParser::from_test_callback(&mut self.cf)
         }
 
         fn finalize_variables(&mut self) {
@@ -1275,7 +1274,7 @@ mod tests {
             Self { _globals: globals, pool, configuration }
         }
 
-        fn configuration(&mut self) -> &mut ngx_conf_t {
+        fn configuration(&mut self) -> HttpConfigurationParser<'_> {
             self.configuration.configuration()
         }
     }
@@ -1740,12 +1739,15 @@ mod tests {
     }
 
     #[test]
-    fn variable_index_rejects_a_non_http_configuration() {
+    fn variable_index_rejects_missing_http_context() {
         let mut cf = unsafe { MaybeUninit::<ngx_conf_t>::zeroed().assume_init() };
 
         assert_eq!(
-            get_variable_index(&mut cf, NgxStr::from_bytes(b"ngx_rs_index")),
-            Err(HttpVariableIndexError::Configuration(HttpConfigError::WrongConfigurationContext))
+            get_variable_index(
+                &mut HttpConfigurationParser::from_test_callback(&mut cf),
+                NgxStr::from_bytes(b"ngx_rs_index"),
+            ),
+            Err(HttpVariableIndexError::MissingCoreMainConfiguration)
         );
     }
 
@@ -1777,14 +1779,14 @@ mod tests {
     fn indexed_lookup_preserves_nginx_cache_and_flush_semantics() {
         let mut fixture = VariableFixture::new();
         add_variable::<IndexedVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_indexed"),
             HttpVariableFlags::NOCACHEABLE,
             0,
         )
         .unwrap();
         let index =
-            get_variable_index(fixture.configuration(), NgxStr::from_bytes(b"ngx_rs_indexed"))
+            get_variable_index(&mut fixture.configuration(), NgxStr::from_bytes(b"ngx_rs_indexed"))
                 .unwrap();
         fixture.configuration.finalize_variables();
         INDEXED_VARIABLE_CALLS.store(0, Ordering::Relaxed);
@@ -1816,15 +1818,17 @@ mod tests {
     fn flushed_lookup_keeps_a_cacheable_value() {
         let mut fixture = VariableFixture::new();
         add_variable::<IndexedVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_cached_index"),
             HttpVariableFlags::empty(),
             0,
         )
         .unwrap();
-        let index =
-            get_variable_index(fixture.configuration(), NgxStr::from_bytes(b"ngx_rs_cached_index"))
-                .unwrap();
+        let index = get_variable_index(
+            &mut fixture.configuration(),
+            NgxStr::from_bytes(b"ngx_rs_cached_index"),
+        )
+        .unwrap();
         fixture.configuration.finalize_variables();
         INDEXED_VARIABLE_CALLS.store(0, Ordering::Relaxed);
 
@@ -1850,7 +1854,7 @@ mod tests {
         let mut fixture = VariableFixture::new();
 
         assert_eq!(
-            get_variable_index(fixture.configuration(), NgxStr::from_bytes(b"")),
+            get_variable_index(&mut fixture.configuration(), NgxStr::from_bytes(b"")),
             Err(HttpVariableIndexError::Registration)
         );
 
@@ -1859,7 +1863,7 @@ mod tests {
             ngx_rs_test_fail_allocations_after(0);
         }
         let result = get_variable_index(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_index_allocation_failure"),
         );
         unsafe { ngx_rs_test_reset_allocation_failures() };
@@ -1872,14 +1876,14 @@ mod tests {
     fn indexed_lookup_rejects_invalid_bounds_and_request_storage() {
         let mut fixture = VariableFixture::new();
         add_variable::<IndexedVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_lookup_bounds"),
             HttpVariableFlags::empty(),
             0,
         )
         .unwrap();
         let index = get_variable_index(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_lookup_bounds"),
         )
         .unwrap();
@@ -1918,14 +1922,14 @@ mod tests {
     fn indexed_lookup_rejects_invalid_definition_handlers() {
         let mut fixture = VariableFixture::new();
         add_variable::<IndexedVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_missing_handler"),
             HttpVariableFlags::empty(),
             0,
         )
         .unwrap();
         let index = get_variable_index(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_missing_handler"),
         )
         .unwrap();
@@ -1945,15 +1949,17 @@ mod tests {
     fn indexed_lookup_maps_a_failed_native_getter_to_a_null_result() {
         let mut fixture = VariableFixture::new();
         add_variable::<FailingVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_failed_index"),
             HttpVariableFlags::empty(),
             0,
         )
         .unwrap();
-        let index =
-            get_variable_index(fixture.configuration(), NgxStr::from_bytes(b"ngx_rs_failed_index"))
-                .unwrap();
+        let index = get_variable_index(
+            &mut fixture.configuration(),
+            NgxStr::from_bytes(b"ngx_rs_failed_index"),
+        )
+        .unwrap();
         fixture.configuration.finalize_variables();
 
         fixture.configuration.with_request(|request| {
@@ -1966,28 +1972,28 @@ mod tests {
     fn variable_indexes_are_recreated_for_a_reload_configuration() {
         let mut fixture = VariableFixture::new();
         add_variable::<IndexedVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_reloaded_index"),
             HttpVariableFlags::empty(),
             0,
         )
         .unwrap();
         let old_index = get_variable_index(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_reloaded_index"),
         )
         .unwrap();
 
         let mut reloaded = VariableConfiguration::new(&mut fixture.pool);
         add_variable::<IndexedVariable>(
-            reloaded.configuration(),
+            &mut reloaded.configuration(),
             NgxStr::from_bytes(b"ngx_rs_reloaded_index"),
             HttpVariableFlags::empty(),
             0,
         )
         .unwrap();
         let new_index = get_variable_index(
-            reloaded.configuration(),
+            &mut reloaded.configuration(),
             NgxStr::from_bytes(b"ngx_rs_reloaded_index"),
         )
         .unwrap();
@@ -2032,7 +2038,7 @@ mod tests {
 
         for (name, lower_name, flags, data) in cases {
             add_variable::<CountingVariable>(
-                fixture.configuration(),
+                &mut fixture.configuration(),
                 NgxStr::from_bytes(name),
                 flags,
                 data,
@@ -2045,7 +2051,7 @@ mod tests {
 
         let prefix_flags = HttpVariableFlags::PREFIX | HttpVariableFlags::CHANGEABLE;
         add_variable::<CountingVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"NgX_Rs_PrEfIx_"),
             prefix_flags,
             32,
@@ -2065,7 +2071,7 @@ mod tests {
         let name = b"ngx_rs_setter";
 
         add_variable_with_setter::<CountingVariable, CountingSetter>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(name),
             HttpVariableFlags::CHANGEABLE,
             data,
@@ -2091,7 +2097,7 @@ mod tests {
         let name = b"ngx_rs_replaced_setter";
 
         add_variable_with_setter::<CountingVariable, CountingSetter>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(name),
             HttpVariableFlags::CHANGEABLE,
             1,
@@ -2100,7 +2106,7 @@ mod tests {
         assert!(fixture.configuration.exact_variable(name).set_handler.is_some());
 
         add_variable::<DataVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(name),
             HttpVariableFlags::CHANGEABLE,
             2,
@@ -2120,7 +2126,7 @@ mod tests {
 
         for (index, name) in names.iter().enumerate() {
             add_variable::<CountingVariable>(
-                fixture.configuration(),
+                &mut fixture.configuration(),
                 NgxStr::from_bytes(name),
                 HttpVariableFlags::empty(),
                 index,
@@ -2148,7 +2154,7 @@ mod tests {
         let mut fixture = VariableFixture::new();
         let name = b"ngx_rs_rejected";
         add_variable::<CountingVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(name),
             HttpVariableFlags::empty(),
             0,
@@ -2163,7 +2169,7 @@ mod tests {
 
         assert!(
             add_variable::<DataVariable>(
-                fixture.configuration(),
+                &mut fixture.configuration(),
                 NgxStr::from_bytes(b"NgX_Rs_ReJeCtEd"),
                 HttpVariableFlags::empty(),
                 usize::MAX,
@@ -2179,7 +2185,7 @@ mod tests {
 
         assert!(
             add_variable::<DataVariable>(
-                fixture.configuration(),
+                &mut fixture.configuration(),
                 NgxStr::from_bytes(b""),
                 HttpVariableFlags::empty(),
                 1,
@@ -2192,7 +2198,7 @@ mod tests {
         let internal = HttpVariableFlags::from_bits_retain(NGX_HTTP_VAR_INDEXED as _);
         assert!(
             add_variable::<DataVariable>(
-                fixture.configuration(),
+                &mut fixture.configuration(),
                 NgxStr::from_bytes(b"ngx_rs_internal"),
                 internal,
                 2,
@@ -2202,7 +2208,7 @@ mod tests {
         let unknown = HttpVariableFlags::from_bits_retain(1_usize << (usize::BITS - 1));
         assert!(
             add_variable::<DataVariable>(
-                fixture.configuration(),
+                &mut fixture.configuration(),
                 NgxStr::from_bytes(b"ngx_rs_unknown"),
                 unknown,
                 3,
@@ -2225,7 +2231,7 @@ mod tests {
             ngx_rs_test_fail_allocations_after(0);
         }
         let result = add_variable::<DataVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_registration_allocation_failure"),
             HttpVariableFlags::empty(),
             1,
@@ -2245,7 +2251,7 @@ mod tests {
         let weak_flags = HttpVariableFlags::CHANGEABLE | HttpVariableFlags::WEAK;
 
         add_variable::<CountingVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(exact_name),
             weak_flags,
             1,
@@ -2256,7 +2262,7 @@ mod tests {
         assert_handler::<CountingVariable>(variable, 1);
 
         add_variable::<DataVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"NgX_Rs_ChAnGeAbLe_WeAk"),
             weak_flags,
             2,
@@ -2267,7 +2273,7 @@ mod tests {
         assert_handler::<DataVariable>(variable, 2);
 
         add_variable::<TestVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(exact_name),
             HttpVariableFlags::CHANGEABLE,
             usize::MAX,
@@ -2279,14 +2285,14 @@ mod tests {
 
         let prefix_name = b"ngx_rs_prefix_weak_";
         add_variable::<CountingVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(prefix_name),
             weak_flags | HttpVariableFlags::PREFIX,
             4,
         )
         .unwrap();
         add_variable::<DataVariable>(
-            fixture.configuration(),
+            &mut fixture.configuration(),
             NgxStr::from_bytes(b"NgX_Rs_PrEfIx_WeAk_"),
             HttpVariableFlags::CHANGEABLE | HttpVariableFlags::PREFIX,
             5,

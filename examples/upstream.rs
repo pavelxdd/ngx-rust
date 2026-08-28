@@ -17,11 +17,11 @@ use ngx::ffi::{
     ngx_http_upstream_init_round_robin, ngx_int_t, ngx_module_t, ngx_str_t, ngx_uint_t,
 };
 use ngx::http::{
-    HttpModule, HttpModuleServerConf, HttpUpstreamInitializer, HttpUpstreamPeerData,
-    HttpUpstreamPeerHandler, Merge, MergeConfigError, NgxHttpUpstreamModule, RequestRefMut,
-    UpstreamCallbackError, UpstreamConfiguration, UpstreamInitCallback, UpstreamPeerConnection,
-    UpstreamPeerInit, UpstreamPeerInitCallback, UpstreamPeerState, UpstreamServerConf,
-    install_upstream_initializer, postconfiguration, preconfiguration,
+    HttpConfigurationParser, HttpModule, HttpModuleServerConf, HttpUpstreamInitializer,
+    HttpUpstreamPeerData, HttpUpstreamPeerHandler, Merge, MergeConfigError, NgxHttpUpstreamModule,
+    RequestRefMut, UpstreamCallbackError, UpstreamConfiguration, UpstreamInitCallback,
+    UpstreamPeerConnection, UpstreamPeerInit, UpstreamPeerInitCallback, UpstreamPeerState,
+    UpstreamServerConf, install_upstream_initializer, postconfiguration, preconfiguration,
 };
 use ngx::{ngx_conf_log_error, ngx_string};
 
@@ -211,15 +211,25 @@ unsafe extern "C" fn ngx_http_upstream_commands_set_custom(
         config.max = n as u32;
     }
 
-    let Ok(Some(upstream)) = NgxHttpUpstreamModule::server_conf_mut(configuration) else {
+    let result = unsafe {
+        HttpConfigurationParser::with_raw(cf, |parser| {
+            let Some(upstream) = NgxHttpUpstreamModule::server_conf_mut(parser).map_err(|_| ())?
+            else {
+                return Err(());
+            };
+
+            if upstream.peer.init_upstream.is_none() {
+                upstream.peer.init_upstream = Some(ngx_http_upstream_init_round_robin);
+            }
+            config.original_init_upstream =
+                install_upstream_initializer::<CustomUpstream>(upstream);
+            Ok(())
+        })
+    };
+    if !matches!(result, Ok(Ok(()))) {
         ngx_conf_log_error!(NGX_LOG_EMERG, configuration, "CUSTOM UPSTREAM no upstream srv_conf");
         return ngx::core::NGX_CONF_ERROR;
-    };
-
-    if upstream.peer.init_upstream.is_none() {
-        upstream.peer.init_upstream = Some(ngx_http_upstream_init_round_robin);
     }
-    config.original_init_upstream = install_upstream_initializer::<CustomUpstream>(upstream);
 
     ngx::core::NGX_CONF_OK
 }

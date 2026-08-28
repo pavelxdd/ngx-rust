@@ -124,6 +124,25 @@ impl From<RequestError> for UpstreamCallbackError {
 }
 
 /// Checked configuration callback view supplied to an upstream initializer.
+///
+/// ```compile_fail
+/// use ngx::http::UpstreamConfiguration;
+///
+/// fn escape<'a>(
+///     configuration: &'a mut UpstreamConfiguration<'_>,
+/// ) -> &'static mut UpstreamConfiguration<'static> {
+///     configuration
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::http::UpstreamConfiguration;
+///
+/// fn duplicate(configuration: UpstreamConfiguration<'_>) {
+///     let first = configuration;
+///     let second = configuration;
+/// }
+/// ```
 pub struct UpstreamConfiguration<'callback> {
     raw: NonNull<ngx_conf_t>,
     _callback: PhantomData<&'callback mut ngx_conf_t>,
@@ -179,7 +198,8 @@ impl<'callback> UpstreamServerConf<'callback> {
     where
         M: HttpModuleServerConf,
     {
-        M::server_conf(unsafe { self.raw.as_ref() })
+        Ok(crate::http::conf::upstream_server_conf_slot(unsafe { self.raw.as_ref() }, M::module())?
+            .map(|value| unsafe { value.as_ref() }))
     }
 
     /// Resolves one mutable typed module server configuration from this upstream configuration.
@@ -187,7 +207,8 @@ impl<'callback> UpstreamServerConf<'callback> {
     where
         M: HttpModuleServerConf,
     {
-        M::server_conf_mut(unsafe { self.raw.as_mut() })
+        Ok(crate::http::conf::upstream_server_conf_slot(unsafe { self.raw.as_ref() }, M::module())?
+            .map(|mut value| unsafe { value.as_mut() }))
     }
 
     /// Returns the current upstream initializer, including an absent initializer.

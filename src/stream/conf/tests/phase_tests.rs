@@ -15,7 +15,8 @@ use crate::ffi::{
     ngx_stream_handler_pt, ngx_stream_session_t, ngx_uint_t,
 };
 use crate::stream::{
-    Session, StreamPhase, StreamSessionHandler, add_phase_handler, try_add_phase_handler,
+    Session, StreamConfigurationParser, StreamPhase, StreamSessionHandler, add_phase_handler,
+    try_add_phase_handler,
 };
 
 const PHASE_COUNT: usize = StreamPhase::Log as usize + 1;
@@ -100,6 +101,10 @@ impl PhaseFixture {
         }
     }
 
+    fn configuration(&mut self) -> StreamConfigurationParser<'_> {
+        StreamConfigurationParser::from_test_callback(&mut self.cf)
+    }
+
     fn phase_handlers(&mut self, phase: StreamPhase) -> &mut ngx_array_t {
         &mut self.main.phases[phase as usize].handlers
     }
@@ -132,7 +137,7 @@ impl StreamSessionHandler for PrereadHandler {
 
 fn assert_preread_registration_error(fixture: &mut PhaseFixture) {
     let before = fixture.phase_handlers(StreamPhase::Preread).nelts;
-    assert!(add_phase_handler::<PrereadHandler>(&mut fixture.cf).is_err());
+    assert!(add_phase_handler::<PrereadHandler>(&mut fixture.configuration()).is_err());
     assert_eq!(fixture.phase_handlers(StreamPhase::Preread).nelts, before);
 }
 
@@ -266,11 +271,12 @@ fn phase_registration_rejects_missing_core_main_configuration() {
 }
 
 #[test]
-fn phase_registration_rejects_a_non_stream_configuration() {
+fn phase_registration_does_not_require_the_late_module_type_discriminator() {
     let mut fixture = PhaseFixture::new();
     fixture.cf.module_type = 0;
 
-    assert_preread_registration_error(&mut fixture);
+    assert!(add_phase_handler::<PrereadHandler>(&mut fixture.configuration()).is_ok());
+    assert_eq!(fixture.phase_handlers(StreamPhase::Preread).nelts, 1);
 }
 
 #[test]
@@ -287,7 +293,7 @@ fn try_phase_registration_returns_error_without_logging() {
     fixture.capture_errors();
     fixture.phase_handlers(StreamPhase::Preread).pool = ptr::null_mut();
 
-    assert!(try_add_phase_handler::<PrereadHandler>(&mut fixture.cf).is_err());
+    assert!(try_add_phase_handler::<PrereadHandler>(&mut fixture.configuration()).is_err());
     assert_eq!(fixture.capture.len, 0);
 }
 
@@ -295,12 +301,12 @@ fn try_phase_registration_returns_error_without_logging() {
 fn phase_registration_appends_every_public_stream_phase() {
     let mut fixture = PhaseFixture::new();
 
-    assert!(add_phase_handler::<PostAcceptHandler>(&mut fixture.cf).is_ok());
-    assert!(add_phase_handler::<PreaccessHandler>(&mut fixture.cf).is_ok());
-    assert!(add_phase_handler::<AccessHandler>(&mut fixture.cf).is_ok());
-    assert!(add_phase_handler::<SslHandler>(&mut fixture.cf).is_ok());
-    assert!(add_phase_handler::<PrereadHandler>(&mut fixture.cf).is_ok());
-    assert!(add_phase_handler::<LogHandler>(&mut fixture.cf).is_ok());
+    assert!(add_phase_handler::<PostAcceptHandler>(&mut fixture.configuration()).is_ok());
+    assert!(add_phase_handler::<PreaccessHandler>(&mut fixture.configuration()).is_ok());
+    assert!(add_phase_handler::<AccessHandler>(&mut fixture.configuration()).is_ok());
+    assert!(add_phase_handler::<SslHandler>(&mut fixture.configuration()).is_ok());
+    assert!(add_phase_handler::<PrereadHandler>(&mut fixture.configuration()).is_ok());
+    assert!(add_phase_handler::<LogHandler>(&mut fixture.configuration()).is_ok());
 
     assert_eq!(fixture.phase_handlers(StreamPhase::PostAccept).nelts, 1);
     assert_eq!(fixture.phase_handlers(StreamPhase::Preaccess).nelts, 1);
@@ -317,8 +323,8 @@ fn phase_registration_keeps_nginx_reverse_dispatch_order() {
     SECOND_HANDLER_ORDER.store(0, Ordering::Relaxed);
     let mut fixture = PhaseFixture::new();
 
-    assert!(add_phase_handler::<FirstPrereadHandler>(&mut fixture.cf).is_ok());
-    assert!(add_phase_handler::<SecondPrereadHandler>(&mut fixture.cf).is_ok());
+    assert!(add_phase_handler::<FirstPrereadHandler>(&mut fixture.configuration()).is_ok());
+    assert!(add_phase_handler::<SecondPrereadHandler>(&mut fixture.configuration()).is_ok());
 
     let handlers = unsafe {
         NgxArray::<ngx_stream_handler_pt>::from_ngx_array(

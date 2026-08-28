@@ -246,16 +246,18 @@ pub unsafe extern "C" fn filter_postconfiguration<M>(cf: *mut ngx_conf_t) -> ngx
 where
     M: HttpFilter,
 {
-    crate::http::module::configuration_callback_status(cf, |cf| {
-        if M::filter_slot().validate_installation(cf).is_err() {
+    crate::http::module::configuration_callback_status(cf, |parser| {
+        if M::filter_slot().validate_installation(unsafe { &*parser.as_raw() }).is_err() {
             return Status::NGX_ERROR.0;
         }
 
-        if M::postconfigure(cf) != Status::NGX_OK.0 {
+        if M::postconfigure(parser) != Status::NGX_OK.0 {
             return Status::NGX_ERROR.0;
         }
 
-        M::filter_slot().install(cf).map_or(Status::NGX_ERROR.0, |_| Status::NGX_OK.0)
+        M::filter_slot()
+            .install(unsafe { &*parser.as_raw() })
+            .map_or(Status::NGX_ERROR.0, |_| Status::NGX_OK.0)
     })
 }
 
@@ -830,7 +832,7 @@ mod tests {
             module()
         }
 
-        fn postconfigure(_cf: &mut ngx_conf_t) -> ngx_int_t {
+        fn postconfigure(_parser: &mut crate::http::HttpConfigurationParser<'_>) -> ngx_int_t {
             FAILED_POSTCONFIGURE_CALLS.fetch_add(1, Ordering::Relaxed);
             Status::NGX_ERROR.0
         }
@@ -869,7 +871,7 @@ mod tests {
             module()
         }
 
-        fn postconfigure(_cf: &mut ngx_conf_t) -> ngx_int_t {
+        fn postconfigure(_parser: &mut crate::http::HttpConfigurationParser<'_>) -> ngx_int_t {
             PANIC_POSTCONFIGURATION_CALLS.fetch_add(1, Ordering::Relaxed);
             panic!("postconfiguration panic");
         }

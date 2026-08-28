@@ -388,13 +388,16 @@ fn phase_postconfiguration_rejects_null_and_misaligned_parser_contexts() {
 }
 
 #[test]
-fn phase_registration_rejects_invalid_configuration_and_core_module_identity() {
-    {
-        let mut fixture = PhaseFixture::new();
-        fixture.cf.module_type = 0;
-        assert_access_registration_error(&mut fixture);
-    }
+fn phase_registration_does_not_require_the_late_module_type_discriminator() {
+    let mut fixture = PhaseFixture::new();
+    fixture.cf.module_type = 0;
 
+    assert_eq!(fixture.register::<AccessHandler>(), Status::NGX_OK.0);
+    assert_eq!(fixture.phase_handlers(HttpPhase::Access).nelts, 1);
+}
+
+#[test]
+fn phase_registration_rejects_missing_configuration_and_invalid_core_module_identity() {
     {
         let mut fixture = PhaseFixture::new();
         fixture.main_slots[0] = ptr::null_mut();

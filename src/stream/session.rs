@@ -4,16 +4,14 @@ use core::marker::PhantomData;
 use core::pin::Pin;
 use core::ptr::NonNull;
 
-use super::conf::{self, sealed};
+use super::conf;
 use crate::core::{ConnectionError, ConnectionRef, ConnectionRefMut, NgxStr, Pool, Status};
 use crate::ffi::{
     NGX_ERROR, NGX_OK, ngx_int_t, ngx_log_t, ngx_module_t, ngx_str_t, ngx_stream_complex_value,
     ngx_stream_complex_value_t, ngx_stream_session_t,
 };
 use crate::stream::{
-    StreamConfigError, StreamModule, StreamModuleMainConf, StreamModuleMainConfExt,
-    StreamModuleMainConfMutExt, StreamModuleServerConf, StreamModuleServerConfExt,
-    StreamModuleServerConfMutExt,
+    StreamConfigError, StreamModule, StreamModuleMainConf, StreamModuleServerConf,
 };
 
 /// Stream phases in which modules can register handlers.
@@ -280,15 +278,24 @@ impl Session<'_> {
     where
         M: StreamModuleMainConf,
     {
-        M::main_conf(self)
+        Ok(conf::session_main_conf_slot(unsafe { self.raw.as_ref() }, M::module())?
+            .map(|value| unsafe { value.as_ref() }))
     }
 
     /// Shared server configuration for module `M`.
+    ///
+    /// ```compile_fail
+    /// # use ngx::stream::{Session, StreamModuleServerConf};
+    /// # fn mutable<M: StreamModuleServerConf>(session: &mut Session<'_>) {
+    /// let _ = session.server_conf_mut::<M>();
+    /// # }
+    /// ```
     pub fn server_conf<M>(&self) -> Result<Option<&M::ServerConf>, StreamConfigError>
     where
         M: StreamModuleServerConf,
     {
-        M::server_conf(self)
+        Ok(conf::session_server_conf_slot(unsafe { self.raw.as_ref() }, M::module())?
+            .map(|value| unsafe { value.as_ref() }))
     }
 
     fn module_context_slot(
@@ -477,50 +484,6 @@ impl Session<'_> {
             return None;
         }
         unsafe { Some(NgxStr::from_ngx_str(value)) }
-    }
-}
-
-impl sealed::MainConfSource for Session<'_> {}
-impl sealed::MainConfSourceMut for Session<'_> {}
-impl sealed::ServerConfSource for Session<'_> {}
-impl sealed::ServerConfSourceMut for Session<'_> {}
-
-impl StreamModuleMainConfExt for Session<'_> {
-    fn stream_main_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, StreamConfigError> {
-        let session = unsafe { self.raw.as_ref() };
-        Ok(conf::session_main_conf_slot(session, module)?.map(|value| unsafe { value.as_ref() }))
-    }
-}
-
-impl StreamModuleMainConfMutExt for Session<'_> {
-    fn stream_main_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, StreamConfigError> {
-        let session = unsafe { self.raw.as_ref() };
-        Ok(conf::session_main_conf_slot(session, module)?
-            .map(|mut value| unsafe { value.as_mut() }))
-    }
-}
-
-impl StreamModuleServerConfExt for Session<'_> {
-    fn stream_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, StreamConfigError> {
-        let session = unsafe { self.raw.as_ref() };
-        Ok(conf::session_server_conf_slot(session, module)?.map(|value| unsafe { value.as_ref() }))
-    }
-}
-
-impl StreamModuleServerConfMutExt for Session<'_> {
-    fn stream_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, StreamConfigError> {
-        let session = unsafe { self.raw.as_ref() };
-        Ok(conf::session_server_conf_slot(session, module)?
-            .map(|mut value| unsafe { value.as_mut() }))
     }
 }
 
@@ -781,7 +744,7 @@ mod tests {
     #[cfg(feature = "test-link")]
     struct TestPool {
         raw: *mut ngx_pool_t,
-        log: Box<ngx_log_t>,
+        _log: Box<ngx_log_t>,
     }
 
     #[cfg(feature = "test-link")]
@@ -790,7 +753,7 @@ mod tests {
             let mut log = Box::new(unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() });
             let raw = unsafe { ngx_create_pool(4096, &raw mut *log) };
             assert!(!raw.is_null());
-            Self { raw, log }
+            Self { raw, _log: log }
         }
     }
 
@@ -1100,7 +1063,7 @@ mod tests {
         }
         TIMER_CONTEXT_DROPS.store(0, Ordering::Relaxed);
         TIMER_CONTEXT_CALLBACKS.store(0, Ordering::Relaxed);
-        let mut owner = TestPool::new();
+        let owner = TestPool::new();
         let log = static_log_ref();
         let mut connection =
             Box::new(unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() });
