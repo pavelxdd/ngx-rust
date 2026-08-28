@@ -22,7 +22,7 @@ use ngx::core::{
 };
 use ngx::http::{
     HttpConfigurationParser, HttpModule, HttpModuleMainConf, HttpVariableFlags,
-    HttpVariableHandler, HttpVariableSetter, HttpVariableValue, HttpVariableValueRef,
+    HttpVariableHandler, HttpVariableOutput, HttpVariableSetter, HttpVariableValueRef,
     RequestRefMut, add_variable_with_setter,
 };
 use ngx::{ngx_conf_log_error, ngx_log_debug, ngx_string};
@@ -726,7 +726,7 @@ impl HttpVariableHandler for SharedDictVariable {
 
     fn get(
         request: &mut RequestRefMut<'_>,
-        output: &mut HttpVariableValue<'_>,
+        output: &mut HttpVariableOutput<'_>,
         data: usize,
     ) -> Self::Output {
         let mut key = ngx_str_t::empty();
@@ -825,7 +825,7 @@ impl HttpVariableHandler for SharedDictEntriesVariable {
 
     fn get(
         request: &mut RequestRefMut<'_>,
-        output: &mut HttpVariableValue<'_>,
+        output: &mut HttpVariableOutput<'_>,
         _data: usize,
     ) -> Self::Output {
         let Ok(Some(smcf)) = request.main_conf::<HttpSharedDictModule>() else {

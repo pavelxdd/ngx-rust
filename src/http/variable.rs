@@ -9,9 +9,10 @@ use crate::allocator::Allocator;
 use crate::core::{NgxStr, Pool};
 use crate::ffi::{
     NGX_ERROR, NGX_HTTP_VAR_CHANGEABLE, NGX_HTTP_VAR_NOCACHEABLE, NGX_HTTP_VAR_NOHASH,
-    NGX_HTTP_VAR_PREFIX, NGX_HTTP_VAR_WEAK, ngx_http_add_variable, ngx_http_core_main_conf_t,
-    ngx_http_get_flushed_variable, ngx_http_get_indexed_variable, ngx_http_get_variable_index,
-    ngx_http_request_t, ngx_http_variable_t, ngx_int_t, ngx_uint_t, ngx_variable_value_t,
+    NGX_HTTP_VAR_PREFIX, NGX_HTTP_VAR_WEAK, NGX_OK, ngx_http_add_variable,
+    ngx_http_core_main_conf_t, ngx_http_get_flushed_variable, ngx_http_get_indexed_variable,
+    ngx_http_get_variable_index, ngx_http_request_t, ngx_http_variable_t, ngx_int_t, ngx_uint_t,
+    ngx_variable_value_t,
 };
 use crate::http::{
     HttpConfigError, HttpConfigurationParser, HttpModuleMainConf, IntoHandlerStatus,
@@ -157,7 +158,7 @@ impl From<HttpConfigError> for HttpVariableLookupError {
 
 /// Error returned when HTTP variable output cannot be published safely.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HttpVariableValueError {
+pub enum HttpVariableOutputError {
     /// The value exceeds nginx's 28-bit variable length field.
     TooLong,
     /// A nonempty value has no backing bytes.
@@ -170,7 +171,7 @@ pub enum HttpVariableValueError {
     PoolMismatch,
 }
 
-impl fmt::Display for HttpVariableValueError {
+impl fmt::Display for HttpVariableOutputError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TooLong => formatter.write_str("HTTP variable value is too long"),
@@ -182,30 +183,13 @@ impl fmt::Display for HttpVariableValueError {
     }
 }
 
-impl error::Error for HttpVariableValueError {}
+impl error::Error for HttpVariableOutputError {}
 
-impl From<RequestError> for HttpVariableValueError {
+impl From<RequestError> for HttpVariableOutputError {
     fn from(error: RequestError) -> Self {
         Self::Request(error)
     }
 }
-
-/// Error returned when a raw HTTP variable value cannot be read safely.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HttpVariableValueReadError {
-    /// A nonempty found value has a null data pointer.
-    NullData,
-}
-
-impl fmt::Display for HttpVariableValueReadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NullData => formatter.write_str("HTTP variable value has null data"),
-        }
-    }
-}
-
-impl error::Error for HttpVariableValueReadError {}
 
 /// Bytes copied into the current HTTP request pool for a variable output.
 ///
@@ -229,19 +213,21 @@ impl<'pool> HttpVariablePoolBytes<'pool> {
     pub fn copy_from_request(
         request: &'pool RequestRefMut<'_>,
         value: &[u8],
-    ) -> Result<Self, HttpVariableValueError> {
-        if value.len() > HttpVariableValue::MAX_LEN {
-            return Err(HttpVariableValueError::TooLong);
+    ) -> Result<Self, HttpVariableOutputError> {
+        if value.len() > HttpVariableOutput::MAX_LEN {
+            return Err(HttpVariableOutputError::TooLong);
         }
 
         let pool = request.pool()?;
         let data = if value.is_empty() {
             NonNull::dangling()
         } else {
-            let layout =
-                Layout::array::<u8>(value.len()).map_err(|_| HttpVariableValueError::Allocation)?;
-            let data =
-                pool.allocate(layout).map_err(|_| HttpVariableValueError::Allocation)?.cast::<u8>();
+            let layout = Layout::array::<u8>(value.len())
+                .map_err(|_| HttpVariableOutputError::Allocation)?;
+            let data = pool
+                .allocate(layout)
+                .map_err(|_| HttpVariableOutputError::Allocation)?
+                .cast::<u8>();
             unsafe { ptr::copy_nonoverlapping(value.as_ptr(), data.as_ptr(), value.len()) };
             data
         };
@@ -259,47 +245,43 @@ impl<'pool> HttpVariablePoolBytes<'pool> {
     }
 }
 
-/// Borrowed output value supplied to an HTTP variable getter.
-pub struct HttpVariableValue<'callback> {
+/// Write-only result supplied to an HTTP variable getter.
+pub struct HttpVariableOutput<'callback> {
     raw: NonNull<ngx_variable_value_t>,
-    _callback: PhantomData<&'callback mut ngx_variable_value_t>,
+    candidate: Option<ngx_variable_value_t>,
+    _callback: PhantomData<&'callback mut core::mem::MaybeUninit<ngx_variable_value_t>>,
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
-impl HttpVariableValue<'_> {
+impl HttpVariableOutput<'_> {
     const MAX_LEN: usize = (1 << 28) - 1;
 
     unsafe fn from_raw<'callback>(
         value: *mut ngx_variable_value_t,
-    ) -> Option<HttpVariableValue<'callback>> {
+    ) -> Option<HttpVariableOutput<'callback>> {
         let raw = NonNull::new(value)?;
         if !value.is_aligned() {
             return None;
         }
 
-        Some(HttpVariableValue { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
-    }
-
-    /// Returns a checked view of the current output state.
-    pub fn read(&self) -> Result<HttpVariableValueRef<'_>, HttpVariableValueReadError> {
-        let raw = unsafe { self.raw.as_ref() };
-        if raw.not_found() == 0 && raw.len() != 0 && raw.data.is_null() {
-            return Err(HttpVariableValueReadError::NullData);
-        }
-
-        Ok(HttpVariableValueRef { raw, _not_thread_safe: PhantomData })
+        Some(HttpVariableOutput {
+            raw,
+            candidate: None,
+            _callback: PhantomData,
+            _not_thread_safe: PhantomData,
+        })
     }
 
     /// Stores bytes whose static lifetime outlives every nginx request.
     ///
     /// ```compile_fail
-    /// use ngx::http::HttpVariableValue;
+    /// use ngx::http::HttpVariableOutput;
     ///
-    /// fn set_from_callback(output: &mut HttpVariableValue<'_>, bytes: &[u8]) {
+    /// fn set_from_callback(output: &mut HttpVariableOutput<'_>, bytes: &[u8]) {
     ///     output.set_static(bytes).unwrap();
     /// }
     /// ```
-    pub fn set_static(&mut self, value: &'static [u8]) -> Result<(), HttpVariableValueError> {
+    pub fn set_static(&mut self, value: &'static [u8]) -> Result<(), HttpVariableOutputError> {
         self.set_found(value.len(), value.as_ptr().cast_mut(), true)
     }
 
@@ -307,7 +289,7 @@ impl HttpVariableValue<'_> {
     pub fn set_static_uncached(
         &mut self,
         value: &'static [u8],
-    ) -> Result<(), HttpVariableValueError> {
+    ) -> Result<(), HttpVariableOutputError> {
         self.set_found(value.len(), value.as_ptr().cast_mut(), false)
     }
 
@@ -322,7 +304,7 @@ impl HttpVariableValue<'_> {
         &mut self,
         data: *mut u8,
         len: usize,
-    ) -> Result<(), HttpVariableValueError> {
+    ) -> Result<(), HttpVariableOutputError> {
         self.set_found(len, data, true)
     }
 
@@ -337,7 +319,7 @@ impl HttpVariableValue<'_> {
         &mut self,
         data: *mut u8,
         len: usize,
-    ) -> Result<(), HttpVariableValueError> {
+    ) -> Result<(), HttpVariableOutputError> {
         self.set_found(len, data, false)
     }
 
@@ -347,23 +329,23 @@ impl HttpVariableValue<'_> {
     /// context, and parser slices cannot be cached accidentally:
     ///
     /// ```compile_fail
-    /// use ngx::http::{HttpVariableValue, RequestRefMut};
+    /// use ngx::http::{HttpVariableOutput, RequestRefMut};
     ///
-    /// fn set(value: &mut HttpVariableValue<'_>, request: &RequestRefMut<'_>) {
+    /// fn set(value: &mut HttpVariableOutput<'_>, request: &RequestRefMut<'_>) {
     ///     let stack = *b"stack";
     ///     value.set_pool(request, &stack);
     /// }
     /// ```
     ///
     /// ```compile_fail
-    /// use ngx::http::{HttpVariableValue, RequestRefMut};
+    /// use ngx::http::{HttpVariableOutput, RequestRefMut};
     ///
     /// struct Context {
     ///     bytes: [u8; 7],
     /// }
     ///
     /// fn set(
-    ///     value: &mut HttpVariableValue<'_>,
+    ///     value: &mut HttpVariableOutput<'_>,
     ///     request: &RequestRefMut<'_>,
     ///     context: &Context,
     /// ) {
@@ -372,9 +354,9 @@ impl HttpVariableValue<'_> {
     /// ```
     ///
     /// ```compile_fail
-    /// use ngx::http::{HttpVariableValue, RequestRefMut};
+    /// use ngx::http::{HttpVariableOutput, RequestRefMut};
     ///
-    /// fn set(value: &mut HttpVariableValue<'_>, request: &RequestRefMut<'_>, parser: &[u8]) {
+    /// fn set(value: &mut HttpVariableOutput<'_>, request: &RequestRefMut<'_>, parser: &[u8]) {
     ///     value.set_pool(request, parser);
     /// }
     /// ```
@@ -382,7 +364,7 @@ impl HttpVariableValue<'_> {
         &mut self,
         request: &RequestRefMut<'_>,
         value: HttpVariablePoolBytes<'_>,
-    ) -> Result<(), HttpVariableValueError> {
+    ) -> Result<(), HttpVariableOutputError> {
         self.set_pool_with_cache(request, value, true)
     }
 
@@ -391,7 +373,7 @@ impl HttpVariableValue<'_> {
         &mut self,
         request: &RequestRefMut<'_>,
         value: HttpVariablePoolBytes<'_>,
-    ) -> Result<(), HttpVariableValueError> {
+    ) -> Result<(), HttpVariableOutputError> {
         self.set_pool_with_cache(request, value, false)
     }
 
@@ -400,7 +382,7 @@ impl HttpVariableValue<'_> {
         &mut self,
         request: &RequestRefMut<'_>,
         value: &[u8],
-    ) -> Result<(), HttpVariableValueError> {
+    ) -> Result<(), HttpVariableOutputError> {
         let value = HttpVariablePoolBytes::copy_from_request(request, value)?;
         self.set_pool(request, value)
     }
@@ -410,30 +392,24 @@ impl HttpVariableValue<'_> {
         &mut self,
         request: &RequestRefMut<'_>,
         value: &[u8],
-    ) -> Result<(), HttpVariableValueError> {
+    ) -> Result<(), HttpVariableOutputError> {
         let value = HttpVariablePoolBytes::copy_from_request(request, value)?;
         self.set_pool_uncached(request, value)
     }
 
-    /// Publishes a cacheable found value with no bytes.
+    /// Sets a cacheable found value with no bytes.
     pub fn set_empty(&mut self) {
         self.write_found(0, ptr::null_mut(), true);
     }
 
-    /// Publishes a noncacheable found value with no bytes.
+    /// Sets a noncacheable found value with no bytes.
     pub fn set_empty_uncached(&mut self) {
         self.write_found(0, ptr::null_mut(), false);
     }
 
-    /// Publishes nginx's exact noncacheable not-found state.
+    /// Sets nginx's exact noncacheable not-found state.
     pub fn set_not_found(&mut self) {
-        let raw = unsafe { self.raw.as_mut() };
-        raw.data = ptr::null_mut();
-        raw.set_len(0);
-        raw.set_escape(0);
-        raw.set_no_cacheable(1);
-        raw.set_valid(0);
-        raw.set_not_found(1);
+        self.candidate = Some(Self::not_found());
     }
 
     fn set_pool_with_cache(
@@ -441,10 +417,10 @@ impl HttpVariableValue<'_> {
         request: &RequestRefMut<'_>,
         value: HttpVariablePoolBytes<'_>,
         cacheable: bool,
-    ) -> Result<(), HttpVariableValueError> {
+    ) -> Result<(), HttpVariableOutputError> {
         let request_pool = request.pool()?;
         if !ptr::eq(request_pool.as_ptr(), value.pool.as_ptr()) {
-            return Err(HttpVariableValueError::PoolMismatch);
+            return Err(HttpVariableOutputError::PoolMismatch);
         }
 
         self.set_found(value.len, value.data.as_ptr(), cacheable)
@@ -455,12 +431,12 @@ impl HttpVariableValue<'_> {
         len: usize,
         data: *mut u8,
         cacheable: bool,
-    ) -> Result<(), HttpVariableValueError> {
+    ) -> Result<(), HttpVariableOutputError> {
         if len > Self::MAX_LEN {
-            return Err(HttpVariableValueError::TooLong);
+            return Err(HttpVariableOutputError::TooLong);
         }
         if len != 0 && data.is_null() {
-            return Err(HttpVariableValueError::NullData);
+            return Err(HttpVariableOutputError::NullData);
         }
 
         self.write_found(len, data, cacheable);
@@ -468,17 +444,34 @@ impl HttpVariableValue<'_> {
     }
 
     fn write_found(&mut self, len: usize, data: *mut u8, cacheable: bool) {
-        let raw = unsafe { self.raw.as_mut() };
-        raw.data = if len == 0 { ptr::null_mut() } else { data };
-        raw.set_len(len as _);
-        raw.set_escape(0);
-        raw.set_not_found(0);
-        raw.set_no_cacheable((!cacheable).into());
-        raw.set_valid(1);
+        self.candidate = Some(ngx_variable_value_t {
+            _bitfield_align_1: [],
+            _bitfield_1: ngx_variable_value_t::new_bitfield_1(
+                len as _,
+                1,
+                (!cacheable).into(),
+                0,
+                0,
+            ),
+            data: if len == 0 { ptr::null_mut() } else { data },
+        });
+    }
+
+    fn not_found() -> ngx_variable_value_t {
+        ngx_variable_value_t {
+            _bitfield_align_1: [],
+            _bitfield_1: ngx_variable_value_t::new_bitfield_1(0, 0, 1, 1, 0),
+            data: ptr::null_mut(),
+        }
+    }
+
+    fn publish_success(self) {
+        let candidate = self.candidate.unwrap_or_else(Self::not_found);
+        unsafe { self.raw.as_ptr().write(candidate) };
     }
 }
 
-/// Checked borrowed view of an HTTP variable output.
+/// Checked borrowed view of an initialized HTTP variable value.
 ///
 /// Values returned from indexed lookup remain borrowed from the active request:
 ///
@@ -628,7 +621,7 @@ pub trait HttpVariableHandler {
     /// Evaluates the variable for one active request.
     fn get(
         request: &mut RequestRefMut<'_>,
-        value: &mut HttpVariableValue<'_>,
+        value: &mut HttpVariableOutput<'_>,
         data: usize,
     ) -> Self::Output;
 }
@@ -730,11 +723,17 @@ where
 {
     unsafe {
         request_callback_status(request, |request| {
-            let Some(mut value) = HttpVariableValue::from_raw(value) else {
-                return Err(crate::core::Status::NGX_ERROR);
+            let Some(mut output) = HttpVariableOutput::from_raw(value) else {
+                return NGX_ERROR as _;
             };
 
-            Ok::<_, crate::core::Status>(H::get(request, &mut value, data))
+            let result = H::get(request, &mut output, data);
+            let status = result.into_handler_status(&request.view());
+            if status == NGX_OK as _ {
+                output.publish_success();
+            }
+
+            status
         })
     }
 }
@@ -778,8 +777,8 @@ mod tests {
 
     use super::{
         HttpVariableFlags, HttpVariableHandler, HttpVariableIndex, HttpVariableIndexError,
-        HttpVariableLookupError, HttpVariablePoolBytes, HttpVariableSetter, HttpVariableValue,
-        HttpVariableValueError, HttpVariableValueReadError, HttpVariableValueRef, add_variable,
+        HttpVariableLookupError, HttpVariableOutput, HttpVariableOutputError,
+        HttpVariablePoolBytes, HttpVariableSetter, HttpVariableValueRef, add_variable,
         add_variable_with_setter, get_variable_index, raw_get_handler, raw_set_handler,
     };
     use crate::core::{NgxStr, Status};
@@ -814,13 +813,7 @@ mod tests {
         value
     }
 
-    fn assert_found(
-        raw: &ngx_variable_value_t,
-        value: &HttpVariableValue<'_>,
-        bytes: &[u8],
-        cacheable: bool,
-        data: *mut u8,
-    ) {
+    fn assert_found(raw: &ngx_variable_value_t, bytes: &[u8], cacheable: bool, data: *mut u8) {
         assert_eq!(raw.len() as usize, bytes.len());
         assert_eq!(raw.valid(), 1);
         assert_eq!(raw.no_cacheable(), (!cacheable).into());
@@ -828,15 +821,15 @@ mod tests {
         assert_eq!(raw.escape(), 0);
         assert_eq!(raw.data, data);
 
-        let read = value.read().unwrap();
-        assert_eq!(read.bytes(), Some(bytes));
-        assert!(read.is_valid());
-        assert_eq!(read.is_cacheable(), cacheable);
-        assert!(!read.is_not_found());
-        assert!(!read.is_escaped());
+        let value = unsafe { HttpVariableValueRef::from_raw(raw) }.unwrap();
+        assert_eq!(value.bytes(), Some(bytes));
+        assert!(value.is_valid());
+        assert_eq!(value.is_cacheable(), cacheable);
+        assert!(!value.is_not_found());
+        assert!(!value.is_escaped());
     }
 
-    fn assert_not_found(raw: &ngx_variable_value_t, value: &HttpVariableValue<'_>) {
+    fn assert_not_found(raw: &ngx_variable_value_t) {
         assert_eq!(raw.len(), 0);
         assert_eq!(raw.valid(), 0);
         assert_eq!(raw.no_cacheable(), 1);
@@ -844,12 +837,12 @@ mod tests {
         assert_eq!(raw.escape(), 0);
         assert!(raw.data.is_null());
 
-        let read = value.read().unwrap();
-        assert_eq!(read.bytes(), None);
-        assert!(!read.is_valid());
-        assert!(!read.is_cacheable());
-        assert!(read.is_not_found());
-        assert!(!read.is_escaped());
+        let value = unsafe { HttpVariableValueRef::from_raw(raw) }.unwrap();
+        assert_eq!(value.bytes(), None);
+        assert!(!value.is_valid());
+        assert!(!value.is_cacheable());
+        assert!(value.is_not_found());
+        assert!(!value.is_escaped());
     }
 
     struct CountingVariable;
@@ -862,11 +855,25 @@ mod tests {
 
         fn get(
             _request: &mut RequestRefMut<'_>,
-            value: &mut HttpVariableValue<'_>,
+            value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
             RAW_VARIABLE_CALLS.fetch_add(1, Ordering::Relaxed);
             value.set_empty();
+            Status::NGX_OK
+        }
+    }
+
+    struct SuccessfulMissingVariable;
+
+    impl HttpVariableHandler for SuccessfulMissingVariable {
+        type Output = Status;
+
+        fn get(
+            _request: &mut RequestRefMut<'_>,
+            _value: &mut HttpVariableOutput<'_>,
+            _data: usize,
+        ) -> Self::Output {
             Status::NGX_OK
         }
     }
@@ -878,7 +885,7 @@ mod tests {
 
         fn get(
             _request: &mut RequestRefMut<'_>,
-            value: &mut HttpVariableValue<'_>,
+            value: &mut HttpVariableOutput<'_>,
             data: usize,
         ) -> Self::Output {
             RAW_VARIABLE_DATA.store(data, Ordering::Relaxed);
@@ -918,7 +925,7 @@ mod tests {
 
         fn get(
             request: &mut RequestRefMut<'_>,
-            value: &mut HttpVariableValue<'_>,
+            value: &mut HttpVariableOutput<'_>,
             data: usize,
         ) -> Self::Output {
             unsafe { (*request.as_ptr()).headers_out.status = data as _ };
@@ -934,7 +941,7 @@ mod tests {
 
         fn get(
             _request: &mut RequestRefMut<'_>,
-            value: &mut HttpVariableValue<'_>,
+            value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
             value.set_empty();
@@ -949,7 +956,7 @@ mod tests {
 
         fn get(
             _request: &mut RequestRefMut<'_>,
-            value: &mut HttpVariableValue<'_>,
+            value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
             value.set_empty();
@@ -964,7 +971,7 @@ mod tests {
 
         fn get(
             _request: &mut RequestRefMut<'_>,
-            _value: &mut HttpVariableValue<'_>,
+            _value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
             None
@@ -978,7 +985,7 @@ mod tests {
 
         fn get(
             _request: &mut RequestRefMut<'_>,
-            value: &mut HttpVariableValue<'_>,
+            value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
             value.set_empty();
@@ -993,7 +1000,7 @@ mod tests {
 
         fn get(
             _request: &mut RequestRefMut<'_>,
-            _value: &mut HttpVariableValue<'_>,
+            _value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
             Err(Status::NGX_AGAIN)
@@ -1009,7 +1016,7 @@ mod tests {
 
         fn get(
             _request: &mut RequestRefMut<'_>,
-            _value: &mut HttpVariableValue<'_>,
+            _value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
             panic!("variable getter panic")
@@ -1319,7 +1326,7 @@ mod tests {
 
         fn get(
             _request: &mut RequestRefMut<'_>,
-            value: &mut HttpVariableValue<'_>,
+            value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
             INDEXED_VARIABLE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1337,7 +1344,7 @@ mod tests {
 
         fn get(
             _request: &mut RequestRefMut<'_>,
-            _value: &mut HttpVariableValue<'_>,
+            _value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
             Status::NGX_ERROR
@@ -1345,28 +1352,20 @@ mod tests {
     }
 
     #[test]
-    fn static_values_replace_every_http_output_field() {
+    fn static_values_replace_every_http_output_field_on_success() {
         static CACHED: &[u8] = b"cached";
         static UNCACHED: &[u8] = b"uncached";
 
         let mut raw = poisoned_value();
-        let mut value = unsafe { HttpVariableValue::from_raw(&raw mut raw) }.unwrap();
+        let mut output = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
+        output.set_static(CACHED).unwrap();
+        output.publish_success();
+        assert_found(&raw, CACHED, true, CACHED.as_ptr().cast_mut());
 
-        value.set_static(CACHED).unwrap();
-        assert_eq!(raw.len() as usize, CACHED.len());
-        assert_eq!(raw.valid(), 1);
-        assert_eq!(raw.no_cacheable(), 0);
-        assert_eq!(raw.not_found(), 0);
-        assert_eq!(raw.escape(), 0);
-        assert_eq!(raw.data, CACHED.as_ptr().cast_mut());
-
-        value.set_static_uncached(UNCACHED).unwrap();
-        assert_eq!(raw.len() as usize, UNCACHED.len());
-        assert_eq!(raw.valid(), 1);
-        assert_eq!(raw.no_cacheable(), 1);
-        assert_eq!(raw.not_found(), 0);
-        assert_eq!(raw.escape(), 0);
-        assert_eq!(raw.data, UNCACHED.as_ptr().cast_mut());
+        let mut output = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
+        output.set_static_uncached(UNCACHED).unwrap();
+        output.publish_success();
+        assert_found(&raw, UNCACHED, false, UNCACHED.as_ptr().cast_mut());
     }
 
     #[test]
@@ -1374,10 +1373,10 @@ mod tests {
         static BACKING: &[u8] = b"borrowed";
 
         let mut raw = poisoned_value();
-        let mut value = unsafe { HttpVariableValue::from_raw(&raw mut raw) }.unwrap();
-
-        unsafe { value.set_borrowed(BACKING.as_ptr().cast_mut(), BACKING.len()) }.unwrap();
-        assert_found(&raw, &value, BACKING, true, BACKING.as_ptr().cast_mut());
+        let mut output = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
+        unsafe { output.set_borrowed(BACKING.as_ptr().cast_mut(), BACKING.len()) }.unwrap();
+        output.publish_success();
+        assert_found(&raw, BACKING, true, BACKING.as_ptr().cast_mut());
     }
 
     #[test]
@@ -1385,21 +1384,22 @@ mod tests {
         static BACKING: &[u8] = b"borrowed";
 
         let mut raw = poisoned_value();
-        let mut value = unsafe { HttpVariableValue::from_raw(&raw mut raw) }.unwrap();
-
-        unsafe { value.set_borrowed_uncached(BACKING.as_ptr().cast_mut(), BACKING.len()) }.unwrap();
-        assert_found(&raw, &value, BACKING, false, BACKING.as_ptr().cast_mut());
+        let mut output = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
+        unsafe { output.set_borrowed_uncached(BACKING.as_ptr().cast_mut(), BACKING.len()) }
+            .unwrap();
+        output.publish_success();
+        assert_found(&raw, BACKING, false, BACKING.as_ptr().cast_mut());
     }
 
     #[test]
     fn raw_variable_value_construction_rejects_null_and_misaligned_pointers() {
-        assert!(unsafe { HttpVariableValue::from_raw(ptr::null_mut()) }.is_none());
+        assert!(unsafe { HttpVariableOutput::from_raw(ptr::null_mut()) }.is_none());
 
         let mut storage = [0_u8;
             core::mem::size_of::<ngx_variable_value_t>()
                 + core::mem::align_of::<ngx_variable_value_t>()];
         let raw = misaligned_ptr::<ngx_variable_value_t>(&mut storage);
-        assert!(unsafe { HttpVariableValue::from_raw(raw) }.is_none());
+        assert!(unsafe { HttpVariableOutput::from_raw(raw) }.is_none());
     }
 
     #[test]
@@ -1529,6 +1529,43 @@ mod tests {
     }
 
     #[test]
+    fn successful_getter_without_a_value_publishes_not_found() {
+        let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+        request.signature = NGX_HTTP_MODULE as _;
+        let mut value = poisoned_value();
+
+        let status = unsafe {
+            raw_get_handler::<SuccessfulMissingVariable>(&raw mut request, &raw mut value, 0)
+        };
+
+        assert_eq!(status, Status::NGX_OK.0);
+        assert_eq!(value.len(), 0);
+        assert_eq!(value.valid(), 0);
+        assert_eq!(value.no_cacheable(), 1);
+        assert_eq!(value.not_found(), 1);
+        assert_eq!(value.escape(), 0);
+        assert!(value.data.is_null());
+    }
+
+    #[test]
+    fn failed_getter_preserves_the_native_output() {
+        let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+        request.signature = NGX_HTTP_MODULE as _;
+        let mut value = poisoned_value();
+
+        let status =
+            unsafe { raw_get_handler::<DataVariable>(&raw mut request, &raw mut value, 0) };
+
+        assert_eq!(status, Status::NGX_DECLINED.0);
+        assert_eq!(value.len(), 17);
+        assert_eq!(value.valid(), 0);
+        assert_eq!(value.no_cacheable(), 0);
+        assert_eq!(value.not_found(), 1);
+        assert_eq!(value.escape(), 1);
+        assert_eq!(value.data, NonNull::<u8>::dangling().as_ptr());
+    }
+
+    #[test]
     fn raw_variable_handler_wraps_the_request_and_value() {
         let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
         request.signature = NGX_HTTP_MODULE as _;
@@ -1544,72 +1581,64 @@ mod tests {
 
         assert_eq!(status, Status::NGX_OK.0);
         assert_eq!(request.headers_out.status, Status::NGX_OK.0 as _);
-        let value = unsafe { HttpVariableValue::from_raw(&raw mut raw_value) }.unwrap();
-        assert_found(&raw_value, &value, b"detected", true, b"detected".as_ptr().cast_mut());
+        assert_found(&raw_value, b"detected", true, b"detected".as_ptr().cast_mut());
     }
 
     #[test]
-    fn empty_and_not_found_values_replace_every_http_output_field() {
+    fn empty_and_not_found_values_replace_every_http_output_field_on_success() {
         let mut raw = poisoned_value();
-        let mut value = unsafe { HttpVariableValue::from_raw(&raw mut raw) }.unwrap();
+        let mut output = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
+        output.set_empty();
+        output.publish_success();
+        assert_found(&raw, b"", true, ptr::null_mut());
 
-        value.set_empty();
-        assert_found(&raw, &value, b"", true, ptr::null_mut());
+        let mut output = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
+        output.set_empty_uncached();
+        output.publish_success();
+        assert_found(&raw, b"", false, ptr::null_mut());
 
-        value.set_empty_uncached();
-        assert_found(&raw, &value, b"", false, ptr::null_mut());
-
-        value.set_not_found();
-        assert_not_found(&raw, &value);
+        let mut output = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
+        output.set_not_found();
+        output.publish_success();
+        assert_not_found(&raw);
     }
 
     #[test]
-    fn length_and_null_data_errors_preserve_the_previous_output() {
+    fn setter_errors_preserve_the_previous_candidate() {
         let mut raw = poisoned_value();
-        let mut value = unsafe { HttpVariableValue::from_raw(&raw mut raw) }.unwrap();
+        let mut output = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
         let data = NonNull::<u8>::dangling().as_ptr();
 
-        value.set_found(HttpVariableValue::MAX_LEN, data, true).unwrap();
-        assert_eq!(raw.len() as usize, HttpVariableValue::MAX_LEN);
+        output.set_found(HttpVariableOutput::MAX_LEN, data, true).unwrap();
+        assert_eq!(raw.len(), 17);
+        assert_eq!(
+            output.set_found(HttpVariableOutput::MAX_LEN + 1, data, true),
+            Err(HttpVariableOutputError::TooLong)
+        );
+        assert_eq!(
+            output.set_found(1, ptr::null_mut(), false),
+            Err(HttpVariableOutputError::NullData)
+        );
+
+        output.publish_success();
+        assert_eq!(raw.len() as usize, HttpVariableOutput::MAX_LEN);
         assert_eq!(raw.data, data);
         assert_eq!(raw.valid(), 1);
         assert_eq!(raw.no_cacheable(), 0);
         assert_eq!(raw.not_found(), 0);
         assert_eq!(raw.escape(), 0);
-
-        let before =
-            (raw.len(), raw.valid(), raw.no_cacheable(), raw.not_found(), raw.escape(), raw.data);
-        assert_eq!(
-            value.set_found(HttpVariableValue::MAX_LEN + 1, data, true),
-            Err(HttpVariableValueError::TooLong)
-        );
-        assert_eq!(
-            (raw.len(), raw.valid(), raw.no_cacheable(), raw.not_found(), raw.escape(), raw.data,),
-            before
-        );
-
-        assert_eq!(
-            value.set_found(1, ptr::null_mut(), false),
-            Err(HttpVariableValueError::NullData)
-        );
-        assert_eq!(
-            (raw.len(), raw.valid(), raw.no_cacheable(), raw.not_found(), raw.escape(), raw.data,),
-            before
-        );
     }
 
     #[test]
-    fn checked_read_rejects_nonempty_null_data_and_accepts_empty_found_values() {
-        let mut raw = poisoned_value();
-        raw.set_len(1);
-        raw.set_not_found(0);
-        raw.data = ptr::null_mut();
-        let mut value = unsafe { HttpVariableValue::from_raw(&raw mut raw) }.unwrap();
+    fn successful_publication_initializes_uninitialized_storage() {
+        let mut raw = MaybeUninit::<ngx_variable_value_t>::uninit();
+        let mut output = unsafe { HttpVariableOutput::from_raw(raw.as_mut_ptr()) }.unwrap();
 
-        assert!(matches!(value.read(), Err(HttpVariableValueReadError::NullData)));
+        output.set_empty();
+        output.publish_success();
 
-        value.set_empty();
-        assert_found(&raw, &value, b"", true, ptr::null_mut());
+        let raw = unsafe { raw.assume_init() };
+        assert_found(&raw, b"", true, ptr::null_mut());
     }
 
     #[cfg(feature = "test-link")]
@@ -1619,20 +1648,23 @@ mod tests {
 
         with_request(&owner, |request| {
             let mut raw = poisoned_value();
-            let mut value = unsafe { HttpVariableValue::from_raw(&raw mut raw) }.unwrap();
+            let mut value = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
             let bytes = HttpVariablePoolBytes::copy_from_request(&*request, b"pool").unwrap();
             let data = bytes.data.as_ptr();
             assert_eq!(bytes.bytes(), b"pool");
             assert_ne!(data, b"pool".as_ptr().cast_mut());
 
             value.set_pool(&*request, bytes).unwrap();
-            assert_found(&raw, &value, b"pool", true, data);
+            value.publish_success();
+            assert_found(&raw, b"pool", true, data);
 
             let bytes =
                 HttpVariablePoolBytes::copy_from_request(&*request, b"uncached-pool").unwrap();
             let data = bytes.data.as_ptr();
+            let mut value = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
             value.set_pool_uncached(&*request, bytes).unwrap();
-            assert_found(&raw, &value, b"uncached-pool", false, data);
+            value.publish_success();
+            assert_found(&raw, b"uncached-pool", false, data);
         });
     }
 
@@ -1643,20 +1675,25 @@ mod tests {
 
         with_request(&owner, |request| {
             let mut raw = poisoned_value();
-            let mut value = unsafe { HttpVariableValue::from_raw(&raw mut raw) }.unwrap();
+            let mut value = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
             let copied = *b"copied";
 
             value.copy_from_request(&*request, &copied).unwrap();
+            value.publish_success();
             assert_ne!(raw.data, copied.as_ptr().cast_mut());
-            assert_found(&raw, &value, &copied, true, raw.data);
+            assert_found(&raw, &copied, true, raw.data);
 
             let uncached = *b"uncached";
+            let mut value = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
             value.copy_from_request_uncached(&*request, &uncached).unwrap();
+            value.publish_success();
             assert_ne!(raw.data, uncached.as_ptr().cast_mut());
-            assert_found(&raw, &value, &uncached, false, raw.data);
+            assert_found(&raw, &uncached, false, raw.data);
 
+            let mut value = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
             value.copy_from_request(&*request, b"").unwrap();
-            assert_found(&raw, &value, b"", true, ptr::null_mut());
+            value.publish_success();
+            assert_found(&raw, b"", true, ptr::null_mut());
         });
     }
 
@@ -1671,7 +1708,7 @@ mod tests {
                 let bytes =
                     HttpVariablePoolBytes::copy_from_request(&*foreign, b"foreign").unwrap();
                 let mut raw = poisoned_value();
-                let mut value = unsafe { HttpVariableValue::from_raw(&raw mut raw) }.unwrap();
+                let mut value = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
                 let before = (
                     raw.len(),
                     raw.valid(),
@@ -1683,7 +1720,7 @@ mod tests {
 
                 assert_eq!(
                     value.set_pool(&*current, bytes),
-                    Err(HttpVariableValueError::PoolMismatch)
+                    Err(HttpVariableOutputError::PoolMismatch)
                 );
                 assert_eq!(
                     (
@@ -1709,7 +1746,7 @@ mod tests {
 
         with_request(&owner, |request| {
             let mut raw = poisoned_value();
-            let mut value = unsafe { HttpVariableValue::from_raw(&raw mut raw) }.unwrap();
+            let mut value = unsafe { HttpVariableOutput::from_raw(&raw mut raw) }.unwrap();
             let before = (
                 raw.len(),
                 raw.valid(),
@@ -1723,7 +1760,7 @@ mod tests {
             let result = value.copy_from_request(&*request, b"copied");
             unsafe { ngx_rs_test_reset_allocation_failures() };
 
-            assert_eq!(result, Err(HttpVariableValueError::Allocation));
+            assert_eq!(result, Err(HttpVariableOutputError::Allocation));
             assert_eq!(
                 (
                     raw.len(),

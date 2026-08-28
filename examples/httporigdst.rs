@@ -10,7 +10,7 @@ use ngx::ffi::{
 };
 use ngx::http::{
     self, HttpModule, HttpModuleRequestContext, HttpVariableFlags, HttpVariableHandler,
-    HttpVariableValue, add_variable,
+    HttpVariableOutput, add_variable,
 };
 use ngx::ngx_log_debug_http;
 
@@ -43,7 +43,7 @@ impl NgxHttpOrigDstCtx {
     fn bind_addr(
         &self,
         request: &http::RequestRefMut<'_>,
-        output: &mut HttpVariableValue<'_>,
+        output: &mut HttpVariableOutput<'_>,
     ) -> Status {
         Self::bind(self.orig_dst_addr, request, output)
     }
@@ -51,7 +51,7 @@ impl NgxHttpOrigDstCtx {
     fn bind_port(
         &self,
         request: &http::RequestRefMut<'_>,
-        output: &mut HttpVariableValue<'_>,
+        output: &mut HttpVariableOutput<'_>,
     ) -> Status {
         Self::bind(self.orig_dst_port, request, output)
     }
@@ -59,7 +59,7 @@ impl NgxHttpOrigDstCtx {
     fn bind(
         value: ngx_str_t,
         request: &http::RequestRefMut<'_>,
-        output: &mut HttpVariableValue<'_>,
+        output: &mut HttpVariableOutput<'_>,
     ) -> Status {
         if value.len == 0 {
             output.set_not_found();
@@ -165,7 +165,7 @@ impl HttpVariableHandler for OrigDstAddrVariable {
 
     fn get(
         request: &mut http::RequestRefMut<'_>,
-        value: &mut HttpVariableValue<'_>,
+        value: &mut HttpVariableOutput<'_>,
         _: usize,
     ) -> Self::Output {
         let ctx = match request.module_context::<Module>() {
@@ -221,7 +221,7 @@ impl HttpVariableHandler for OrigDstPortVariable {
 
     fn get(
         request: &mut http::RequestRefMut<'_>,
-        value: &mut HttpVariableValue<'_>,
+        value: &mut HttpVariableOutput<'_>,
         _: usize,
     ) -> Self::Output {
         let ctx = match request.module_context::<Module>() {
