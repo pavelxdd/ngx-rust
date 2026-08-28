@@ -11,8 +11,8 @@ use crate::ffi::{
     NGX_ERROR, NGX_HTTP_VAR_CHANGEABLE, NGX_HTTP_VAR_NOCACHEABLE, NGX_HTTP_VAR_NOHASH,
     NGX_HTTP_VAR_PREFIX, NGX_HTTP_VAR_WEAK, NGX_OK, ngx_http_add_variable,
     ngx_http_core_main_conf_t, ngx_http_get_flushed_variable, ngx_http_get_indexed_variable,
-    ngx_http_get_variable_index, ngx_http_request_t, ngx_http_variable_t, ngx_int_t, ngx_uint_t,
-    ngx_variable_value_t,
+    ngx_http_get_variable_index, ngx_http_request_t, ngx_http_variable_t, ngx_int_t, ngx_str_t,
+    ngx_uint_t, ngx_variable_value_t,
 };
 use crate::http::{
     HttpConfigError, HttpConfigurationParser, HttpModuleMainConf, IntoHandlerStatus,
@@ -31,7 +31,7 @@ bitflags::bitflags! {
         const NOHASH = NGX_HTTP_VAR_NOHASH as _;
         /// Lets a later non-weak definition replace this variable.
         const WEAK = NGX_HTTP_VAR_WEAK as _;
-        /// Treats the name as a prefix matched against variable names.
+        /// Native prefix marker applied automatically by [`add_prefix_variable`].
         const PREFIX = NGX_HTTP_VAR_PREFIX as _;
     }
 }
@@ -628,6 +628,19 @@ pub trait HttpVariableHandler {
     ) -> Self::Output;
 }
 
+/// Typed getter for a prefix-matched HTTP variable.
+pub trait HttpPrefixVariableHandler {
+    /// Getter result converted into an nginx status.
+    type Output: IntoHandlerStatus;
+
+    /// Evaluates the variable for one active request and the full queried variable name.
+    fn get(
+        request: &mut RequestRefMut<'_>,
+        value: &mut HttpVariableOutput<'_>,
+        name: &NgxStr,
+    ) -> Self::Output;
+}
+
 /// Typed setter for a registered HTTP variable.
 ///
 /// Setters receive only shared request access, so they cannot safely flush or re-evaluate a
@@ -652,9 +665,10 @@ pub trait HttpVariableSetter {
     fn set(request: &RequestRef<'_>, value: HttpVariableValueRef<'_>, data: usize);
 }
 
-/// Registers a typed read-only HTTP variable.
+/// Registers a typed read-only exact HTTP variable.
 ///
 /// Call this function from the module's preconfiguration callback. `name` does not include `$`.
+/// Use [`add_prefix_variable`] instead of passing [`HttpVariableFlags::PREFIX`].
 pub fn add_variable<H>(
     parser: &mut HttpConfigurationParser<'_>,
     name: &NgxStr,
@@ -672,9 +686,10 @@ where
     Ok(())
 }
 
-/// Registers a typed HTTP variable with a setter.
+/// Registers a typed exact HTTP variable with a setter.
 ///
 /// Call this function from the module's preconfiguration callback. `name` does not include `$`.
+/// Prefix variables do not have an nginx assignment route and are rejected.
 pub fn add_variable_with_setter<H, S>(
     parser: &mut HttpConfigurationParser<'_>,
     name: &NgxStr,
@@ -693,36 +708,63 @@ where
     Ok(())
 }
 
+/// Registers a typed prefix-matched HTTP variable.
+///
+/// Call this function from the module's preconfiguration callback. `prefix` does not include `$`.
+/// The full queried variable name is passed to the handler when nginx finds this prefix. `flags`
+/// must not include [`HttpVariableFlags::PREFIX`], which this function applies automatically.
+pub fn add_prefix_variable<H>(
+    parser: &mut HttpConfigurationParser<'_>,
+    prefix: &NgxStr,
+    flags: HttpVariableFlags,
+) -> Result<(), HttpVariableRegistrationError>
+where
+    H: HttpPrefixVariableHandler,
+{
+    if flags.bits() & !HttpVariableFlags::all().bits() != 0
+        || flags.contains(HttpVariableFlags::PREFIX)
+    {
+        return Err(HttpVariableRegistrationError);
+    }
+
+    let main = NgxHttpCoreModule::main_conf_mut(parser)
+        .ok()
+        .flatten()
+        .ok_or(HttpVariableRegistrationError)?;
+    let original_nelts = main.prefix_variables.nelts;
+    let prefix_nelts = &raw mut main.prefix_variables.nelts;
+    let mut prefix = prefix.as_ngx_str();
+    let Some(mut variable) = NonNull::new(unsafe {
+        ngx_http_add_variable(
+            parser.as_raw(),
+            &raw mut prefix,
+            flags.bits() | HttpVariableFlags::PREFIX.bits(),
+        )
+    }) else {
+        unsafe { prefix_nelts.write(original_nelts) };
+        return Err(HttpVariableRegistrationError);
+    };
+    let variable = unsafe { variable.as_mut() };
+    variable.get_handler = Some(raw_prefix_get_handler::<H>);
+    variable.set_handler = None;
+    variable.data = 0;
+    Ok(())
+}
+
 fn register_variable(
     parser: &mut HttpConfigurationParser<'_>,
     name: &NgxStr,
     flags: HttpVariableFlags,
 ) -> Result<NonNull<ngx_http_variable_t>, HttpVariableRegistrationError> {
-    if flags.bits() & !HttpVariableFlags::all().bits() != 0 {
+    if flags.bits() & !HttpVariableFlags::all().bits() != 0
+        || flags.contains(HttpVariableFlags::PREFIX)
+    {
         return Err(HttpVariableRegistrationError);
     }
 
-    let prefix_nelts = if flags.contains(HttpVariableFlags::PREFIX) {
-        let main = NgxHttpCoreModule::main_conf_mut(parser)
-            .ok()
-            .flatten()
-            .ok_or(HttpVariableRegistrationError)?;
-        let original = main.prefix_variables.nelts;
-        Some((&raw mut main.prefix_variables.nelts, original))
-    } else {
-        None
-    };
-
     let mut name = name.as_ngx_str();
-    let variable = NonNull::new(unsafe {
-        ngx_http_add_variable(parser.as_raw(), &raw mut name, flags.bits())
-    });
-    if variable.is_none()
-        && let Some((nelts, original)) = prefix_nelts
-    {
-        unsafe { nelts.write(original) };
-    }
-    variable.ok_or(HttpVariableRegistrationError)
+    NonNull::new(unsafe { ngx_http_add_variable(parser.as_raw(), &raw mut name, flags.bits()) })
+        .ok_or(HttpVariableRegistrationError)
 }
 
 /// Creates an opaque index for an HTTP variable.
@@ -779,6 +821,53 @@ where
     }
 }
 
+unsafe fn prefix_name_from_data<'callback>(data: usize) -> Option<&'callback NgxStr> {
+    let name = NonNull::new(ptr::with_exposed_provenance_mut::<ngx_str_t>(data))?;
+    if !name.as_ptr().is_aligned() {
+        return None;
+    }
+
+    let name = unsafe { name.as_ptr().read() };
+    if name.len == 0 || name.len > isize::MAX as usize || name.data.is_null() {
+        return None;
+    }
+
+    Some(unsafe { NgxStr::from_ngx_str(name) })
+}
+
+/// C-compatible adapter for a typed prefix-matched HTTP variable getter.
+///
+/// # Safety
+/// `request` and `value` must be valid pointers supplied by nginx for this callback, and `data`
+/// must encode the live `ngx_str_t` full-name descriptor used by nginx's prefix dispatch.
+pub(crate) unsafe extern "C" fn raw_prefix_get_handler<H>(
+    request: *mut ngx_http_request_t,
+    value: *mut ngx_variable_value_t,
+    data: usize,
+) -> ngx_int_t
+where
+    H: HttpPrefixVariableHandler,
+{
+    unsafe {
+        request_callback_status(request, |request| {
+            let Some(mut output) = HttpVariableOutput::from_raw(value) else {
+                return NGX_ERROR as _;
+            };
+            let Some(name) = prefix_name_from_data(data) else {
+                return NGX_ERROR as _;
+            };
+
+            let result = H::get(request, &mut output, name);
+            let status = result.into_handler_status(&request.view());
+            if status == NGX_OK as _ {
+                output.publish_success();
+            }
+
+            status
+        })
+    }
+}
+
 /// C-compatible adapter for a typed HTTP variable setter.
 ///
 /// # Safety
@@ -817,10 +906,11 @@ mod tests {
     use std::sync::MutexGuard;
 
     use super::{
-        HttpVariableFlags, HttpVariableHandler, HttpVariableIndex, HttpVariableIndexError,
-        HttpVariableLookupError, HttpVariableOutput, HttpVariableOutputError,
-        HttpVariablePoolBytes, HttpVariableSetter, HttpVariableValueRef, add_variable,
-        add_variable_with_setter, get_variable_index, raw_get_handler, raw_set_handler,
+        HttpPrefixVariableHandler, HttpVariableFlags, HttpVariableHandler, HttpVariableIndex,
+        HttpVariableIndexError, HttpVariableLookupError, HttpVariableOutput,
+        HttpVariableOutputError, HttpVariablePoolBytes, HttpVariableSetter, HttpVariableValueRef,
+        add_prefix_variable, add_variable, add_variable_with_setter, get_variable_index,
+        raw_get_handler, raw_prefix_get_handler, raw_set_handler,
     };
     use crate::core::{NgxStr, Status};
     use crate::ffi::{
@@ -936,6 +1026,62 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "test-link")]
+    static PREFIX_VARIABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(feature = "test-link")]
+    struct PrefixVariable;
+
+    #[cfg(feature = "test-link")]
+    impl HttpPrefixVariableHandler for PrefixVariable {
+        type Output = Status;
+
+        fn get(
+            _request: &mut RequestRefMut<'_>,
+            value: &mut HttpVariableOutput<'_>,
+            name: &NgxStr,
+        ) -> Self::Output {
+            assert_eq!(name.as_bytes(), b"ngx_rs_native_prefix_suffix");
+            PREFIX_VARIABLE_CALLS.fetch_add(1, Ordering::Relaxed);
+            value.set_static(PREFIX_VARIABLE_VALUE).unwrap();
+            Status::NGX_OK
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    struct CountingPrefixVariable;
+
+    #[cfg(feature = "test-link")]
+    impl HttpPrefixVariableHandler for CountingPrefixVariable {
+        type Output = Status;
+
+        fn get(
+            _request: &mut RequestRefMut<'_>,
+            value: &mut HttpVariableOutput<'_>,
+            _name: &NgxStr,
+        ) -> Self::Output {
+            value.set_empty();
+            Status::NGX_OK
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    struct DataPrefixVariable;
+
+    #[cfg(feature = "test-link")]
+    impl HttpPrefixVariableHandler for DataPrefixVariable {
+        type Output = Status;
+
+        fn get(
+            _request: &mut RequestRefMut<'_>,
+            value: &mut HttpVariableOutput<'_>,
+            _name: &NgxStr,
+        ) -> Self::Output {
+            value.set_empty();
+            Status::NGX_OK
+        }
+    }
+
     static RAW_SET_VARIABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static RAW_SET_VARIABLE_DATA: AtomicUsize = AtomicUsize::new(0);
 
@@ -963,6 +1109,7 @@ mod tests {
     struct TestVariable;
 
     static TEST_VARIABLE_VALUE: &[u8] = b"detected";
+    static PREFIX_VARIABLE_VALUE: &[u8] = b"prefix";
 
     impl HttpVariableHandler for TestVariable {
         type Output = Status;
@@ -1359,6 +1506,14 @@ mod tests {
     }
 
     #[cfg(feature = "test-link")]
+    fn assert_prefix_handler<H>(variable: &ngx_http_variable_t)
+    where
+        H: HttpPrefixVariableHandler,
+    {
+        assert!(same_handler(variable.get_handler, Some(raw_prefix_get_handler::<H>)));
+    }
+
+    #[cfg(feature = "test-link")]
     static INDEXED_VARIABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     #[cfg(feature = "test-link")]
@@ -1736,6 +1891,7 @@ mod tests {
                 true,
                 TEST_VARIABLE_VALUE.as_ptr().cast_mut(),
             );
+            assert_eq!(unsafe { (*request.as_ptr()).headers_out.status }, Status::NGX_OK.0 as _);
 
             let mut not_found_name = not_found_name.as_ngx_str();
             let not_found = unsafe {
@@ -1758,6 +1914,88 @@ mod tests {
             };
             assert!(error.is_null());
         });
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn native_prefix_lookups_pass_the_full_queried_name() {
+        let mut fixture = VariableFixture::new();
+        let prefix = NgxStr::from_bytes(b"ngx_rs_native_prefix_");
+        let full_name = NgxStr::from_bytes(b"ngx_rs_native_prefix_suffix");
+        add_prefix_variable::<PrefixVariable>(
+            &mut fixture.configuration(),
+            prefix,
+            HttpVariableFlags::empty(),
+        )
+        .unwrap();
+        let index = get_variable_index(&mut fixture.configuration(), full_name).unwrap();
+        fixture.configuration.finalize_variables();
+        PREFIX_VARIABLE_CALLS.store(0, Ordering::Relaxed);
+
+        fixture.configuration.with_request(|request| {
+            let mut name = full_name.as_ngx_str();
+            let value = unsafe {
+                ngx_http_get_variable(
+                    request.as_ptr(),
+                    &raw mut name,
+                    ngx_hash_key_lc(name.data, name.len),
+                )
+            };
+            assert!(!value.is_null());
+            assert_found(
+                unsafe { &*value },
+                PREFIX_VARIABLE_VALUE,
+                true,
+                PREFIX_VARIABLE_VALUE.as_ptr().cast_mut(),
+            );
+
+            assert_eq!(index.get_cached(request).unwrap().bytes(), Some(PREFIX_VARIABLE_VALUE));
+        });
+
+        assert_eq!(PREFIX_VARIABLE_CALLS.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn exact_registration_rejects_prefix_flags() {
+        let mut fixture = VariableFixture::new();
+        let name = NgxStr::from_bytes(b"ngx_rs_rejected_prefix_");
+        let prefix_count = fixture.configuration.prefix_variables().len();
+
+        assert!(
+            add_variable::<CountingVariable>(
+                &mut fixture.configuration(),
+                name,
+                HttpVariableFlags::PREFIX,
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            add_variable_with_setter::<CountingVariable, CountingSetter>(
+                &mut fixture.configuration(),
+                name,
+                HttpVariableFlags::PREFIX,
+                1,
+            )
+            .is_err()
+        );
+        assert_eq!(fixture.configuration.prefix_variables().len(), prefix_count);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn raw_prefix_handler_rejects_an_invalid_name_descriptor() {
+        let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+        request.signature = NGX_HTTP_MODULE as _;
+        let mut value = MaybeUninit::<ngx_variable_value_t>::uninit();
+
+        assert_eq!(
+            unsafe {
+                raw_prefix_get_handler::<PrefixVariable>(&raw mut request, value.as_mut_ptr(), 0)
+            },
+            NGX_ERROR as _
+        );
     }
 
     #[cfg(feature = "test-link")]
@@ -2221,17 +2459,18 @@ mod tests {
             assert_handler::<CountingVariable>(variable, data);
         }
 
-        let prefix_flags = HttpVariableFlags::PREFIX | HttpVariableFlags::CHANGEABLE;
-        add_variable::<CountingVariable>(
+        add_prefix_variable::<CountingPrefixVariable>(
             &mut fixture.configuration(),
             NgxStr::from_bytes(b"NgX_Rs_PrEfIx_"),
-            prefix_flags,
-            32,
+            HttpVariableFlags::CHANGEABLE,
         )
         .unwrap();
         let prefix = fixture.configuration.prefix_variable(b"ngx_rs_prefix_");
-        assert_eq!(prefix.flags, prefix_flags.bits());
-        assert_handler::<CountingVariable>(prefix, 32);
+        assert_eq!(
+            prefix.flags,
+            (HttpVariableFlags::PREFIX | HttpVariableFlags::CHANGEABLE).bits()
+        );
+        assert_prefix_handler::<CountingPrefixVariable>(prefix);
     }
 
     #[cfg(feature = "test-link")]
@@ -2425,22 +2664,20 @@ mod tests {
             (*fixture.pool.raw).max = 0;
             ngx_rs_test_fail_allocations_after(0);
         }
-        let result = add_variable::<DataVariable>(
+        let result = add_prefix_variable::<DataPrefixVariable>(
             &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_prefix_allocation_failure_"),
-            HttpVariableFlags::PREFIX,
-            1,
+            HttpVariableFlags::empty(),
         );
         unsafe { ngx_rs_test_reset_allocation_failures() };
 
         assert!(result.is_err());
         assert_eq!(fixture.configuration.prefix_variables().len(), prefix_count);
 
-        add_variable::<CountingVariable>(
+        add_prefix_variable::<CountingPrefixVariable>(
             &mut fixture.configuration(),
             NgxStr::from_bytes(b"ngx_rs_prefix_allocation_failure_"),
-            HttpVariableFlags::PREFIX,
-            2,
+            HttpVariableFlags::empty(),
         )
         .unwrap();
         let index = get_variable_index(
@@ -2449,9 +2686,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fixture.configuration.prefix_variables().len(), prefix_count + 1);
-        assert_handler::<CountingVariable>(
+        assert_prefix_handler::<CountingPrefixVariable>(
             fixture.configuration.prefix_variable(b"ngx_rs_prefix_allocation_failure_"),
-            2,
         );
         fixture.configuration.finalize_variables();
         fixture.configuration.with_request(|request| {
@@ -2500,18 +2736,16 @@ mod tests {
         assert_handler::<TestVariable>(variable, usize::MAX);
 
         let prefix_name = b"ngx_rs_prefix_weak_";
-        add_variable::<CountingVariable>(
+        add_prefix_variable::<CountingPrefixVariable>(
             &mut fixture.configuration(),
             NgxStr::from_bytes(prefix_name),
-            weak_flags | HttpVariableFlags::PREFIX,
-            4,
+            weak_flags,
         )
         .unwrap();
-        add_variable::<DataVariable>(
+        add_prefix_variable::<DataPrefixVariable>(
             &mut fixture.configuration(),
             NgxStr::from_bytes(b"NgX_Rs_PrEfIx_WeAk_"),
-            HttpVariableFlags::CHANGEABLE | HttpVariableFlags::PREFIX,
-            5,
+            HttpVariableFlags::CHANGEABLE,
         )
         .unwrap();
         let prefix = fixture.configuration.prefix_variable(prefix_name);
@@ -2519,6 +2753,6 @@ mod tests {
             prefix.flags,
             (HttpVariableFlags::CHANGEABLE | HttpVariableFlags::PREFIX).bits()
         );
-        assert_handler::<DataVariable>(prefix, 5);
+        assert_prefix_handler::<DataPrefixVariable>(prefix);
     }
 }
