@@ -1409,9 +1409,12 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn prefix_name_allocation_failure_does_not_publish_a_partial_entry() {
+    fn post_push_prefix_name_allocation_failure_rolls_back_entry() {
         let mut fixture = VariableFixture::new();
         let prefix_count = fixture.prefix_variables().len();
+        let prefix_capacity = fixture.main.prefix_variables.nalloc;
+        let prefix_storage = fixture.main.prefix_variables.elts;
+        assert!(prefix_count < prefix_capacity);
 
         unsafe {
             (*fixture._pool.raw).max = 0;
@@ -1426,6 +1429,8 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(fixture.prefix_variables().len(), prefix_count);
+        assert_eq!(fixture.main.prefix_variables.nalloc, prefix_capacity);
+        assert_eq!(fixture.main.prefix_variables.elts, prefix_storage);
 
         add_prefix_variable::<CountingPrefixVariable>(
             &mut fixture.configuration(),
