@@ -32,9 +32,7 @@ unsafe impl StreamModule for Module {
     }
 
     fn postconfigure(parser: &mut ngx::stream::StreamConfigurationParser<'_>) -> ngx_int_t {
-        add_phase_handler::<ProbeHandler>(parser)
-            .map_or(Status::NGX_ERROR, |_| Status::NGX_OK)
-            .0
+        add_phase_handler::<ProbeHandler>(parser).map_or(Status::NGX_ERROR, |_| Status::NGX_OK).0
     }
 }
 

@@ -111,7 +111,8 @@ impl HttpRequestHandler for SubRequestAccessHandler {
     type Output = Result<Status, ExampleError>;
 
     fn handler(request: &mut RequestRefMut<'_>) -> Self::Output {
-        let config = request.location_conf::<Module>()
+        let config = request
+            .location_conf::<Module>()
             .map_err(|_| ExampleError::Config)?
             .ok_or(ExampleError::Config)?;
         if config.uri.data.is_null() {
