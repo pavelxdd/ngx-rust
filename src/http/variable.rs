@@ -16,7 +16,7 @@ use crate::ffi::{
 };
 use crate::http::{
     HttpConfigError, HttpConfigurationParser, HttpModuleMainConf, IntoHandlerStatus,
-    NgxHttpCoreModule, RequestError, RequestRefMut, request_callback_status,
+    NgxHttpCoreModule, RequestError, RequestRef, RequestRefMut, request_callback_status,
 };
 
 bitflags::bitflags! {
@@ -471,9 +471,10 @@ impl HttpVariableOutput<'_> {
     }
 }
 
-/// Checked borrowed view of an initialized HTTP variable value.
+/// Checked callback-bound snapshot of an initialized HTTP variable value.
 ///
-/// Values returned from indexed lookup remain borrowed from the active request:
+/// The descriptor fields are copied so native variable evaluation cannot alias a Rust reference.
+/// Its data bytes remain borrowed from the active request or setter callback:
 ///
 /// ```compile_fail
 /// use ngx::http::{HttpVariableIndex, HttpVariableValueRef, RequestRefMut};
@@ -486,7 +487,8 @@ impl HttpVariableOutput<'_> {
 /// }
 /// ```
 pub struct HttpVariableValueRef<'value> {
-    raw: &'value ngx_variable_value_t,
+    raw: ngx_variable_value_t,
+    _value: PhantomData<&'value [u8]>,
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
@@ -497,12 +499,12 @@ impl HttpVariableValueRef<'_> {
             return None;
         }
 
-        let raw = unsafe { raw.as_ref() };
+        let raw = unsafe { raw.as_ptr().read() };
         if raw.not_found() == 0 && raw.len() != 0 && raw.data.is_null() {
             return None;
         }
 
-        Some(Self { raw, _not_thread_safe: PhantomData })
+        Some(Self { raw, _value: PhantomData, _not_thread_safe: PhantomData })
     }
 
     /// Returns the found bytes, or `None` for nginx's not-found state.
@@ -627,9 +629,27 @@ pub trait HttpVariableHandler {
 }
 
 /// Typed setter for a registered HTTP variable.
+///
+/// Setters receive only shared request access, so they cannot safely flush or re-evaluate a
+/// variable while retaining the assigned value:
+///
+/// ```compile_fail
+/// use ngx::http::{HttpVariableSetter, HttpVariableValueRef, RequestRefMut};
+///
+/// struct MutableSetter;
+///
+/// impl HttpVariableSetter for MutableSetter {
+///     fn set(
+///         _request: &mut RequestRefMut<'_>,
+///         _value: HttpVariableValueRef<'_>,
+///         _data: usize,
+///     ) {
+///     }
+/// }
+/// ```
 pub trait HttpVariableSetter {
     /// Receives an assignment for one active request.
-    fn set(request: &mut RequestRefMut<'_>, value: HttpVariableValueRef<'_>, data: usize);
+    fn set(request: &RequestRef<'_>, value: HttpVariableValueRef<'_>, data: usize);
 }
 
 /// Registers a typed read-only HTTP variable.
@@ -777,7 +797,7 @@ pub(crate) unsafe extern "C" fn raw_set_handler<S>(
                 return crate::core::Status::NGX_ERROR;
             };
 
-            S::set(request, value, data);
+            S::set(&request.view(), value, data);
             crate::core::Status::NGX_OK
         })
     };
@@ -807,7 +827,7 @@ mod tests {
         NGX_ERROR, NGX_HTTP_MODULE, ngx_conf_t, ngx_http_core_main_conf_t, ngx_http_request_t,
         ngx_int_t, ngx_variable_value_t,
     };
-    use crate::http::{HttpConfigurationParser, RequestRefMut};
+    use crate::http::{HttpConfigurationParser, RequestRef, RequestRefMut};
 
     #[cfg(feature = "test-link")]
     use crate::ffi::{
@@ -921,7 +941,7 @@ mod tests {
     struct SetVariable;
 
     impl HttpVariableSetter for SetVariable {
-        fn set(_request: &mut RequestRefMut<'_>, value: HttpVariableValueRef<'_>, data: usize) {
+        fn set(_request: &RequestRef<'_>, value: HttpVariableValueRef<'_>, data: usize) {
             assert_eq!(value.bytes(), Some(&b"set value"[..]));
             assert!(value.is_valid());
             assert!(value.is_cacheable());
@@ -933,7 +953,7 @@ mod tests {
     struct CountingSetter;
 
     impl HttpVariableSetter for CountingSetter {
-        fn set(_request: &mut RequestRefMut<'_>, _value: HttpVariableValueRef<'_>, data: usize) {
+        fn set(_request: &RequestRef<'_>, _value: HttpVariableValueRef<'_>, data: usize) {
             let calls = unsafe { &*(data as *const AtomicUsize) };
             calls.fetch_add(1, Ordering::Relaxed);
         }
@@ -1049,7 +1069,7 @@ mod tests {
 
     #[cfg(feature = "std")]
     impl HttpVariableSetter for PanickingSetter {
-        fn set(_request: &mut RequestRefMut<'_>, _value: HttpVariableValueRef<'_>, _data: usize) {
+        fn set(_request: &RequestRef<'_>, _value: HttpVariableValueRef<'_>, _data: usize) {
             panic!("variable setter panic")
         }
     }
