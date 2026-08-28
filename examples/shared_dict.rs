@@ -22,7 +22,7 @@ use ngx::core::{
 };
 use ngx::http::{
     HttpConfigurationParser, HttpModule, HttpModuleMainConf, HttpVariableFlags,
-    HttpVariableHandler, HttpVariableOutput, HttpVariableSetter, HttpVariableValueRef,
+    HttpVariableHandler, HttpVariableOutput, HttpVariableSetter, HttpVariableValueRef, RequestRef,
     RequestRefMut, add_variable_with_setter,
 };
 use ngx::{ngx_conf_log_error, ngx_log_debug, ngx_string};
@@ -777,9 +777,12 @@ impl HttpVariableHandler for SharedDictVariable {
 }
 
 impl HttpVariableSetter for SharedDictVariable {
-    fn set(request: &mut RequestRefMut<'_>, value: HttpVariableValueRef<'_>, data: usize) {
+    fn set(request: &RequestRef<'_>, value: HttpVariableValueRef<'_>, data: usize) {
         let mut key = ngx_str_t::empty();
-        if unsafe { ngx_http_complex_value(request.as_ptr(), data as _, &raw mut key) }
+        // SAFETY: `data` is the configuration-owned compiled key for this registered setter. The
+        // assigned descriptor is already snapshotted, and its bytes are not borrowed until this
+        // potentially reentrant evaluation has completed.
+        if unsafe { ngx_http_complex_value(request.as_ptr().cast_mut(), data as _, &raw mut key) }
             != Status::NGX_OK.into()
         {
             return;
@@ -864,7 +867,7 @@ impl HttpVariableHandler for SharedDictEntriesVariable {
 }
 
 impl HttpVariableSetter for SharedDictEntriesVariable {
-    fn set(request: &mut RequestRefMut<'_>, _value: HttpVariableValueRef<'_>, _data: usize) {
+    fn set(request: &RequestRef<'_>, _value: HttpVariableValueRef<'_>, _data: usize) {
         let Ok(Some(smcf)) = request.main_conf::<HttpSharedDictModule>() else {
             return;
         };
