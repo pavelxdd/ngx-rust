@@ -10,7 +10,7 @@ use ngx::ngx_string;
 use ngx::stream::{
     Merge, MergeConfigError, Session, StreamModule, StreamModuleServerConf,
     StreamModuleSessionContext, StreamPhase, StreamSessionHandler, StreamVariableFlags,
-    StreamVariableHandler, StreamVariableValue, add_phase_handler, add_variable,
+    StreamVariableHandler, StreamVariableOutput, add_phase_handler, add_variable,
 };
 
 struct Module;
@@ -95,7 +95,7 @@ impl StreamVariableHandler for ProbeVariable {
 
     fn get(
         session: &mut Session<'_>,
-        value: &mut StreamVariableValue<'_>,
+        value: &mut StreamVariableOutput<'_>,
         _data: usize,
     ) -> Self::Output {
         let seen = match session.module_context::<Module>() {
