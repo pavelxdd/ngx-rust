@@ -243,7 +243,7 @@ impl HttpRequestHandler for AwsSigV4HeaderHandler {
 
     fn handler(request: &mut RequestRefMut<'_>) -> Self::Output {
         // get Module Config from request
-        let Ok(Some(conf)) = Module::location_conf(request) else {
+        let Ok(Some(conf)) = request.location_conf::<Module>() else {
             return Status::NGX_ERROR;
         };
         ngx_log_debug_http!(request, "AWS signature V4 module {}", {

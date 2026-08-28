@@ -5,8 +5,8 @@ use core::ptr;
 use libc::sockaddr_storage;
 use ngx::core::{NgxStr, Pool, SocketType, Status};
 use ngx::ffi::{
-    NGX_HTTP_MODULE, in_port_t, ngx_conf_t, ngx_http_module_t, ngx_inet_get_port, ngx_int_t,
-    ngx_module_t, ngx_sock_ntop, ngx_str_t, sockaddr,
+    NGX_HTTP_MODULE, in_port_t, ngx_http_module_t, ngx_inet_get_port, ngx_int_t, ngx_module_t,
+    ngx_sock_ntop, ngx_str_t, sockaddr,
 };
 use ngx::http::{
     self, HttpModule, HttpModuleRequestContext, HttpVariableFlags, HttpVariableHandler,
@@ -277,9 +277,9 @@ unsafe impl HttpModule for Module {
         unsafe { &*::core::ptr::addr_of!(ngx_http_orig_dst_module) }
     }
 
-    fn preconfigure(cf: &mut ngx_conf_t) -> ngx_int_t {
+    fn preconfigure(parser: &mut http::HttpConfigurationParser<'_>) -> ngx_int_t {
         if add_variable::<OrigDstAddrVariable>(
-            cf,
+            parser,
             NgxStr::from_bytes(b"server_orig_addr"),
             HttpVariableFlags::empty(),
             0,
@@ -289,7 +289,7 @@ unsafe impl HttpModule for Module {
             return Status::NGX_ERROR.0;
         }
         if add_variable::<OrigDstPortVariable>(
-            cf,
+            parser,
             NgxStr::from_bytes(b"server_orig_port"),
             HttpVariableFlags::empty(),
             0,

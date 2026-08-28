@@ -3,13 +3,19 @@ use core::ptr::NonNull;
 
 use crate::ffi::{
     NGX_STREAM_MODULE, ngx_conf_t, ngx_cycle_t, ngx_module_t, ngx_stream_conf_ctx_t,
-    ngx_stream_core_srv_conf_t, ngx_stream_session_t, ngx_stream_upstream_srv_conf_t, ngx_uint_t,
+    ngx_stream_session_t, ngx_uint_t,
 };
 use crate::stream::StreamModule;
 
 /// Failure while resolving a typed Stream configuration slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamConfigError {
+    /// The configuration callback received a null parser pointer.
+    NullConfiguration,
+    /// The configuration callback received a misaligned parser pointer.
+    MisalignedConfiguration,
+    /// The parser contains a misaligned Stream context pointer.
+    MisalignedContext,
     /// The module descriptor is not a Stream module.
     WrongModuleType,
     /// Nginx has not assigned the module's global index.
@@ -20,8 +26,6 @@ pub enum StreamConfigError {
     ModuleIndexOutOfBounds,
     /// The module's Stream configuration index is outside the configured slot array.
     ContextIndexOutOfBounds,
-    /// The configuration parser is not in a Stream context.
-    WrongConfigurationContext,
     /// The Stream core module does not have a usable global index.
     UnsetStreamModuleIndex,
     /// The Stream core module index is outside the configured module array.
@@ -122,222 +126,134 @@ pub(crate) fn session_server_conf_slot<T>(
     server_conf_slot(session.srv_conf, module)
 }
 
-pub(crate) mod sealed {
-    pub trait MainConfSource {}
-    pub trait MainConfSourceMut: MainConfSource {}
-    pub trait ServerConfSource {}
-    pub trait ServerConfSourceMut: ServerConfSource {}
-}
-
-/// Source of a Stream module's main configuration.
+/// Checked Stream configuration parser for one nginx callback invocation.
 ///
-/// This trait is sealed because its implementations carry the nginx-owned slot-array invariant.
-/// Use [`StreamModuleMainConf::main_conf`] instead of calling it directly.
-pub trait StreamModuleMainConfExt: sealed::MainConfSource {
-    /// Resolves a checked typed main-configuration slot.
-    #[doc(hidden)]
-    fn stream_main_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, StreamConfigError>;
-}
-
-/// Exclusive source of a Stream module's main configuration.
-pub trait StreamModuleMainConfMutExt: StreamModuleMainConfExt + sealed::MainConfSourceMut {
-    /// Resolves a checked exclusive main-configuration slot.
-    #[doc(hidden)]
-    fn stream_main_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, StreamConfigError>;
-}
-
-/// Source of a Stream module's server configuration.
+/// The callback-scoped capability cannot be retained after its FFI adapter returns.
 ///
-/// This trait is sealed because its implementations carry the nginx-owned slot-array invariant.
-/// Use [`StreamModuleServerConf::server_conf`] instead of calling it directly.
-pub trait StreamModuleServerConfExt: sealed::ServerConfSource {
-    /// Resolves a checked typed server-configuration slot.
-    #[doc(hidden)]
-    fn stream_server_conf<T>(&self, module: &ngx_module_t)
-    -> Result<Option<&T>, StreamConfigError>;
+/// ```compile_fail
+/// use core::marker::PhantomData;
+/// use core::ptr::NonNull;
+/// use ngx::ffi::ngx_conf_t;
+/// use ngx::stream::StreamConfigurationParser;
+///
+/// fn forge(raw: NonNull<ngx_conf_t>) -> StreamConfigurationParser<'static> {
+///     StreamConfigurationParser {
+///         raw,
+///         _callback: PhantomData,
+///         _not_thread_safe: PhantomData,
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_conf_t;
+/// use ngx::stream::StreamConfigurationParser;
+///
+/// unsafe fn escape(
+///     raw: *mut ngx_conf_t,
+/// ) -> &'static mut StreamConfigurationParser<'static> {
+///     unsafe { StreamConfigurationParser::with_raw(raw, |parser| parser) }.unwrap()
+/// }
+/// ```
+pub struct StreamConfigurationParser<'callback> {
+    raw: NonNull<ngx_conf_t>,
+    _callback: core::marker::PhantomData<&'callback mut ngx_conf_t>,
+    _not_thread_safe: core::marker::PhantomData<*mut ()>,
 }
 
-/// Exclusive source of a Stream module's server configuration.
-pub trait StreamModuleServerConfMutExt:
-    StreamModuleServerConfExt + sealed::ServerConfSourceMut
-{
-    /// Resolves a checked exclusive server-configuration slot.
-    #[doc(hidden)]
-    fn stream_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, StreamConfigError>;
-}
-
-impl sealed::MainConfSource for ngx_stream_conf_ctx_t {}
-impl sealed::MainConfSourceMut for ngx_stream_conf_ctx_t {}
-impl sealed::ServerConfSource for ngx_stream_conf_ctx_t {}
-impl sealed::ServerConfSourceMut for ngx_stream_conf_ctx_t {}
-
-impl StreamModuleMainConfExt for ngx_stream_conf_ctx_t {
-    fn stream_main_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, StreamConfigError> {
-        Ok(main_conf_slot(self.main_conf, module)?.map(|value| unsafe { value.as_ref() }))
+#[cfg(test)]
+impl<'callback> StreamConfigurationParser<'callback> {
+    pub(crate) fn from_test_callback(configuration: &'callback mut ngx_conf_t) -> Self {
+        Self {
+            raw: NonNull::from(configuration),
+            _callback: core::marker::PhantomData,
+            _not_thread_safe: core::marker::PhantomData,
+        }
     }
 }
 
-impl StreamModuleMainConfMutExt for ngx_stream_conf_ctx_t {
-    fn stream_main_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, StreamConfigError> {
-        Ok(main_conf_slot(self.main_conf, module)?.map(|mut value| unsafe { value.as_mut() }))
-    }
-}
+impl StreamConfigurationParser<'_> {
+    /// Invokes a closure with a checked parser capability that cannot escape the callback.
+    ///
+    /// # Safety
+    ///
+    /// `configuration` must point to the live nginx Stream parser state for this callback. Its
+    /// context and configuration slots must remain valid and exclusively mutable until the
+    /// closure returns.
+    pub unsafe fn with_raw<R>(
+        configuration: *mut ngx_conf_t,
+        callback: impl for<'scope> FnOnce(&mut StreamConfigurationParser<'scope>) -> R,
+    ) -> Result<R, StreamConfigError> {
+        let raw = NonNull::new(configuration).ok_or(StreamConfigError::NullConfiguration)?;
+        if !configuration.is_aligned() {
+            return Err(StreamConfigError::MisalignedConfiguration);
+        }
 
-impl StreamModuleServerConfExt for ngx_stream_conf_ctx_t {
-    fn stream_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, StreamConfigError> {
-        Ok(server_conf_slot(self.srv_conf, module)?.map(|value| unsafe { value.as_ref() }))
-    }
-}
-
-impl StreamModuleServerConfMutExt for ngx_stream_conf_ctx_t {
-    fn stream_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, StreamConfigError> {
-        Ok(server_conf_slot(self.srv_conf, module)?.map(|mut value| unsafe { value.as_mut() }))
-    }
-}
-
-fn stream_context(
-    cf: &ngx_conf_t,
-) -> Result<Option<NonNull<ngx_stream_conf_ctx_t>>, StreamConfigError> {
-    if cf.module_type != NGX_STREAM_MODULE as ngx_uint_t {
-        return Err(StreamConfigError::WrongConfigurationContext);
+        let mut parser = StreamConfigurationParser {
+            raw,
+            _callback: core::marker::PhantomData,
+            _not_thread_safe: core::marker::PhantomData,
+        };
+        Ok(callback(&mut parser))
     }
 
-    Ok(NonNull::new(cf.ctx.cast()))
-}
-
-impl sealed::MainConfSource for ngx_conf_t {}
-impl sealed::MainConfSourceMut for ngx_conf_t {}
-impl sealed::ServerConfSource for ngx_conf_t {}
-impl sealed::ServerConfSourceMut for ngx_conf_t {}
-
-impl StreamModuleMainConfExt for ngx_conf_t {
-    fn stream_main_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, StreamConfigError> {
-        let Some(context) = stream_context(self)? else {
+    fn context(&self) -> Result<Option<NonNull<ngx_stream_conf_ctx_t>>, StreamConfigError> {
+        let context = unsafe { self.raw.as_ref().ctx.cast::<ngx_stream_conf_ctx_t>() };
+        let Some(context) = NonNull::new(context) else {
             return Ok(None);
         };
-        unsafe { context.as_ref().stream_main_conf(module) }
+        if !context.as_ptr().is_aligned() {
+            return Err(StreamConfigError::MisalignedContext);
+        }
+        Ok(Some(context))
     }
-}
 
-impl StreamModuleMainConfMutExt for ngx_conf_t {
-    fn stream_main_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, StreamConfigError> {
-        let Some(mut context) = stream_context(self)? else {
+    fn main_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, StreamConfigError> {
+        let Some(context) = self.context()? else {
             return Ok(None);
         };
-        unsafe { context.as_mut().stream_main_conf_mut(module) }
+        Ok(main_conf_slot(unsafe { context.as_ref().main_conf }, module)?
+            .map(|value| unsafe { value.as_ref() }))
     }
-}
 
-impl StreamModuleServerConfExt for ngx_conf_t {
-    fn stream_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, StreamConfigError> {
-        let Some(context) = stream_context(self)? else {
-            return Ok(None);
-        };
-        unsafe { context.as_ref().stream_server_conf(module) }
-    }
-}
-
-impl StreamModuleServerConfMutExt for ngx_conf_t {
-    fn stream_server_conf_mut<T>(
+    fn main_conf_mut<T>(
         &mut self,
         module: &ngx_module_t,
     ) -> Result<Option<&mut T>, StreamConfigError> {
-        let Some(mut context) = stream_context(self)? else {
+        let Some(context) = self.context()? else {
             return Ok(None);
         };
-        unsafe { context.as_mut().stream_server_conf_mut(module) }
+        Ok(main_conf_slot(unsafe { context.as_ref().main_conf }, module)?
+            .map(|mut value| unsafe { value.as_mut() }))
     }
-}
 
-impl sealed::MainConfSource for ngx_stream_core_srv_conf_t {}
-impl sealed::MainConfSourceMut for ngx_stream_core_srv_conf_t {}
-impl sealed::ServerConfSource for ngx_stream_core_srv_conf_t {}
-impl sealed::ServerConfSourceMut for ngx_stream_core_srv_conf_t {}
-
-impl StreamModuleMainConfExt for ngx_stream_core_srv_conf_t {
-    fn stream_main_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, StreamConfigError> {
-        let Some(context) = NonNull::new(self.ctx) else {
+    fn server_conf<T>(&self, module: &ngx_module_t) -> Result<Option<&T>, StreamConfigError> {
+        let Some(context) = self.context()? else {
             return Ok(None);
         };
-        unsafe { context.as_ref().stream_main_conf(module) }
+        Ok(server_conf_slot(unsafe { context.as_ref().srv_conf }, module)?
+            .map(|value| unsafe { value.as_ref() }))
     }
-}
 
-impl StreamModuleMainConfMutExt for ngx_stream_core_srv_conf_t {
-    fn stream_main_conf_mut<T>(
+    fn server_conf_mut<T>(
         &mut self,
         module: &ngx_module_t,
     ) -> Result<Option<&mut T>, StreamConfigError> {
-        let Some(mut context) = NonNull::new(self.ctx) else {
+        let Some(context) = self.context()? else {
             return Ok(None);
         };
-        unsafe { context.as_mut().stream_main_conf_mut(module) }
+        Ok(server_conf_slot(unsafe { context.as_ref().srv_conf }, module)?
+            .map(|mut value| unsafe { value.as_mut() }))
     }
-}
 
-impl StreamModuleServerConfExt for ngx_stream_core_srv_conf_t {
-    fn stream_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, StreamConfigError> {
-        let Some(context) = NonNull::new(self.ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_ref().stream_server_conf(module) }
-    }
-}
-
-impl StreamModuleServerConfMutExt for ngx_stream_core_srv_conf_t {
-    fn stream_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, StreamConfigError> {
-        let Some(mut context) = NonNull::new(self.ctx) else {
-            return Ok(None);
-        };
-        unsafe { context.as_mut().stream_server_conf_mut(module) }
-    }
-}
-
-impl sealed::ServerConfSource for ngx_stream_upstream_srv_conf_t {}
-impl sealed::ServerConfSourceMut for ngx_stream_upstream_srv_conf_t {}
-
-impl StreamModuleServerConfExt for ngx_stream_upstream_srv_conf_t {
-    fn stream_server_conf<T>(
-        &self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&T>, StreamConfigError> {
-        Ok(server_conf_slot(self.srv_conf, module)?.map(|value| unsafe { value.as_ref() }))
-    }
-}
-
-impl StreamModuleServerConfMutExt for ngx_stream_upstream_srv_conf_t {
-    fn stream_server_conf_mut<T>(
-        &mut self,
-        module: &ngx_module_t,
-    ) -> Result<Option<&mut T>, StreamConfigError> {
-        Ok(server_conf_slot(self.srv_conf, module)?.map(|mut value| unsafe { value.as_mut() }))
+    /// Returns the native parser pointer for an explicit FFI operation.
+    ///
+    /// # Safety
+    ///
+    /// The pointer must not be retained beyond this callback, and the target nginx API must not
+    /// violate the parser capability's exclusive access to configuration state.
+    pub unsafe fn as_raw(&mut self) -> *mut ngx_conf_t {
+        self.raw.as_ptr()
     }
 }
 
@@ -352,16 +268,23 @@ pub unsafe trait StreamModuleMainConf: StreamModule {
     /// Gets the module's main configuration from a checked nginx-owned source.
     ///
     /// ```compile_fail
+    /// # use ngx::stream::{StreamConfigurationParser, StreamModuleMainConf};
+    /// fn wrong_slot_type<M: StreamModuleMainConf>(parser: &StreamConfigurationParser<'_>) {
+    ///     let _: &u8 = M::main_conf(parser).unwrap().unwrap();
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
     /// # use ngx::ffi::ngx_conf_t;
     /// # use ngx::stream::StreamModuleMainConf;
     /// fn escape<M: StreamModuleMainConf>(source: &ngx_conf_t) -> &'static M::MainConf {
     ///     M::main_conf(source).unwrap().unwrap()
     /// }
     /// ```
-    fn main_conf(
-        source: &impl StreamModuleMainConfExt,
-    ) -> Result<Option<&Self::MainConf>, StreamConfigError> {
-        source.stream_main_conf(Self::module())
+    fn main_conf<'a>(
+        parser: &'a StreamConfigurationParser<'_>,
+    ) -> Result<Option<&'a Self::MainConf>, StreamConfigError> {
+        parser.main_conf(Self::module())
     }
 
     /// Gets exclusive access to the module's main configuration.
@@ -373,10 +296,23 @@ pub unsafe trait StreamModuleMainConf: StreamModule {
     /// let _ = M::main_conf_mut(cf);
     /// # }
     /// ```
-    fn main_conf_mut(
-        source: &mut impl StreamModuleMainConfMutExt,
-    ) -> Result<Option<&mut Self::MainConf>, StreamConfigError> {
-        source.stream_main_conf_mut(Self::module())
+    fn main_conf_mut<'a>(
+        parser: &'a mut StreamConfigurationParser<'_>,
+    ) -> Result<Option<&'a mut Self::MainConf>, StreamConfigError> {
+        parser.main_conf_mut(Self::module())
+    }
+
+    /// Resolves shared main configuration from a native Stream context.
+    ///
+    /// # Safety
+    ///
+    /// `context` must be the live initialized context selected by nginx for the current callback.
+    /// Its slot arrays must remain valid and must contain the current Stream module slot count.
+    unsafe fn main_conf_from_context(
+        context: &ngx_stream_conf_ctx_t,
+    ) -> Result<Option<&Self::MainConf>, StreamConfigError> {
+        Ok(main_conf_slot(context.main_conf, Self::module())?
+            .map(|value| unsafe { value.as_ref() }))
     }
 
     /// Resolves configuration from an explicitly selected live cycle.
@@ -444,10 +380,10 @@ pub unsafe trait StreamModuleServerConf: StreamModule {
     type ServerConf: 'static;
 
     /// Gets the module's server configuration from a checked nginx-owned source.
-    fn server_conf(
-        source: &impl StreamModuleServerConfExt,
-    ) -> Result<Option<&Self::ServerConf>, StreamConfigError> {
-        source.stream_server_conf(Self::module())
+    fn server_conf<'a>(
+        parser: &'a StreamConfigurationParser<'_>,
+    ) -> Result<Option<&'a Self::ServerConf>, StreamConfigError> {
+        parser.server_conf(Self::module())
     }
 
     /// Gets exclusive access to the module's server configuration.
@@ -459,10 +395,23 @@ pub unsafe trait StreamModuleServerConf: StreamModule {
     /// let _ = M::server_conf_mut(cf);
     /// # }
     /// ```
-    fn server_conf_mut(
-        source: &mut impl StreamModuleServerConfMutExt,
-    ) -> Result<Option<&mut Self::ServerConf>, StreamConfigError> {
-        source.stream_server_conf_mut(Self::module())
+    fn server_conf_mut<'a>(
+        parser: &'a mut StreamConfigurationParser<'_>,
+    ) -> Result<Option<&'a mut Self::ServerConf>, StreamConfigError> {
+        parser.server_conf_mut(Self::module())
+    }
+
+    /// Resolves shared server configuration from a native Stream context.
+    ///
+    /// # Safety
+    ///
+    /// `context` must be the live initialized context selected by nginx for the current callback.
+    /// Its slot arrays must remain valid and must contain the current Stream module slot count.
+    unsafe fn server_conf_from_context(
+        context: &ngx_stream_conf_ctx_t,
+    ) -> Result<Option<&Self::ServerConf>, StreamConfigError> {
+        Ok(server_conf_slot(context.srv_conf, Self::module())?
+            .map(|value| unsafe { value.as_ref() }))
     }
 }
 
@@ -470,12 +419,13 @@ mod core_module {
     use crate::allocator::AllocError;
     use crate::collections::NgxArray;
     use crate::ffi::{
-        NGX_LOG_EMERG, ngx_conf_t, ngx_stream_core_main_conf_t, ngx_stream_core_module,
+        NGX_LOG_EMERG, ngx_stream_core_main_conf_t, ngx_stream_core_module,
         ngx_stream_core_srv_conf_t, ngx_stream_handler_pt,
     };
     use crate::ngx_conf_log_error;
     use crate::stream::{
-        StreamModule, StreamModuleMainConf, StreamModuleServerConf, StreamSessionHandler,
+        StreamConfigurationParser, StreamModule, StreamModuleMainConf, StreamModuleServerConf,
+        StreamSessionHandler,
     };
 
     /// Typed access to `ngx_stream_core_module` configuration.
@@ -499,12 +449,15 @@ mod core_module {
     ///
     /// Call this function from the module's postconfiguration callback when the caller owns the
     /// configuration diagnostic.
-    pub fn try_add_phase_handler<H>(cf: &mut ngx_conf_t) -> Result<(), AllocError>
+    pub fn try_add_phase_handler<H>(
+        parser: &mut StreamConfigurationParser<'_>,
+    ) -> Result<(), AllocError>
     where
         H: StreamSessionHandler,
     {
-        let main =
-            NgxStreamCoreModule::main_conf_mut(cf).map_err(|_| AllocError)?.ok_or(AllocError)?;
+        let main = NgxStreamCoreModule::main_conf_mut(parser)
+            .map_err(|_| AllocError)?
+            .ok_or(AllocError)?;
         let phase = main.phases.get_mut(H::PHASE as usize).ok_or(AllocError)?;
         let handlers =
             unsafe { NgxArray::<ngx_stream_handler_pt>::from_ngx_array_mut(&mut phase.handlers) }
@@ -516,13 +469,16 @@ mod core_module {
     /// Registers a typed handler in its declared Stream phase.
     ///
     /// Call this function from the module's postconfiguration callback.
-    pub fn add_phase_handler<H>(cf: &mut ngx_conf_t) -> Result<(), AllocError>
+    pub fn add_phase_handler<H>(
+        parser: &mut StreamConfigurationParser<'_>,
+    ) -> Result<(), AllocError>
     where
         H: StreamSessionHandler,
     {
-        let result = try_add_phase_handler::<H>(cf);
+        let result = try_add_phase_handler::<H>(parser);
 
-        if result.is_err() && !cf.log.is_null() {
+        let cf = unsafe { parser.as_raw() };
+        if result.is_err() && !unsafe { (*cf).log }.is_null() {
             ngx_conf_log_error!(NGX_LOG_EMERG, cf, "failed to register {} handler", H::name(),);
         }
 
@@ -594,10 +550,13 @@ mod tests {
     #[cfg(feature = "test-link")]
     use std::sync::MutexGuard;
 
-    use super::{StreamConfigError, StreamModuleMainConf, StreamModuleServerConf, module_indexes};
+    use super::{
+        StreamConfigError, StreamConfigurationParser, StreamModuleMainConf, StreamModuleServerConf,
+        module_indexes,
+    };
     use crate::ffi::{NGX_STREAM_MODULE, ngx_module_t, ngx_uint_t};
     #[cfg(feature = "test-link")]
-    use crate::ffi::{ngx_conf_t, ngx_stream_conf_ctx_t, ngx_stream_core_srv_conf_t};
+    use crate::ffi::{ngx_conf_t, ngx_stream_conf_ctx_t};
     use crate::stream::StreamModule;
 
     fn stream_module(index: ngx_uint_t, context_index: ngx_uint_t) -> ngx_module_t {
@@ -697,39 +656,59 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn wrong_module_type_does_not_read_a_stream_configuration_slot() {
+    fn parser_rejects_wrong_module_type_before_reading_a_slot() {
+        let _globals = StreamGlobals::new(1, 1);
         let mut value = 42_u32;
         let mut slots: [*mut c_void; 1] = [(&raw mut value).cast()];
-        let context =
+        let mut context =
             ngx_stream_conf_ctx_t { main_conf: slots.as_mut_ptr(), srv_conf: ptr::null_mut() };
-
-        assert_eq!(WrongTypeModule::main_conf(&context), Err(StreamConfigError::WrongModuleType));
-    }
-
-    #[cfg(feature = "test-link")]
-    #[test]
-    fn missing_parser_context_returns_none_and_wrong_context_errors() {
         let mut configuration = unsafe { mem::zeroed::<ngx_conf_t>() };
-        configuration.module_type = NGX_STREAM_MODULE as _;
+        configuration.ctx = (&raw mut context).cast();
+        let parser = StreamConfigurationParser::from_test_callback(&mut configuration);
 
-        assert_eq!(
-            TestStreamModule::main_conf(&configuration).map(|value| value.copied()),
-            Ok(None)
-        );
-
-        configuration.module_type = 0;
-        assert_eq!(
-            TestStreamModule::main_conf(&configuration),
-            Err(StreamConfigError::WrongConfigurationContext)
-        );
+        assert_eq!(WrongTypeModule::main_conf(&parser), Err(StreamConfigError::WrongModuleType));
     }
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn core_server_without_stream_context_returns_none() {
-        let server = unsafe { mem::zeroed::<ngx_stream_core_srv_conf_t>() };
+    fn parser_checks_callback_pointer_and_stream_context() {
+        assert_eq!(
+            unsafe {
+                StreamConfigurationParser::with_raw(ptr::null_mut(), |_| {
+                    crate::core::Status::NGX_OK.0
+                })
+            },
+            Err(StreamConfigError::NullConfiguration)
+        );
+        assert_eq!(
+            unsafe {
+                StreamConfigurationParser::with_raw(ptr::without_provenance_mut(1), |_| {
+                    crate::core::Status::NGX_OK.0
+                })
+            },
+            Err(StreamConfigError::MisalignedConfiguration)
+        );
 
-        assert_eq!(TestStreamModule::server_conf(&server).map(|value| value.copied()), Ok(None));
+        let _globals = StreamGlobals::new(2, 1);
+        let mut configuration = unsafe { mem::zeroed::<ngx_conf_t>() };
+        assert_eq!(
+            unsafe {
+                StreamConfigurationParser::with_raw(&raw mut configuration, |parser| {
+                    TestStreamModule::main_conf(parser).map(|value| value.copied())
+                })
+            },
+            Ok(Ok(None))
+        );
+
+        configuration.ctx = ptr::without_provenance_mut(1);
+        assert_eq!(
+            unsafe {
+                StreamConfigurationParser::with_raw(&raw mut configuration, |parser| {
+                    TestStreamModule::main_conf(parser).map(|value| value.copied())
+                })
+            },
+            Ok(Err(StreamConfigError::MisalignedContext))
+        );
     }
 
     #[cfg(feature = "test-link")]
@@ -826,18 +805,7 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn null_stream_configuration_slots_return_none() {
-        let _globals = StreamGlobals::new(2, 1);
-        let context =
-            ngx_stream_conf_ctx_t { main_conf: ptr::null_mut(), srv_conf: ptr::null_mut() };
-
-        assert_eq!(TestStreamModule::main_conf(&context).map(|value| value.copied()), Ok(None));
-        assert_eq!(TestStreamModule::server_conf(&context).map(|value| value.copied()), Ok(None));
-    }
-
-    #[cfg(feature = "test-link")]
-    #[test]
-    fn typed_stream_configuration_access_follows_the_source_borrow() {
+    fn parser_owns_shared_and_mutable_stream_configuration_access() {
         let _globals = StreamGlobals::new(2, 1);
         let mut main = 42_u32;
         let mut server = 99_u32;
@@ -847,22 +815,26 @@ mod tests {
             main_conf: main_slots.as_mut_ptr(),
             srv_conf: server_slots.as_mut_ptr(),
         };
+        let mut configuration = unsafe { mem::zeroed::<ngx_conf_t>() };
+        configuration.ctx = (&raw mut context).cast();
 
-        assert_eq!(TestStreamModule::main_conf(&context).map(|value| value.copied()), Ok(Some(42)));
-        assert_eq!(
-            TestStreamModule::server_conf(&context).map(|value| value.copied()),
-            Ok(Some(99))
-        );
-
-        if let Some(value) = TestStreamModule::main_conf_mut(&mut context).unwrap() {
-            *value = 7;
+        unsafe {
+            StreamConfigurationParser::with_raw(&raw mut configuration, |parser| {
+                assert_eq!(
+                    TestStreamModule::main_conf(parser).map(|value| value.copied()),
+                    Ok(Some(42))
+                );
+                assert_eq!(
+                    TestStreamModule::server_conf(parser).map(|value| value.copied()),
+                    Ok(Some(99))
+                );
+                *TestStreamModule::main_conf_mut(parser).unwrap().unwrap() = 7;
+                *TestStreamModule::server_conf_mut(parser).unwrap().unwrap() = 8;
+            })
         }
-        if let Some(value) = TestStreamModule::server_conf_mut(&mut context).unwrap() {
-            *value = 8;
-        }
+        .unwrap();
 
-        assert_eq!(main, 7);
-        assert_eq!(server, 8);
+        assert_eq!((main, server), (7, 8));
     }
 
     #[cfg(feature = "test-link")]

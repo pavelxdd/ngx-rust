@@ -2,7 +2,7 @@ extern crate alloc;
 
 use alloc::string::ToString;
 use core::ffi::{c_char, c_void};
-use core::ptr::{self, NonNull};
+use core::ptr;
 use core::time::Duration;
 use std::time::Instant;
 
@@ -25,8 +25,8 @@ unsafe impl http::HttpModule for Module {
         unsafe { &*::core::ptr::addr_of!(ngx_http_async_module) }
     }
 
-    fn postconfigure(cf: &mut ngx_conf_t) -> ngx_int_t {
-        http::add_async_phase_handler::<AsyncAccessHandler>(cf)
+    fn postconfigure(parser: &mut http::HttpConfigurationParser<'_>) -> ngx_int_t {
+        http::add_async_phase_handler::<AsyncAccessHandler>(parser)
             .map_or(Status::NGX_ERROR.0, |_| Status::NGX_OK.0)
     }
 
@@ -35,11 +35,12 @@ unsafe impl http::HttpModule for Module {
             return Status::NGX_ERROR.0;
         }
 
-        let log = unsafe { NonNull::new((*cycle.as_ptr()).log) };
+        let log = unsafe { ngx::log::LogRef::from_raw((*cycle.as_ptr()).log) };
         let Some(log) = log else {
             return Status::NGX_ERROR.0;
         };
-        if ngx_async::init_worker(log).is_err() {
+        // SAFETY: nginx retains the process-cycle logger until the matching exit hook.
+        if unsafe { ngx_async::init_worker(log) }.is_err() {
             return Status::NGX_ERROR.0;
         }
 
@@ -188,13 +189,15 @@ impl AsyncHttpRequestHandler for AsyncAccessHandler {
     fn start(
         request: &mut http::RequestRefMut<'_>,
     ) -> impl core::future::Future<Output = Self::Output> + 'static {
-        let enabled = Module::location_conf(request)
+        let enabled = request
+            .location_conf::<Module>()
             .map_err(|_| SubRequestError::Create(Status::NGX_ERROR.into()))
             .and_then(|configuration| {
                 configuration
                     .map(|configuration| configuration.enable.unwrap_or(false))
                     .ok_or(SubRequestError::Create(Status::NGX_ERROR.into()))
             });
+        let log = request.log().ok().flatten();
         let subrequest = match enabled {
             Ok(enabled) => {
                 ngx_log_debug_http!(request, "async module enabled: {enabled}");
@@ -222,8 +225,13 @@ impl AsyncHttpRequestHandler for AsyncAccessHandler {
             };
             let (started, subrequest) = subrequest?;
             let subrequest_status = subrequest.await?;
+            let log = log
+                .and_then(|log| unsafe { ngx::log::LogRef::from_raw(log.as_ptr()) })
+                .ok_or(SubRequestError::Create(Status::NGX_ERROR.into()))?;
 
-            ngx_async::sleep(Duration::from_millis(10)).await;
+            // SAFETY: the async handler's request hold retains the connection logger until this
+            // future completes or is cancelled.
+            unsafe { ngx_async::sleep(Duration::from_millis(10), log) }.await;
             // nginx's IOCP event module has no cross-thread notification hook.
             #[cfg(not(windows))]
             ThreadWake::new().await;

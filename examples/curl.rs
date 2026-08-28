@@ -72,7 +72,7 @@ impl HttpRequestHandler for CurlRequestHandler {
     type Output = Status;
 
     fn handler(request: &mut RequestRefMut<'_>) -> Self::Output {
-        let Ok(Some(co)) = Module::location_conf(request) else {
+        let Ok(Some(co)) = request.location_conf::<Module>() else {
             return Status::NGX_ERROR;
         };
 
