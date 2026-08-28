@@ -99,7 +99,7 @@ impl fmt::Display for ExampleError {
 impl IntoHandlerStatus for ExampleError {
     fn into_handler_status(self, request: &RequestRef<'_>) -> ngx_int_t {
         if let Ok(Some(log)) = request.log() {
-            ngx_log_error!(NGX_LOG_ERR, log.as_ptr(), "subrequest example: {self}");
+            ngx_log_error!(NGX_LOG_ERR, log, "subrequest example: {self}");
         }
         NGX_ERROR as ngx_int_t
     }
@@ -160,7 +160,7 @@ fn subrequest_done(request: &mut RequestRefMut<'_>, completion_status: ngx_int_t
     };
     let Ok(Some(context)) = main.module_context_mut::<Module>() else {
         if let Ok(Some(log)) = request.log() {
-            ngx_log_error!(NGX_LOG_ERR, log.as_ptr(), "subrequest example: context is missing");
+            ngx_log_error!(NGX_LOG_ERR, log, "subrequest example: context is missing");
         }
         return Status::NGX_ERROR;
     };

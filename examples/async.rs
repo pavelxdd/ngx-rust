@@ -198,7 +198,13 @@ impl AsyncHttpRequestHandler for AsyncAccessHandler {
                     .map(|configuration| configuration.enable.unwrap_or(false))
                     .ok_or(SubRequestError::Create(Status::NGX_ERROR.into()))
             });
-        let log = request.log().ok().flatten();
+        // SAFETY: the async handler's request hold retains the connection logger until this
+        // future completes or is cancelled.
+        let log = request
+            .log()
+            .ok()
+            .flatten()
+            .and_then(|log| unsafe { ngx::log::LogRef::from_raw(log.as_ptr()) });
         let subrequest = match enabled {
             Ok(enabled) => {
                 ngx_log_debug_http!(request, "async module enabled: {enabled}");
@@ -226,12 +232,8 @@ impl AsyncHttpRequestHandler for AsyncAccessHandler {
             };
             let (started, subrequest) = subrequest?;
             let subrequest_status = subrequest.await?;
-            let log = log
-                .and_then(|log| unsafe { ngx::log::LogRef::from_raw(log.as_ptr()) })
-                .ok_or(SubRequestError::Create(Status::NGX_ERROR.into()))?;
+            let log = log.ok_or(SubRequestError::Create(Status::NGX_ERROR.into()))?;
 
-            // SAFETY: the async handler's request hold retains the connection logger until this
-            // future completes or is cancelled.
             unsafe { ngx_async::sleep(Duration::from_millis(10), log) }.await;
             // nginx's IOCP event module has no cross-thread notification hook.
             #[cfg(not(windows))]
