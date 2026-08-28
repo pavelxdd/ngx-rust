@@ -876,15 +876,17 @@ impl<'request, 'callback> HttpHeadersInBuilder<'request, 'callback> {
     /// Starts constructing a request-pool body candidate for this replacement-header set.
     pub fn request_body_candidate(
         &self,
-    ) -> Result<RequestBodyCandidate<'callback>, RequestBodyBuildError> {
-        let pool = unsafe { Pool::from_raw(self.pool) }.ok_or(RequestError::MisalignedPool)?;
+    ) -> Result<RequestBodyCandidate<'request>, RequestBodyBuildError> {
+        // SAFETY: this builder exclusively borrows the request for `'request`.
+        let pool =
+            unsafe { Pool::<'request>::from_raw(self.pool) }.ok_or(RequestError::MisalignedPool)?;
         Ok(RequestBodyCandidate::new(pool))
     }
 
     /// Publishes the replacement headers, body, and authoritative body framing together.
     pub fn commit_with_body(
         self,
-        body: RequestBodyCandidate<'callback>,
+        body: RequestBodyCandidate<'request>,
     ) -> Result<(), RequestBodyBuildError> {
         let Self { request, pool, mut headers } = self;
         if pool != body.pool.as_ptr() {
@@ -967,6 +969,19 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
 }
 
 /// Request-pool candidate for a non-null HTTP request body.
+///
+/// ```compile_fail
+/// use ngx::http::{HTTPStatus, RequestRefMut};
+///
+/// fn finalize_then_append(mut request: RequestRefMut<'_>) {
+///     let mut body = {
+///         let headers = request.headers_in_builder(1).unwrap();
+///         headers.request_body_candidate().unwrap()
+///     };
+///     request.finalize(HTTPStatus::BAD_REQUEST).unwrap();
+///     body.append_copy(b"late").unwrap();
+/// }
+/// ```
 pub struct RequestBodyCandidate<'callback> {
     pool: Pool<'callback>,
     chain: PoolChain<'callback>,
@@ -1018,14 +1033,15 @@ impl<'callback> RequestBodyCandidate<'callback> {
 /// Request-pool builder for atomically replacing an HTTP request body and its framing.
 pub struct RequestBodyBuilder<'request, 'callback> {
     request: &'request mut RequestRefMut<'callback>,
-    body: RequestBodyCandidate<'callback>,
+    body: RequestBodyCandidate<'request>,
 }
 
 impl<'request, 'callback> RequestBodyBuilder<'request, 'callback> {
     fn new(request: &'request mut RequestRefMut<'callback>) -> Result<Self, RequestBodyBuildError> {
         let raw_pool = request.pool()?.as_ptr();
-        // The checked request view owns the callback lifetime that keeps its pool alive.
-        let pool = unsafe { Pool::from_raw(raw_pool) }.ok_or(RequestError::MisalignedPool)?;
+        // SAFETY: this builder exclusively borrows the request for `'request`.
+        let pool =
+            unsafe { Pool::<'request>::from_raw(raw_pool) }.ok_or(RequestError::MisalignedPool)?;
 
         Ok(Self { request, body: RequestBodyCandidate::new(pool) })
     }
@@ -1036,7 +1052,7 @@ impl<'request, 'callback> RequestBodyBuilder<'request, 'callback> {
     }
 
     /// Appends one request-pool-owned buffer to the body candidate.
-    pub fn append(&mut self, buffer: PoolBuffer<'callback>) -> Result<(), RequestBodyBuildError> {
+    pub fn append(&mut self, buffer: PoolBuffer<'request>) -> Result<(), RequestBodyBuildError> {
         self.body.append(buffer)
     }
 
@@ -1057,8 +1073,8 @@ impl<'request, 'callback> RequestBodyBuilder<'request, 'callback> {
 
 static REQUEST_TEMP_FILE_WARNING: &[u8] = b"an HTTP body is buffered to a temporary file\0";
 
-impl<'callback> RequestTempFile<'callback> {
-    fn new(request: &RequestRefMut<'callback>) -> Result<Self, RequestTempFileError> {
+impl<'request> RequestTempFile<'request> {
+    fn new(request: &'request RequestRefMut<'_>) -> Result<Self, RequestTempFileError> {
         let pool = request.pool()?;
         let state = RequestTempFileState::new(request)?;
         Ok(Self { state, pool })
@@ -1071,8 +1087,8 @@ impl<'callback> RequestTempFile<'callback> {
     /// retain their control flags without opening a temporary file.
     pub fn append(
         &mut self,
-        input: ChainRef<'callback>,
-    ) -> Result<PoolChain<'callback>, RequestTempFileError> {
+        input: ChainRef<'request>,
+    ) -> Result<PoolChain<'request>, RequestTempFileError> {
         self.state.append_with_pool(&self.pool, input)
     }
 }
@@ -1107,11 +1123,11 @@ impl RequestTempFileState {
     /// request-pool file descriptors over their original ranges, and zero-size control buffers
     /// retain their control flags without opening a temporary file.
     ///
-    pub fn append<'callback>(
+    pub fn append<'request>(
         &mut self,
-        request: &RequestRefMut<'callback>,
-        input: ChainRef<'callback>,
-    ) -> Result<PoolChain<'callback>, RequestTempFileError> {
+        request: &'request RequestRefMut<'_>,
+        input: ChainRef<'request>,
+    ) -> Result<PoolChain<'request>, RequestTempFileError> {
         let pool = self.checked_pool(request)?;
         self.append_with_pool(&pool, input)
     }
@@ -1159,12 +1175,12 @@ impl RequestTempFileState {
     ///
     /// Nonempty memory is written to the persistent temporary file. File and control buffers are
     /// recreated in the request pool without opening a temporary file.
-    pub fn append_buffer<'callback>(
+    pub fn append_buffer<'request>(
         &mut self,
-        request: &RequestRefMut<'callback>,
+        request: &'request RequestRefMut<'_>,
         input: BufferRef<'_>,
         flags: BufferFlags,
-    ) -> Result<PoolChain<'callback>, RequestTempFileError> {
+    ) -> Result<PoolChain<'request>, RequestTempFileError> {
         let pool = self.checked_pool(request)?;
         let mut output = pool.chain();
         match input.kind()? {
@@ -1255,10 +1271,10 @@ impl RequestTempFileState {
         Ok(temp_file)
     }
 
-    fn checked_pool<'callback>(
+    fn checked_pool<'request>(
         &self,
-        request: &RequestRefMut<'callback>,
-    ) -> Result<Pool<'callback>, RequestTempFileError> {
+        request: &'request RequestRefMut<'_>,
+    ) -> Result<Pool<'request>, RequestTempFileError> {
         let pool = request.pool()?;
         if self.request != request.raw || self.pool != pool.as_ptr() {
             return Err(RequestTempFileError::ForeignRequest);
@@ -2208,7 +2224,17 @@ impl<'callback> RequestRefMut<'callback> {
     }
 
     /// Request pool.
-    pub fn pool(&self) -> Result<Pool<'callback>, RequestError> {
+    ///
+    /// ```compile_fail
+    /// use ngx::http::{HTTPStatus, RequestRefMut};
+    ///
+    /// fn finalize_then_allocate(request: RequestRefMut<'_>) {
+    ///     let pool = request.pool().unwrap();
+    ///     request.finalize(HTTPStatus::BAD_REQUEST).unwrap();
+    ///     pool.allocate_with_cleanup(|| ()).unwrap();
+    /// }
+    /// ```
+    pub fn pool(&self) -> Result<Pool<'_>, RequestError> {
         let pool = unsafe { self.raw.as_ref().pool };
         if pool.is_null() {
             return Err(RequestError::MissingPool);
@@ -2490,7 +2516,17 @@ impl<'callback> RequestRefMut<'callback> {
     ///
     /// The owner allocates its native state and opens its file only when a nonempty memory buffer
     /// is appended through [`RequestTempFile::append`].
-    pub fn temp_file(&self) -> Result<RequestTempFile<'callback>, RequestTempFileError> {
+    ///
+    /// ```compile_fail
+    /// use ngx::http::{HTTPStatus, RequestRefMut};
+    ///
+    /// fn finalize_then_keep_temp_file(request: RequestRefMut<'_>) {
+    ///     let temp_file = request.temp_file().unwrap();
+    ///     request.finalize(HTTPStatus::BAD_REQUEST).unwrap();
+    ///     drop(temp_file);
+    /// }
+    /// ```
+    pub fn temp_file(&self) -> Result<RequestTempFile<'_>, RequestTempFileError> {
         RequestTempFile::new(self)
     }
 
@@ -4702,6 +4738,7 @@ mod tests {
         let buffer = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
         let mut body = pool.chain();
         body.append(buffer).unwrap();
+        let body = body.into_raw();
 
         {
             let mut headers = request.clean_headers_out_builder(1).unwrap();
@@ -4709,7 +4746,7 @@ mod tests {
             headers.commit();
         }
 
-        assert!(!body.into_raw().is_null());
+        assert!(!body.is_null());
     }
 
     #[cfg(feature = "test-link")]
