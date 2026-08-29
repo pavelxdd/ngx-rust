@@ -193,6 +193,15 @@ macro_rules! ngx_conf_log_error {
 }
 
 /// Write to logger at debug level.
+///
+/// ```compile_fail
+/// use core::ptr::NonNull;
+/// use ngx::ffi::ngx_log_t;
+/// use ngx::ngx_log_debug;
+///
+/// let log = NonNull::<ngx_log_t>::dangling().as_ptr();
+/// ngx_log_debug!(log, "invalid logger");
+/// ```
 #[macro_export]
 macro_rules! ngx_log_debug {
     ( mask: $mask:expr, $log:expr, $($arg:tt)+ ) => {
