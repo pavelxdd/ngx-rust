@@ -46,15 +46,6 @@ impl From<&'static CStr> for MergeConfigError {
     }
 }
 
-impl MergeConfigError {
-    fn as_conf_result(&self) -> *mut c_char {
-        match self {
-            Self::NoValue => NGX_CONF_ERROR,
-            Self::Message(message) => message.as_ptr().cast_mut(),
-        }
-    }
-}
-
 /// Merges a child configuration value with its parent.
 pub trait Merge {
     /// Applies inherited values or returns a configuration error.
@@ -388,7 +379,7 @@ where
     }
 }
 
-fn log_merge_error(cf: *mut ngx_conf_t, level: &str, error: &MergeConfigError) {
+fn log_configuration_error(cf: *mut ngx_conf_t, action: &str, error: &dyn fmt::Display) {
     let Some(configuration) = (unsafe { checked_ref(cf) }) else {
         return;
     };
@@ -396,7 +387,18 @@ fn log_merge_error(cf: *mut ngx_conf_t, level: &str, error: &MergeConfigError) {
         return;
     }
 
-    crate::ngx_conf_log_error!(NGX_LOG_EMERG, cf, "failed to merge {level} configuration: {error}",);
+    crate::ngx_conf_log_error!(NGX_LOG_EMERG, cf, "failed to {action}: {error}");
+}
+
+fn log_merge_error(cf: *mut ngx_conf_t, level: &str, error: &dyn fmt::Display) {
+    let Some(configuration) = (unsafe { checked_ref(cf) }) else {
+        return;
+    };
+    if configuration.log.is_null() {
+        return;
+    }
+
+    crate::ngx_conf_log_error!(NGX_LOG_EMERG, cf, "failed to merge {level} configuration: {error}");
 }
 
 fn init_configuration<T>(cf: *mut ngx_conf_t, conf: *mut c_void) -> *mut c_char
@@ -411,19 +413,19 @@ where
     };
 
     #[cfg(feature = "std")]
-    {
-        match catch_unwind(AssertUnwindSafe(|| conf.init_main_conf())) {
-            Ok(Ok(())) => ptr::null_mut(),
-            Ok(Err(error)) => error.as_conf_result(),
-            Err(_) => NGX_CONF_ERROR,
-        }
-    }
-
+    let result = catch_unwind(AssertUnwindSafe(|| conf.init_main_conf()));
     #[cfg(not(feature = "std"))]
-    {
-        match conf.init_main_conf() {
-            Ok(()) => ptr::null_mut(),
-            Err(error) => error.as_conf_result(),
+    let result = Ok::<_, ()>(conf.init_main_conf());
+
+    match result {
+        Ok(Ok(())) => ptr::null_mut(),
+        Ok(Err(error)) => {
+            log_configuration_error(cf, "initialize main configuration", &error);
+            NGX_CONF_ERROR
+        }
+        Err(_) => {
+            log_configuration_error(cf, "initialize main configuration", &"callback panicked");
+            NGX_CONF_ERROR
         }
     }
 }
@@ -456,9 +458,12 @@ where
         Ok(Ok(())) => ptr::null_mut(),
         Ok(Err(error)) => {
             log_merge_error(cf, level, &error);
-            error.as_conf_result()
+            NGX_CONF_ERROR
         }
-        Err(_) => NGX_CONF_ERROR,
+        Err(_) => {
+            log_merge_error(cf, level, &"callback panicked");
+            NGX_CONF_ERROR
+        }
     }
 }
 
@@ -608,10 +613,11 @@ pub unsafe trait HttpModuleRequestContext: HttpModule {
 mod tests {
     extern crate alloc;
 
-    use alloc::boxed::Box;
+    use alloc::{boxed::Box, vec::Vec};
     use core::ffi::c_void;
     use core::mem;
     use core::ptr;
+    use core::slice;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
@@ -619,15 +625,42 @@ mod tests {
         init_process, postconfiguration, preconfiguration,
     };
     use crate::core::{ModuleDescriptor, NGX_CONF_ERROR, Status};
-    use crate::ffi::{ngx_conf_t, ngx_cycle_t, ngx_int_t, ngx_module_t};
     #[cfg(feature = "test-link")]
-    use crate::ffi::{ngx_create_pool, ngx_destroy_pool, ngx_log_t, ngx_pool_t, ngx_uint_t};
+    use crate::ffi::{
+        NGX_LOG_EMERG, ngx_create_pool, ngx_destroy_pool, ngx_log_t, ngx_pool_t, ngx_uint_t,
+    };
+    use crate::ffi::{ngx_conf_t, ngx_cycle_t, ngx_int_t, ngx_module_t};
     use crate::http::{HttpModuleLocationConf, HttpModuleMainConf, HttpModuleServerConf};
 
     #[cfg(feature = "test-link")]
     unsafe extern "C" {
         fn ngx_rs_test_fail_allocations_after(successes: ngx_uint_t);
         fn ngx_rs_test_reset_allocation_failures();
+    }
+
+    #[cfg(feature = "test-link")]
+    #[derive(Default)]
+    struct ConfigLogCapture {
+        records: Vec<(ngx_uint_t, Vec<u8>)>,
+    }
+
+    #[cfg(feature = "test-link")]
+    unsafe extern "C" fn capture_config_log(
+        log: *mut ngx_log_t,
+        level: ngx_uint_t,
+        bytes: *mut u8,
+        len: usize,
+    ) {
+        let Some(log) = (unsafe { log.as_mut() }) else {
+            return;
+        };
+        let Some(capture) = (unsafe { log.wdata.cast::<ConfigLogCapture>().as_mut() }) else {
+            return;
+        };
+        if bytes.is_null() {
+            return;
+        }
+        capture.records.push((level, unsafe { slice::from_raw_parts(bytes, len) }.to_vec()));
     }
 
     fn test_module() -> ModuleDescriptor {
@@ -1006,7 +1039,7 @@ mod tests {
 
     impl InitMainConf for RejectMainConf {
         fn init_main_conf(&mut self) -> Result<(), MergeConfigError> {
-            Err(MergeConfigError::Message(c"init rejected"))
+            Err(MergeConfigError::NoValue)
         }
     }
 
@@ -1022,16 +1055,30 @@ mod tests {
         type MainConf = RejectMainConf;
     }
 
+    #[cfg(feature = "test-link")]
     #[test]
-    fn main_initialization_preserves_a_static_error_message() {
-        let mut parser = unsafe { mem::zeroed::<ngx_conf_t>() };
+    fn main_initialization_logs_no_value_once_and_returns_the_silent_sentinel() {
+        let mut pool = TestPool::new();
+        let mut capture = ConfigLogCapture::default();
+        pool._log.log_level = NGX_LOG_EMERG as _;
+        pool._log.writer = Some(capture_config_log);
+        pool._log.wdata = (&raw mut capture).cast();
+        let mut parser = pool.configuration();
         let mut configuration = RejectMainConf;
 
         assert_eq!(
             unsafe {
                 RejectMainModule::init_main_conf(&raw mut parser, (&raw mut configuration).cast())
             },
-            c"init rejected".as_ptr().cast_mut()
+            NGX_CONF_ERROR
+        );
+        assert_eq!(capture.records.len(), 1);
+        assert_eq!(capture.records[0].0, NGX_LOG_EMERG as _);
+        assert!(
+            capture.records[0]
+                .1
+                .windows(b"failed to initialize main configuration: no value".len())
+                .any(|message| message == b"failed to initialize main configuration: no value")
         );
     }
 
@@ -1075,9 +1122,15 @@ mod tests {
         type LocationConf = RejectLocationConf;
     }
 
+    #[cfg(feature = "test-link")]
     #[test]
-    fn server_and_location_merges_preserve_static_error_messages() {
-        let mut parser = unsafe { mem::zeroed::<ngx_conf_t>() };
+    fn server_and_location_merges_log_messages_once_and_return_the_silent_sentinel() {
+        let mut pool = TestPool::new();
+        let mut capture = ConfigLogCapture::default();
+        pool._log.log_level = NGX_LOG_EMERG as _;
+        pool._log.writer = Some(capture_config_log);
+        pool._log.wdata = (&raw mut capture).cast();
+        let mut parser = pool.configuration();
         let mut server_parent = RejectServerConf;
         let mut server_child = RejectServerConf;
         assert_eq!(
@@ -1088,9 +1141,18 @@ mod tests {
                     (&raw mut server_child).cast(),
                 )
             },
-            c"server rejected".as_ptr().cast_mut()
+            NGX_CONF_ERROR
+        );
+        assert_eq!(capture.records.len(), 1);
+        assert_eq!(capture.records[0].0, NGX_LOG_EMERG as _);
+        assert!(
+            capture.records[0]
+                .1
+                .windows(b"failed to merge server configuration: server rejected".len())
+                .any(|message| message == b"failed to merge server configuration: server rejected")
         );
 
+        capture.records.clear();
         let mut location_parent = RejectLocationConf;
         let mut location_child = RejectLocationConf;
         assert_eq!(
@@ -1101,7 +1163,16 @@ mod tests {
                     (&raw mut location_child).cast(),
                 )
             },
-            c"location rejected".as_ptr().cast_mut()
+            NGX_CONF_ERROR
+        );
+        assert_eq!(capture.records.len(), 1);
+        assert_eq!(capture.records[0].0, NGX_LOG_EMERG as _);
+        assert!(
+            capture.records[0]
+                .1
+                .windows(b"failed to merge location configuration: location rejected".len())
+                .any(|message| message
+                    == b"failed to merge location configuration: location rejected")
         );
     }
 

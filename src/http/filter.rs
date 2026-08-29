@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::ptr;
 
 use crate::core::{ChainMut, Status};
-use crate::ffi::{ngx_conf_t, ngx_cycle_t, ngx_http_request_t, ngx_int_t};
+use crate::ffi::{NGX_LOG_EMERG, ngx_conf_t, ngx_cycle_t, ngx_http_request_t, ngx_int_t};
 use crate::http::{HttpModule, IntoHandlerStatus, RequestRefMut};
 
 type HeaderFilter = unsafe extern "C" fn(*mut ngx_http_request_t) -> ngx_int_t;
@@ -29,6 +29,41 @@ pub enum HttpFilterError {
     MissingHeaderNext,
     /// No saved body filter is available for an explicit continuation.
     MissingBodyNext,
+}
+
+fn log_postconfiguration_error(cf: &mut ngx_conf_t, module: &str) {
+    if cf.log.is_null() {
+        return;
+    }
+
+    crate::ngx_conf_log_error!(
+        NGX_LOG_EMERG,
+        cf,
+        "{module} HTTP output filter postconfiguration failed"
+    );
+}
+
+fn log_installation_error(cf: &mut ngx_conf_t, module: &str, error: HttpFilterError) {
+    if cf.log.is_null() {
+        return;
+    }
+
+    let message = match error {
+        HttpFilterError::IncompleteInstallation => "incomplete prior installation",
+        HttpFilterError::AlreadyInstalled => "already installed for this configuration cycle",
+        HttpFilterError::MissingHeaderFilter => "header filter chain is empty",
+        HttpFilterError::MissingBodyFilter => "body filter chain is empty",
+        HttpFilterError::HeaderSelfRecursion => "header filter would recurse",
+        HttpFilterError::BodySelfRecursion => "body filter would recurse",
+        HttpFilterError::MissingHeaderNext | HttpFilterError::MissingBodyNext => {
+            "saved filter continuation is unavailable"
+        }
+    };
+    crate::ngx_conf_log_error!(
+        NGX_LOG_EMERG,
+        cf,
+        "failed to install {module} HTTP output filters: {message}"
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -247,25 +282,35 @@ where
     M: HttpFilter,
 {
     crate::http::module::configuration_callback_status(cf, |parser| {
-        if M::filter_slot().validate_installation(unsafe { &*parser.as_raw() }).is_err() {
+        let module = core::any::type_name::<M>();
+        let validation = M::filter_slot().validate_installation(unsafe { &*parser.as_raw() });
+        if let Err(error) = validation {
+            log_installation_error(unsafe { &mut *parser.as_raw() }, module, error);
             return Status::NGX_ERROR.0;
         }
 
         if M::postconfigure(parser) != Status::NGX_OK.0 {
+            log_postconfiguration_error(unsafe { &mut *parser.as_raw() }, module);
             return Status::NGX_ERROR.0;
         }
 
-        M::filter_slot()
-            .install(unsafe { &*parser.as_raw() })
-            .map_or(Status::NGX_ERROR.0, |_| Status::NGX_OK.0)
+        let installation = M::filter_slot().install(unsafe { &*parser.as_raw() });
+        if let Err(error) = installation {
+            log_installation_error(unsafe { &mut *parser.as_raw() }, module, error);
+            return Status::NGX_ERROR.0;
+        }
+
+        Status::NGX_OK.0
     })
 }
 
 #[cfg(all(test, feature = "test-link"))]
 mod tests {
+    use alloc::vec::Vec;
     use core::ffi::c_int;
     use core::mem::MaybeUninit;
     use core::ptr;
+    use core::slice;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use std::process::Command;
     use std::sync::MutexGuard;
@@ -276,9 +321,9 @@ mod tests {
     };
     use crate::core::{ChainMut, ConnectionError, ModuleDescriptor, Pool, Status};
     use crate::ffi::{
-        NGX_HTTP_MODULE, ngx_buf_t, ngx_chain_t, ngx_conf_t, ngx_connection_t, ngx_cycle_t,
-        ngx_http_output_body_filter_pt, ngx_http_output_header_filter_pt, ngx_http_request_t,
-        ngx_int_t, ngx_log_t, ngx_module_t, ngx_pool_t,
+        NGX_HTTP_MODULE, NGX_LOG_EMERG, ngx_buf_t, ngx_chain_t, ngx_conf_t, ngx_connection_t,
+        ngx_cycle_t, ngx_http_output_body_filter_pt, ngx_http_output_header_filter_pt,
+        ngx_http_request_t, ngx_int_t, ngx_log_t, ngx_module_t, ngx_pool_t, ngx_uint_t,
     };
     use crate::http::{
         HttpModule, RequestContinuationError, RequestError, RequestHold, RequestRefMut,
@@ -292,6 +337,46 @@ mod tests {
     static FAILING_BODY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     const RELOAD_TEST_CHILD: &str = "NGX_HTTP_FILTER_RELOAD_TEST_CHILD";
+
+    #[derive(Default)]
+    struct ConfigLogCapture {
+        records: Vec<(ngx_uint_t, Vec<u8>)>,
+    }
+
+    unsafe extern "C" fn capture_config_log(
+        log: *mut ngx_log_t,
+        level: ngx_uint_t,
+        bytes: *mut u8,
+        len: usize,
+    ) {
+        let Some(log) = (unsafe { log.as_mut() }) else {
+            return;
+        };
+        let Some(capture) = (unsafe { log.wdata.cast::<ConfigLogCapture>().as_mut() }) else {
+            return;
+        };
+        if bytes.is_null() {
+            return;
+        }
+        capture.records.push((level, unsafe { slice::from_raw_parts(bytes, len) }.to_vec()));
+    }
+
+    fn attach_config_log(
+        configuration: &mut ngx_conf_t,
+        log: &mut ngx_log_t,
+        capture: &mut ConfigLogCapture,
+    ) {
+        log.log_level = NGX_LOG_EMERG as _;
+        log.writer = Some(capture_config_log);
+        log.wdata = ptr::from_mut(capture).cast();
+        configuration.log = ptr::from_mut(log);
+    }
+
+    fn assert_single_emergency(capture: &ConfigLogCapture, message: &[u8]) {
+        assert_eq!(capture.records.len(), 1);
+        assert_eq!(capture.records[0].0, NGX_LOG_EMERG as _);
+        assert!(capture.records[0].1.windows(message.len()).any(|record| record == message));
+    }
 
     unsafe extern "C" {
         fn fork() -> c_int;
@@ -1409,6 +1494,9 @@ mod tests {
         let _globals = FilterGlobals::new();
         let mut cycle = unsafe { MaybeUninit::<ngx_cycle_t>::zeroed().assume_init() };
         let mut configuration = configuration(&mut cycle);
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut capture = ConfigLogCapture::default();
+        attach_config_log(&mut configuration, &mut log, &mut capture);
         NEXT_HEADER_CALLS.store(0, Ordering::Relaxed);
         NEXT_BODY_CALLS.store(0, Ordering::Relaxed);
         assert_eq!(
@@ -1419,6 +1507,7 @@ mod tests {
             unsafe { filter_postconfiguration::<RepeatedFilter>(&raw mut configuration) },
             Status::NGX_ERROR.0
         );
+        assert_single_emergency(&capture, b"failed to install");
 
         let mut request = request();
         let mut chain = ngx_chain_t { buf: ptr::null_mut(), next: ptr::null_mut() };
@@ -1485,10 +1574,13 @@ mod tests {
     }
 
     #[test]
-    fn postconfiguration_failure_does_not_install_either_filter() {
+    fn postconfiguration_failure_logs_once_without_installing_either_filter() {
         let _globals = FilterGlobals::new();
         let mut cycle = unsafe { MaybeUninit::<ngx_cycle_t>::zeroed().assume_init() };
         let mut configuration = configuration(&mut cycle);
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut capture = ConfigLogCapture::default();
+        attach_config_log(&mut configuration, &mut log, &mut capture);
         FAILED_POSTCONFIGURE_CALLS.store(0, Ordering::Relaxed);
         assert_eq!(
             unsafe {
@@ -1497,6 +1589,7 @@ mod tests {
             Status::NGX_ERROR.0
         );
         assert_eq!(FAILED_POSTCONFIGURE_CALLS.load(Ordering::Relaxed), 1);
+        assert_single_emergency(&capture, b"HTTP output filter postconfiguration failed");
 
         let expected_header: HeaderFilter = next_header;
         let expected_body: BodyFilter = next_body;
