@@ -405,6 +405,26 @@ pub unsafe trait HttpModuleMainConf: HttpModule {
     /// let _ = M::main_conf_mut(cf);
     /// # }
     /// ```
+    ///
+    /// Runtime requests expose configuration only through shared views:
+    ///
+    /// ```compile_fail
+    /// # use ngx::http::{HttpModuleMainConf, RequestRefMut};
+    /// # fn access<M: HttpModuleMainConf>(request: &mut RequestRefMut<'_>) {
+    /// let _ = M::main_conf_mut(request);
+    /// # }
+    /// ```
+    ///
+    /// A live mutable slot borrow prevents a second lifecycle view of the same configuration:
+    ///
+    /// ```compile_fail
+    /// # use ngx::http::{HttpConfigurationParser, HttpModuleMainConf};
+    /// # fn alias<M: HttpModuleMainConf>(parser: &mut HttpConfigurationParser<'_>) {
+    /// let first = M::main_conf_mut(parser).unwrap();
+    /// let second = M::main_conf_mut(parser).unwrap();
+    /// let _ = (first, second);
+    /// # }
+    /// ```
     fn main_conf_mut<'a>(
         parser: &'a mut HttpConfigurationParser<'_>,
     ) -> Result<Option<&'a mut Self::MainConf>, HttpConfigError> {
@@ -412,6 +432,17 @@ pub unsafe trait HttpModuleMainConf: HttpModule {
     }
 
     /// Resolves shared main configuration from a native HTTP context.
+    ///
+    /// A raw context, including a copied descriptor, is not a safe configuration source:
+    ///
+    /// ```compile_fail
+    /// # use ngx::ffi::ngx_http_conf_ctx_t;
+    /// # use ngx::http::HttpModuleMainConf;
+    /// # fn access<M: HttpModuleMainConf>(context: ngx_http_conf_ctx_t) {
+    /// let copied = context;
+    /// let _ = M::main_conf_from_context(&copied);
+    /// # }
+    /// ```
     ///
     /// # Safety
     ///
@@ -488,6 +519,13 @@ pub unsafe trait HttpModuleServerConf: HttpModule {
     /// let _ = M::server_conf_mut(cf);
     /// # }
     /// ```
+    ///
+    /// ```compile_fail
+    /// # use ngx::http::{HttpModuleServerConf, RequestRefMut};
+    /// # fn access<M: HttpModuleServerConf>(request: &mut RequestRefMut<'_>) {
+    /// let _ = M::server_conf_mut(request);
+    /// # }
+    /// ```
     fn server_conf_mut<'a>(
         parser: &'a mut HttpConfigurationParser<'_>,
     ) -> Result<Option<&'a mut Self::ServerConf>, HttpConfigError> {
@@ -525,6 +563,13 @@ pub unsafe trait HttpModuleLocationConf: HttpModule {
     /// # use ngx::http::HttpModuleLocationConf;
     /// # fn access<M: HttpModuleLocationConf>(cf: &ngx_conf_t) {
     /// let _ = M::location_conf_mut(cf);
+    /// # }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// # use ngx::http::{HttpModuleLocationConf, RequestRefMut};
+    /// # fn access<M: HttpModuleLocationConf>(request: &mut RequestRefMut<'_>) {
+    /// let _ = M::location_conf_mut(request);
     /// # }
     /// ```
     fn location_conf_mut<'a>(

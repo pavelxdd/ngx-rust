@@ -682,6 +682,18 @@ pub trait HttpVariableSetter {
 ///
 /// Call this function from the module's preconfiguration callback. `name` does not include `$`.
 /// Use [`add_prefix_variable`] instead of passing [`HttpVariableFlags::PREFIX`].
+///
+/// A raw nginx parser is not a safe registration capability:
+///
+/// ```compile_fail
+/// use ngx::core::NgxStr;
+/// use ngx::ffi::ngx_conf_t;
+/// use ngx::http::{HttpVariableFlags, HttpVariableHandler, add_variable};
+///
+/// fn register<H: HttpVariableHandler>(parser: &mut ngx_conf_t, name: &NgxStr) {
+///     add_variable::<H>(parser, name, HttpVariableFlags::empty(), 0).unwrap();
+/// }
+/// ```
 pub fn add_variable<H>(
     parser: &mut HttpConfigurationParser<'_>,
     name: &NgxStr,
@@ -784,6 +796,16 @@ fn register_variable(
 ///
 /// Call this function during the same configuration pass that registers the variable. The index
 /// can later be used only with requests from that HTTP core configuration.
+///
+/// ```compile_fail
+/// use ngx::core::NgxStr;
+/// use ngx::ffi::ngx_conf_t;
+/// use ngx::http::get_variable_index;
+///
+/// fn index(parser: &mut ngx_conf_t, name: &NgxStr) {
+///     let _ = get_variable_index(parser, name);
+/// }
+/// ```
 pub fn get_variable_index(
     parser: &mut HttpConfigurationParser<'_>,
     name: &NgxStr,
