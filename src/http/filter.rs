@@ -198,6 +198,9 @@ where
 /// [`filter_postconfiguration`] for its postconfiguration callback so nginx installs both filters
 /// after the module's [`HttpModule::postconfigure`] work succeeds.
 pub unsafe trait HttpFilter: HttpModule + Sized + 'static {
+    /// Whether every non-OK postconfiguration return already has a contextual nginx diagnostic.
+    const LOGS_POSTCONFIGURATION_FAILURE: bool = false;
+
     /// Header-filter return type.
     type HeaderOutput: IntoHandlerStatus;
     /// Body-filter return type.
@@ -290,7 +293,9 @@ where
         }
 
         if M::postconfigure(parser) != Status::NGX_OK.0 {
-            log_postconfiguration_error(unsafe { &mut *parser.as_raw() }, module);
+            if !M::LOGS_POSTCONFIGURATION_FAILURE {
+                log_postconfiguration_error(unsafe { &mut *parser.as_raw() }, module);
+            }
             return Status::NGX_ERROR.0;
         }
 
@@ -926,6 +931,46 @@ mod tests {
 
         fn filter_slot() -> &'static HttpFilterSlot<Self> {
             &FAILED_POSTCONFIGURATION_SLOT
+        }
+
+        fn header_filter(_request: &mut RequestRefMut<'_>) -> Self::HeaderOutput {
+            Status::NGX_OK
+        }
+
+        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainMut<'_>) -> Self::BodyOutput {
+            Status::NGX_OK
+        }
+    }
+
+    struct LoggedFailedPostconfigurationFilter;
+
+    static LOGGED_FAILED_POSTCONFIGURATION_SLOT: HttpFilterSlot<
+        LoggedFailedPostconfigurationFilter,
+    > = HttpFilterSlot::new();
+
+    unsafe impl HttpModule for LoggedFailedPostconfigurationFilter {
+        fn module() -> ModuleDescriptor {
+            module()
+        }
+
+        fn postconfigure(parser: &mut crate::http::HttpConfigurationParser<'_>) -> ngx_int_t {
+            crate::ngx_conf_log_error!(
+                NGX_LOG_EMERG,
+                unsafe { parser.as_raw() },
+                "module postconfiguration rejected"
+            );
+            Status::NGX_ERROR.0
+        }
+    }
+
+    unsafe impl HttpFilter for LoggedFailedPostconfigurationFilter {
+        const LOGS_POSTCONFIGURATION_FAILURE: bool = true;
+
+        type HeaderOutput = Status;
+        type BodyOutput = Status;
+
+        fn filter_slot() -> &'static HttpFilterSlot<Self> {
+            &LOGGED_FAILED_POSTCONFIGURATION_SLOT
         }
 
         fn header_filter(_request: &mut RequestRefMut<'_>) -> Self::HeaderOutput {
@@ -1601,6 +1646,26 @@ mod tests {
             unsafe { nginx_sys::ngx_http_top_body_filter }.unwrap(),
             expected_body
         ));
+    }
+
+    #[test]
+    fn module_owned_postconfiguration_diagnostic_is_not_duplicated() {
+        let _globals = FilterGlobals::new();
+        let mut cycle = unsafe { MaybeUninit::<ngx_cycle_t>::zeroed().assume_init() };
+        let mut configuration = configuration(&mut cycle);
+        let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+        let mut capture = ConfigLogCapture::default();
+        attach_config_log(&mut configuration, &mut log, &mut capture);
+
+        assert_eq!(
+            unsafe {
+                filter_postconfiguration::<LoggedFailedPostconfigurationFilter>(
+                    &raw mut configuration,
+                )
+            },
+            Status::NGX_ERROR.0
+        );
+        assert_single_emergency(&capture, b"module postconfiguration rejected");
     }
 
     #[cfg(feature = "std")]
