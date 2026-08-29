@@ -486,6 +486,19 @@ impl HttpVariableOutput<'_> {
 ///     index.get_cached(request).unwrap()
 /// }
 /// ```
+///
+/// A live value snapshot also keeps the request mutably borrowed, so safe code cannot flush the
+/// same indexed slot before it finishes reading the snapshot:
+///
+/// ```compile_fail
+/// use ngx::http::{HttpVariableIndex, RequestRefMut};
+///
+/// fn flush_while_reading(index: &HttpVariableIndex, request: &mut RequestRefMut<'_>) {
+///     let value = index.get_cached(request).unwrap();
+///     let _ = index.get_flushed(request);
+///     let _ = value.bytes();
+/// }
+/// ```
 pub struct HttpVariableValueRef<'value> {
     raw: ngx_variable_value_t,
     _value: PhantomData<&'value [u8]>,
@@ -1535,6 +1548,30 @@ mod tests {
     }
 
     #[cfg(feature = "test-link")]
+    struct NestedVariable;
+
+    #[cfg(feature = "test-link")]
+    impl HttpVariableHandler for NestedVariable {
+        type Output = Status;
+
+        fn get(
+            request: &mut RequestRefMut<'_>,
+            value: &mut HttpVariableOutput<'_>,
+            data: usize,
+        ) -> Self::Output {
+            // The fixture keeps the boxed index alive until after every registered callback.
+            let nested_index = unsafe { &*(data as *const HttpVariableIndex) };
+            {
+                let nested = nested_index.get_cached(request).unwrap();
+                assert_eq!(nested.bytes(), Some(&b"indexed"[..]));
+            }
+
+            value.set_static(b"outer").unwrap();
+            Status::NGX_OK
+        }
+    }
+
+    #[cfg(feature = "test-link")]
     struct FailingVariable;
 
     #[cfg(feature = "test-link")]
@@ -2205,6 +2242,46 @@ mod tests {
             }
             assert_eq!(INDEXED_VARIABLE_CALLS.load(Ordering::Relaxed), 2);
         });
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn indexed_getter_can_finish_a_nested_lookup_before_publishing_its_output() {
+        let mut fixture = VariableFixture::new();
+        add_variable::<IndexedVariable>(
+            &mut fixture.configuration(),
+            NgxStr::from_bytes(b"ngx_rs_nested_inner"),
+            HttpVariableFlags::empty(),
+            0,
+        )
+        .unwrap();
+        let nested_index = Box::new(
+            get_variable_index(
+                &mut fixture.configuration(),
+                NgxStr::from_bytes(b"ngx_rs_nested_inner"),
+            )
+            .unwrap(),
+        );
+        add_variable::<NestedVariable>(
+            &mut fixture.configuration(),
+            NgxStr::from_bytes(b"ngx_rs_nested_outer"),
+            HttpVariableFlags::empty(),
+            nested_index.as_ref() as *const HttpVariableIndex as usize,
+        )
+        .unwrap();
+        let outer_index = get_variable_index(
+            &mut fixture.configuration(),
+            NgxStr::from_bytes(b"ngx_rs_nested_outer"),
+        )
+        .unwrap();
+        fixture.configuration.finalize_variables();
+        INDEXED_VARIABLE_CALLS.store(0, Ordering::Relaxed);
+
+        fixture.configuration.with_request(|request| {
+            let value = outer_index.get_cached(request).unwrap();
+            assert_eq!(value.bytes(), Some(&b"outer"[..]));
+        });
+        assert_eq!(INDEXED_VARIABLE_CALLS.load(Ordering::Relaxed), 1);
     }
 
     #[cfg(feature = "test-link")]
