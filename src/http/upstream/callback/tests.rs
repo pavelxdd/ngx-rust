@@ -1,6 +1,8 @@
+use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::mem::MaybeUninit;
 use core::ptr;
+use core::slice;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::MutexGuard;
 
@@ -8,9 +10,9 @@ use super::super::test_support::TestPool;
 use super::*;
 use crate::core::{ModuleDescriptor, Status};
 use crate::ffi::{
-    NGX_BUSY, NGX_DECLINED, NGX_ERROR, NGX_HTTP_MODULE, ngx_conf_t, ngx_http_request_t,
-    ngx_http_upstream_srv_conf_t, ngx_http_upstream_t, ngx_int_t, ngx_module_t,
-    ngx_peer_connection_t, ngx_uint_t,
+    NGX_BUSY, NGX_DECLINED, NGX_ERROR, NGX_HTTP_MODULE, NGX_LOG_ERR, ngx_conf_t, ngx_connection_t,
+    ngx_http_request_t, ngx_http_upstream_srv_conf_t, ngx_http_upstream_t, ngx_int_t, ngx_log_t,
+    ngx_module_t, ngx_peer_connection_t, ngx_uint_t,
 };
 use crate::http::{HttpModule, HttpModuleServerConf, RequestRefMut};
 
@@ -24,6 +26,41 @@ static OBSERVED_GET_CALLBACK_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_
 static OBSERVED_FREE_PEER_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static OBSERVED_FREE_CALLBACK_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static OBSERVED_FREE_STATE: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Default)]
+struct LogCapture {
+    records: Vec<(ngx_uint_t, Vec<u8>)>,
+}
+
+unsafe extern "C" fn capture_log(
+    log: *mut ngx_log_t,
+    level: ngx_uint_t,
+    bytes: *mut u8,
+    len: usize,
+) {
+    let Some(log) = (unsafe { log.as_mut() }) else {
+        return;
+    };
+    let Some(capture) = (unsafe { log.wdata.cast::<LogCapture>().as_mut() }) else {
+        return;
+    };
+    if bytes.is_null() {
+        return;
+    }
+    capture.records.push((level, unsafe { slice::from_raw_parts(bytes, len) }.to_vec()));
+}
+
+fn attach_log(log: &mut ngx_log_t, capture: &mut LogCapture) {
+    log.log_level = NGX_LOG_ERR as _;
+    log.writer = Some(capture_log);
+    log.wdata = ptr::from_mut(capture).cast();
+}
+
+fn assert_single_record(capture: &LogCapture, level: ngx_uint_t, message: &[u8]) {
+    assert_eq!(capture.records.len(), 1);
+    assert_eq!(capture.records[0].0, level);
+    assert!(capture.records[0].1.windows(message.len()).any(|record| record == message));
+}
 
 struct HttpSlotCounts {
     _guard: MutexGuard<'static, ()>,
@@ -647,6 +684,61 @@ fn absent_original_peer_callbacks_return_error_without_losing_typed_data() {
 }
 
 #[test]
+fn callback_errors_emit_one_record_from_the_configuration_request_or_peer_owner() {
+    let pool = TestPool::new();
+    let mut capture = LogCapture::default();
+    let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+    attach_log(&mut log, &mut capture);
+
+    let mut configuration = unsafe { MaybeUninit::<ngx_conf_t>::zeroed().assume_init() };
+    configuration.pool = pool.raw;
+    configuration.log = &raw mut log;
+    let mut server = unsafe { MaybeUninit::<ngx_http_upstream_srv_conf_t>::zeroed().assume_init() };
+    assert_eq!(
+        unsafe {
+            raw_init_upstream::<MissingOriginalInitializer>(&raw mut configuration, &raw mut server)
+        },
+        NGX_ERROR as _
+    );
+    assert_single_record(
+        &capture,
+        crate::ffi::NGX_LOG_EMERG as _,
+        b"HTTP upstream initialization failed",
+    );
+
+    capture.records.clear();
+    let mut connection = unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() };
+    connection.log = &raw mut log;
+    let mut request_upstream =
+        unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
+    let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+    initialized_request(&pool, &mut request, &mut request_upstream);
+    request.connection = &raw mut connection;
+    assert_eq!(
+        unsafe { raw_init_peer::<DelegatePeerInit>(&raw mut request, &raw mut server) },
+        NGX_ERROR as _
+    );
+    assert_single_record(&capture, NGX_LOG_ERR as _, b"HTTP upstream peer initialization failed");
+
+    capture.records.clear();
+    assert_eq!(
+        unsafe { raw_init_peer::<MissingOriginalPeer>(&raw mut request, &raw mut server) },
+        Status::NGX_OK.0
+    );
+    request_upstream.peer.log = &raw mut log;
+    let typed_data = request_upstream.peer.data;
+    assert_eq!(
+        unsafe { raw_get_peer::<MissingOriginalPeer>(&raw mut request_upstream.peer, typed_data) },
+        NGX_ERROR as _
+    );
+    assert_single_record(&capture, NGX_LOG_ERR as _, b"HTTP upstream peer selection failed");
+
+    capture.records.clear();
+    unsafe { raw_free_peer::<MissingOriginalPeer>(&raw mut request_upstream.peer, typed_data, 0) };
+    assert_single_record(&capture, NGX_LOG_ERR as _, b"HTTP upstream peer release failed");
+}
+
+#[test]
 fn peer_callback_adapters_reject_mismatched_or_misaligned_typed_data() {
     let pool = TestPool::new();
     let mut request_upstream =
@@ -683,10 +775,14 @@ fn peer_callback_adapters_reject_mismatched_or_misaligned_typed_data() {
 
 #[cfg(feature = "std")]
 #[test]
-fn upstream_callback_adapters_convert_rust_panics_to_nginx_errors() {
+fn upstream_callback_adapters_log_rust_panics_once_before_returning_nginx_errors() {
     let pool = TestPool::new();
+    let mut capture = LogCapture::default();
+    let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
+    attach_log(&mut log, &mut capture);
     let mut configuration = unsafe { MaybeUninit::<ngx_conf_t>::zeroed().assume_init() };
     configuration.pool = pool.raw;
+    configuration.log = &raw mut log;
     let mut init_upstream =
         unsafe { MaybeUninit::<ngx_http_upstream_srv_conf_t>::zeroed().assume_init() };
     assert_eq!(
@@ -695,11 +791,20 @@ fn upstream_callback_adapters_convert_rust_panics_to_nginx_errors() {
         },
         NGX_ERROR as _
     );
+    assert_single_record(
+        &capture,
+        crate::ffi::NGX_LOG_EMERG as _,
+        b"HTTP upstream initialization failed: upstream callback panicked",
+    );
 
+    capture.records.clear();
+    let mut connection = unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() };
+    connection.log = &raw mut log;
     let mut request_upstream =
         unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
     initialized_request(&pool, &mut request, &mut request_upstream);
+    request.connection = &raw mut connection;
     let mut server = unsafe { MaybeUninit::<ngx_http_upstream_srv_conf_t>::zeroed().assume_init() };
 
     assert_eq!(
@@ -709,16 +814,35 @@ fn upstream_callback_adapters_convert_rust_panics_to_nginx_errors() {
     assert!(request_upstream.peer.data.is_null());
     assert!(request_upstream.peer.get.is_none());
     assert!(request_upstream.peer.free.is_none());
+    assert_single_record(
+        &capture,
+        NGX_LOG_ERR as _,
+        b"HTTP upstream peer initialization failed: upstream callback panicked",
+    );
 
+    capture.records.clear();
     assert_eq!(
         unsafe { raw_init_peer::<PanicPeer>(&raw mut request, &raw mut server) },
         Status::NGX_OK.0
     );
+    request_upstream.peer.log = &raw mut log;
     let typed_data = request_upstream.peer.data;
     assert_eq!(
         unsafe { raw_get_peer::<PanicPeer>(&raw mut request_upstream.peer, typed_data) },
         NGX_ERROR as _
     );
+    assert_single_record(
+        &capture,
+        NGX_LOG_ERR as _,
+        b"HTTP upstream peer selection failed: upstream callback panicked",
+    );
+
+    capture.records.clear();
     unsafe { raw_free_peer::<PanicPeer>(&raw mut request_upstream.peer, typed_data, 0) };
     assert_eq!(request_upstream.peer.data, typed_data);
+    assert_single_record(
+        &capture,
+        NGX_LOG_ERR as _,
+        b"HTTP upstream peer release failed: upstream callback panicked",
+    );
 }

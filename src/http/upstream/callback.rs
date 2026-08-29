@@ -7,11 +7,13 @@ use core::ptr::{self, NonNull};
 
 use crate::core::{Pool, Status};
 use crate::ffi::{
-    ngx_conf_t, ngx_event_free_peer_pt, ngx_event_get_peer_pt, ngx_http_request_t,
-    ngx_http_upstream_init_peer_pt, ngx_http_upstream_init_pt, ngx_http_upstream_srv_conf_t,
-    ngx_http_upstream_t, ngx_int_t, ngx_peer_connection_t, ngx_uint_t,
+    NGX_LOG_EMERG, NGX_LOG_ERR, ngx_conf_t, ngx_event_free_peer_pt, ngx_event_get_peer_pt,
+    ngx_http_request_t, ngx_http_upstream_init_peer_pt, ngx_http_upstream_init_pt,
+    ngx_http_upstream_srv_conf_t, ngx_http_upstream_t, ngx_int_t, ngx_peer_connection_t,
+    ngx_uint_t,
 };
 use crate::http::{HttpConfigError, HttpModuleServerConf, RequestError, RequestRefMut};
+use crate::log::LogRef;
 
 const PEER_DATA_MAGIC: u64 = 0x7d5a_1bc8_9e34_f602;
 
@@ -58,6 +60,8 @@ pub enum UpstreamCallbackError {
     Configuration(HttpConfigError),
     /// Resolving the active request pool failed.
     Request(RequestError),
+    /// A Rust upstream callback panicked.
+    CallbackPanicked,
 }
 
 impl fmt::Display for UpstreamCallbackError {
@@ -105,6 +109,7 @@ impl fmt::Display for UpstreamCallbackError {
                 formatter.write_str("failed to resolve upstream configuration")
             }
             Self::Request(_) => formatter.write_str("failed to resolve upstream request state"),
+            Self::CallbackPanicked => formatter.write_str("upstream callback panicked"),
         }
     }
 }
@@ -167,6 +172,17 @@ impl UpstreamConfiguration<'_> {
     pub fn pool(&self) -> Result<Pool<'_>, UpstreamCallbackError> {
         unsafe { Pool::from_raw(self.raw.as_ref().pool) }
             .ok_or(UpstreamCallbackError::MissingConfigurationPool)
+    }
+
+    fn log_failure(&mut self, action: &str, error: &UpstreamCallbackError) {
+        if unsafe { self.raw.as_ref().log.is_null() } {
+            return;
+        }
+        crate::ngx_conf_log_error!(
+            NGX_LOG_EMERG,
+            self.raw.as_ptr(),
+            "HTTP upstream {action} failed: {error}"
+        );
     }
 }
 
@@ -380,6 +396,14 @@ impl UpstreamPeerConnection<'_> {
     fn set_data(&mut self, data: *mut c_void) {
         unsafe { self.raw.as_mut().data = data };
     }
+
+    fn log_failure(&self, action: &str, error: &UpstreamCallbackError) {
+        let log = unsafe { self.raw.as_ref().log };
+        let Some(log) = (unsafe { LogRef::from_raw(log) }) else {
+            return;
+        };
+        crate::ngx_log_error!(NGX_LOG_ERR, log, "HTTP upstream {action} failed: {error}");
+    }
 }
 
 /// Exact nginx peer release-state bits passed to a `free_peer` callback.
@@ -522,21 +546,26 @@ where
     Ok(data)
 }
 
-fn upstream_callback_status(
-    callback: impl FnOnce() -> Result<ngx_int_t, UpstreamCallbackError>,
-) -> ngx_int_t {
+fn catch_upstream_callback<T>(
+    callback: impl FnOnce() -> Result<T, UpstreamCallbackError>,
+) -> Result<T, UpstreamCallbackError> {
     #[cfg(feature = "std")]
     {
-        match std::panic::catch_unwind(core::panic::AssertUnwindSafe(callback)) {
-            Ok(Ok(status)) => status,
-            Ok(Err(_)) | Err(_) => Status::NGX_ERROR.0,
-        }
+        std::panic::catch_unwind(core::panic::AssertUnwindSafe(callback))
+            .unwrap_or(Err(UpstreamCallbackError::CallbackPanicked))
     }
 
     #[cfg(not(feature = "std"))]
     {
-        callback().unwrap_or(Status::NGX_ERROR.0)
+        callback()
     }
+}
+
+fn log_request_failure(request: &RequestRefMut<'_>, action: &str, error: &UpstreamCallbackError) {
+    let Ok(Some(log)) = request.log() else {
+        return;
+    };
+    crate::ngx_log_error!(NGX_LOG_ERR, log, "HTTP upstream {action} failed: {error}");
 }
 
 unsafe extern "C" fn raw_init_upstream<H>(
@@ -546,12 +575,20 @@ unsafe extern "C" fn raw_init_upstream<H>(
 where
     H: HttpUpstreamInitializer,
 {
-    upstream_callback_status(|| {
-        // SAFETY: nginx invokes this initializer with its stable configuration pool.
-        let mut configuration = unsafe { UpstreamConfiguration::from_raw(configuration) }?;
+    // SAFETY: nginx invokes this initializer with its stable configuration pool.
+    let Ok(mut configuration) = (unsafe { UpstreamConfiguration::from_raw(configuration) }) else {
+        return Status::NGX_ERROR.0;
+    };
+    match catch_upstream_callback(|| {
         let mut upstream = unsafe { UpstreamServerConf::from_raw(upstream) }?;
         H::init(&mut configuration, &mut upstream)
-    })
+    }) {
+        Ok(status) => status,
+        Err(error) => {
+            configuration.log_failure("initialization", &error);
+            Status::NGX_ERROR.0
+        }
+    }
 }
 
 unsafe extern "C" fn raw_init_peer<H>(
@@ -562,22 +599,29 @@ where
     H: HttpUpstreamPeerHandler,
 {
     unsafe {
-        crate::http::request_callback_status(request, |request| {
-            let result = (|| -> Result<Status, UpstreamCallbackError> {
-                let mut request_upstream = RequestUpstream::from_request(request)?;
+        RequestRefMut::with_raw(request, |mut request| {
+            let result = catch_upstream_callback(|| {
+                let mut request_upstream = RequestUpstream::from_request(&request)?;
                 let mut upstream = UpstreamServerConf::from_raw(upstream)?;
-                match H::init(request, &mut upstream)? {
+                match H::init(&mut request, &mut upstream)? {
                     UpstreamPeerInit::Install(value) => {
                         let pool = request.pool()?;
                         request_upstream.install::<H>(&pool, value)?;
-                        Ok(Status::NGX_OK)
+                        Ok(Status::NGX_OK.0)
                     }
-                    UpstreamPeerInit::Return(status) => Ok(Status(status)),
+                    UpstreamPeerInit::Return(status) => Ok(status),
                 }
-            })();
-            result.map_err(|_| Status::NGX_ERROR)
+            });
+            match result {
+                Ok(status) => status,
+                Err(error) => {
+                    log_request_failure(&request, "peer initialization", &error);
+                    Status::NGX_ERROR.0
+                }
+            }
         })
     }
+    .unwrap_or(Status::NGX_ERROR.0)
 }
 
 unsafe extern "C" fn raw_get_peer<H>(
@@ -587,12 +631,20 @@ unsafe extern "C" fn raw_get_peer<H>(
 where
     H: HttpUpstreamPeerHandler,
 {
-    upstream_callback_status(|| {
-        let mut peer = unsafe { UpstreamPeerConnection::from_raw(peer) }?;
+    let Ok(mut peer) = (unsafe { UpstreamPeerConnection::from_raw(peer) }) else {
+        return Status::NGX_ERROR.0;
+    };
+    match catch_upstream_callback(|| {
         let mut data = peer_data::<H>(&peer, data)?;
         let data = unsafe { data.as_mut() };
         H::get(&mut peer, data)
-    })
+    }) {
+        Ok(status) => status,
+        Err(error) => {
+            peer.log_failure("peer selection", &error);
+            Status::NGX_ERROR.0
+        }
+    }
 }
 
 unsafe extern "C" fn raw_free_peer<H>(
@@ -602,28 +654,16 @@ unsafe extern "C" fn raw_free_peer<H>(
 ) where
     H: HttpUpstreamPeerHandler,
 {
-    #[cfg(feature = "std")]
-    {
-        let _ = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
-            let result = (|| -> Result<(), UpstreamCallbackError> {
-                let mut peer = unsafe { UpstreamPeerConnection::from_raw(peer) }?;
-                let mut data = peer_data::<H>(&peer, data)?;
-                let data = unsafe { data.as_mut() };
-                H::free(&mut peer, data, UpstreamPeerState(state))
-            })();
-            let _ = result;
-        }));
-    }
-
-    #[cfg(not(feature = "std"))]
-    {
-        let result = (|| -> Result<(), UpstreamCallbackError> {
-            let mut peer = unsafe { UpstreamPeerConnection::from_raw(peer) }?;
-            let mut data = peer_data::<H>(&peer, data)?;
-            let data = unsafe { data.as_mut() };
-            H::free(&mut peer, data, UpstreamPeerState(state))
-        })();
-        let _ = result;
+    let Ok(mut peer) = (unsafe { UpstreamPeerConnection::from_raw(peer) }) else {
+        return;
+    };
+    let result = catch_upstream_callback(|| {
+        let mut data = peer_data::<H>(&peer, data)?;
+        let data = unsafe { data.as_mut() };
+        H::free(&mut peer, data, UpstreamPeerState(state))
+    });
+    if let Err(error) = result {
+        peer.log_failure("peer release", &error);
     }
 }
 
