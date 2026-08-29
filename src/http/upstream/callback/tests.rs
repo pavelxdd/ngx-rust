@@ -2,16 +2,17 @@ use core::ffi::c_void;
 use core::mem::MaybeUninit;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::MutexGuard;
 
 use super::super::test_support::TestPool;
 use super::*;
-use crate::core::Status;
+use crate::core::{ModuleDescriptor, Status};
 use crate::ffi::{
     NGX_BUSY, NGX_DECLINED, NGX_ERROR, NGX_HTTP_MODULE, ngx_conf_t, ngx_http_request_t,
-    ngx_http_upstream_srv_conf_t, ngx_http_upstream_t, ngx_int_t, ngx_peer_connection_t,
-    ngx_uint_t,
+    ngx_http_upstream_srv_conf_t, ngx_http_upstream_t, ngx_int_t, ngx_module_t,
+    ngx_peer_connection_t, ngx_uint_t,
 };
-use crate::http::RequestRefMut;
+use crate::http::{HttpModule, HttpModuleServerConf, RequestRefMut};
 
 static ORIGINAL_INIT_PEER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_INIT_UPSTREAM_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -23,6 +24,55 @@ static OBSERVED_GET_CALLBACK_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_
 static OBSERVED_FREE_PEER_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static OBSERVED_FREE_CALLBACK_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static OBSERVED_FREE_STATE: AtomicUsize = AtomicUsize::new(0);
+
+struct HttpSlotCounts {
+    _guard: MutexGuard<'static, ()>,
+    max_module: ngx_uint_t,
+    http_max_module: ngx_uint_t,
+}
+
+impl HttpSlotCounts {
+    fn one() -> Self {
+        let guard = crate::TEST_NGINX_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
+        let previous = unsafe {
+            Self {
+                _guard: guard,
+                max_module: nginx_sys::ngx_max_module,
+                http_max_module: nginx_sys::ngx_http_max_module,
+            }
+        };
+        unsafe {
+            nginx_sys::ngx_max_module = 1;
+            nginx_sys::ngx_http_max_module = 1;
+        }
+        previous
+    }
+}
+
+impl Drop for HttpSlotCounts {
+    fn drop(&mut self) {
+        unsafe {
+            nginx_sys::ngx_max_module = self.max_module;
+            nginx_sys::ngx_http_max_module = self.http_max_module;
+        }
+    }
+}
+
+struct TestServerModule;
+
+unsafe impl HttpModule for TestServerModule {
+    fn module() -> ModuleDescriptor {
+        let mut module = ngx_module_t::default();
+        module.type_ = NGX_HTTP_MODULE as _;
+        module.index = 0;
+        module.ctx_index = 0;
+        ModuleDescriptor::from_test(module)
+    }
+}
+
+unsafe impl HttpModuleServerConf for TestServerModule {
+    type ServerConf = u32;
+}
 
 unsafe extern "C" fn declined_init_peer(
     _request: *mut ngx_http_request_t,
@@ -90,6 +140,22 @@ impl HttpUpstreamInitializer for PoolInitializer {
         _upstream: &mut UpstreamServerConf<'_>,
     ) -> Result<ngx_int_t, UpstreamCallbackError> {
         let _ = configuration.pool()?;
+        Ok(Status::NGX_OK.0)
+    }
+}
+
+struct TypedConfigurationInitializer;
+
+impl HttpUpstreamInitializer for TypedConfigurationInitializer {
+    fn init(
+        _configuration: &mut UpstreamConfiguration<'_>,
+        upstream: &mut UpstreamServerConf<'_>,
+    ) -> Result<ngx_int_t, UpstreamCallbackError> {
+        {
+            let configuration = upstream.module_conf::<TestServerModule>()?.unwrap();
+            assert_eq!(*configuration, 41);
+        }
+        *upstream.module_conf_mut::<TestServerModule>()?.unwrap() = 42;
         Ok(Status::NGX_OK.0)
     }
 }
@@ -333,6 +399,24 @@ fn upstream_initializer_preserves_saved_callback_and_rejects_invalid_inputs() {
         },
         NGX_ERROR as _
     );
+}
+
+#[test]
+fn upstream_initializer_reads_and_mutates_typed_server_configuration() {
+    let _slots = HttpSlotCounts::one();
+    let pool = TestPool::new();
+    let mut configuration = unsafe { MaybeUninit::<ngx_conf_t>::zeroed().assume_init() };
+    configuration.pool = pool.raw;
+    let mut module_configuration = 41_u32;
+    let mut slots: [*mut c_void; 1] = [(&raw mut module_configuration).cast()];
+    let mut upstream =
+        unsafe { MaybeUninit::<ngx_http_upstream_srv_conf_t>::zeroed().assume_init() };
+    upstream.srv_conf = slots.as_mut_ptr();
+
+    install_upstream_initializer::<TypedConfigurationInitializer>(&mut upstream);
+    let callback = upstream.peer.init_upstream.unwrap();
+    assert_eq!(unsafe { callback(&raw mut configuration, &raw mut upstream) }, Status::NGX_OK.0);
+    assert_eq!(module_configuration, 42);
 }
 
 #[test]

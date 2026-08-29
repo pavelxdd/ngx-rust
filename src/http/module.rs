@@ -270,6 +270,17 @@ pub(crate) fn configuration_callback_status(
 
 /// C-compatible adapter for an HTTP module preconfiguration callback.
 ///
+/// Raw parser pointers cannot invoke module hooks through safe Rust:
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_conf_t;
+/// use ngx::http::{HttpModule, preconfiguration};
+///
+/// fn invoke<M: HttpModule>(parser: *mut ngx_conf_t) {
+///     preconfiguration::<M>(parser);
+/// }
+/// ```
+///
 /// # Safety
 ///
 /// `cf` must point to a live nginx configuration parser state for this callback invocation.
