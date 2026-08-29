@@ -176,6 +176,18 @@ impl From<ConnectionError> for SessionContextError {
 /// ```
 ///
 /// ```compile_fail
+/// use ngx::ffi::ngx_stream_complex_value_t;
+/// use ngx::stream::Session;
+///
+/// fn reject_raw_complex_value(
+///     session: &mut Session<'_>,
+///     value: &ngx_stream_complex_value_t,
+/// ) {
+///     let _ = session.complex_value(value);
+/// }
+/// ```
+///
+/// ```compile_fail
 /// use ngx::core::ConnectionRef;
 /// use ngx::ffi::ngx_stream_session_t;
 /// use ngx::stream::Session;
