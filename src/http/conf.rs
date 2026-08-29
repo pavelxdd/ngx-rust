@@ -762,6 +762,8 @@ pub use http_v3::NgxHttpV3Module;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "test-link")]
+    use ::core::ffi::c_int;
     use ::core::ffi::c_void;
     #[cfg(feature = "test-link")]
     use ::core::mem;
@@ -781,8 +783,15 @@ mod tests {
         NGX_CORE_MODULE, NGX_HTTP_MODULE, ngx_http_conf_ctx_t, ngx_module_t, ngx_uint_t,
     };
     #[cfg(feature = "test-link")]
-    use crate::ffi::{ngx_conf_t, ngx_cycle_t, ngx_http_request_t, ngx_int_t};
+    use crate::ffi::{NGX_OK, ngx_conf_t, ngx_cycle_t, ngx_http_request_t, ngx_int_t};
     use crate::http::{HttpModule, ProcessCycle, RequestRefMut, exit_process, init_process};
+
+    #[cfg(feature = "test-link")]
+    unsafe extern "C" {
+        fn fork() -> c_int;
+        fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+        fn _exit(status: c_int) -> !;
+    }
 
     fn http_module(index: ngx_uint_t, context_index: ngx_uint_t) -> ngx_module_t {
         let mut module = ngx_module_t::default();
@@ -800,6 +809,70 @@ mod tests {
             module_indexes(ModuleDescriptor::from_test(module), 2, 1),
             Err(HttpConfigError::WrongModuleType)
         ));
+    }
+
+    #[cfg(feature = "test-link")]
+    fn native_http_module_lifecycle_succeeds() -> bool {
+        let raw = core::ptr::addr_of_mut!(nginx_sys::ngx_http_core_module);
+        let Some(descriptor) = (unsafe { ModuleDescriptor::from_raw(raw) }) else {
+            return false;
+        };
+        if !matches!(
+            module_indexes(descriptor, usize::MAX, usize::MAX),
+            Err(HttpConfigError::UnsetModuleIndex)
+        ) {
+            return false;
+        }
+        if unsafe { nginx_sys::ngx_preinit_modules() } != NGX_OK as ngx_int_t {
+            return false;
+        }
+
+        let mut modules = [raw, ptr::null_mut()];
+        let mut first_cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+        first_cycle.modules = modules.as_mut_ptr();
+        let http_slots = unsafe {
+            nginx_sys::ngx_count_modules(&raw mut first_cycle, NGX_HTTP_MODULE as ngx_uint_t)
+        };
+        let Ok(http_slots) = usize::try_from(http_slots) else {
+            return false;
+        };
+        let module_slots = unsafe { nginx_sys::ngx_max_module };
+        let first = unsafe { descriptor.snapshot() };
+        if module_indexes(descriptor, module_slots, http_slots).is_err() {
+            return false;
+        }
+
+        let mut reload_modules = [raw, ptr::null_mut()];
+        let mut reload_cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
+        reload_cycle.modules = reload_modules.as_mut_ptr();
+        reload_cycle.old_cycle = &raw mut first_cycle;
+        let reload_slots = unsafe {
+            nginx_sys::ngx_count_modules(&raw mut reload_cycle, NGX_HTTP_MODULE as ngx_uint_t)
+        };
+        let Ok(reload_slots) = usize::try_from(reload_slots) else {
+            return false;
+        };
+        let reloaded = unsafe { descriptor.snapshot() };
+
+        reload_slots == http_slots
+            && first.index == reloaded.index
+            && first.context_index == reloaded.context_index
+            && module_indexes(descriptor, module_slots, reload_slots).is_ok()
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn native_assignment_keeps_the_opaque_http_descriptor_reload_safe() {
+        let _guard = crate::TEST_NGINX_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
+        let child = unsafe { fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe { _exit(if native_http_module_lifecycle_succeeds() { 0 } else { 1 }) };
+        }
+
+        let mut status = 0;
+        assert_eq!(unsafe { waitpid(child, &raw mut status, 0) }, child);
+        assert_eq!(status, 0);
     }
 
     #[test]
