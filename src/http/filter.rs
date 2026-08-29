@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::ptr;
 
 use crate::core::{ChainMut, Status};
-use crate::ffi::{NGX_LOG_EMERG, ngx_conf_t, ngx_cycle_t, ngx_http_request_t, ngx_int_t};
+use crate::ffi::{NGX_LOG_EMERG, ngx_conf_t, ngx_http_request_t, ngx_int_t};
 use crate::http::{HttpModule, IntoHandlerStatus, RequestRefMut};
 
 type HeaderFilter = unsafe extern "C" fn(*mut ngx_http_request_t) -> ngx_int_t;
@@ -15,8 +15,6 @@ type BodyFilter =
 pub enum HttpFilterError {
     /// The slot contains only one saved callback and cannot be safely reused.
     IncompleteInstallation,
-    /// The slot already belongs to the current nginx configuration cycle.
-    AlreadyInstalled,
     /// Nginx has no header filter to continue.
     MissingHeaderFilter,
     /// Nginx has no body filter to continue.
@@ -50,7 +48,6 @@ fn log_installation_error(cf: &mut ngx_conf_t, module: &str, error: HttpFilterEr
 
     let message = match error {
         HttpFilterError::IncompleteInstallation => "incomplete prior installation",
-        HttpFilterError::AlreadyInstalled => "already installed for this configuration cycle",
         HttpFilterError::MissingHeaderFilter => "header filter chain is empty",
         HttpFilterError::MissingBodyFilter => "body filter chain is empty",
         HttpFilterError::HeaderSelfRecursion => "header filter would recurse",
@@ -68,18 +65,17 @@ fn log_installation_error(cf: &mut ngx_conf_t, module: &str, error: HttpFilterEr
 
 #[derive(Clone, Copy)]
 struct FilterState {
-    cycle: *mut ngx_cycle_t,
     header: Option<HeaderFilter>,
     body: Option<BodyFilter>,
 }
 
 impl FilterState {
     const fn empty() -> Self {
-        Self { cycle: ptr::null_mut(), header: None, body: None }
+        Self { header: None, body: None }
     }
 
     fn is_empty(self) -> bool {
-        self.cycle.is_null() && self.header.is_none() && self.body.is_none()
+        self.header.is_none() && self.body.is_none()
     }
 
     fn is_complete(self) -> bool {
@@ -153,15 +149,10 @@ where
         Ok(unsafe { next(request, chain.as_ptr()) })
     }
 
-    fn validate_installation(&self, cf: &ngx_conf_t) -> Result<FilterState, HttpFilterError> {
+    fn validate_installation(&self) -> Result<FilterState, HttpFilterError> {
         let state = unsafe { *self.state.get() };
-        if !state.is_empty() {
-            if !state.is_complete() {
-                return Err(HttpFilterError::IncompleteInstallation);
-            }
-            if ptr::eq(state.cycle, cf.cycle) {
-                return Err(HttpFilterError::AlreadyInstalled);
-            }
+        if !state.is_empty() && !state.is_complete() {
+            return Err(HttpFilterError::IncompleteInstallation);
         }
 
         let header = unsafe { nginx_sys::ngx_http_top_header_filter }
@@ -175,11 +166,11 @@ where
             return Err(HttpFilterError::BodySelfRecursion);
         }
 
-        Ok(FilterState { cycle: cf.cycle, header: Some(header), body: Some(body) })
+        Ok(FilterState { header: Some(header), body: Some(body) })
     }
 
-    fn install(&self, cf: &ngx_conf_t) -> Result<(), HttpFilterError> {
-        let next = self.validate_installation(cf)?;
+    fn install(&self) -> Result<(), HttpFilterError> {
+        let next = self.validate_installation()?;
 
         unsafe {
             *self.state.get() = next;
@@ -286,7 +277,7 @@ where
 {
     crate::http::module::configuration_callback_status(cf, |parser| {
         let module = core::any::type_name::<M>();
-        let validation = M::filter_slot().validate_installation(unsafe { &*parser.as_raw() });
+        let validation = M::filter_slot().validate_installation();
         if let Err(error) = validation {
             log_installation_error(unsafe { &mut *parser.as_raw() }, module, error);
             return Status::NGX_ERROR.0;
@@ -299,7 +290,7 @@ where
             return Status::NGX_ERROR.0;
         }
 
-        let installation = M::filter_slot().install(unsafe { &*parser.as_raw() });
+        let installation = M::filter_slot().install();
         if let Err(error) = installation {
             log_installation_error(unsafe { &mut *parser.as_raw() }, module, error);
             return Status::NGX_ERROR.0;
@@ -342,6 +333,7 @@ mod tests {
     static FAILING_BODY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     const RELOAD_TEST_CHILD: &str = "NGX_HTTP_FILTER_RELOAD_TEST_CHILD";
+    const FAILED_RELOAD_REUSE_TEST_CHILD: &str = "NGX_HTTP_FILTER_FAILED_RELOAD_REUSE_TEST_CHILD";
 
     #[derive(Default)]
     struct ConfigLogCapture {
@@ -1714,6 +1706,49 @@ mod tests {
         assert_eq!(top_body(&mut request, &raw mut chain), Status::NGX_ERROR.0);
         assert_eq!(NEXT_HEADER_CALLS.load(Ordering::Relaxed), 0);
         assert_eq!(NEXT_BODY_CALLS.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn failed_reload_does_not_reject_a_reused_cycle_address() {
+        if std::env::var_os(FAILED_RELOAD_REUSE_TEST_CHILD).is_some() {
+            failed_reload_reuse_in_isolated_test_process();
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("test executable");
+        let status = Command::new(executable)
+            .arg("--exact")
+            .arg("http::filter::tests::failed_reload_does_not_reject_a_reused_cycle_address")
+            .env(FAILED_RELOAD_REUSE_TEST_CHILD, "1")
+            .env("RUST_TEST_THREADS", "1")
+            .status()
+            .expect("spawn isolated failed-reload test");
+        assert!(status.success(), "isolated failed-reload test failed: {status}");
+    }
+
+    fn failed_reload_reuse_in_isolated_test_process() {
+        let globals = FilterGlobals::new();
+        let mut recycled_cycle = unsafe { MaybeUninit::<ngx_cycle_t>::zeroed().assume_init() };
+        let mut configuration = configuration(&mut recycled_cycle);
+
+        globals.set(Some(old_header), Some(old_body));
+        assert_eq!(
+            unsafe { filter_postconfiguration::<ReloadFilter>(&raw mut configuration) },
+            Status::NGX_OK.0
+        );
+
+        // Core filter initialization rebuilds the native chain before a later reload attempt.
+        // Reusing the failed cycle allocation must not make the Rust slot reject that attempt.
+        globals.set(Some(new_header), Some(new_body));
+        assert_eq!(
+            unsafe { filter_postconfiguration::<ReloadFilter>(&raw mut configuration) },
+            Status::NGX_OK.0
+        );
+
+        let mut request = request();
+        let mut chain = ngx_chain_t { buf: ptr::null_mut(), next: ptr::null_mut() };
+        assert_eq!(top_header(&mut request), Status::NGX_AGAIN.0);
+        assert_eq!(top_body(&mut request, &raw mut chain), Status::NGX_BUSY.0);
     }
 
     #[test]
