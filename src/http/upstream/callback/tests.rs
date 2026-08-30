@@ -856,7 +856,7 @@ fn peer_initializer_rejects_missing_and_invalid_owners() {
 }
 
 #[test]
-fn peer_callback_family_delegates_in_order_and_restores_typed_data() {
+fn peer_callback_family_composes_with_distinct_outer_and_original_data() {
     CALLBACK_ORDER.store(0, Ordering::Relaxed);
     OBSERVED_GET_PEER_DATA.store(ptr::null_mut(), Ordering::Relaxed);
     OBSERVED_GET_CALLBACK_DATA.store(ptr::null_mut(), Ordering::Relaxed);
@@ -891,22 +891,25 @@ fn peer_callback_family_delegates_in_order_and_restores_typed_data() {
     );
     let typed_data = request_upstream.peer.data;
     assert_ne!(typed_data, original_data);
+    let mut outer_data = 8_u8;
+    let outer_data = ptr::from_mut(&mut outer_data).cast::<c_void>();
+    request_upstream.peer.data = outer_data;
     assert_eq!(CALLBACK_ORDER.load(Ordering::Relaxed), 1);
 
     assert_eq!(
         unsafe { raw_get_peer::<OrderedPeer>(&raw mut request_upstream.peer, typed_data) },
         NGX_BUSY as _
     );
-    assert_eq!(OBSERVED_GET_PEER_DATA.load(Ordering::Relaxed), original_data);
+    assert_eq!(OBSERVED_GET_PEER_DATA.load(Ordering::Relaxed), outer_data);
     assert_eq!(OBSERVED_GET_CALLBACK_DATA.load(Ordering::Relaxed), original_data);
-    assert_eq!(request_upstream.peer.data, typed_data);
+    assert_eq!(request_upstream.peer.data, outer_data);
 
     let state = 0x5a_u32 as ngx_uint_t;
     unsafe { raw_free_peer::<OrderedPeer>(&raw mut request_upstream.peer, typed_data, state) };
-    assert_eq!(OBSERVED_FREE_PEER_DATA.load(Ordering::Relaxed), original_data);
+    assert_eq!(OBSERVED_FREE_PEER_DATA.load(Ordering::Relaxed), outer_data);
     assert_eq!(OBSERVED_FREE_CALLBACK_DATA.load(Ordering::Relaxed), original_data);
     assert_eq!(OBSERVED_FREE_STATE.load(Ordering::Relaxed), state as usize);
-    assert_eq!(request_upstream.peer.data, typed_data);
+    assert_eq!(request_upstream.peer.data, outer_data);
 
     let notify_type = 0x6b_u32 as ngx_uint_t;
     unsafe {
@@ -916,10 +919,10 @@ fn peer_callback_family_delegates_in_order_and_restores_typed_data() {
             notify_type,
         )
     };
-    assert_eq!(OBSERVED_NOTIFY_PEER_DATA.load(Ordering::Relaxed), original_data);
+    assert_eq!(OBSERVED_NOTIFY_PEER_DATA.load(Ordering::Relaxed), outer_data);
     assert_eq!(OBSERVED_NOTIFY_CALLBACK_DATA.load(Ordering::Relaxed), original_data);
     assert_eq!(OBSERVED_NOTIFY_TYPE.load(Ordering::Relaxed), notify_type);
-    assert_eq!(request_upstream.peer.data, typed_data);
+    assert_eq!(request_upstream.peer.data, outer_data);
 
     #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
     unsafe {
@@ -927,14 +930,14 @@ fn peer_callback_family_delegates_in_order_and_restores_typed_data() {
             request_upstream.peer.set_session.unwrap()(&raw mut request_upstream.peer, typed_data,),
             NGX_BUSY as _
         );
-        assert_eq!(OBSERVED_SET_SESSION_PEER_DATA.load(Ordering::Relaxed), original_data);
+        assert_eq!(OBSERVED_SET_SESSION_PEER_DATA.load(Ordering::Relaxed), outer_data);
         assert_eq!(OBSERVED_SET_SESSION_CALLBACK_DATA.load(Ordering::Relaxed), original_data);
-        assert_eq!(request_upstream.peer.data, typed_data);
+        assert_eq!(request_upstream.peer.data, outer_data);
 
         request_upstream.peer.save_session.unwrap()(&raw mut request_upstream.peer, typed_data);
-        assert_eq!(OBSERVED_SAVE_SESSION_PEER_DATA.load(Ordering::Relaxed), original_data);
+        assert_eq!(OBSERVED_SAVE_SESSION_PEER_DATA.load(Ordering::Relaxed), outer_data);
         assert_eq!(OBSERVED_SAVE_SESSION_CALLBACK_DATA.load(Ordering::Relaxed), original_data);
-        assert_eq!(request_upstream.peer.data, typed_data);
+        assert_eq!(request_upstream.peer.data, outer_data);
     }
 
     #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
@@ -1062,7 +1065,7 @@ fn callback_errors_emit_one_record_from_the_configuration_request_or_peer_owner(
 }
 
 #[test]
-fn peer_callback_adapters_reject_mismatched_or_misaligned_typed_data() {
+fn peer_callback_adapters_reject_misaligned_explicit_typed_data() {
     let pool = TestPool::new();
     let mut request_upstream =
         unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
@@ -1074,17 +1077,7 @@ fn peer_callback_adapters_reject_mismatched_or_misaligned_typed_data() {
         unsafe { raw_init_peer::<MissingOriginalPeer>(&raw mut request, &raw mut server) },
         Status::NGX_OK.0
     );
-    let typed_data = request_upstream.peer.data;
-
-    request_upstream.peer.data = ptr::null_mut();
-    assert_eq!(
-        unsafe { raw_get_peer::<MissingOriginalPeer>(&raw mut request_upstream.peer, typed_data) },
-        NGX_ERROR as _
-    );
-    unsafe { raw_free_peer::<MissingOriginalPeer>(&raw mut request_upstream.peer, typed_data, 0) };
-
     let invalid_data = ptr::without_provenance_mut::<c_void>(1);
-    request_upstream.peer.data = invalid_data;
     assert_eq!(
         unsafe {
             raw_get_peer::<MissingOriginalPeer>(&raw mut request_upstream.peer, invalid_data)

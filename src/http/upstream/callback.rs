@@ -4,7 +4,7 @@ use core::ffi::c_void;
 use core::fmt;
 use core::marker::PhantomData;
 use core::ops::Deref;
-use core::ptr::{self, NonNull};
+use core::ptr::NonNull;
 
 use crate::core::{Pool, Status};
 use crate::ffi::{
@@ -47,8 +47,6 @@ pub enum UpstreamCallbackError {
     MisalignedPeerData,
     /// The peer callback data does not belong to this typed handler.
     ForeignPeerData,
-    /// nginx invoked a peer callback with data different from `pc->data`.
-    PeerDataMismatch,
     /// The saved original upstream initializer is absent.
     MissingOriginalInitUpstream,
     /// The saved original request peer initializer is absent.
@@ -109,9 +107,6 @@ impl fmt::Display for UpstreamCallbackError {
             Self::MisalignedPeerData => formatter.write_str("upstream peer data is misaligned"),
             Self::ForeignPeerData => {
                 formatter.write_str("upstream peer data belongs to another handler")
-            }
-            Self::PeerDataMismatch => {
-                formatter.write_str("upstream peer callback data does not match the peer")
             }
             Self::MissingOriginalInitUpstream => {
                 formatter.write_str("upstream has no original initializer")
@@ -609,14 +604,6 @@ impl UpstreamPeerConnection<'_> {
         Ok(SelectedUpstreamPeer { status, _callback: PhantomData })
     }
 
-    fn data(&self) -> *mut c_void {
-        unsafe { self.raw.as_ref().data }
-    }
-
-    fn set_data(&mut self, data: *mut c_void) {
-        unsafe { self.raw.as_mut().data = data };
-    }
-
     fn log_failure(&self, action: &str, error: &UpstreamCallbackError) {
         let log = unsafe { self.raw.as_ref().log };
         let Some(log) = (unsafe { LogRef::from_raw(log) }) else {
@@ -672,7 +659,7 @@ impl<'callback> OriginalPeerGet<'callback> {
     ) -> Result<UpstreamPeerSelection<'callback>, UpstreamCallbackError> {
         let callback = self.original.get.ok_or(UpstreamCallbackError::MissingOriginalGetPeer)?;
         let status =
-            with_original_data(self.original, peer, |peer, data| unsafe { callback(peer, data) });
+            call_original(self.original, peer, |peer, data| unsafe { callback(peer, data) });
         match status {
             status if status == Status::NGX_ERROR.0 => Ok(UpstreamPeerSelection::Error),
             status if status == Status::NGX_BUSY.0 => Ok(UpstreamPeerSelection::Busy),
@@ -712,7 +699,7 @@ impl<'callback> OriginalPeerFree<'callback> {
         peer: &'callback mut UpstreamPeerConnection<'_>,
     ) -> Result<(), UpstreamCallbackError> {
         let callback = self.original.free.ok_or(UpstreamCallbackError::MissingOriginalFreePeer)?;
-        with_original_data(self.original, peer, |peer, data| unsafe {
+        call_original(self.original, peer, |peer, data| unsafe {
             callback(peer, data, self.state.bits())
         });
         Ok(())
@@ -742,16 +729,12 @@ impl<T> HttpUpstreamPeerData<T> {
     }
 }
 
-fn with_original_data<R>(
+fn call_original<R>(
     original: OriginalPeerCallbacks,
     peer: &mut UpstreamPeerConnection<'_>,
     callback: impl FnOnce(*mut ngx_peer_connection_t, *mut c_void) -> R,
 ) -> R {
-    let previous = peer.data();
-    peer.set_data(original.data);
-    let result = callback(peer.raw.as_ptr(), original.data);
-    peer.set_data(previous);
-    result
+    callback(peer.raw.as_ptr(), original.data)
 }
 
 struct RequestUpstream {
@@ -810,7 +793,6 @@ impl RequestUpstream {
 }
 
 fn peer_data<H>(
-    peer: &UpstreamPeerConnection<'_>,
     data: *mut c_void,
 ) -> Result<NonNull<HttpUpstreamPeerData<H::Data>>, UpstreamCallbackError>
 where
@@ -821,10 +803,6 @@ where
     if !data.as_ptr().is_aligned() {
         return Err(UpstreamCallbackError::MisalignedPeerData);
     }
-    if !ptr::eq(peer.data(), data.as_ptr().cast()) {
-        return Err(UpstreamCallbackError::PeerDataMismatch);
-    }
-
     let value = unsafe { data.as_ref() };
     if value.magic != PEER_DATA_MAGIC || value.handler != TypeId::of::<H>() {
         return Err(UpstreamCallbackError::ForeignPeerData);
@@ -926,7 +904,7 @@ where
         return Status::NGX_ERROR.0;
     };
     match catch_upstream_callback(|| {
-        let mut data = peer_data::<H>(&peer, data)?;
+        let mut data = peer_data::<H>(data)?;
         let data = unsafe { data.as_mut() };
         let selection = H::get(
             &mut peer,
@@ -954,7 +932,7 @@ unsafe extern "C" fn raw_free_peer<H>(
         return;
     };
     let result = catch_upstream_callback(|| {
-        let mut data = peer_data::<H>(&peer, data)?;
+        let mut data = peer_data::<H>(data)?;
         let data = unsafe { data.as_mut() };
         let state = UpstreamPeerState(state);
         H::free(
@@ -979,7 +957,7 @@ unsafe extern "C" fn raw_notify_peer<H>(
     let Ok(mut peer) = (unsafe { UpstreamPeerConnection::from_raw(peer) }) else {
         return;
     };
-    let data = match peer_data::<H>(&peer, data) {
+    let data = match peer_data::<H>(data) {
         Ok(data) => unsafe { data.as_ref() },
         Err(error) => {
             peer.log_failure("peer notification", &error);
@@ -989,9 +967,7 @@ unsafe extern "C" fn raw_notify_peer<H>(
     let Some(callback) = data.original.notify else {
         return;
     };
-    with_original_data(data.original, &mut peer, |peer, data| unsafe {
-        callback(peer, data, type_)
-    });
+    call_original(data.original, &mut peer, |peer, data| unsafe { callback(peer, data, type_) });
 }
 
 #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
@@ -1005,7 +981,7 @@ where
     let Ok(mut peer) = (unsafe { UpstreamPeerConnection::from_raw(peer) }) else {
         return Status::NGX_ERROR.0;
     };
-    let data = match peer_data::<H>(&peer, data) {
+    let data = match peer_data::<H>(data) {
         Ok(data) => unsafe { data.as_ref() },
         Err(error) => {
             peer.log_failure("peer session lookup", &error);
@@ -1015,7 +991,7 @@ where
     let Some(callback) = data.original.set_session else {
         return Status::NGX_ERROR.0;
     };
-    with_original_data(data.original, &mut peer, |peer, data| unsafe { callback(peer, data) })
+    call_original(data.original, &mut peer, |peer, data| unsafe { callback(peer, data) })
 }
 
 #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
@@ -1026,7 +1002,7 @@ where
     let Ok(mut peer) = (unsafe { UpstreamPeerConnection::from_raw(peer) }) else {
         return;
     };
-    let data = match peer_data::<H>(&peer, data) {
+    let data = match peer_data::<H>(data) {
         Ok(data) => unsafe { data.as_ref() },
         Err(error) => {
             peer.log_failure("peer session save", &error);
@@ -1036,7 +1012,7 @@ where
     let Some(callback) = data.original.save_session else {
         return;
     };
-    with_original_data(data.original, &mut peer, |peer, data| unsafe { callback(peer, data) });
+    call_original(data.original, &mut peer, |peer, data| unsafe { callback(peer, data) });
 }
 
 #[cfg(all(test, feature = "test-link"))]
