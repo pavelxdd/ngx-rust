@@ -57,6 +57,24 @@ pub enum UpstreamCallbackError {
     MissingOriginalGetPeer,
     /// The saved original peer releaser is absent.
     MissingOriginalFreePeer,
+    /// A successful upstream initializer left the request peer initializer absent.
+    MissingPeerInitializer,
+    /// A successful original request peer initializer left the peer getter absent.
+    MissingPeerGetter,
+    /// The original peer getter returned a status outside nginx's supported set.
+    InvalidOriginalGetStatus(ngx_int_t),
+    /// A newly selected peer has no socket address.
+    MissingSelectedPeerAddress,
+    /// A newly selected peer has a misaligned socket address.
+    MisalignedSelectedPeerAddress,
+    /// A selected peer has no display name.
+    MissingSelectedPeerName,
+    /// A selected peer has a misaligned display name.
+    MisalignedSelectedPeerName,
+    /// A reused or pending selected peer has no connection.
+    MissingSelectedPeerConnection,
+    /// A reused or pending selected peer has a misaligned connection.
+    MisalignedSelectedPeerConnection,
     /// nginx could not retain handler data in the request pool.
     Allocation,
     /// Resolving a typed module configuration failed.
@@ -106,6 +124,33 @@ impl fmt::Display for UpstreamCallbackError {
             }
             Self::MissingOriginalFreePeer => {
                 formatter.write_str("upstream has no original peer releaser")
+            }
+            Self::MissingPeerInitializer => {
+                formatter.write_str("upstream initialization installed no peer initializer")
+            }
+            Self::MissingPeerGetter => {
+                formatter.write_str("peer initialization installed no peer getter")
+            }
+            Self::InvalidOriginalGetStatus(status) => {
+                write!(formatter, "original peer getter returned unsupported status {status}")
+            }
+            Self::MissingSelectedPeerAddress => {
+                formatter.write_str("selected upstream peer has no socket address")
+            }
+            Self::MisalignedSelectedPeerAddress => {
+                formatter.write_str("selected upstream peer socket address is misaligned")
+            }
+            Self::MissingSelectedPeerName => {
+                formatter.write_str("selected upstream peer has no name")
+            }
+            Self::MisalignedSelectedPeerName => {
+                formatter.write_str("selected upstream peer name is misaligned")
+            }
+            Self::MissingSelectedPeerConnection => {
+                formatter.write_str("selected upstream peer has no connection")
+            }
+            Self::MisalignedSelectedPeerConnection => {
+                formatter.write_str("selected upstream peer connection is misaligned")
             }
             Self::Allocation => formatter.write_str("failed to allocate upstream peer data"),
             Self::Configuration(_) => {
@@ -267,6 +312,45 @@ impl<'callback> UpstreamServerConf<'callback> {
         unsafe { self.raw.as_mut().peer.init = Some(raw_init_peer::<H>) };
         previous
     }
+
+    /// Proves that this configured upstream has a request peer initializer.
+    pub fn initialized(&self) -> Result<UpstreamInitialized<'_>, UpstreamCallbackError> {
+        if unsafe { self.raw.as_ref().peer.init.is_none() } {
+            return Err(UpstreamCallbackError::MissingPeerInitializer);
+        }
+        Ok(UpstreamInitialized { _upstream: PhantomData })
+    }
+}
+
+/// Proof that a configured upstream has its mandatory request peer initializer.
+///
+/// ```compile_fail
+/// use core::marker::PhantomData;
+/// use ngx::http::UpstreamInitialized;
+///
+/// fn forge<'a>() -> UpstreamInitialized<'a> {
+///     UpstreamInitialized { _upstream: PhantomData }
+/// }
+/// ```
+pub struct UpstreamInitialized<'upstream> {
+    _upstream: PhantomData<&'upstream ngx_http_upstream_srv_conf_t>,
+}
+
+/// Checked result returned by a saved native upstream initializer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpstreamInitStatus {
+    /// The native initializer succeeded and installed a request peer initializer.
+    Initialized,
+    /// The native initializer returned a non-success status.
+    Unavailable,
+}
+
+/// Result of typed upstream configuration initialization.
+pub enum UpstreamInitialization<'upstream> {
+    /// The mandatory request peer initializer is installed.
+    Initialized(UpstreamInitialized<'upstream>),
+    /// Configuration initialization did not succeed.
+    Unavailable,
 }
 
 /// Saved HTTP upstream initializer that can be called through checked callback views.
@@ -284,10 +368,24 @@ impl UpstreamInitCallback {
         self,
         configuration: &mut UpstreamConfiguration<'_>,
         upstream: &mut UpstreamServerConf<'_>,
-    ) -> Result<ngx_int_t, UpstreamCallbackError> {
+    ) -> Result<UpstreamInitStatus, UpstreamCallbackError> {
         let callback = self.0.ok_or(UpstreamCallbackError::MissingOriginalInitUpstream)?;
-        Ok(unsafe { callback(configuration.raw.as_ptr(), upstream.raw.as_ptr()) })
+        let status = unsafe { callback(configuration.raw.as_ptr(), upstream.raw.as_ptr()) };
+        if status != Status::NGX_OK.0 {
+            return Ok(UpstreamInitStatus::Unavailable);
+        }
+        let _ = upstream.initialized()?;
+        Ok(UpstreamInitStatus::Initialized)
     }
+}
+
+/// Checked result returned by a saved native request peer initializer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpstreamPeerInitStatus {
+    /// The native initializer succeeded and installed a peer getter.
+    Initialized,
+    /// The native initializer returned a non-success status.
+    Unavailable,
 }
 
 /// Saved HTTP request peer initializer that can be called through checked callback views.
@@ -305,9 +403,17 @@ impl UpstreamPeerInitCallback {
         self,
         request: &mut UpstreamPeerInitRequest<'_>,
         upstream: &mut UpstreamServerConf<'_>,
-    ) -> Result<ngx_int_t, UpstreamCallbackError> {
+    ) -> Result<UpstreamPeerInitStatus, UpstreamCallbackError> {
         let callback = self.0.ok_or(UpstreamCallbackError::MissingOriginalInitPeer)?;
-        Ok(unsafe { callback(request.request.as_ptr(), upstream.raw.as_ptr()) })
+        let status = unsafe { callback(request.request.as_ptr(), upstream.raw.as_ptr()) };
+        if status != Status::NGX_OK.0 {
+            return Ok(UpstreamPeerInitStatus::Unavailable);
+        }
+        let request_upstream = RequestUpstream::from_request(request)?;
+        if unsafe { request_upstream.raw.as_ref().peer.get.is_none() } {
+            return Err(UpstreamCallbackError::MissingPeerGetter);
+        }
+        Ok(UpstreamPeerInitStatus::Initialized)
     }
 }
 
@@ -351,19 +457,27 @@ where
 
 /// Typed HTTP upstream initializer.
 pub trait HttpUpstreamInitializer: 'static {
-    /// Initializes one configured upstream and returns the exact nginx status to propagate.
-    fn init(
+    /// Initializes one configured upstream without exposing a forgeable success status.
+    fn init<'upstream>(
         configuration: &mut UpstreamConfiguration<'_>,
-        upstream: &mut UpstreamServerConf<'_>,
-    ) -> Result<ngx_int_t, UpstreamCallbackError>;
+        upstream: &'upstream mut UpstreamServerConf<'_>,
+    ) -> Result<UpstreamInitialization<'upstream>, UpstreamCallbackError>;
 }
 
 /// Result of initializing a request's typed upstream peer callbacks.
+///
+/// ```compile_fail
+/// use ngx::http::UpstreamPeerInit;
+///
+/// fn forge() -> UpstreamPeerInit<()> {
+///     UpstreamPeerInit::Return(0)
+/// }
+/// ```
 pub enum UpstreamPeerInit<T> {
     /// Install the typed peer data and callback adapters around the original peer callbacks.
     Install(T),
-    /// Return this nginx status without installing typed peer data or callbacks.
-    Return(ngx_int_t),
+    /// Return a non-success status without installing typed peer data or callbacks.
+    Unavailable,
 }
 
 /// Typed request peer initializer, getter, and releaser for one upstream implementation.
@@ -373,7 +487,7 @@ pub trait HttpUpstreamPeerHandler: 'static {
 
     /// Initializes custom request peer data after any needed original initialization.
     ///
-    /// Return [`UpstreamPeerInit::Return`] to preserve an original initializer's non-OK status
+    /// Return [`UpstreamPeerInit::Unavailable`] when an original initializer does not succeed,
     /// without replacing the native peer callbacks.
     fn init(
         request: &mut UpstreamPeerInitRequest<'_>,
@@ -381,19 +495,65 @@ pub trait HttpUpstreamPeerHandler: 'static {
     ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError>;
 
     /// Selects a peer or delegates selection to the saved original callback.
-    fn get(
-        peer: &mut UpstreamPeerConnection<'_>,
+    fn get<'callback>(
+        peer: &'callback mut UpstreamPeerConnection<'_>,
         data: &mut Self::Data,
-        original: OriginalPeerGet,
-    ) -> Result<ngx_int_t, UpstreamCallbackError>;
+        original: OriginalPeerGet<'callback>,
+    ) -> Result<UpstreamPeerSelection<'callback>, UpstreamCallbackError>;
 
     /// Releases a peer or delegates release to the saved original callback.
-    fn free(
-        peer: &mut UpstreamPeerConnection<'_>,
+    fn free<'callback>(
+        peer: &'callback mut UpstreamPeerConnection<'_>,
         data: &mut Self::Data,
         state: UpstreamPeerState,
-        original: OriginalPeerFree,
+        original: OriginalPeerFree<'callback>,
     ) -> Result<(), UpstreamCallbackError>;
+}
+
+/// Opaque proof that a native callback populated the fields required for a selected peer.
+///
+/// ```compile_fail
+/// use core::marker::PhantomData;
+/// use ngx::http::SelectedUpstreamPeer;
+///
+/// fn forge<'a>() -> SelectedUpstreamPeer<'a> {
+///     SelectedUpstreamPeer { status: 0, _callback: PhantomData }
+/// }
+/// ```
+pub struct SelectedUpstreamPeer<'callback> {
+    status: ngx_int_t,
+    _callback: PhantomData<&'callback mut ngx_peer_connection_t>,
+}
+
+/// Safe result of an upstream peer selection callback.
+///
+/// ```compile_fail
+/// use ngx::http::UpstreamPeerSelection;
+///
+/// fn escape<'a>(selection: UpstreamPeerSelection<'a>) -> UpstreamPeerSelection<'static> {
+///     selection
+/// }
+/// ```
+pub enum UpstreamPeerSelection<'callback> {
+    /// Peer selection failed.
+    Error,
+    /// No live peer is currently available.
+    Busy,
+    /// This peer selection attempt was declined.
+    Declined,
+    /// A new, pending, or reused peer has all native fields required by nginx.
+    Selected(SelectedUpstreamPeer<'callback>),
+}
+
+impl UpstreamPeerSelection<'_> {
+    fn status(self) -> ngx_int_t {
+        match self {
+            Self::Error => Status::NGX_ERROR.0,
+            Self::Busy => Status::NGX_BUSY.0,
+            Self::Declined => Status::NGX_DECLINED.0,
+            Self::Selected(selected) => selected.status,
+        }
+    }
 }
 
 /// Checked peer-connection callback view.
@@ -416,6 +576,37 @@ impl UpstreamPeerConnection<'_> {
     /// Returns the number of remaining peer attempts nginx recorded.
     pub fn tries(&self) -> ngx_uint_t {
         unsafe { self.raw.as_ref().tries }
+    }
+
+    fn selected(
+        &mut self,
+        status: ngx_int_t,
+    ) -> Result<SelectedUpstreamPeer<'_>, UpstreamCallbackError> {
+        let peer = unsafe { self.raw.as_ref() };
+        if peer.name.is_null() {
+            return Err(UpstreamCallbackError::MissingSelectedPeerName);
+        }
+        if !peer.name.is_aligned() {
+            return Err(UpstreamCallbackError::MisalignedSelectedPeerName);
+        }
+
+        if status == Status::NGX_OK.0 {
+            if peer.sockaddr.is_null() {
+                return Err(UpstreamCallbackError::MissingSelectedPeerAddress);
+            }
+            if !peer.sockaddr.is_aligned() {
+                return Err(UpstreamCallbackError::MisalignedSelectedPeerAddress);
+            }
+        } else {
+            if peer.connection.is_null() {
+                return Err(UpstreamCallbackError::MissingSelectedPeerConnection);
+            }
+            if !peer.connection.is_aligned() {
+                return Err(UpstreamCallbackError::MisalignedSelectedPeerConnection);
+            }
+        }
+
+        Ok(SelectedUpstreamPeer { status, _callback: PhantomData })
     }
 
     fn data(&self) -> *mut c_void {
@@ -463,23 +654,38 @@ struct OriginalPeerCallbacks {
 /// ```compile_fail
 /// use ngx::http::{OriginalPeerGet, UpstreamPeerConnection};
 ///
-/// fn duplicate(original: OriginalPeerGet, peer: &mut UpstreamPeerConnection<'_>) {
+/// fn duplicate(original: OriginalPeerGet<'_>, peer: &mut UpstreamPeerConnection<'_>) {
 ///     original.call(peer).unwrap();
 ///     original.call(peer).unwrap();
 /// }
 /// ```
-pub struct OriginalPeerGet {
+pub struct OriginalPeerGet<'callback> {
     original: OriginalPeerCallbacks,
+    _callback: PhantomData<&'callback mut ngx_peer_connection_t>,
 }
 
-impl OriginalPeerGet {
+impl<'callback> OriginalPeerGet<'callback> {
     /// Consumes this capability and invokes the original peer selector once.
     pub fn call(
         self,
-        peer: &mut UpstreamPeerConnection<'_>,
-    ) -> Result<ngx_int_t, UpstreamCallbackError> {
+        peer: &'callback mut UpstreamPeerConnection<'_>,
+    ) -> Result<UpstreamPeerSelection<'callback>, UpstreamCallbackError> {
         let callback = self.original.get.ok_or(UpstreamCallbackError::MissingOriginalGetPeer)?;
-        Ok(with_original_data(self.original, peer, |peer, data| unsafe { callback(peer, data) }))
+        let status =
+            with_original_data(self.original, peer, |peer, data| unsafe { callback(peer, data) });
+        match status {
+            status if status == Status::NGX_ERROR.0 => Ok(UpstreamPeerSelection::Error),
+            status if status == Status::NGX_BUSY.0 => Ok(UpstreamPeerSelection::Busy),
+            status if status == Status::NGX_DECLINED.0 => Ok(UpstreamPeerSelection::Declined),
+            status
+                if status == Status::NGX_OK.0
+                    || status == Status::NGX_AGAIN.0
+                    || status == Status::NGX_DONE.0 =>
+            {
+                Ok(UpstreamPeerSelection::Selected(peer.selected(status)?))
+            }
+            status => Err(UpstreamCallbackError::InvalidOriginalGetStatus(status)),
+        }
     }
 }
 
@@ -488,19 +694,23 @@ impl OriginalPeerGet {
 /// ```compile_fail
 /// use ngx::http::{OriginalPeerFree, UpstreamPeerConnection};
 ///
-/// fn duplicate(original: OriginalPeerFree, peer: &mut UpstreamPeerConnection<'_>) {
+/// fn duplicate(original: OriginalPeerFree<'_>, peer: &mut UpstreamPeerConnection<'_>) {
 ///     original.call(peer).unwrap();
 ///     original.call(peer).unwrap();
 /// }
 /// ```
-pub struct OriginalPeerFree {
+pub struct OriginalPeerFree<'callback> {
     original: OriginalPeerCallbacks,
     state: UpstreamPeerState,
+    _callback: PhantomData<&'callback mut ngx_peer_connection_t>,
 }
 
-impl OriginalPeerFree {
+impl<'callback> OriginalPeerFree<'callback> {
     /// Consumes this capability and invokes the original peer releaser once.
-    pub fn call(self, peer: &mut UpstreamPeerConnection<'_>) -> Result<(), UpstreamCallbackError> {
+    pub fn call(
+        self,
+        peer: &'callback mut UpstreamPeerConnection<'_>,
+    ) -> Result<(), UpstreamCallbackError> {
         let callback = self.original.free.ok_or(UpstreamCallbackError::MissingOriginalFreePeer)?;
         with_original_data(self.original, peer, |peer, data| unsafe {
             callback(peer, data, self.state.bits())
@@ -658,7 +868,10 @@ where
     };
     match catch_upstream_callback(|| {
         let mut upstream = unsafe { UpstreamServerConf::from_raw(upstream) }?;
-        H::init(&mut configuration, &mut upstream)
+        match H::init(&mut configuration, &mut upstream)? {
+            UpstreamInitialization::Initialized(_) => Ok(Status::NGX_OK.0),
+            UpstreamInitialization::Unavailable => Ok(Status::NGX_ERROR.0),
+        }
     }) {
         Ok(status) => status,
         Err(error) => {
@@ -687,7 +900,7 @@ where
                         request_upstream.install::<H>(&pool, value)?;
                         Ok(Status::NGX_OK.0)
                     }
-                    UpstreamPeerInit::Return(status) => Ok(status),
+                    UpstreamPeerInit::Unavailable => Ok(Status::NGX_ERROR.0),
                 }
             });
             match result {
@@ -715,7 +928,12 @@ where
     match catch_upstream_callback(|| {
         let mut data = peer_data::<H>(&peer, data)?;
         let data = unsafe { data.as_mut() };
-        H::get(&mut peer, &mut data.value, OriginalPeerGet { original: data.original })
+        let selection = H::get(
+            &mut peer,
+            &mut data.value,
+            OriginalPeerGet { original: data.original, _callback: PhantomData },
+        )?;
+        Ok(selection.status())
     }) {
         Ok(status) => status,
         Err(error) => {
@@ -743,7 +961,7 @@ unsafe extern "C" fn raw_free_peer<H>(
             &mut peer,
             &mut data.value,
             state,
-            OriginalPeerFree { original: data.original, state },
+            OriginalPeerFree { original: data.original, state, _callback: PhantomData },
         )
     });
     if let Err(error) = result {

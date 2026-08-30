@@ -10,19 +10,20 @@ use core::ffi::{c_char, c_void};
 use core::ptr::{self, NonNull};
 
 use ngx::collections::NgxArray;
-use ngx::core::{ModuleDescriptor, Status};
+use ngx::core::ModuleDescriptor;
 use ngx::ffi::{
     NGX_CONF_NOARGS, NGX_CONF_TAKE1, NGX_ERROR, NGX_HTTP_MODULE, NGX_HTTP_SRV_CONF_OFFSET,
     NGX_HTTP_UPS_CONF, NGX_LOG_EMERG, ngx_atoi, ngx_command_t, ngx_conf_t, ngx_http_module_t,
-    ngx_http_upstream_init_round_robin, ngx_int_t, ngx_module_t, ngx_str_t, ngx_uint_t,
+    ngx_http_upstream_init_round_robin, ngx_module_t, ngx_str_t, ngx_uint_t,
 };
 use ngx::http::{
     HttpConfigurationParser, HttpModule, HttpModuleServerConf, HttpUpstreamInitializer,
     HttpUpstreamPeerHandler, Merge, MergeConfigError, NgxHttpUpstreamModule, OriginalPeerFree,
     OriginalPeerGet, UpstreamCallbackError, UpstreamConfiguration, UpstreamInitCallback,
-    UpstreamPeerConnection, UpstreamPeerInit, UpstreamPeerInitCallback, UpstreamPeerInitRequest,
-    UpstreamPeerState, UpstreamServerConf, install_upstream_initializer, postconfiguration,
-    preconfiguration,
+    UpstreamInitStatus, UpstreamInitialization, UpstreamPeerConnection, UpstreamPeerInit,
+    UpstreamPeerInitCallback, UpstreamPeerInitRequest, UpstreamPeerInitStatus,
+    UpstreamPeerSelection, UpstreamPeerState, UpstreamServerConf, install_upstream_initializer,
+    postconfiguration, preconfiguration,
 };
 use ngx::{ngx_conf_log_error, ngx_string};
 
@@ -92,31 +93,30 @@ pub static mut ngx_http_upstream_custom_module: ngx_module_t = ngx_module_t {
 struct CustomUpstream;
 
 impl HttpUpstreamInitializer for CustomUpstream {
-    fn init(
+    fn init<'upstream>(
         configuration: &mut UpstreamConfiguration<'_>,
-        upstream: &mut UpstreamServerConf<'_>,
-    ) -> Result<ngx_int_t, UpstreamCallbackError> {
+        upstream: &'upstream mut UpstreamServerConf<'_>,
+    ) -> Result<UpstreamInitialization<'upstream>, UpstreamCallbackError> {
         let original = {
             let Some(config) = upstream.module_conf_mut::<Module>()? else {
-                return Ok(Status::NGX_ERROR.0);
+                return Ok(UpstreamInitialization::Unavailable);
             };
             if config.max == u32::MAX {
                 config.max = 100;
             }
             config.original_init_upstream
         };
-        let status = original.call(configuration, upstream)?;
-        if status != Status::NGX_OK.0 {
-            return Ok(status);
+        if original.call(configuration, upstream)? == UpstreamInitStatus::Unavailable {
+            return Ok(UpstreamInitialization::Unavailable);
         }
 
         let original_peer = upstream.init_peer();
         let Some(config) = upstream.module_conf_mut::<Module>()? else {
-            return Ok(Status::NGX_ERROR.0);
+            return Ok(UpstreamInitialization::Unavailable);
         };
         config.original_init_peer = original_peer;
         upstream.replace_init_peer::<CustomPeer>();
-        Ok(Status::NGX_OK.0)
+        Ok(UpstreamInitialization::Initialized(upstream.initialized()?))
     }
 }
 
@@ -131,29 +131,27 @@ impl HttpUpstreamPeerHandler for CustomPeer {
     ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
         let original = match upstream.module_conf::<Module>()? {
             Some(config) => config.original_init_peer,
-            None => return Ok(UpstreamPeerInit::Return(Status::NGX_ERROR.0)),
+            None => return Ok(UpstreamPeerInit::Unavailable),
         };
-        let status = original.call(request, upstream)?;
-        if status == Status::NGX_OK.0 {
-            Ok(UpstreamPeerInit::Install(()))
-        } else {
-            Ok(UpstreamPeerInit::Return(status))
+        match original.call(request, upstream)? {
+            UpstreamPeerInitStatus::Initialized => Ok(UpstreamPeerInit::Install(())),
+            UpstreamPeerInitStatus::Unavailable => Ok(UpstreamPeerInit::Unavailable),
         }
     }
 
-    fn get(
-        peer: &mut UpstreamPeerConnection<'_>,
+    fn get<'callback>(
+        peer: &'callback mut UpstreamPeerConnection<'_>,
         _data: &mut Self::Data,
-        original: OriginalPeerGet,
-    ) -> Result<ngx_int_t, UpstreamCallbackError> {
+        original: OriginalPeerGet<'callback>,
+    ) -> Result<UpstreamPeerSelection<'callback>, UpstreamCallbackError> {
         original.call(peer)
     }
 
-    fn free(
-        peer: &mut UpstreamPeerConnection<'_>,
+    fn free<'callback>(
+        peer: &'callback mut UpstreamPeerConnection<'_>,
         _data: &mut Self::Data,
         _state: UpstreamPeerState,
-        original: OriginalPeerFree,
+        original: OriginalPeerFree<'callback>,
     ) -> Result<(), UpstreamCallbackError> {
         original.call(peer)
     }
