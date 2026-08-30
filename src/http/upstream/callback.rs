@@ -9,10 +9,12 @@ use core::ptr::{self, NonNull};
 use crate::core::{Pool, Status};
 use crate::ffi::{
     NGX_LOG_EMERG, NGX_LOG_ERR, ngx_conf_t, ngx_event_free_peer_pt, ngx_event_get_peer_pt,
-    ngx_http_request_t, ngx_http_upstream_init_peer_pt, ngx_http_upstream_init_pt,
-    ngx_http_upstream_srv_conf_t, ngx_http_upstream_t, ngx_int_t, ngx_peer_connection_t,
-    ngx_uint_t,
+    ngx_event_notify_peer_pt, ngx_http_request_t, ngx_http_upstream_init_peer_pt,
+    ngx_http_upstream_init_pt, ngx_http_upstream_srv_conf_t, ngx_http_upstream_t, ngx_int_t,
+    ngx_peer_connection_t, ngx_uint_t,
 };
+#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+use crate::ffi::{ngx_event_save_peer_session_pt, ngx_event_set_peer_session_pt};
 use crate::http::{HttpConfigError, HttpModuleServerConf, RequestError, RequestRefMut};
 use crate::log::LogRef;
 
@@ -446,6 +448,11 @@ impl UpstreamPeerState {
 struct OriginalPeerCallbacks {
     get: ngx_event_get_peer_pt,
     free: ngx_event_free_peer_pt,
+    notify: ngx_event_notify_peer_pt,
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    set_session: ngx_event_set_peer_session_pt,
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    save_session: ngx_event_save_peer_session_pt,
     data: *mut c_void,
 }
 
@@ -472,6 +479,18 @@ impl<T> HttpUpstreamPeerData<T> {
         }
     }
 
+    fn with_original_data<R>(
+        &self,
+        peer: &mut UpstreamPeerConnection<'_>,
+        callback: impl FnOnce(*mut ngx_peer_connection_t, *mut c_void) -> R,
+    ) -> R {
+        let previous = peer.data();
+        peer.set_data(self.original.data);
+        let result = callback(peer.raw.as_ptr(), self.original.data);
+        peer.set_data(previous);
+        result
+    }
+
     /// Returns the module's request-pool peer data.
     pub fn value(&self) -> &T {
         &self.value
@@ -491,11 +510,7 @@ impl<T> HttpUpstreamPeerData<T> {
         peer: &mut UpstreamPeerConnection<'_>,
     ) -> Result<ngx_int_t, UpstreamCallbackError> {
         let callback = self.original.get.ok_or(UpstreamCallbackError::MissingOriginalGetPeer)?;
-        let previous = peer.data();
-        peer.set_data(self.original.data);
-        let status = unsafe { callback(peer.raw.as_ptr(), self.original.data) };
-        peer.set_data(previous);
-        Ok(status)
+        Ok(self.with_original_data(peer, |peer, data| unsafe { callback(peer, data) }))
     }
 
     /// Delegates peer release to the saved original callback without changing nginx state bits.
@@ -505,10 +520,7 @@ impl<T> HttpUpstreamPeerData<T> {
         state: UpstreamPeerState,
     ) -> Result<(), UpstreamCallbackError> {
         let callback = self.original.free.ok_or(UpstreamCallbackError::MissingOriginalFreePeer)?;
-        let previous = peer.data();
-        peer.set_data(self.original.data);
-        unsafe { callback(peer.raw.as_ptr(), self.original.data, state.bits()) };
-        peer.set_data(previous);
+        self.with_original_data(peer, |peer, data| unsafe { callback(peer, data, state.bits()) });
         Ok(())
     }
 }
@@ -534,7 +546,16 @@ impl RequestUpstream {
         H: HttpUpstreamPeerHandler,
     {
         let peer = unsafe { &mut self.raw.as_mut().peer };
-        let original = OriginalPeerCallbacks { get: peer.get, free: peer.free, data: peer.data };
+        let original = OriginalPeerCallbacks {
+            get: peer.get,
+            free: peer.free,
+            notify: peer.notify,
+            #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+            set_session: peer.set_session,
+            #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+            save_session: peer.save_session,
+            data: peer.data,
+        };
         let data = pool
             .allocate_with_cleanup(|| HttpUpstreamPeerData::new::<H>(value, original))
             .map_err(|_| UpstreamCallbackError::Allocation)?
@@ -543,6 +564,18 @@ impl RequestUpstream {
         peer.data = data.as_ptr().cast();
         peer.get = Some(raw_get_peer::<H>);
         peer.free = Some(raw_free_peer::<H>);
+        if original.notify.is_some() {
+            peer.notify = Some(raw_notify_peer::<H>);
+        }
+        #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+        {
+            if original.set_session.is_some() {
+                peer.set_session = Some(raw_set_session::<H>);
+            }
+            if original.save_session.is_some() {
+                peer.save_session = Some(raw_save_session::<H>);
+            }
+        }
         Ok(())
     }
 }
@@ -691,6 +724,74 @@ unsafe extern "C" fn raw_free_peer<H>(
     if let Err(error) = result {
         peer.log_failure("peer release", &error);
     }
+}
+
+unsafe extern "C" fn raw_notify_peer<H>(
+    peer: *mut ngx_peer_connection_t,
+    data: *mut c_void,
+    type_: ngx_uint_t,
+) where
+    H: HttpUpstreamPeerHandler,
+{
+    let Ok(mut peer) = (unsafe { UpstreamPeerConnection::from_raw(peer) }) else {
+        return;
+    };
+    let data = match peer_data::<H>(&peer, data) {
+        Ok(data) => unsafe { data.as_ref() },
+        Err(error) => {
+            peer.log_failure("peer notification", &error);
+            return;
+        }
+    };
+    let Some(callback) = data.original.notify else {
+        return;
+    };
+    data.with_original_data(&mut peer, |peer, data| unsafe { callback(peer, data, type_) });
+}
+
+#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+unsafe extern "C" fn raw_set_session<H>(
+    peer: *mut ngx_peer_connection_t,
+    data: *mut c_void,
+) -> ngx_int_t
+where
+    H: HttpUpstreamPeerHandler,
+{
+    let Ok(mut peer) = (unsafe { UpstreamPeerConnection::from_raw(peer) }) else {
+        return Status::NGX_ERROR.0;
+    };
+    let data = match peer_data::<H>(&peer, data) {
+        Ok(data) => unsafe { data.as_ref() },
+        Err(error) => {
+            peer.log_failure("peer session lookup", &error);
+            return Status::NGX_ERROR.0;
+        }
+    };
+    let Some(callback) = data.original.set_session else {
+        return Status::NGX_ERROR.0;
+    };
+    data.with_original_data(&mut peer, |peer, data| unsafe { callback(peer, data) })
+}
+
+#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+unsafe extern "C" fn raw_save_session<H>(peer: *mut ngx_peer_connection_t, data: *mut c_void)
+where
+    H: HttpUpstreamPeerHandler,
+{
+    let Ok(mut peer) = (unsafe { UpstreamPeerConnection::from_raw(peer) }) else {
+        return;
+    };
+    let data = match peer_data::<H>(&peer, data) {
+        Ok(data) => unsafe { data.as_ref() },
+        Err(error) => {
+            peer.log_failure("peer session save", &error);
+            return;
+        }
+    };
+    let Some(callback) = data.original.save_session else {
+        return;
+    };
+    data.with_original_data(&mut peer, |peer, data| unsafe { callback(peer, data) });
 }
 
 #[cfg(all(test, feature = "test-link"))]

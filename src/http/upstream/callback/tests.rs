@@ -26,6 +26,17 @@ static OBSERVED_GET_CALLBACK_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_
 static OBSERVED_FREE_PEER_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static OBSERVED_FREE_CALLBACK_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static OBSERVED_FREE_STATE: AtomicUsize = AtomicUsize::new(0);
+static OBSERVED_NOTIFY_PEER_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static OBSERVED_NOTIFY_CALLBACK_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static OBSERVED_NOTIFY_TYPE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+static OBSERVED_SET_SESSION_PEER_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+static OBSERVED_SET_SESSION_CALLBACK_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+static OBSERVED_SAVE_SESSION_PEER_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+static OBSERVED_SAVE_SESSION_CALLBACK_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 #[derive(Default)]
 struct LogCapture {
@@ -235,6 +246,12 @@ unsafe extern "C" fn ordered_init_peer(
     peer.data = ORIGINAL_DATA.load(Ordering::Relaxed);
     peer.get = Some(ordered_get_peer);
     peer.free = Some(ordered_free_peer);
+    peer.notify = Some(ordered_notify_peer);
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    {
+        peer.set_session = Some(ordered_set_session);
+        peer.save_session = Some(ordered_save_session);
+    }
     CALLBACK_ORDER.fetch_add(1, Ordering::Relaxed);
     Status::NGX_OK.0
 }
@@ -257,6 +274,35 @@ unsafe extern "C" fn ordered_free_peer(
     OBSERVED_FREE_PEER_DATA.store(unsafe { (*peer).data }, Ordering::Relaxed);
     OBSERVED_FREE_CALLBACK_DATA.store(data, Ordering::Relaxed);
     OBSERVED_FREE_STATE.store(state, Ordering::Relaxed);
+    CALLBACK_ORDER.fetch_add(1, Ordering::Relaxed);
+}
+
+unsafe extern "C" fn ordered_notify_peer(
+    peer: *mut ngx_peer_connection_t,
+    data: *mut c_void,
+    type_: ngx_uint_t,
+) {
+    OBSERVED_NOTIFY_PEER_DATA.store(unsafe { (*peer).data }, Ordering::Relaxed);
+    OBSERVED_NOTIFY_CALLBACK_DATA.store(data, Ordering::Relaxed);
+    OBSERVED_NOTIFY_TYPE.store(type_, Ordering::Relaxed);
+    CALLBACK_ORDER.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+unsafe extern "C" fn ordered_set_session(
+    peer: *mut ngx_peer_connection_t,
+    data: *mut c_void,
+) -> ngx_int_t {
+    OBSERVED_SET_SESSION_PEER_DATA.store(unsafe { (*peer).data }, Ordering::Relaxed);
+    OBSERVED_SET_SESSION_CALLBACK_DATA.store(data, Ordering::Relaxed);
+    CALLBACK_ORDER.fetch_add(1, Ordering::Relaxed);
+    NGX_BUSY as _
+}
+
+#[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+unsafe extern "C" fn ordered_save_session(peer: *mut ngx_peer_connection_t, data: *mut c_void) {
+    OBSERVED_SAVE_SESSION_PEER_DATA.store(unsafe { (*peer).data }, Ordering::Relaxed);
+    OBSERVED_SAVE_SESSION_CALLBACK_DATA.store(data, Ordering::Relaxed);
     CALLBACK_ORDER.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -576,13 +622,23 @@ fn peer_initializer_rejects_missing_and_invalid_owners() {
 }
 
 #[test]
-fn peer_callbacks_delegate_in_order_and_restore_typed_data() {
+fn peer_callback_family_delegates_in_order_and_restores_typed_data() {
     CALLBACK_ORDER.store(0, Ordering::Relaxed);
     OBSERVED_GET_PEER_DATA.store(ptr::null_mut(), Ordering::Relaxed);
     OBSERVED_GET_CALLBACK_DATA.store(ptr::null_mut(), Ordering::Relaxed);
     OBSERVED_FREE_PEER_DATA.store(ptr::null_mut(), Ordering::Relaxed);
     OBSERVED_FREE_CALLBACK_DATA.store(ptr::null_mut(), Ordering::Relaxed);
     OBSERVED_FREE_STATE.store(0, Ordering::Relaxed);
+    OBSERVED_NOTIFY_PEER_DATA.store(ptr::null_mut(), Ordering::Relaxed);
+    OBSERVED_NOTIFY_CALLBACK_DATA.store(ptr::null_mut(), Ordering::Relaxed);
+    OBSERVED_NOTIFY_TYPE.store(0, Ordering::Relaxed);
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    {
+        OBSERVED_SET_SESSION_PEER_DATA.store(ptr::null_mut(), Ordering::Relaxed);
+        OBSERVED_SET_SESSION_CALLBACK_DATA.store(ptr::null_mut(), Ordering::Relaxed);
+        OBSERVED_SAVE_SESSION_PEER_DATA.store(ptr::null_mut(), Ordering::Relaxed);
+        OBSERVED_SAVE_SESSION_CALLBACK_DATA.store(ptr::null_mut(), Ordering::Relaxed);
+    }
     let pool = TestPool::new();
     let mut original_data = 7_u8;
     let original_data = ptr::from_mut(&mut original_data).cast::<c_void>();
@@ -617,7 +673,40 @@ fn peer_callbacks_delegate_in_order_and_restore_typed_data() {
     assert_eq!(OBSERVED_FREE_CALLBACK_DATA.load(Ordering::Relaxed), original_data);
     assert_eq!(OBSERVED_FREE_STATE.load(Ordering::Relaxed), state as usize);
     assert_eq!(request_upstream.peer.data, typed_data);
-    assert_eq!(CALLBACK_ORDER.load(Ordering::Relaxed), 3);
+
+    let notify_type = 0x6b_u32 as ngx_uint_t;
+    unsafe {
+        request_upstream.peer.notify.unwrap()(
+            &raw mut request_upstream.peer,
+            typed_data,
+            notify_type,
+        )
+    };
+    assert_eq!(OBSERVED_NOTIFY_PEER_DATA.load(Ordering::Relaxed), original_data);
+    assert_eq!(OBSERVED_NOTIFY_CALLBACK_DATA.load(Ordering::Relaxed), original_data);
+    assert_eq!(OBSERVED_NOTIFY_TYPE.load(Ordering::Relaxed), notify_type);
+    assert_eq!(request_upstream.peer.data, typed_data);
+
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    unsafe {
+        assert_eq!(
+            request_upstream.peer.set_session.unwrap()(&raw mut request_upstream.peer, typed_data,),
+            NGX_BUSY as _
+        );
+        assert_eq!(OBSERVED_SET_SESSION_PEER_DATA.load(Ordering::Relaxed), original_data);
+        assert_eq!(OBSERVED_SET_SESSION_CALLBACK_DATA.load(Ordering::Relaxed), original_data);
+        assert_eq!(request_upstream.peer.data, typed_data);
+
+        request_upstream.peer.save_session.unwrap()(&raw mut request_upstream.peer, typed_data);
+        assert_eq!(OBSERVED_SAVE_SESSION_PEER_DATA.load(Ordering::Relaxed), original_data);
+        assert_eq!(OBSERVED_SAVE_SESSION_CALLBACK_DATA.load(Ordering::Relaxed), original_data);
+        assert_eq!(request_upstream.peer.data, typed_data);
+    }
+
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    assert_eq!(CALLBACK_ORDER.load(Ordering::Relaxed), 6);
+    #[cfg(not(any(ngx_feature = "ssl", ngx_feature = "compat")))]
+    assert_eq!(CALLBACK_ORDER.load(Ordering::Relaxed), 4);
 }
 
 #[test]
