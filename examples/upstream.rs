@@ -25,7 +25,7 @@ use ngx::http::{
     UpstreamPeerSelection, UpstreamPeerState, UpstreamServerConf, install_upstream_initializer,
     postconfiguration, preconfiguration,
 };
-use ngx::{ngx_conf_log_error, ngx_string};
+use ngx::{ngx_conf_log_error, ngx_log_debug_http, ngx_string};
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -134,7 +134,10 @@ impl HttpUpstreamPeerHandler for CustomPeer {
             None => return Ok(UpstreamPeerInit::Unavailable),
         };
         match original.call(request, upstream)? {
-            UpstreamPeerInitStatus::Initialized => Ok(UpstreamPeerInit::Install(())),
+            UpstreamPeerInitStatus::Initialized => {
+                ngx_log_debug_http!(request, "CUSTOM UPSTREAM request peer init");
+                Ok(UpstreamPeerInit::Install(()))
+            }
             UpstreamPeerInitStatus::Unavailable => Ok(UpstreamPeerInit::Unavailable),
         }
     }
