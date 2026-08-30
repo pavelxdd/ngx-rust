@@ -1,9 +1,11 @@
 extern crate duct;
 
 use core::error::Error as StdError;
+use core::sync::atomic::{AtomicU64, Ordering};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 use std::{env, fs};
 
@@ -183,36 +185,189 @@ fn get_archive(cache_dir: &Path, source: &SourceSpec, version: &str) -> io::Resu
     Ok(archive)
 }
 
+const EXTRACTION_MARKER: &str = ".ngx-rust-extracted";
+static NEXT_STAGING_ID: AtomicU64 = AtomicU64::new(0);
+
+struct StagingDir {
+    path: PathBuf,
+}
+
+impl StagingDir {
+    fn create(base_dir: &Path, stem: &str) -> io::Result<Self> {
+        for _ in 0..100 {
+            let id = NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed);
+            let path = base_dir.join(format!(".{stem}.extracting-{}-{id}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("unable to create a staging directory for {stem}"),
+        ))
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn invalid_archive(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn completed_extraction(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+        && fs::symlink_metadata(path.join(EXTRACTION_MARKER))
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+fn remove_unmarked_extraction(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+
+    if metadata.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) }
+}
+
+fn validate_archive_path(path: &Path, stem: &OsStr) -> io::Result<()> {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::Normal(root)) if root == stem) {
+        return Err(invalid_archive(format!(
+            "archive entry is outside the expected {stem:?} root: {}",
+            path.display()
+        )));
+    }
+
+    for (index, component) in components.enumerate() {
+        let Component::Normal(component) = component else {
+            return Err(invalid_archive(format!(
+                "archive entry contains an unsafe path: {}",
+                path.display()
+            )));
+        };
+        if index == 0 && component == OsStr::new(EXTRACTION_MARKER) {
+            return Err(invalid_archive(format!(
+                "archive entry uses reserved extraction marker: {}",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_symlink_target(path: &Path, target: &Path) -> io::Result<()> {
+    let mut depth = path.parent().map_or(0, |parent| parent.components().count());
+    for component in target.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir if depth > 1 => depth -= 1,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(invalid_archive(format!(
+                    "archive link escapes the expected root: {} -> {}",
+                    path.display(),
+                    target.display()
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_archive_link<R: io::Read>(
+    entry: &tar::Entry<'_, R>,
+    path: &Path,
+    stem: &OsStr,
+) -> io::Result<()> {
+    let entry_type = entry.header().entry_type();
+    if !entry_type.is_symlink() && !entry_type.is_hard_link() {
+        return Ok(());
+    }
+
+    let target = entry
+        .link_name()?
+        .ok_or_else(|| invalid_archive(format!("archive link has no target: {}", path.display())))?
+        .into_owned();
+    if entry_type.is_symlink() {
+        validate_symlink_target(path, &target)
+    } else {
+        validate_archive_path(&target, stem)
+    }
+}
+
 /// Extracts a tarball into a subdirectory based on the tarball's name under the source base
 /// directory.
 fn extract_archive(archive_path: &Path, extract_output_base_dir: &Path) -> io::Result<PathBuf> {
-    if !extract_output_base_dir.exists() {
-        fs::create_dir_all(extract_output_base_dir)?;
-    }
-    let archive_file = File::open(archive_path)
-        .unwrap_or_else(|_| panic!("Unable to open archive file: {}", archive_path.display()));
-    let stem = archive_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .and_then(|s| s.rsplitn(3, '.').last())
-        .expect("Unable to determine archive file name stem");
+    fs::create_dir_all(extract_output_base_dir)?;
 
-    let extract_output_dir = extract_output_base_dir.to_owned();
-    let archive_output_dir = extract_output_dir.join(stem);
-    if !archive_output_dir.exists() {
-        Archive::new(GzDecoder::new(archive_file)).entries()?.filter_map(|e| e.ok()).for_each(
-            |mut entry| {
-                let path = entry.path().unwrap();
-                let stripped_path = path.components().skip(1).collect::<PathBuf>();
-                entry.unpack(archive_output_dir.join(stripped_path)).unwrap();
-            },
-        );
-    } else {
+    let filename = archive_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| invalid_archive("unable to determine archive file name"))?;
+    let stem = filename
+        .strip_suffix(".tar.gz")
+        .filter(|stem| matches!(Path::new(stem).components().next(), Some(Component::Normal(_))))
+        .ok_or_else(|| invalid_archive(format!("unsupported archive file name: {filename}")))?;
+    let archive_output_dir = extract_output_base_dir.join(stem);
+
+    if completed_extraction(&archive_output_dir) {
         println!(
             "Archive [{}] already extracted to directory: {}",
             stem,
             archive_output_dir.display()
         );
+        return Ok(archive_output_dir);
+    }
+    remove_unmarked_extraction(&archive_output_dir)?;
+
+    let staging = StagingDir::create(extract_output_base_dir, stem)?;
+    let archive_file = File::open(archive_path)?;
+    let mut archive = Archive::new(GzDecoder::new(archive_file));
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        validate_archive_path(&path, OsStr::new(stem))?;
+        if path.components().count() == 1 && !entry.header().entry_type().is_dir() {
+            return Err(invalid_archive(format!(
+                "archive top-level entry is not a directory: {}",
+                path.display()
+            )));
+        }
+        validate_archive_link(&entry, &path, OsStr::new(stem))?;
+        if !entry.unpack_in(&staging.path)? {
+            return Err(invalid_archive(format!(
+                "archive entry escapes the extraction root: {}",
+                path.display()
+            )));
+        }
+    }
+
+    let staged_output_dir = staging.path.join(stem);
+    if !fs::symlink_metadata(&staged_output_dir).is_ok_and(|metadata| metadata.file_type().is_dir())
+    {
+        return Err(invalid_archive(format!(
+            "archive does not contain the expected {stem} directory"
+        )));
+    }
+
+    let marker = staged_output_dir.join(EXTRACTION_MARKER);
+    File::options().write(true).create_new(true).open(marker)?;
+
+    if let Err(err) = fs::rename(&staged_output_dir, &archive_output_dir) {
+        if completed_extraction(&archive_output_dir) {
+            return Ok(archive_output_dir);
+        }
+        return Err(err);
     }
 
     Ok(archive_output_dir)
@@ -249,4 +404,235 @@ pub fn prepare(source_dir: &Path, build_dir: &Path) -> io::Result<(PathBuf, Vec<
     }
 
     Ok((source_dir, options))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+    use std::io;
+    use std::path::PathBuf;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use tar::{Builder, EntryType, Header};
+    use tempfile::TempDir;
+
+    use super::extract_archive;
+
+    struct TestEntry<'a> {
+        path: &'a str,
+        entry_type: EntryType,
+        link_name: Option<&'a str>,
+        contents: &'a [u8],
+    }
+
+    fn write_header_field(field: &mut [u8], value: &str) {
+        assert!(value.len() < field.len());
+        field.fill(0);
+        field[..value.len()].copy_from_slice(value.as_bytes());
+    }
+
+    fn create_archive(temp_dir: &TempDir, entries: &[TestEntry<'_>]) -> io::Result<PathBuf> {
+        let path = temp_dir.path().join("source.tar.gz");
+        let encoder = GzEncoder::new(File::create(&path)?, Compression::default());
+        let mut builder = Builder::new(encoder);
+
+        for entry in entries {
+            let mut header = Header::new_gnu();
+            header.set_entry_type(entry.entry_type);
+            header.set_mode(if entry.entry_type.is_dir() { 0o755 } else { 0o644 });
+            header.set_size(entry.contents.len() as u64);
+
+            // Builder's path setters reject traversal, so hostile fixtures write raw tar fields.
+            let bytes = header.as_mut_bytes();
+            write_header_field(&mut bytes[..100], entry.path);
+            if let Some(link_name) = entry.link_name {
+                write_header_field(&mut bytes[157..257], link_name);
+            }
+            header.set_cksum();
+            builder.append(&header, entry.contents)?;
+        }
+
+        builder.into_inner()?.finish()?;
+        Ok(path)
+    }
+
+    fn directory(path: &str) -> TestEntry<'_> {
+        TestEntry { path, entry_type: EntryType::Directory, link_name: None, contents: &[] }
+    }
+
+    fn file<'a>(path: &'a str, contents: &'static [u8]) -> TestEntry<'a> {
+        TestEntry { path, entry_type: EntryType::Regular, link_name: None, contents }
+    }
+
+    #[test]
+    fn valid_archive_is_published_under_its_expected_root() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive =
+            create_archive(&temp_dir, &[directory("source/"), file("source/README", b"complete")])?;
+        let output = temp_dir.path().join("output");
+
+        let extracted = extract_archive(&archive, &output)?;
+
+        assert_eq!(extracted, output.join("source"));
+        assert_eq!(fs::read(extracted.join("README"))?, b"complete");
+        Ok(())
+    }
+
+    #[test]
+    fn unexpected_top_level_root_is_rejected() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive =
+            create_archive(&temp_dir, &[directory("other/"), file("other/README", b"unexpected")])?;
+        let output = temp_dir.path().join("output");
+
+        assert!(extract_archive(&archive, &output).is_err());
+        assert!(!output.join("source").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn traversal_does_not_escape_or_publish_a_partial_tree() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive = create_archive(
+            &temp_dir,
+            &[
+                directory("source/"),
+                file("source/README", b"partial"),
+                file("source/../../escaped", b"escaped"),
+            ],
+        )?;
+        let output = temp_dir.path().join("output");
+
+        let extraction = std::panic::catch_unwind(|| extract_archive(&archive, &output));
+
+        assert!(extraction.is_ok(), "malformed archives must return an error");
+        assert!(extraction.expect("extract_archive panicked").is_err());
+        assert!(!temp_dir.path().join("escaped").exists());
+        assert!(!output.join("source").exists());
+        assert_eq!(fs::read_dir(&output)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn archive_cannot_publish_its_own_completion_marker() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive = create_archive(
+            &temp_dir,
+            &[directory("source/"), file("source/.ngx-rust-extracted", b"forged")],
+        )?;
+        let output = temp_dir.path().join("output");
+
+        assert!(extract_archive(&archive, &output).is_err());
+        assert!(!output.join("source").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaping_symlink_is_rejected() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive = create_archive(
+            &temp_dir,
+            &[
+                directory("source/"),
+                TestEntry {
+                    path: "source/link",
+                    entry_type: EntryType::Symlink,
+                    link_name: Some("../../outside"),
+                    contents: &[],
+                },
+            ],
+        )?;
+        let output = temp_dir.path().join("output");
+
+        assert!(extract_archive(&archive, &output).is_err());
+        assert!(!output.join("source").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cannot_replace_the_expected_top_level_directory() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive = create_archive(
+            &temp_dir,
+            &[TestEntry {
+                path: "source",
+                entry_type: EntryType::Symlink,
+                link_name: Some("."),
+                contents: &[],
+            }],
+        )?;
+        let output = temp_dir.path().join("output");
+
+        assert!(extract_archive(&archive, &output).is_err());
+        assert!(!output.join("source").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_symlink_within_the_expected_root_is_extracted() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive = create_archive(
+            &temp_dir,
+            &[
+                directory("source/"),
+                directory("source/dir/"),
+                file("source/target", b"target"),
+                TestEntry {
+                    path: "source/dir/link",
+                    entry_type: EntryType::Symlink,
+                    link_name: Some("../target"),
+                    contents: &[],
+                },
+            ],
+        )?;
+        let output = temp_dir.path().join("output");
+
+        let extracted = extract_archive(&archive, &output)?;
+
+        assert_eq!(fs::read(extracted.join("dir/link"))?, b"target");
+        Ok(())
+    }
+
+    #[test]
+    fn escaping_hard_link_is_rejected() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive = create_archive(
+            &temp_dir,
+            &[
+                directory("source/"),
+                TestEntry {
+                    path: "source/link",
+                    entry_type: EntryType::Link,
+                    link_name: Some("source/../../outside"),
+                    contents: &[],
+                },
+            ],
+        )?;
+        let output = temp_dir.path().join("output");
+
+        assert!(extract_archive(&archive, &output).is_err());
+        assert!(!output.join("source").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn unmarked_existing_tree_is_replaced() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive =
+            create_archive(&temp_dir, &[directory("source/"), file("source/README", b"complete")])?;
+        let output = temp_dir.path().join("output");
+        let existing = output.join("source");
+        fs::create_dir_all(&existing)?;
+        fs::write(existing.join("partial"), b"stale")?;
+
+        let extracted = extract_archive(&archive, &output)?;
+
+        assert_eq!(fs::read(extracted.join("README"))?, b"complete");
+        assert!(!extracted.join("partial").exists());
+        Ok(())
+    }
 }

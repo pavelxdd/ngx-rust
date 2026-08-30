@@ -527,6 +527,7 @@ dependencies = [
  "duct",
  "flate2",
  "tar",
+ "tempfile",
  "ureq",
 ]
 

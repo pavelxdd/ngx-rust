@@ -26,5 +26,8 @@ flate2 = "1.1.9"
 tar = "0.4.46"
 ureq = "3.2"
 
+[dev-dependencies]
+tempfile = { version = "3.27.0", default-features = false }
+
 [lints]
 workspace = true
