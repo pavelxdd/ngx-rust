@@ -26,11 +26,11 @@ pub use crate::http::{
     SelectedUpstreamPeer, UpstreamAddress, UpstreamAddresses, UpstreamCallbackError,
     UpstreamConfiguration, UpstreamInitCallback, UpstreamInitStatus, UpstreamInitialization,
     UpstreamInitialized, UpstreamPeerConnection, UpstreamPeerInit, UpstreamPeerInitCallback,
-    UpstreamPeerInitStatus, UpstreamPeerSelection, UpstreamPeerState, UpstreamPort,
-    UpstreamServerConf, UpstreamState, UpstreamStateError, UpstreamStates, UpstreamUrlMessage,
-    UpstreamUrlParseError, UpstreamUrlViewError, add_phase_handler, add_variable,
-    add_variable_with_setter, exit_process, filter_postconfiguration, get_variable_index,
-    init_process, install_upstream_initializer, phase_handler_postconfiguration, postconfiguration,
-    preconfiguration,
+    UpstreamPeerInitRequest, UpstreamPeerInitStatus, UpstreamPeerSelection, UpstreamPeerState,
+    UpstreamPort, UpstreamServerConf, UpstreamState, UpstreamStateError, UpstreamStates,
+    UpstreamUrlMessage, UpstreamUrlParseError, UpstreamUrlViewError, add_phase_handler,
+    add_variable, add_variable_with_setter, exit_process, filter_postconfiguration,
+    get_variable_index, init_process, install_upstream_initializer,
+    phase_handler_postconfiguration, postconfiguration, preconfiguration,
 };
 pub use crate::ngx_log_debug_http;
