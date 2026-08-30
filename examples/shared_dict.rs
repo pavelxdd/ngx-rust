@@ -22,8 +22,8 @@ use ngx::core::{
 };
 use ngx::http::{
     HttpConfigurationParser, HttpModule, HttpModuleMainConf, HttpVariableFlags,
-    HttpVariableHandler, HttpVariableOutput, HttpVariableSetter, HttpVariableValueRef, RequestRef,
-    RequestRefMut, add_variable_with_setter,
+    HttpVariableHandler, HttpVariableOutput, HttpVariableRequest, HttpVariableSetter,
+    HttpVariableValueRef, RequestRef, RequestRefMut, add_variable_with_setter,
 };
 use ngx::{ngx_conf_log_error, ngx_log_debug, ngx_string};
 
@@ -725,7 +725,7 @@ impl HttpVariableHandler for SharedDictVariable {
     type Output = Status;
 
     fn get(
-        request: &mut RequestRefMut<'_>,
+        request: &mut HttpVariableRequest<'_, '_>,
         output: &mut HttpVariableOutput<'_>,
         data: usize,
     ) -> Self::Output {
@@ -833,7 +833,7 @@ impl HttpVariableHandler for SharedDictEntriesVariable {
     type Output = Status;
 
     fn get(
-        request: &mut RequestRefMut<'_>,
+        request: &mut HttpVariableRequest<'_, '_>,
         output: &mut HttpVariableOutput<'_>,
         _data: usize,
     ) -> Self::Output {
