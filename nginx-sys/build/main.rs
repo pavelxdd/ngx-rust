@@ -140,7 +140,9 @@ impl NginxSource {
 fn generate_binding(nginx: &NginxSource) {
     let autoconf_makefile_path = nginx.build_dir.join("Makefile");
     let makefile = read_to_string(&autoconf_makefile_path).expect("configured NGINX Makefile");
-    let standard = c_standard(&logical_makefile_lines(&makefile));
+    let makefile_lines = logical_makefile_lines(&makefile);
+    let standard = c_standard(&makefile_lines);
+    let c_compiler = ConfiguredCCompiler::from_makefile(&makefile_lines);
     let (includes, defines) = parse_makefile(&autoconf_makefile_path);
     let includes: Vec<_> = includes
         .into_iter()
@@ -220,17 +222,17 @@ fn generate_binding(nginx: &NginxSource) {
     bindings.write_to_file(out_path.join("bindings.rs")).expect("Couldn't write bindings!");
 
     if build_http {
-        build_http_request_shim(&includes, &defines, standard.as_deref());
+        build_http_request_shim(&includes, &defines, &c_compiler);
     }
 
     #[cfg(feature = "test-link")]
-    build_test_library(nginx, &includes, &defines, build_http);
+    build_test_library(nginx, &includes, &defines, build_http, &c_compiler);
 }
 
 fn build_http_request_shim(
     includes: &[PathBuf],
     defines: &[(String, Option<String>)],
-    standard: Option<&str>,
+    c_compiler: &ConfiguredCCompiler,
 ) {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let shim = out_dir.join("nginx_http_request_shim.c");
@@ -284,9 +286,7 @@ ngx_rs_http_request_set_header_sent(ngx_http_request_t *request, ngx_uint_t head
     for (name, value) in defines {
         build.define(name, value.as_deref());
     }
-    if let Some(standard) = standard {
-        build.flag(standard);
-    }
+    c_compiler.apply(&mut build);
     build.warnings(false);
     build.compile("nginx_http_request_shim");
 }
@@ -297,6 +297,7 @@ fn build_test_library(
     includes: &[PathBuf],
     defines: &[(String, Option<String>)],
     build_http: bool,
+    c_compiler: &ConfiguredCCompiler,
 ) {
     assert_eq!(
         env::var("CARGO_CFG_TARGET_OS").as_deref(),
@@ -611,9 +612,7 @@ ngx_rs_test_stream_proxy_protocol_addr_port(ngx_stream_session_t *session,
     for (name, value) in defines {
         build.define(name, value.as_deref());
     }
-    if let Some(standard) = c_standard(&lines) {
-        build.flag(&standard);
-    }
+    c_compiler.apply(&mut build);
     build.warnings(false);
     build.files(sources);
     build.compile("nginx_test");
@@ -697,6 +696,61 @@ fn resolve_makefile_path(nginx: &NginxSource, path: &str) -> PathBuf {
     }
 
     panic!("NGINX Makefile path does not exist: {}", path.display());
+}
+
+struct ConfiguredCCompiler {
+    program: String,
+    flags: Vec<String>,
+}
+
+impl ConfiguredCCompiler {
+    fn from_makefile(lines: &[String]) -> Self {
+        let mut compiler = shlex::split(makefile_variable(lines, "CC"))
+            .expect("configured NGINX compiler command");
+        assert!(!compiler.is_empty(), "configured NGINX compiler command is empty");
+        let program = compiler.remove(0);
+        let mut flags = compiler;
+
+        let configured_flags =
+            shlex::split(makefile_variable(lines, "CFLAGS")).expect("configured NGINX CFLAGS");
+        let mut configured_flags = configured_flags.into_iter();
+        while let Some(flag) = configured_flags.next() {
+            if flag == "-I" || flag == "-D" {
+                configured_flags.next().expect("configured NGINX CFLAGS argument");
+            } else if !flag.starts_with("-I")
+                && !flag.starts_with("-D")
+                && !is_link_time_optimization_flag(&flag)
+            {
+                flags.push(flag);
+            }
+        }
+
+        Self { program, flags }
+    }
+
+    fn apply(&self, build: &mut cc::Build) {
+        build.compiler(&self.program);
+        for flag in &self.flags {
+            build.flag(flag);
+        }
+    }
+}
+
+// cc archives shim objects independently, without nginx's linker-plugin toolchain. LTO changes
+// object representation but not the C ABI the shim must inherit.
+fn is_link_time_optimization_flag(flag: &str) -> bool {
+    flag.starts_with("-flto")
+        || matches!(flag, "-ffat-lto-objects" | "-fno-fat-lto-objects" | "-fuse-linker-plugin")
+}
+
+fn makefile_variable<'a>(lines: &'a [String], name: &str) -> &'a str {
+    lines
+        .iter()
+        .find_map(|line| {
+            let value = line.strip_prefix(name)?.trim_start().strip_prefix('=')?;
+            Some(value.trim())
+        })
+        .unwrap_or_else(|| panic!("configured NGINX Makefile has no {name}"))
 }
 
 fn c_standard(lines: &[String]) -> Option<String> {
