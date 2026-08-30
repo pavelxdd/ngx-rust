@@ -179,7 +179,10 @@ fn generate_binding(nginx: &NginxSource) {
     // See rust-lang/bindgen#1770
     clang_args.push("-fno-builtin".to_string());
 
-    print_cargo_metadata(nginx, &includes, &defines).expect("cargo dependency metadata");
+    let nginx_features =
+        print_cargo_metadata(nginx, &includes, &defines).expect("cargo dependency metadata");
+    let build_http =
+        cfg!(feature = "http") && nginx_features.iter().any(|feature| feature == "http");
 
     // bindgen targets the latest known stable by default
     let rust_target: bindgen::RustTarget = env::var("CARGO_PKG_RUST_VERSION")
@@ -222,14 +225,14 @@ fn generate_binding(nginx: &NginxSource) {
     let out_path = PathBuf::from(out_dir_env);
     bindings.write_to_file(out_path.join("bindings.rs")).expect("Couldn't write bindings!");
 
-    #[cfg(feature = "http")]
-    build_http_request_shim(&includes, &defines, standard.as_deref());
+    if build_http {
+        build_http_request_shim(&includes, &defines, standard.as_deref());
+    }
 
     #[cfg(feature = "test-link")]
-    build_test_library(nginx, &includes, &defines);
+    build_test_library(nginx, &includes, &defines, build_http);
 }
 
-#[cfg(feature = "http")]
 fn build_http_request_shim(
     includes: &[PathBuf],
     defines: &[(String, Option<String>)],
@@ -299,6 +302,7 @@ fn build_test_library(
     nginx: &NginxSource,
     includes: &[PathBuf],
     defines: &[(String, Option<String>)],
+    build_http: bool,
 ) {
     assert_eq!(
         env::var("CARGO_CFG_TARGET_OS").as_deref(),
@@ -386,8 +390,7 @@ ngx_rs_test_delete_posted_event(ngx_event_t *ev)
     .expect("NGINX event test wrapper");
     sources.push(event_wrapper);
 
-    #[cfg(feature = "http")]
-    {
+    if build_http {
         let request_wrapper = out_dir.join("nginx_test_http_request.c");
         let mut file = File::create(&request_wrapper).expect("NGINX HTTP request test wrapper");
         file.write_all(
@@ -834,7 +837,7 @@ pub fn print_cargo_metadata<T: AsRef<Path>>(
     nginx: &NginxSource,
     includes: &[T],
     defines: &[(String, Option<String>)],
-) -> Result<(), Box<dyn StdError>> {
+) -> Result<Vec<String>, Box<dyn StdError>> {
     // Unquote and merge C string constants
     let unquote_re = regex::Regex::new(r#""(.*?[^\\])"\s*"#).unwrap();
     let unquote = |data: &str| -> String {
@@ -900,7 +903,7 @@ pub fn print_cargo_metadata<T: AsRef<Path>>(
 
     // A list of features enabled in the nginx build we're using
     println!("cargo::metadata=features={}", ngx_features.join(","));
-    for feature in ngx_features {
+    for feature in &ngx_features {
         println!("cargo::rustc-cfg=ngx_feature=\"{feature}\"");
     }
 
@@ -912,7 +915,7 @@ pub fn print_cargo_metadata<T: AsRef<Path>>(
     println!("cargo::metadata=os={ngx_os}");
     println!("cargo::rustc-cfg=ngx_os=\"{ngx_os}\"");
 
-    Ok(())
+    Ok(ngx_features)
 }
 
 fn expand_definitions<T: AsRef<Path>>(
