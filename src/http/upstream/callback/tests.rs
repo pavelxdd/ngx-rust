@@ -223,15 +223,17 @@ impl HttpUpstreamPeerHandler for DelegatePeerInit {
 
     fn get(
         _peer: &mut UpstreamPeerConnection<'_>,
-        _data: &mut HttpUpstreamPeerData<Self::Data>,
+        _data: &mut Self::Data,
+        _original: OriginalPeerGet,
     ) -> Result<ngx_int_t, UpstreamCallbackError> {
         Ok(Status::NGX_ERROR.0)
     }
 
     fn free(
         _peer: &mut UpstreamPeerConnection<'_>,
-        _data: &mut HttpUpstreamPeerData<Self::Data>,
+        _data: &mut Self::Data,
         _state: UpstreamPeerState,
+        _original: OriginalPeerFree,
     ) -> Result<(), UpstreamCallbackError> {
         Ok(())
     }
@@ -325,17 +327,19 @@ impl HttpUpstreamPeerHandler for OrderedPeer {
 
     fn get(
         peer: &mut UpstreamPeerConnection<'_>,
-        data: &mut HttpUpstreamPeerData<Self::Data>,
+        _data: &mut Self::Data,
+        original: OriginalPeerGet,
     ) -> Result<ngx_int_t, UpstreamCallbackError> {
-        data.delegate_get(peer)
+        original.call(peer)
     }
 
     fn free(
         peer: &mut UpstreamPeerConnection<'_>,
-        data: &mut HttpUpstreamPeerData<Self::Data>,
-        state: UpstreamPeerState,
+        _data: &mut Self::Data,
+        _state: UpstreamPeerState,
+        original: OriginalPeerFree,
     ) -> Result<(), UpstreamCallbackError> {
-        data.delegate_free(peer, state)
+        original.call(peer)
     }
 }
 
@@ -353,17 +357,19 @@ impl HttpUpstreamPeerHandler for MissingOriginalPeer {
 
     fn get(
         peer: &mut UpstreamPeerConnection<'_>,
-        data: &mut HttpUpstreamPeerData<Self::Data>,
+        _data: &mut Self::Data,
+        original: OriginalPeerGet,
     ) -> Result<ngx_int_t, UpstreamCallbackError> {
-        data.delegate_get(peer)
+        original.call(peer)
     }
 
     fn free(
         peer: &mut UpstreamPeerConnection<'_>,
-        data: &mut HttpUpstreamPeerData<Self::Data>,
-        state: UpstreamPeerState,
+        _data: &mut Self::Data,
+        _state: UpstreamPeerState,
+        original: OriginalPeerFree,
     ) -> Result<(), UpstreamCallbackError> {
-        data.delegate_free(peer, state)
+        original.call(peer)
     }
 }
 
@@ -381,15 +387,17 @@ impl HttpUpstreamPeerHandler for PanicPeer {
 
     fn get(
         _peer: &mut UpstreamPeerConnection<'_>,
-        _data: &mut HttpUpstreamPeerData<Self::Data>,
+        _data: &mut Self::Data,
+        _original: OriginalPeerGet,
     ) -> Result<ngx_int_t, UpstreamCallbackError> {
         panic!("peer getter panic")
     }
 
     fn free(
         _peer: &mut UpstreamPeerConnection<'_>,
-        _data: &mut HttpUpstreamPeerData<Self::Data>,
+        _data: &mut Self::Data,
         _state: UpstreamPeerState,
+        _original: OriginalPeerFree,
     ) -> Result<(), UpstreamCallbackError> {
         panic!("peer releaser panic")
     }
@@ -424,15 +432,17 @@ impl HttpUpstreamPeerHandler for PanicPeerInitializer {
 
     fn get(
         _peer: &mut UpstreamPeerConnection<'_>,
-        _data: &mut HttpUpstreamPeerData<Self::Data>,
+        _data: &mut Self::Data,
+        _original: OriginalPeerGet,
     ) -> Result<ngx_int_t, UpstreamCallbackError> {
         Ok(Status::NGX_ERROR.0)
     }
 
     fn free(
         _peer: &mut UpstreamPeerConnection<'_>,
-        _data: &mut HttpUpstreamPeerData<Self::Data>,
+        _data: &mut Self::Data,
         _state: UpstreamPeerState,
+        _original: OriginalPeerFree,
     ) -> Result<(), UpstreamCallbackError> {
         Ok(())
     }

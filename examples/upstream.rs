@@ -18,10 +18,11 @@ use ngx::ffi::{
 };
 use ngx::http::{
     HttpConfigurationParser, HttpModule, HttpModuleServerConf, HttpUpstreamInitializer,
-    HttpUpstreamPeerData, HttpUpstreamPeerHandler, Merge, MergeConfigError, NgxHttpUpstreamModule,
-    UpstreamCallbackError, UpstreamConfiguration, UpstreamInitCallback, UpstreamPeerConnection,
-    UpstreamPeerInit, UpstreamPeerInitCallback, UpstreamPeerInitRequest, UpstreamPeerState,
-    UpstreamServerConf, install_upstream_initializer, postconfiguration, preconfiguration,
+    HttpUpstreamPeerHandler, Merge, MergeConfigError, NgxHttpUpstreamModule, OriginalPeerFree,
+    OriginalPeerGet, UpstreamCallbackError, UpstreamConfiguration, UpstreamInitCallback,
+    UpstreamPeerConnection, UpstreamPeerInit, UpstreamPeerInitCallback, UpstreamPeerInitRequest,
+    UpstreamPeerState, UpstreamServerConf, install_upstream_initializer, postconfiguration,
+    preconfiguration,
 };
 use ngx::{ngx_conf_log_error, ngx_string};
 
@@ -142,17 +143,19 @@ impl HttpUpstreamPeerHandler for CustomPeer {
 
     fn get(
         peer: &mut UpstreamPeerConnection<'_>,
-        data: &mut HttpUpstreamPeerData<Self::Data>,
+        _data: &mut Self::Data,
+        original: OriginalPeerGet,
     ) -> Result<ngx_int_t, UpstreamCallbackError> {
-        data.delegate_get(peer)
+        original.call(peer)
     }
 
     fn free(
         peer: &mut UpstreamPeerConnection<'_>,
-        data: &mut HttpUpstreamPeerData<Self::Data>,
-        state: UpstreamPeerState,
+        _data: &mut Self::Data,
+        _state: UpstreamPeerState,
+        original: OriginalPeerFree,
     ) -> Result<(), UpstreamCallbackError> {
-        data.delegate_free(peer, state)
+        original.call(peer)
     }
 }
 
