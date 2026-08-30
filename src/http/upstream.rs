@@ -5,8 +5,8 @@ pub use callback::{
     HttpUpstreamInitializer, HttpUpstreamPeerHandler, OriginalPeerFree, OriginalPeerGet,
     SelectedUpstreamPeer, UpstreamCallbackError, UpstreamConfiguration, UpstreamInitCallback,
     UpstreamInitStatus, UpstreamInitialization, UpstreamInitialized, UpstreamPeerConnection,
-    UpstreamPeerInit, UpstreamPeerInitCallback, UpstreamPeerInitStatus, UpstreamPeerSelection,
-    UpstreamPeerState, UpstreamServerConf, install_upstream_initializer,
+    UpstreamPeerInit, UpstreamPeerInitCallback, UpstreamPeerInitRequest, UpstreamPeerInitStatus,
+    UpstreamPeerSelection, UpstreamPeerState, UpstreamServerConf, install_upstream_initializer,
 };
 pub use url::{
     ConfiguredUpstreamUrl, UpstreamAddress, UpstreamAddressIter, UpstreamAddresses, UpstreamPort,
