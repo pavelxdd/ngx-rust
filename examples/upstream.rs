@@ -19,8 +19,8 @@ use ngx::ffi::{
 use ngx::http::{
     HttpConfigurationParser, HttpModule, HttpModuleServerConf, HttpUpstreamInitializer,
     HttpUpstreamPeerData, HttpUpstreamPeerHandler, Merge, MergeConfigError, NgxHttpUpstreamModule,
-    RequestRefMut, UpstreamCallbackError, UpstreamConfiguration, UpstreamInitCallback,
-    UpstreamPeerConnection, UpstreamPeerInit, UpstreamPeerInitCallback, UpstreamPeerState,
+    UpstreamCallbackError, UpstreamConfiguration, UpstreamInitCallback, UpstreamPeerConnection,
+    UpstreamPeerInit, UpstreamPeerInitCallback, UpstreamPeerInitRequest, UpstreamPeerState,
     UpstreamServerConf, install_upstream_initializer, postconfiguration, preconfiguration,
 };
 use ngx::{ngx_conf_log_error, ngx_string};
@@ -125,7 +125,7 @@ impl HttpUpstreamPeerHandler for CustomPeer {
     type Data = ();
 
     fn init(
-        request: &mut RequestRefMut<'_>,
+        request: &mut UpstreamPeerInitRequest<'_>,
         upstream: &mut UpstreamServerConf<'_>,
     ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
         let original = match upstream.module_conf::<Module>()? {

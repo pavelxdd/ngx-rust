@@ -3,6 +3,8 @@ use core::error;
 use core::fmt;
 use core::marker::PhantomData;
 use core::mem;
+use core::ops::Deref;
+use core::pin::Pin;
 use core::ptr::{self, NonNull};
 
 use crate::allocator::Allocator;
@@ -15,8 +17,9 @@ use crate::ffi::{
     ngx_uint_t, ngx_variable_value_t,
 };
 use crate::http::{
-    HttpConfigError, HttpConfigurationParser, HttpModuleMainConf, IntoHandlerStatus,
-    NgxHttpCoreModule, RequestError, RequestRef, RequestRefMut, request_callback_status,
+    HttpConfigError, HttpConfigurationParser, HttpModuleMainConf, HttpModuleRequestContext,
+    IntoHandlerStatus, NgxHttpCoreModule, RequestContextError, RequestError, RequestRef,
+    RequestRefMut, request_callback_status,
 };
 
 bitflags::bitflags! {
@@ -628,14 +631,102 @@ impl HttpVariableIndex {
     }
 }
 
+/// Mutable variable-evaluation capability without terminal request authority.
+///
+/// Shared request operations remain available through dereferencing, while mutable access is
+/// limited to module context and indexed-variable evaluation:
+///
+/// ```compile_fail
+/// use ngx::http::{HTTPStatus, HttpVariableRequest};
+///
+/// fn cannot_finalize(request: &mut HttpVariableRequest<'_, '_>) {
+///     request.finalize(HTTPStatus::BAD_REQUEST).unwrap();
+/// }
+/// ```
+pub struct HttpVariableRequest<'request, 'callback> {
+    request: &'request mut RequestRefMut<'callback>,
+}
+
+impl<'request, 'callback> HttpVariableRequest<'request, 'callback> {
+    fn new(request: &'request mut RequestRefMut<'callback>) -> Self {
+        Self { request }
+    }
+
+    /// Returns exclusive access to a movable request context associated with module `M`.
+    pub fn module_context_mut<M>(
+        &mut self,
+    ) -> Result<Option<&mut M::RequestContext>, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+        M::RequestContext: Unpin,
+    {
+        self.request.module_context_mut::<M>()
+    }
+
+    /// Returns pinned exclusive access to a request context associated with module `M`.
+    pub fn pinned_module_context_mut<M>(
+        &mut self,
+    ) -> Result<Option<Pin<&mut M::RequestContext>>, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+    {
+        self.request.pinned_module_context_mut::<M>()
+    }
+
+    /// Looks up the value currently cached for this request.
+    pub fn get_cached<'value>(
+        &'value mut self,
+        index: &HttpVariableIndex,
+    ) -> Result<HttpVariableValueRef<'value>, HttpVariableLookupError> {
+        index.get_cached(self.request)
+    }
+
+    /// Clears a noncacheable value before looking it up for this request.
+    pub fn get_flushed<'value>(
+        &'value mut self,
+        index: &HttpVariableIndex,
+    ) -> Result<HttpVariableValueRef<'value>, HttpVariableLookupError> {
+        index.get_flushed(self.request)
+    }
+}
+
+impl<'request, 'callback> Deref for HttpVariableRequest<'request, 'callback> {
+    type Target = RequestRefMut<'callback>;
+
+    fn deref(&self) -> &Self::Target {
+        self.request
+    }
+}
+
 /// Typed getter for a registered HTTP variable.
+///
+/// Getters receive shared access so they cannot terminate or redirect the request while nginx is
+/// still evaluating its variable:
+///
+/// ```compile_fail
+/// use ngx::http::{HttpVariableHandler, HttpVariableOutput, RequestRefMut};
+///
+/// struct TerminalGetter;
+///
+/// impl HttpVariableHandler for TerminalGetter {
+///     type Output = ngx::core::Status;
+///
+///     fn get(
+///         _request: &mut RequestRefMut<'_>,
+///         _value: &mut HttpVariableOutput<'_>,
+///         _data: usize,
+///     ) -> Self::Output {
+///         ngx::core::Status::NGX_ERROR
+///     }
+/// }
+/// ```
 pub trait HttpVariableHandler {
     /// Getter result converted into an nginx status.
     type Output: IntoHandlerStatus;
 
     /// Evaluates the variable for one active request.
     fn get(
-        request: &mut RequestRefMut<'_>,
+        request: &mut HttpVariableRequest<'_, '_>,
         value: &mut HttpVariableOutput<'_>,
         data: usize,
     ) -> Self::Output;
@@ -648,7 +739,7 @@ pub trait HttpPrefixVariableHandler {
 
     /// Evaluates the variable for one active request and the full queried variable name.
     fn get(
-        request: &mut RequestRefMut<'_>,
+        request: &mut HttpVariableRequest<'_, '_>,
         value: &mut HttpVariableOutput<'_>,
         name: &NgxStr,
     ) -> Self::Output;
@@ -845,7 +936,8 @@ where
                 return NGX_ERROR as _;
             };
 
-            let result = H::get(request, &mut output, data);
+            let mut request = HttpVariableRequest::new(request);
+            let result = H::get(&mut request, &mut output, data);
             let status = result.into_handler_status(&request.view());
             if status == NGX_OK as _ {
                 output.publish_success();
@@ -892,7 +984,8 @@ where
                 return NGX_ERROR as _;
             };
 
-            let result = H::get(request, &mut output, name);
+            let mut request = HttpVariableRequest::new(request);
+            let result = H::get(&mut request, &mut output, name);
             let status = result.into_handler_status(&request.view());
             if status == NGX_OK as _ {
                 output.publish_success();
@@ -943,9 +1036,9 @@ mod tests {
     use super::{
         HttpPrefixVariableHandler, HttpVariableFlags, HttpVariableHandler, HttpVariableIndex,
         HttpVariableIndexError, HttpVariableLookupError, HttpVariableOutput,
-        HttpVariableOutputError, HttpVariablePoolBytes, HttpVariableSetter, HttpVariableValueRef,
-        add_prefix_variable, add_variable, add_variable_with_setter, get_variable_index,
-        raw_get_handler, raw_prefix_get_handler, raw_set_handler,
+        HttpVariableOutputError, HttpVariablePoolBytes, HttpVariableRequest, HttpVariableSetter,
+        HttpVariableValueRef, add_prefix_variable, add_variable, add_variable_with_setter,
+        get_variable_index, raw_get_handler, raw_prefix_get_handler, raw_set_handler,
     };
     use crate::core::{NgxStr, Status};
     use crate::ffi::{
@@ -1021,7 +1114,7 @@ mod tests {
         type Output = Status;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
@@ -1037,7 +1130,7 @@ mod tests {
         type Output = Status;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             _value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
@@ -1051,7 +1144,7 @@ mod tests {
         type Output = Status;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             value: &mut HttpVariableOutput<'_>,
             data: usize,
         ) -> Self::Output {
@@ -1072,7 +1165,7 @@ mod tests {
         type Output = Status;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             value: &mut HttpVariableOutput<'_>,
             name: &NgxStr,
         ) -> Self::Output {
@@ -1091,7 +1184,7 @@ mod tests {
         type Output = Status;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             value: &mut HttpVariableOutput<'_>,
             _name: &NgxStr,
         ) -> Self::Output {
@@ -1108,7 +1201,7 @@ mod tests {
         type Output = Status;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             value: &mut HttpVariableOutput<'_>,
             _name: &NgxStr,
         ) -> Self::Output {
@@ -1150,7 +1243,7 @@ mod tests {
         type Output = Status;
 
         fn get(
-            request: &mut RequestRefMut<'_>,
+            request: &mut HttpVariableRequest<'_, '_>,
             value: &mut HttpVariableOutput<'_>,
             data: usize,
         ) -> Self::Output {
@@ -1166,7 +1259,7 @@ mod tests {
         type Output = ngx_int_t;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
@@ -1181,7 +1274,7 @@ mod tests {
         type Output = Option<Status>;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
@@ -1196,7 +1289,7 @@ mod tests {
         type Output = Option<Status>;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             _value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
@@ -1210,7 +1303,7 @@ mod tests {
         type Output = Result<Status, Status>;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
@@ -1225,7 +1318,7 @@ mod tests {
         type Output = Result<Status, Status>;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             _value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
@@ -1241,7 +1334,7 @@ mod tests {
         type Output = Status;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             _value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
@@ -1559,7 +1652,7 @@ mod tests {
         type Output = Status;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {
@@ -1577,14 +1670,14 @@ mod tests {
         type Output = Status;
 
         fn get(
-            request: &mut RequestRefMut<'_>,
+            request: &mut HttpVariableRequest<'_, '_>,
             value: &mut HttpVariableOutput<'_>,
             data: usize,
         ) -> Self::Output {
             // The fixture keeps the boxed index alive until after every registered callback.
             let nested_index = unsafe { &*(data as *const HttpVariableIndex) };
             {
-                let nested = nested_index.get_cached(request).unwrap();
+                let nested = request.get_cached(nested_index).unwrap();
                 assert_eq!(nested.bytes(), Some(&b"indexed"[..]));
             }
 
@@ -1601,7 +1694,7 @@ mod tests {
         type Output = Status;
 
         fn get(
-            _request: &mut RequestRefMut<'_>,
+            _request: &mut HttpVariableRequest<'_, '_>,
             _value: &mut HttpVariableOutput<'_>,
             _data: usize,
         ) -> Self::Output {

@@ -164,7 +164,7 @@ impl HttpVariableHandler for OrigDstAddrVariable {
     type Output = Status;
 
     fn get(
-        request: &mut http::RequestRefMut<'_>,
+        request: &mut http::HttpVariableRequest<'_, '_>,
         value: &mut HttpVariableOutput<'_>,
         _: usize,
     ) -> Self::Output {
@@ -220,7 +220,7 @@ impl HttpVariableHandler for OrigDstPortVariable {
     type Output = Status;
 
     fn get(
-        request: &mut http::RequestRefMut<'_>,
+        request: &mut http::HttpVariableRequest<'_, '_>,
         value: &mut HttpVariableOutput<'_>,
         _: usize,
     ) -> Self::Output {

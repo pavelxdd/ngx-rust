@@ -3,6 +3,7 @@ use core::error;
 use core::ffi::c_void;
 use core::fmt;
 use core::marker::PhantomData;
+use core::ops::Deref;
 use core::ptr::{self, NonNull};
 
 use crate::core::{Pool, Status};
@@ -300,11 +301,35 @@ impl UpstreamPeerInitCallback {
     /// Delegates to the saved request peer initializer with its original nginx arguments.
     pub fn call(
         self,
-        request: &mut RequestRefMut<'_>,
+        request: &mut UpstreamPeerInitRequest<'_>,
         upstream: &mut UpstreamServerConf<'_>,
     ) -> Result<ngx_int_t, UpstreamCallbackError> {
         let callback = self.0.ok_or(UpstreamCallbackError::MissingOriginalInitPeer)?;
-        Ok(unsafe { callback(request.as_ptr(), upstream.raw.as_ptr()) })
+        Ok(unsafe { callback(request.request.as_ptr(), upstream.raw.as_ptr()) })
+    }
+}
+
+/// Request peer-initialization capability without terminal request authority.
+///
+/// Shared request operations remain available through dereferencing. The saved native peer
+/// initializer can mutate the request only through [`UpstreamPeerInitCallback::call`]:
+///
+/// ```compile_fail
+/// use ngx::http::{HTTPStatus, UpstreamPeerInitRequest};
+///
+/// fn cannot_finalize(request: &mut UpstreamPeerInitRequest<'_>) {
+///     request.finalize(HTTPStatus::BAD_REQUEST).unwrap();
+/// }
+/// ```
+pub struct UpstreamPeerInitRequest<'callback> {
+    request: RequestRefMut<'callback>,
+}
+
+impl<'callback> Deref for UpstreamPeerInitRequest<'callback> {
+    type Target = RequestRefMut<'callback>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
     }
 }
 
@@ -349,7 +374,7 @@ pub trait HttpUpstreamPeerHandler: 'static {
     /// Return [`UpstreamPeerInit::Return`] to preserve an original initializer's non-OK status
     /// without replacing the native peer callbacks.
     fn init(
-        request: &mut RequestRefMut<'_>,
+        request: &mut UpstreamPeerInitRequest<'_>,
         upstream: &mut UpstreamServerConf<'_>,
     ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError>;
 
@@ -493,8 +518,8 @@ struct RequestUpstream {
 }
 
 impl RequestUpstream {
-    fn from_request(request: &RequestRefMut<'_>) -> Result<Self, UpstreamCallbackError> {
-        let request = unsafe { request.as_ptr() };
+    fn from_request(request: &UpstreamPeerInitRequest<'_>) -> Result<Self, UpstreamCallbackError> {
+        let request = unsafe { request.request.as_ptr() };
         let raw = NonNull::new(unsafe { (*request).upstream })
             .ok_or(UpstreamCallbackError::MissingRequestUpstream)?;
         if !raw.as_ptr().is_aligned() {
@@ -599,7 +624,8 @@ where
     H: HttpUpstreamPeerHandler,
 {
     unsafe {
-        RequestRefMut::with_raw(request, |mut request| {
+        RequestRefMut::with_raw(request, |request| {
+            let mut request = UpstreamPeerInitRequest { request };
             let result = catch_upstream_callback(|| {
                 let mut request_upstream = RequestUpstream::from_request(&request)?;
                 let mut upstream = UpstreamServerConf::from_raw(upstream)?;
