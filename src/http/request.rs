@@ -2111,6 +2111,81 @@ pub struct RequestRefMut<'callback> {
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
+/// Exclusive access to a main request's module context without terminal request authority.
+pub struct MainRequestRefMut<'callback> {
+    request: RequestRefMut<'callback>,
+}
+
+impl MainRequestRefMut<'_> {
+    /// Returns a shared view of the main request.
+    pub fn view(&self) -> RequestRef<'_> {
+        self.request.view()
+    }
+
+    /// Returns exclusive access to a movable context associated with module `M`.
+    pub fn module_context_mut<M>(
+        &mut self,
+    ) -> Result<Option<&mut M::RequestContext>, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+        M::RequestContext: Unpin,
+    {
+        self.request.module_context_mut::<M>()
+    }
+
+    /// Returns pinned exclusive access to a context associated with module `M`.
+    pub fn pinned_module_context_mut<M>(
+        &mut self,
+    ) -> Result<Option<Pin<&mut M::RequestContext>>, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+    {
+        self.request.pinned_module_context_mut::<M>()
+    }
+
+    /// Returns a movable main-request context, inserting a pool-owned value when absent.
+    pub fn get_or_insert_module_context_with<M>(
+        &mut self,
+        constructor: impl FnOnce() -> M::RequestContext,
+    ) -> Result<&mut M::RequestContext, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+        M::RequestContext: Unpin,
+    {
+        self.request.get_or_insert_module_context_with::<M>(constructor)
+    }
+
+    /// Returns a pinned main-request context, inserting a pool-owned value when absent.
+    pub fn get_or_insert_pinned_module_context_with<M>(
+        &mut self,
+        constructor: impl FnOnce() -> M::RequestContext,
+    ) -> Result<Pin<&mut M::RequestContext>, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+    {
+        self.request.get_or_insert_pinned_module_context_with::<M>(constructor)
+    }
+
+    /// Returns a pinned main-request context, using a fallible constructor when absent.
+    pub fn try_get_or_insert_pinned_module_context_with<M, E>(
+        &mut self,
+        constructor: impl FnOnce() -> Result<M::RequestContext, E>,
+    ) -> Result<Pin<&mut M::RequestContext>, RequestContextCreateError<E>>
+    where
+        M: HttpModuleRequestContext,
+    {
+        self.request.try_get_or_insert_pinned_module_context_with::<M, E>(constructor)
+    }
+
+    /// Drops and removes the module context when present.
+    pub fn remove_module_context<M>(&mut self) -> Result<bool, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+    {
+        self.request.remove_module_context::<M>()
+    }
+}
+
 impl<'callback> RequestRefMut<'callback> {
     /// Creates a checked exclusive request view from an nginx callback pointer.
     ///
@@ -2628,12 +2703,22 @@ impl<'callback> RequestRefMut<'callback> {
         self.raw.as_ptr()
     }
 
-    /// Exclusive reborrow of the root main request.
-    pub fn main_mut(&mut self) -> Result<RequestRefMut<'_>, RequestError> {
+    /// Exclusive reborrow of the root main request without terminal request authority.
+    ///
+    /// ```compile_fail
+    /// use ngx::http::{HTTPStatus, RequestRefMut};
+    ///
+    /// fn finalize_through_reborrow(request: &mut RequestRefMut<'_>) {
+    ///     request.main_mut().unwrap().finalize(HTTPStatus::BAD_REQUEST).unwrap();
+    /// }
+    /// ```
+    pub fn main_mut(&mut self) -> Result<MainRequestRefMut<'_>, RequestError> {
         let raw =
             RequestRef { raw: self.raw, _callback: PhantomData, _not_thread_safe: PhantomData }
                 .main_raw()?;
-        Ok(RequestRefMut { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
+        Ok(MainRequestRefMut {
+            request: RequestRefMut { raw, _callback: PhantomData, _not_thread_safe: PhantomData },
+        })
     }
 
     /// Consumes this view and returns exclusive access to the root main request.
@@ -6765,18 +6850,22 @@ mod tests {
 
     #[test]
     fn main_mut_updates_the_parent_of_a_subrequest() {
+        let _globals = RequestGlobals::new(1, 1);
+        let mut context = 41u32;
+        let mut contexts = [(&raw mut context).cast()];
         let mut raw_main = zeroed_request();
         initialize_request(&mut raw_main);
+        raw_main.ctx = contexts.as_mut_ptr();
         let mut raw_subrequest = zeroed_request();
         initialize_request(&mut raw_subrequest);
         raw_subrequest.main = &raw mut raw_main;
         raw_subrequest.parent = &raw mut raw_main;
 
         let mut request = request_from(&mut raw_subrequest);
-        let main = request.main_mut().unwrap();
-        unsafe { (*main.as_ptr()).request_length = 4096 };
+        let mut main = request.main_mut().unwrap();
+        *main.module_context_mut::<TestContextModule>().unwrap().unwrap() = 42;
 
-        assert_eq!(raw_main.request_length, 4096);
+        assert_eq!(context, 42);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::ffi::{
     ngx_http_request_t, ngx_http_upstream_srv_conf_t, ngx_http_upstream_t, ngx_int_t, ngx_log_t,
     ngx_module_t, ngx_peer_connection_t, ngx_uint_t,
 };
-use crate::http::{HttpModule, HttpModuleServerConf, RequestRefMut};
+use crate::http::{HttpModule, HttpModuleServerConf};
 
 static ORIGINAL_INIT_PEER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_INIT_UPSTREAM_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -203,7 +203,7 @@ impl HttpUpstreamPeerHandler for DelegatePeerInit {
     type Data = ();
 
     fn init(
-        request: &mut RequestRefMut<'_>,
+        request: &mut UpstreamPeerInitRequest<'_>,
         upstream: &mut UpstreamServerConf<'_>,
     ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
         let status = upstream.init_peer().call(request, upstream)?;
@@ -266,7 +266,7 @@ impl HttpUpstreamPeerHandler for OrderedPeer {
     type Data = ();
 
     fn init(
-        request: &mut RequestRefMut<'_>,
+        request: &mut UpstreamPeerInitRequest<'_>,
         upstream: &mut UpstreamServerConf<'_>,
     ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
         let status = upstream.init_peer().call(request, upstream)?;
@@ -299,7 +299,7 @@ impl HttpUpstreamPeerHandler for MissingOriginalPeer {
     type Data = ();
 
     fn init(
-        _request: &mut RequestRefMut<'_>,
+        _request: &mut UpstreamPeerInitRequest<'_>,
         _upstream: &mut UpstreamServerConf<'_>,
     ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
         Ok(UpstreamPeerInit::Install(()))
@@ -327,7 +327,7 @@ impl HttpUpstreamPeerHandler for PanicPeer {
     type Data = ();
 
     fn init(
-        _request: &mut RequestRefMut<'_>,
+        _request: &mut UpstreamPeerInitRequest<'_>,
         _upstream: &mut UpstreamServerConf<'_>,
     ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
         Ok(UpstreamPeerInit::Install(()))
@@ -370,7 +370,7 @@ impl HttpUpstreamPeerHandler for PanicPeerInitializer {
     type Data = ();
 
     fn init(
-        _request: &mut RequestRefMut<'_>,
+        _request: &mut UpstreamPeerInitRequest<'_>,
         _upstream: &mut UpstreamServerConf<'_>,
     ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
         panic!("peer initializer panic")
