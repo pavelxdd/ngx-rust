@@ -2,9 +2,10 @@ mod callback;
 mod url;
 
 pub use callback::{
-    HttpUpstreamInitializer, HttpUpstreamPeerData, HttpUpstreamPeerHandler, UpstreamCallbackError,
-    UpstreamConfiguration, UpstreamInitCallback, UpstreamPeerConnection, UpstreamPeerInit,
-    UpstreamPeerInitCallback, UpstreamPeerState, UpstreamServerConf, install_upstream_initializer,
+    HttpUpstreamInitializer, HttpUpstreamPeerHandler, OriginalPeerFree, OriginalPeerGet,
+    UpstreamCallbackError, UpstreamConfiguration, UpstreamInitCallback, UpstreamPeerConnection,
+    UpstreamPeerInit, UpstreamPeerInitCallback, UpstreamPeerState, UpstreamServerConf,
+    install_upstream_initializer,
 };
 pub use url::{
     ConfiguredUpstreamUrl, UpstreamAddress, UpstreamAddressIter, UpstreamAddresses, UpstreamPort,

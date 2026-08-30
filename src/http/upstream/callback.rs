@@ -383,14 +383,16 @@ pub trait HttpUpstreamPeerHandler: 'static {
     /// Selects a peer or delegates selection to the saved original callback.
     fn get(
         peer: &mut UpstreamPeerConnection<'_>,
-        data: &mut HttpUpstreamPeerData<Self::Data>,
+        data: &mut Self::Data,
+        original: OriginalPeerGet,
     ) -> Result<ngx_int_t, UpstreamCallbackError>;
 
     /// Releases a peer or delegates release to the saved original callback.
     fn free(
         peer: &mut UpstreamPeerConnection<'_>,
-        data: &mut HttpUpstreamPeerData<Self::Data>,
+        data: &mut Self::Data,
         state: UpstreamPeerState,
+        original: OriginalPeerFree,
     ) -> Result<(), UpstreamCallbackError>;
 }
 
@@ -456,8 +458,58 @@ struct OriginalPeerCallbacks {
     data: *mut c_void,
 }
 
-/// Request-pool peer data with typed access to the saved original callbacks.
-pub struct HttpUpstreamPeerData<T> {
+/// One callback-local capability to invoke the saved original peer selector.
+///
+/// ```compile_fail
+/// use ngx::http::{OriginalPeerGet, UpstreamPeerConnection};
+///
+/// fn duplicate(original: OriginalPeerGet, peer: &mut UpstreamPeerConnection<'_>) {
+///     original.call(peer).unwrap();
+///     original.call(peer).unwrap();
+/// }
+/// ```
+pub struct OriginalPeerGet {
+    original: OriginalPeerCallbacks,
+}
+
+impl OriginalPeerGet {
+    /// Consumes this capability and invokes the original peer selector once.
+    pub fn call(
+        self,
+        peer: &mut UpstreamPeerConnection<'_>,
+    ) -> Result<ngx_int_t, UpstreamCallbackError> {
+        let callback = self.original.get.ok_or(UpstreamCallbackError::MissingOriginalGetPeer)?;
+        Ok(with_original_data(self.original, peer, |peer, data| unsafe { callback(peer, data) }))
+    }
+}
+
+/// One callback-local capability to invoke the saved original peer releaser.
+///
+/// ```compile_fail
+/// use ngx::http::{OriginalPeerFree, UpstreamPeerConnection};
+///
+/// fn duplicate(original: OriginalPeerFree, peer: &mut UpstreamPeerConnection<'_>) {
+///     original.call(peer).unwrap();
+///     original.call(peer).unwrap();
+/// }
+/// ```
+pub struct OriginalPeerFree {
+    original: OriginalPeerCallbacks,
+    state: UpstreamPeerState,
+}
+
+impl OriginalPeerFree {
+    /// Consumes this capability and invokes the original peer releaser once.
+    pub fn call(self, peer: &mut UpstreamPeerConnection<'_>) -> Result<(), UpstreamCallbackError> {
+        let callback = self.original.free.ok_or(UpstreamCallbackError::MissingOriginalFreePeer)?;
+        with_original_data(self.original, peer, |peer, data| unsafe {
+            callback(peer, data, self.state.bits())
+        });
+        Ok(())
+    }
+}
+
+struct HttpUpstreamPeerData<T> {
     magic: u64,
     handler: TypeId,
     value: T,
@@ -478,51 +530,18 @@ impl<T> HttpUpstreamPeerData<T> {
             _not_thread_safe: PhantomData,
         }
     }
+}
 
-    fn with_original_data<R>(
-        &self,
-        peer: &mut UpstreamPeerConnection<'_>,
-        callback: impl FnOnce(*mut ngx_peer_connection_t, *mut c_void) -> R,
-    ) -> R {
-        let previous = peer.data();
-        peer.set_data(self.original.data);
-        let result = callback(peer.raw.as_ptr(), self.original.data);
-        peer.set_data(previous);
-        result
-    }
-
-    /// Returns the module's request-pool peer data.
-    pub fn value(&self) -> &T {
-        &self.value
-    }
-
-    /// Returns mutable module request-pool peer data.
-    pub fn value_mut(&mut self) -> &mut T {
-        &mut self.value
-    }
-
-    /// Delegates peer selection to the saved original callback.
-    ///
-    /// The original callback receives its saved data through both the callback argument and
-    /// `pc->data`; the custom data is restored before this method returns.
-    pub fn delegate_get(
-        &mut self,
-        peer: &mut UpstreamPeerConnection<'_>,
-    ) -> Result<ngx_int_t, UpstreamCallbackError> {
-        let callback = self.original.get.ok_or(UpstreamCallbackError::MissingOriginalGetPeer)?;
-        Ok(self.with_original_data(peer, |peer, data| unsafe { callback(peer, data) }))
-    }
-
-    /// Delegates peer release to the saved original callback without changing nginx state bits.
-    pub fn delegate_free(
-        &mut self,
-        peer: &mut UpstreamPeerConnection<'_>,
-        state: UpstreamPeerState,
-    ) -> Result<(), UpstreamCallbackError> {
-        let callback = self.original.free.ok_or(UpstreamCallbackError::MissingOriginalFreePeer)?;
-        self.with_original_data(peer, |peer, data| unsafe { callback(peer, data, state.bits()) });
-        Ok(())
-    }
+fn with_original_data<R>(
+    original: OriginalPeerCallbacks,
+    peer: &mut UpstreamPeerConnection<'_>,
+    callback: impl FnOnce(*mut ngx_peer_connection_t, *mut c_void) -> R,
+) -> R {
+    let previous = peer.data();
+    peer.set_data(original.data);
+    let result = callback(peer.raw.as_ptr(), original.data);
+    peer.set_data(previous);
+    result
 }
 
 struct RequestUpstream {
@@ -696,7 +715,7 @@ where
     match catch_upstream_callback(|| {
         let mut data = peer_data::<H>(&peer, data)?;
         let data = unsafe { data.as_mut() };
-        H::get(&mut peer, data)
+        H::get(&mut peer, &mut data.value, OriginalPeerGet { original: data.original })
     }) {
         Ok(status) => status,
         Err(error) => {
@@ -719,7 +738,13 @@ unsafe extern "C" fn raw_free_peer<H>(
     let result = catch_upstream_callback(|| {
         let mut data = peer_data::<H>(&peer, data)?;
         let data = unsafe { data.as_mut() };
-        H::free(&mut peer, data, UpstreamPeerState(state))
+        let state = UpstreamPeerState(state);
+        H::free(
+            &mut peer,
+            &mut data.value,
+            state,
+            OriginalPeerFree { original: data.original, state },
+        )
     });
     if let Err(error) = result {
         peer.log_failure("peer release", &error);
@@ -746,7 +771,9 @@ unsafe extern "C" fn raw_notify_peer<H>(
     let Some(callback) = data.original.notify else {
         return;
     };
-    data.with_original_data(&mut peer, |peer, data| unsafe { callback(peer, data, type_) });
+    with_original_data(data.original, &mut peer, |peer, data| unsafe {
+        callback(peer, data, type_)
+    });
 }
 
 #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
@@ -770,7 +797,7 @@ where
     let Some(callback) = data.original.set_session else {
         return Status::NGX_ERROR.0;
     };
-    data.with_original_data(&mut peer, |peer, data| unsafe { callback(peer, data) })
+    with_original_data(data.original, &mut peer, |peer, data| unsafe { callback(peer, data) })
 }
 
 #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
@@ -791,7 +818,7 @@ where
     let Some(callback) = data.original.save_session else {
         return;
     };
-    data.with_original_data(&mut peer, |peer, data| unsafe { callback(peer, data) });
+    with_original_data(data.original, &mut peer, |peer, data| unsafe { callback(peer, data) });
 }
 
 #[cfg(all(test, feature = "test-link"))]
