@@ -958,6 +958,8 @@ pub struct HttpHeadersOutBuilder<'request, 'callback> {
     request: &'request mut RequestRefMut<'callback>,
     pool: *mut ngx_pool_t,
     headers: ngx_http_headers_out_t,
+    trailer_capacity: usize,
+    trailers_owned: bool,
     expect_trailers: Option<bool>,
 }
 
@@ -971,7 +973,14 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
         headers.headers = create_header_list(pool, capacity)?;
         clear_headers_out_slots(&mut headers);
 
-        Ok(Self { request, pool, headers, expect_trailers: None })
+        Ok(Self {
+            request,
+            pool,
+            headers,
+            trailer_capacity: capacity,
+            trailers_owned: false,
+            expect_trailers: None,
+        })
     }
 
     /// Adds a copied raw output header to the candidate list.
@@ -987,8 +996,12 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
         Ok(())
     }
 
-    /// Adds a copied raw output trailer to the candidate list.
+    /// Adds a copied raw output trailer to a fresh candidate trailer list.
     pub fn add_trailer(&mut self, key: &[u8], value: &[u8]) -> Result<(), HeaderBuildError> {
+        if !self.trailers_owned {
+            self.headers.trailers = create_header_list(self.pool, self.trailer_capacity)?;
+            self.trailers_owned = true;
+        }
         append_pool_header(&mut self.headers.trailers, self.pool, key, value)?;
         self.expect_trailers = Some(true);
         Ok(())
@@ -2724,7 +2737,6 @@ impl<'callback> RequestRefMut<'callback> {
     ) -> Result<HttpHeadersOutBuilder<'_, 'callback>, HeaderBuildError> {
         let mut builder = HttpHeadersOutBuilder::new(self, capacity)?;
         clear_headers_out_metadata(&mut builder.headers);
-        builder.headers.trailers = create_header_list(builder.pool, capacity)?;
         builder.expect_trailers = Some(false);
         Ok(builder)
     }
