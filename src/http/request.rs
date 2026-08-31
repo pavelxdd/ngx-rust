@@ -918,6 +918,41 @@ impl<'request, 'callback> HttpHeadersInBuilder<'request, 'callback> {
     }
 }
 
+/// Request-pool builder for atomically replacing HTTP output trailers.
+pub struct HttpTrailersOutBuilder<'request, 'callback> {
+    request: &'request mut RequestRefMut<'callback>,
+    pool: *mut ngx_pool_t,
+    trailers: ngx_list_t,
+    has_trailers: bool,
+}
+
+impl<'request, 'callback> HttpTrailersOutBuilder<'request, 'callback> {
+    fn new(
+        request: &'request mut RequestRefMut<'callback>,
+        capacity: usize,
+    ) -> Result<Self, HeaderBuildError> {
+        let pool = request.pool()?.as_ptr();
+        let trailers = create_header_list(pool, capacity)?;
+        Ok(Self { request, pool, trailers, has_trailers: false })
+    }
+
+    /// Adds a copied raw output trailer to the candidate list.
+    pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<(), HeaderBuildError> {
+        append_pool_header(&mut self.trailers, self.pool, key, value)?;
+        self.has_trailers = true;
+        Ok(())
+    }
+
+    /// Publishes the complete output-trailer candidate to the request.
+    pub fn commit(self) {
+        let Self { request, trailers, has_trailers, .. } = self;
+        let request = unsafe { request.raw.as_mut() };
+        request.headers_out.trailers = trailers;
+        request.set_expect_trailers(has_trailers.into());
+        repair_header_list_last(&mut request.headers_out.trailers);
+    }
+}
+
 /// Request-pool builder for atomically replacing HTTP output headers.
 pub struct HttpHeadersOutBuilder<'request, 'callback> {
     request: &'request mut RequestRefMut<'callback>,
@@ -2689,8 +2724,17 @@ impl<'callback> RequestRefMut<'callback> {
     ) -> Result<HttpHeadersOutBuilder<'_, 'callback>, HeaderBuildError> {
         let mut builder = HttpHeadersOutBuilder::new(self, capacity)?;
         clear_headers_out_metadata(&mut builder.headers);
+        builder.headers.trailers = create_header_list(builder.pool, capacity)?;
         builder.expect_trailers = Some(false);
         Ok(builder)
+    }
+
+    /// Starts constructing a complete replacement output-trailer list in the request pool.
+    pub fn trailers_out_builder(
+        &mut self,
+        capacity: usize,
+    ) -> Result<HttpTrailersOutBuilder<'_, 'callback>, HeaderBuildError> {
+        HttpTrailersOutBuilder::new(self, capacity)
     }
 
     /// Returns a checked byte-oriented view over output trailers.
@@ -4884,6 +4928,78 @@ mod tests {
         let trace = trailers.next().expect("X-Trace trailer");
         assert_eq!((trace.key(), trace.value()), (b"X-Trace".as_slice(), b"one".as_slice()));
         assert!(trailers.next().is_none());
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn output_trailer_builder_replaces_only_the_trailer_set() {
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        raw.headers_out.status = 201;
+
+        {
+            let mut request = request_from(&mut raw);
+            let mut trailers = request.trailers_out_builder(1).unwrap();
+            trailers.add(b"X-Original", b"old").unwrap();
+            trailers.commit();
+        }
+        {
+            let mut request = request_from(&mut raw);
+            let mut trailers = request.trailers_out_builder(1).unwrap();
+            trailers.add(b"Digest", b"sha-256=value").unwrap();
+            trailers.add(b"X-Trace", b"one").unwrap();
+            trailers.commit();
+        }
+
+        assert_eq!(raw.headers_out.status, 201);
+        assert_ne!(raw.expect_trailers(), 0);
+        let request = request_from(&mut raw);
+        let trailers = request.trailers_out().unwrap();
+        let fields = trailers
+            .iter()
+            .map(|trailer| (trailer.key().to_vec(), trailer.value().to_vec()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fields,
+            vec![
+                (b"Digest".to_vec(), b"sha-256=value".to_vec()),
+                (b"X-Trace".to_vec(), b"one".to_vec()),
+            ]
+        );
+
+        {
+            let mut request = request_from(&mut raw);
+            request.trailers_out_builder(1).unwrap().commit();
+        }
+        assert_eq!(raw.headers_out.status, 201);
+        assert_eq!(raw.expect_trailers(), 0);
+        assert!(request_from(&mut raw).trailers_out().unwrap().iter().next().is_none());
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn abandoned_clean_output_header_candidate_does_not_mutate_live_trailers() {
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+
+        {
+            let mut request = request_from(&mut raw);
+            let mut trailers = request.trailers_out_builder(1).unwrap();
+            trailers.add(b"X-Original", b"old").unwrap();
+            trailers.commit();
+        }
+        {
+            let mut request = request_from(&mut raw);
+            let mut headers = request.clean_headers_out_builder(1).unwrap();
+            headers.add_trailer(b"X-Candidate", b"new").unwrap();
+        }
+
+        let request = request_from(&mut raw);
+        let trailers = request.trailers_out().unwrap();
+        let trailer = trailers.iter().next().expect("original trailer");
+        assert_eq!((trailer.key(), trailer.value()), (b"X-Original".as_slice(), b"old".as_slice()));
     }
 
     #[cfg(feature = "test-link")]
