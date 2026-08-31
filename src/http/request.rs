@@ -1001,6 +1001,7 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
     /// Adds a copied raw output trailer to a fresh candidate trailer list.
     pub fn add_trailer(&mut self, key: &[u8], value: &[u8]) -> Result<(), HeaderBuildError> {
         if !self.trailers_owned {
+            repair_header_list_last(&mut self.headers.trailers);
             self.headers.trailers =
                 clone_header_list(self.pool, &self.headers.trailers, self.trailer_capacity)?;
             self.trailers_owned = true;
