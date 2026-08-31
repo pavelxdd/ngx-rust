@@ -453,6 +453,8 @@ pub enum HeaderListError {
 pub enum HeaderBuildError {
     /// The request could not provide a usable pool.
     Request(RequestError),
+    /// The existing output-trailer list is not safe to clone into a candidate.
+    InvalidSource(HeaderListError),
     /// The requested initial list capacity is zero or cannot describe a list allocation.
     InvalidCapacity,
     /// Nginx could not allocate request-pool storage.
@@ -999,7 +1001,8 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
     /// Adds a copied raw output trailer to a fresh candidate trailer list.
     pub fn add_trailer(&mut self, key: &[u8], value: &[u8]) -> Result<(), HeaderBuildError> {
         if !self.trailers_owned {
-            self.headers.trailers = create_header_list(self.pool, self.trailer_capacity)?;
+            self.headers.trailers =
+                clone_header_list(self.pool, &self.headers.trailers, self.trailer_capacity)?;
             self.trailers_owned = true;
         }
         append_pool_header(&mut self.headers.trailers, self.pool, key, value)?;
@@ -1443,6 +1446,24 @@ fn create_header_list(
     }
 
     Ok(headers)
+}
+
+fn clone_header_list(
+    pool: *mut ngx_pool_t,
+    source: &ngx_list_t,
+    additional_capacity: usize,
+) -> Result<ngx_list_t, HeaderBuildError> {
+    let source = checked_header_list(source).map_err(HeaderBuildError::InvalidSource)?;
+    let capacity =
+        source.len().checked_add(additional_capacity).ok_or(HeaderBuildError::CountOverflow)?;
+    let mut candidate = create_header_list(pool, capacity)?;
+    for header in source.headers.iter() {
+        repair_header_list_last(&mut candidate);
+        let target = NonNull::new(unsafe { ngx_list_push(&raw mut candidate).cast() })
+            .ok_or(HeaderBuildError::Allocation)?;
+        unsafe { ptr::copy_nonoverlapping(header, target.as_ptr(), 1) };
+    }
+    Ok(candidate)
 }
 
 fn copy_pool_bytes(pool: *mut ngx_pool_t, bytes: &[u8]) -> Result<ngx_str_t, HeaderBuildError> {
