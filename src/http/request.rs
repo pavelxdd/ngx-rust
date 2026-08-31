@@ -923,6 +923,7 @@ pub struct HttpHeadersOutBuilder<'request, 'callback> {
     request: &'request mut RequestRefMut<'callback>,
     pool: *mut ngx_pool_t,
     headers: ngx_http_headers_out_t,
+    expect_trailers: Option<bool>,
 }
 
 impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
@@ -935,7 +936,7 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
         headers.headers = create_header_list(pool, capacity)?;
         clear_headers_out_slots(&mut headers);
 
-        Ok(Self { request, pool, headers })
+        Ok(Self { request, pool, headers, expect_trailers: None })
     }
 
     /// Adds a copied raw output header to the candidate list.
@@ -948,6 +949,13 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
 
         let header = append_pool_header(&mut self.headers.headers, self.pool, key, value)?;
         unsafe { bind_headers_out(&mut self.headers, header.as_ptr()) };
+        Ok(())
+    }
+
+    /// Adds a copied raw output trailer to the candidate list.
+    pub fn add_trailer(&mut self, key: &[u8], value: &[u8]) -> Result<(), HeaderBuildError> {
+        append_pool_header(&mut self.headers.trailers, self.pool, key, value)?;
+        self.expect_trailers = Some(true);
         Ok(())
     }
 
@@ -964,8 +972,12 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
 
     /// Publishes the complete output-header candidate to the request.
     pub fn commit(self) {
-        let request = unsafe { self.request.raw.as_mut() };
-        request.headers_out = self.headers;
+        let Self { request, headers, expect_trailers, .. } = self;
+        let request = unsafe { request.raw.as_mut() };
+        request.headers_out = headers;
+        if let Some(expect_trailers) = expect_trailers {
+            request.set_expect_trailers(expect_trailers.into());
+        }
         repair_header_list_last(&mut request.headers_out.headers);
         repair_header_list_last(&mut request.headers_out.trailers);
     }
@@ -2021,6 +2033,11 @@ impl<'callback> RequestRef<'callback> {
         checked_header_list(unsafe { &self.raw.as_ref().headers_out.headers })
     }
 
+    /// Returns a checked byte-oriented view over output trailers.
+    pub fn trailers_out(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
+        checked_header_list(unsafe { &self.raw.as_ref().headers_out.trailers })
+    }
+
     /// Returns the active upstream pointer for an explicit nginx FFI operation.
     ///
     /// # Safety
@@ -2672,7 +2689,13 @@ impl<'callback> RequestRefMut<'callback> {
     ) -> Result<HttpHeadersOutBuilder<'_, 'callback>, HeaderBuildError> {
         let mut builder = HttpHeadersOutBuilder::new(self, capacity)?;
         clear_headers_out_metadata(&mut builder.headers);
+        builder.expect_trailers = Some(false);
         Ok(builder)
+    }
+
+    /// Returns a checked byte-oriented view over output trailers.
+    pub fn trailers_out(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
+        checked_header_list(unsafe { &self.raw.as_ref().headers_out.trailers })
     }
 
     /// Returns the active upstream pointer for an explicit nginx FFI operation.
@@ -4836,6 +4859,35 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
+    fn output_header_builder_publishes_trailers_and_expectation() {
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+
+        {
+            let mut request = request_from(&mut raw);
+            let mut headers = request.clean_headers_out_builder(1).unwrap();
+            headers.add_trailer(b"Digest", b"sha-256=value").unwrap();
+            headers.add_trailer(b"X-Trace", b"one").unwrap();
+            headers.commit();
+        }
+
+        assert_ne!(raw.expect_trailers(), 0);
+        let request = request_from(&mut raw);
+        let trailers = request.trailers_out().unwrap();
+        let mut trailers = trailers.iter();
+        let digest = trailers.next().expect("Digest trailer");
+        assert_eq!(
+            (digest.key(), digest.value()),
+            (b"Digest".as_slice(), b"sha-256=value".as_slice())
+        );
+        let trace = trailers.next().expect("X-Trace trailer");
+        assert_eq!((trace.key(), trace.value()), (b"X-Trace".as_slice(), b"one".as_slice()));
+        assert!(trailers.next().is_none());
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
     fn output_header_builder_resets_response_metadata_on_request() {
         let owner = TestPool::new();
         let status_line = b"201 Created";
@@ -4850,6 +4902,7 @@ mod tests {
         raw.headers_out.content_offset = 7;
         raw.headers_out.date_time = 11;
         raw.headers_out.last_modified_time = 13;
+        raw.set_expect_trailers(1);
 
         {
             let mut request = request_from(&mut raw);
@@ -4867,6 +4920,7 @@ mod tests {
         assert_eq!(raw.headers_out.content_offset, 0);
         assert_eq!(raw.headers_out.date_time, 0);
         assert_eq!(raw.headers_out.last_modified_time, -1);
+        assert_eq!(raw.expect_trailers(), 0);
         assert_eq!(raw.headers_out.trailers.part.nelts, 0);
         assert!(raw.headers_out.trailers.part.next.is_null());
         assert_eq!(raw.headers_out.trailers.last, &raw mut raw.headers_out.trailers.part);
