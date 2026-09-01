@@ -95,6 +95,157 @@ pub struct HttpVariableIndex {
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
+/// Error returned when nginx's indexed HTTP variable cache cannot be invalidated safely.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpVariableCacheInvalidationError {
+    /// The request cannot resolve the HTTP core main configuration.
+    Configuration(HttpConfigError),
+    /// The request has no HTTP core main configuration.
+    MissingCoreMainConfiguration,
+    /// A preserved index belongs to a different HTTP core configuration.
+    ForeignIndex,
+    /// A preserved index is outside the configured definition array.
+    IndexOutOfBounds,
+    /// Nginx's configured variable-definition array cannot be read safely.
+    InvalidDefinitionArray,
+    /// The request has no indexed-variable storage.
+    MissingRequestVariables,
+    /// The request's indexed-variable storage is misaligned.
+    MisalignedRequestVariables,
+    /// The invalidation was prepared for a different request.
+    ForeignRequest,
+}
+
+impl fmt::Display for HttpVariableCacheInvalidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Configuration(_) => {
+                formatter.write_str("failed to resolve HTTP variable configuration")
+            }
+            Self::MissingCoreMainConfiguration => {
+                formatter.write_str("HTTP core main configuration is unavailable")
+            }
+            Self::ForeignIndex => formatter
+                .write_str("preserved HTTP variable index belongs to another configuration"),
+            Self::IndexOutOfBounds => {
+                formatter.write_str("preserved HTTP variable index is out of bounds")
+            }
+            Self::InvalidDefinitionArray => {
+                formatter.write_str("HTTP variable definitions are invalid")
+            }
+            Self::MissingRequestVariables => {
+                formatter.write_str("request has no indexed HTTP variable storage")
+            }
+            Self::MisalignedRequestVariables => {
+                formatter.write_str("request HTTP variable storage is misaligned")
+            }
+            Self::ForeignRequest => {
+                formatter.write_str("HTTP variable invalidation belongs to another request")
+            }
+        }
+    }
+}
+
+impl error::Error for HttpVariableCacheInvalidationError {}
+
+impl From<HttpConfigError> for HttpVariableCacheInvalidationError {
+    fn from(error: HttpConfigError) -> Self {
+        Self::Configuration(error)
+    }
+}
+
+/// Checked one-shot invalidation of getter-backed indexed HTTP variable values.
+///
+/// Preparation validates every pointer and preserved index before request state changes. Commit
+/// clears getter-backed cached values, including changeable computed variables such as maps, while
+/// preserving explicitly listed indexes and native weak slots assigned directly by rewrite code.
+pub struct HttpVariableCacheInvalidation<'preserved, 'callback> {
+    request: NonNull<ngx_http_request_t>,
+    definitions: NonNull<ngx_http_variable_t>,
+    values: NonNull<ngx_variable_value_t>,
+    count: usize,
+    preserved: &'preserved [HttpVariableIndex],
+    _callback: PhantomData<&'callback mut ngx_http_request_t>,
+    _not_thread_safe: PhantomData<*mut ()>,
+}
+
+impl<'preserved, 'callback> HttpVariableCacheInvalidation<'preserved, 'callback> {
+    /// Validates the request cache and indexes that must survive invalidation.
+    pub fn prepare(
+        request: &RequestRefMut<'callback>,
+        preserved: &'preserved [HttpVariableIndex],
+    ) -> Result<Self, HttpVariableCacheInvalidationError> {
+        let core_main = request
+            .main_conf::<NgxHttpCoreModule>()?
+            .ok_or(HttpVariableCacheInvalidationError::MissingCoreMainConfiguration)?;
+        let variables = &core_main.variables;
+        if variables.nelts > variables.nalloc
+            || variables.size != mem::size_of::<ngx_http_variable_t>()
+            || (variables.nelts != 0 && (variables.elts.is_null() || !variables.elts.is_aligned()))
+        {
+            return Err(HttpVariableCacheInvalidationError::InvalidDefinitionArray);
+        }
+        for index in preserved {
+            if !ptr::eq(core_main, index.core_main.as_ptr()) {
+                return Err(HttpVariableCacheInvalidationError::ForeignIndex);
+            }
+            if index.index >= variables.nelts {
+                return Err(HttpVariableCacheInvalidationError::IndexOutOfBounds);
+            }
+        }
+
+        let raw_request = NonNull::new(unsafe { request.as_ptr() })
+            .ok_or(HttpVariableCacheInvalidationError::ForeignRequest)?;
+        let values = NonNull::new(unsafe { (*raw_request.as_ptr()).variables });
+        if variables.nelts != 0 {
+            let values =
+                values.ok_or(HttpVariableCacheInvalidationError::MissingRequestVariables)?;
+            if !values.as_ptr().is_aligned() {
+                return Err(HttpVariableCacheInvalidationError::MisalignedRequestVariables);
+            }
+        }
+
+        Ok(Self {
+            request: raw_request,
+            definitions: NonNull::new(variables.elts.cast()).unwrap_or_else(NonNull::dangling),
+            values: values.unwrap_or_else(NonNull::dangling),
+            count: variables.nelts,
+            preserved,
+            _callback: PhantomData,
+            _not_thread_safe: PhantomData,
+        })
+    }
+
+    /// Invalidates the prepared request's recomputable variable values.
+    pub fn commit(
+        self,
+        request: &mut RequestRefMut<'callback>,
+    ) -> Result<(), HttpVariableCacheInvalidationError> {
+        let raw_request = unsafe { request.as_ptr() };
+        if !ptr::eq(raw_request, self.request.as_ptr())
+            || (self.count != 0 && unsafe { (*raw_request).variables } != self.values.as_ptr())
+        {
+            return Err(HttpVariableCacheInvalidationError::ForeignRequest);
+        }
+
+        for index in 0..self.count {
+            let definition = unsafe { &*self.definitions.as_ptr().add(index) };
+            if definition.get_handler.is_none()
+                || definition.flags & NGX_HTTP_VAR_WEAK as ngx_uint_t != 0
+                || self.preserved.iter().any(|preserved| preserved.index == index as ngx_uint_t)
+            {
+                continue;
+            }
+
+            let value = unsafe { &mut *self.values.as_ptr().add(index) };
+            value.set_valid(0);
+            value.set_not_found(0);
+        }
+
+        Ok(())
+    }
+}
+
 /// Error returned when an indexed HTTP variable cannot be looked up safely.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpVariableLookupError {
@@ -1034,11 +1185,12 @@ mod tests {
     use std::sync::MutexGuard;
 
     use super::{
-        HttpPrefixVariableHandler, HttpVariableFlags, HttpVariableHandler, HttpVariableIndex,
-        HttpVariableIndexError, HttpVariableLookupError, HttpVariableOutput,
-        HttpVariableOutputError, HttpVariablePoolBytes, HttpVariableRequest, HttpVariableSetter,
-        HttpVariableValueRef, add_prefix_variable, add_variable, add_variable_with_setter,
-        get_variable_index, raw_get_handler, raw_prefix_get_handler, raw_set_handler,
+        HttpPrefixVariableHandler, HttpVariableCacheInvalidation, HttpVariableFlags,
+        HttpVariableHandler, HttpVariableIndex, HttpVariableIndexError, HttpVariableLookupError,
+        HttpVariableOutput, HttpVariableOutputError, HttpVariablePoolBytes, HttpVariableRequest,
+        HttpVariableSetter, HttpVariableValueRef, add_prefix_variable, add_variable,
+        add_variable_with_setter, get_variable_index, raw_get_handler, raw_prefix_get_handler,
+        raw_set_handler,
     };
     use crate::core::{NgxStr, Status};
     use crate::ffi::{
@@ -2356,6 +2508,52 @@ mod tests {
                 assert_eq!(value.bytes(), Some(&b"indexed"[..]));
             }
             assert_eq!(INDEXED_VARIABLE_CALLS.load(Ordering::Relaxed), 2);
+        });
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn variable_cache_invalidation_refreshes_getters_but_preserves_assigned_and_excluded_values() {
+        let mut fixture = VariableFixture::new();
+        let definitions = [
+            (b"ngx_rs_refresh".as_slice(), HttpVariableFlags::empty()),
+            (b"ngx_rs_changeable_getter".as_slice(), HttpVariableFlags::CHANGEABLE),
+            (
+                b"ngx_rs_assigned".as_slice(),
+                HttpVariableFlags::CHANGEABLE | HttpVariableFlags::WEAK,
+            ),
+            (b"ngx_rs_preserved".as_slice(), HttpVariableFlags::empty()),
+        ];
+        for (name, flags) in definitions {
+            add_variable::<IndexedVariable>(
+                &mut fixture.configuration(),
+                NgxStr::from_bytes(name),
+                flags,
+                0,
+            )
+            .unwrap();
+        }
+        let indexes = definitions.map(|(name, _)| {
+            get_variable_index(&mut fixture.configuration(), NgxStr::from_bytes(name)).unwrap()
+        });
+        fixture.configuration.finalize_variables();
+        INDEXED_VARIABLE_CALLS.store(0, Ordering::Relaxed);
+
+        fixture.configuration.with_request(|request| {
+            for index in &indexes {
+                assert_eq!(index.get_cached(request).unwrap().bytes(), Some(&b"indexed"[..]));
+            }
+            assert_eq!(INDEXED_VARIABLE_CALLS.load(Ordering::Relaxed), 4);
+
+            let preserved = [indexes[3]];
+            let invalidation = HttpVariableCacheInvalidation::prepare(request, &preserved).unwrap();
+            invalidation.commit(request).unwrap();
+
+            assert_eq!(indexes[0].get_cached(request).unwrap().bytes(), Some(&b"indexed"[..]));
+            assert_eq!(indexes[1].get_cached(request).unwrap().bytes(), Some(&b"indexed"[..]));
+            assert_eq!(indexes[2].get_cached(request).unwrap().bytes(), Some(&b"indexed"[..]));
+            assert_eq!(indexes[3].get_cached(request).unwrap().bytes(), Some(&b"indexed"[..]));
+            assert_eq!(INDEXED_VARIABLE_CALLS.load(Ordering::Relaxed), 6);
         });
     }
 
