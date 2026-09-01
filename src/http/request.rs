@@ -1468,13 +1468,13 @@ fn clone_header_list(
 }
 
 fn copy_pool_bytes(pool: *mut ngx_pool_t, bytes: &[u8]) -> Result<ngx_str_t, HeaderBuildError> {
-    if bytes.is_empty() {
-        return Ok(ngx_str_t::empty());
-    }
-
-    let data = NonNull::new(unsafe { ngx_pnalloc(pool, bytes.len()).cast::<u_char>() })
+    let allocation = bytes.len().checked_add(1).ok_or(HeaderBuildError::Allocation)?;
+    let data = NonNull::new(unsafe { ngx_pnalloc(pool, allocation).cast::<u_char>() })
         .ok_or(HeaderBuildError::Allocation)?;
-    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), data.as_ptr(), bytes.len()) };
+    unsafe {
+        ptr::copy_nonoverlapping(bytes.as_ptr(), data.as_ptr(), bytes.len());
+        *data.as_ptr().add(bytes.len()) = 0;
+    }
     Ok(ngx_str_t { len: bytes.len(), data: data.as_ptr() })
 }
 
@@ -4797,6 +4797,31 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
+    fn input_header_builder_terminates_nonempty_and_empty_native_storage() {
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+
+        {
+            let mut request = request_from(&mut raw);
+            let mut headers = request.headers_in_builder(2).unwrap();
+            headers.add(b"Host", b"example.test").unwrap();
+            headers.add(b"User-Agent", b"").unwrap();
+            headers.commit();
+        }
+
+        unsafe {
+            for header in [&*raw.headers_in.host, &*raw.headers_in.user_agent] {
+                assert!(!header.key.data.is_null());
+                assert!(!header.value.data.is_null());
+                assert_eq!(*header.key.data.add(header.key.len), 0);
+                assert_eq!(*header.value.data.add(header.value.len), 0);
+            }
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
     fn output_header_builder_binds_slots_and_preserves_response_state() {
         let owner = TestPool::new();
         let content_type = b"application/test";
@@ -5244,6 +5269,11 @@ mod tests {
             .unwrap();
         assert_eq!(content_length.lowercase_key(), Some(b"content-length".as_slice()));
         assert_ne!(content_length.hash(), 0);
+        unsafe {
+            let content_length = &*raw.headers_in.content_length;
+            assert_eq!(*content_length.key.data.add(content_length.key.len), 0);
+            assert_eq!(*content_length.value.data.add(content_length.value.len), 0);
+        }
     }
 
     #[cfg(feature = "test-link")]
