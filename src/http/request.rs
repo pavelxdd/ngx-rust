@@ -673,6 +673,19 @@ pub enum ClientBodyReadStatus {
     Error(Status),
 }
 
+/// Start-side ownership returned by nginx client-body processing.
+///
+/// For every non-special native status, nginx retains one main-request reference while the body
+/// callback owns asynchronous processing. [`release`](Self::release) consumes this token and
+/// releases the caller-side reference exactly once. A special response was already released by
+/// nginx and needs no finalization.
+#[must_use = "client-body start ownership must be released after handling its status"]
+pub struct ClientBodyReadStart<'request> {
+    request: RequestRefMut<'request>,
+    status: ClientBodyReadStatus,
+    release_required: bool,
+}
+
 impl ClientBodyReadStatus {
     fn from_raw(status: ngx_int_t) -> Self {
         if status == NGX_OK as ngx_int_t {
@@ -2735,10 +2748,17 @@ impl<'callback> RequestRefMut<'callback> {
     ///
     /// An immediate special response is returned without invoking `H`. The callback's owner keeps
     /// cancellation state in its pinned request context through [`HttpClientBodyHandler::is_active`].
-    pub fn read_client_body<H: HttpClientBodyHandler>(&mut self) -> ClientBodyReadStatus {
-        ClientBodyReadStatus::from_raw(unsafe {
+    /// The returned token must be released after its status has been handled.
+    pub fn read_client_body<'request, H: HttpClientBodyHandler>(
+        &'request mut self,
+    ) -> ClientBodyReadStart<'request> {
+        let status = ClientBodyReadStatus::from_raw(unsafe {
             ngx_http_read_client_request_body(self.raw.as_ptr(), Some(raw_client_body_handler::<H>))
-        })
+        });
+        let release_required = !matches!(&status, ClientBodyReadStatus::Special(_));
+        let request = unsafe { RequestRefMut::from_raw(self.raw.as_ptr()) }
+            .expect("a client-body start reborrows its validated request");
+        ClientBodyReadStart { request, status, release_required }
     }
 
     /// Starts constructing a complete replacement output-header list in the request pool.
@@ -2991,6 +3011,27 @@ impl<'callback> RequestRefMut<'callback> {
         request.write_event_handler = Some(ngx_http_core_run_phases);
         request.phase_handler = phase_handler;
         Ok(())
+    }
+}
+
+impl ClientBodyReadStart<'_> {
+    /// Returns the native status class without releasing start-side ownership.
+    pub fn status(&self) -> &ClientBodyReadStatus {
+        &self.status
+    }
+
+    /// Returns the request while start-side ownership keeps it live.
+    pub fn request(&self) -> &RequestRefMut<'_> {
+        &self.request
+    }
+
+    /// Releases start-side ownership after the caller has handled the native status.
+    ///
+    /// This may synchronously finalize the request and must be the caller's final request operation.
+    pub fn release(self) {
+        if self.release_required {
+            unsafe { ngx_http_finalize_request(self.request.raw.as_ptr(), NGX_DONE as _) };
+        }
     }
 }
 
@@ -6470,37 +6511,41 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn client_body_read_invokes_once_and_ignores_cancelled_or_invalid_callbacks() {
-        let _globals = RequestGlobals::new(0, 0);
-        let owner = TestPool::new();
-        let mut raw = zeroed_request();
-        raw.pool = owner.raw;
+    fn client_body_read_invokes_once_and_releases_each_start_reference() {
+        let mut fixture = TerminalRequestFixture::new();
         let mut body: ngx_http_request_body_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        raw.request_body = &raw mut body;
+        fixture.request.request_body = &raw mut body;
 
         BODY_CALLBACKS.store(0, Ordering::Relaxed);
         BODY_CALLBACK_ACTIVE.store(false, Ordering::Relaxed);
-        assert_eq!(
-            request_from(&mut raw).read_client_body::<BodyCallback>(),
-            ClientBodyReadStatus::Ok
-        );
+        let mut request = request_from(&mut fixture.request);
+        let start = request.read_client_body::<BodyCallback>();
+        assert_eq!(start.status(), &ClientBodyReadStatus::Ok);
+        assert_eq!(unsafe { start.request.raw.as_ref().count() }, 2);
+        start.release();
+        assert_eq!(fixture.request.count(), 1);
         assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 0);
 
         BODY_CALLBACK_ACTIVE.store(true, Ordering::Relaxed);
-        assert_eq!(
-            request_from(&mut raw).read_client_body::<BodyCallback>(),
-            ClientBodyReadStatus::Ok
-        );
+        let mut request = request_from(&mut fixture.request);
+        let start = request.read_client_body::<BodyCallback>();
+        assert_eq!(start.status(), &ClientBodyReadStatus::Ok);
+        assert_eq!(unsafe { start.request.raw.as_ref().count() }, 2);
+        start.release();
+        assert_eq!(fixture.request.count(), 1);
         assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 1);
 
         BODY_CALLBACK_ACTIVE.store(false, Ordering::Relaxed);
-        unsafe { raw_client_body_handler::<BodyCallback>(&raw mut raw) };
+        unsafe { raw_client_body_handler::<BodyCallback>(&raw mut *fixture.request) };
         unsafe { raw_client_body_handler::<BodyCallback>(ptr::null_mut()) };
         let mut storage = [0_u8;
             core::mem::size_of::<ngx_http_request_t>()
                 + core::mem::align_of::<ngx_http_request_t>()];
         unsafe { raw_client_body_handler::<BodyCallback>(storage.as_mut_ptr().add(1).cast()) };
         assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 1);
+
+        request_from(&mut fixture.request).finalize(Status::NGX_DONE).unwrap();
+        fixture.disarm_nginx_pools();
     }
 
     #[cfg(feature = "test-link")]
@@ -6517,10 +6562,15 @@ mod tests {
             (*owner.raw).max = 0;
             ngx_rs_test_fail_allocations_after(0);
         }
-        let status = request_from(&mut raw).read_client_body::<BodyCallback>();
+        let mut request = request_from(&mut raw);
+        let start = request.read_client_body::<BodyCallback>();
         unsafe { ngx_rs_test_reset_allocation_failures() };
 
-        assert_eq!(status, ClientBodyReadStatus::Special(HTTPStatus::INTERNAL_SERVER_ERROR));
+        assert_eq!(
+            start.status(),
+            &ClientBodyReadStatus::Special(HTTPStatus::INTERNAL_SERVER_ERROR)
+        );
+        start.release();
         assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 0);
     }
 
