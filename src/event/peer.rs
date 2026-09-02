@@ -6,7 +6,7 @@ use core::mem;
 use core::ptr::{self, NonNull};
 use core::slice;
 
-use super::EventError;
+use super::{EventError, EventRef, PostedQueue};
 use crate::core::{
     ConnectionError, ConnectionRefMut, NgxStr, SocketAddress, SocketAddressError, SocketType,
     parse_socket_address,
@@ -324,26 +324,11 @@ impl<'log> EventPeerPreparation<'log> {
     }
 }
 
-/// State of an event-peer connection owner.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EventPeerConnectionState {
-    /// nginx connected the socket immediately or connect completion succeeded.
-    Connected,
-    /// nginx has a nonblocking connect in progress.
-    Pending,
-    /// Connect completion consumed a terminal socket error.
-    Failed,
-    /// The connection returned from a keepalive owner and is not newly allocated.
-    Borrowed,
-}
-
 /// Failure while operating on a connected event peer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventPeerConnectionError {
     /// The peer no longer owns a connection.
     Detached,
-    /// The requested operation requires a pending nonblocking connect.
-    NotPending,
     /// nginx has not reported connect readiness yet.
     NotReady,
     /// The requested connection pool is smaller than nginx's minimum layout.
@@ -403,7 +388,6 @@ impl fmt::Display for EventPeerConnectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Detached => formatter.write_str("event peer connection is detached"),
-            Self::NotPending => formatter.write_str("event peer connection is not pending"),
             Self::NotReady => formatter.write_str("event peer connection is not ready"),
             Self::PoolTooSmall { requested, minimum } => write!(
                 formatter,
@@ -687,7 +671,6 @@ impl<'address, 'log> EventPeerBuilder<'address, 'log> {
 
         Ok(EventPeer {
             raw,
-            state: EventPeerState::Detached,
             selected: false,
             _address: PhantomData,
             _log: PhantomData,
@@ -742,33 +725,22 @@ fn socket_type_raw(socket_type: SocketType) -> c_int {
 #[derive(Debug)]
 pub struct EventPeer<'address, 'log> {
     raw: ngx_peer_connection_t,
-    state: EventPeerState,
     selected: bool,
     _address: PhantomData<&'address ngx_addr_t>,
     _log: PhantomData<&'log ngx_log_t>,
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EventPeerState {
-    Detached,
-    Connected,
-    Pending,
-    Keepalive,
-}
-
 impl<'address, 'log> EventPeer<'address, 'log> {
     /// Invokes nginx's native peer connect operation and preserves its exact result category.
     ///
     /// `NGX_ERROR` is returned as [`EventPeerConnectResult::Error`]. `Err` is reserved for an
-    /// invalid native status or ownership transition.
+    /// invalid native status or connection descriptor.
     #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub fn connect(
         mut self,
     ) -> Result<EventPeerConnectResult<'address, 'log>, EventPeerConnectError<'address, 'log>> {
-        if self.state != EventPeerState::Detached || !self.raw.connection.is_null() {
-            return Err(EventPeerConnectError::AlreadyOwned { peer: self });
-        }
+        debug_assert!(self.raw.connection.is_null());
         let get = self.raw.get.expect("validated event peer selector");
         let selection_status = unsafe { get(&raw mut self.raw, self.raw.data) };
         if selection_status != NGX_OK as _ {
@@ -832,11 +804,6 @@ impl<'address, 'log> EventPeer<'address, 'log> {
                     read.as_mut().handler = Some(inert_event_handler);
                     write.as_mut().handler = Some(inert_event_handler);
                 }
-                self.state = if status == EventPeerConnectStatus::Pending {
-                    EventPeerState::Pending
-                } else {
-                    EventPeerState::Connected
-                };
             }
             EventPeerConnectStatus::Busy
             | EventPeerConnectStatus::Declined
@@ -850,34 +817,20 @@ impl<'address, 'log> EventPeer<'address, 'log> {
         }
 
         Ok(match status {
-            EventPeerConnectStatus::Connected => EventPeerConnectResult::Connected(self),
-            EventPeerConnectStatus::Reused => EventPeerConnectResult::Reused(self),
-            EventPeerConnectStatus::Pending => EventPeerConnectResult::Pending(self),
+            EventPeerConnectStatus::Connected => {
+                EventPeerConnectResult::Connected(EventPeerConnection { peer: self })
+            }
+            EventPeerConnectStatus::Reused => {
+                EventPeerConnectResult::Reused(EventPeerConnection { peer: self })
+            }
+            EventPeerConnectStatus::Pending => {
+                EventPeerConnectResult::Pending(EventPeerPendingConnection { peer: self })
+            }
             EventPeerConnectStatus::SelectionPending => unreachable!("classified native status"),
             EventPeerConnectStatus::Busy => EventPeerConnectResult::Busy(self),
             EventPeerConnectStatus::Declined => EventPeerConnectResult::Declined(self),
             EventPeerConnectStatus::Error => EventPeerConnectResult::Error(self),
         })
-    }
-
-    /// Transfers a connected or pending socket into its explicit connection owner.
-    #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
-    pub fn into_connection(
-        self,
-    ) -> Result<EventPeerConnection<'address, 'log>, EventPeerIntoConnectionError<'address, 'log>>
-    {
-        let state = match self.state {
-            EventPeerState::Connected => EventPeerConnectionState::Connected,
-            EventPeerState::Pending => EventPeerConnectionState::Pending,
-            EventPeerState::Detached => {
-                return Err(EventPeerIntoConnectionError::Detached { peer: self });
-            }
-            EventPeerState::Keepalive => {
-                return Err(EventPeerIntoConnectionError::Keepalive { peer: self });
-            }
-        };
-
-        Ok(EventPeerConnection { peer: self, state })
     }
 
     /// Transfers an externally owned live connection into a keepalive owner.
@@ -893,9 +846,7 @@ impl<'address, 'log> EventPeer<'address, 'log> {
         mut self,
         connection: *mut ngx_connection_t,
     ) -> Result<EventPeerKeepalive<'address, 'log>, EventPeerAttachError<'address, 'log>> {
-        if self.state != EventPeerState::Detached || !self.raw.connection.is_null() {
-            return Err(EventPeerAttachError::AlreadyOwned { peer: self });
-        }
+        debug_assert!(self.raw.connection.is_null());
         if let Err(error) = checked_event_peer_connection(connection) {
             return Err(EventPeerAttachError::Connection { error, peer: self });
         }
@@ -905,7 +856,6 @@ impl<'address, 'log> EventPeer<'address, 'log> {
             self.raw.connection = ptr::null_mut();
             return Err(EventPeerAttachError::Connection { error, peer: self });
         }
-        self.state = EventPeerState::Keepalive;
         Ok(EventPeerKeepalive { peer: self })
     }
 
@@ -960,7 +910,6 @@ impl<'address, 'log> EventPeer<'address, 'log> {
         let this = mem::ManuallyDrop::new(self);
         EventPeer {
             raw: unsafe { ptr::read(&raw const this.raw) },
-            state: this.state,
             selected: this.selected,
             _address: PhantomData,
             _log: PhantomData,
@@ -1118,7 +1067,6 @@ impl<'address, 'log> EventPeer<'address, 'log> {
     fn close_owned(&mut self) {
         let connection = self.raw.connection;
         self.raw.connection = ptr::null_mut();
-        self.state = EventPeerState::Detached;
 
         let Ok(mut connection) = checked_event_peer_connection_ptr(connection) else {
             return;
@@ -1214,51 +1162,9 @@ fn checked_event_peer_pool(
     Ok(Some(pool))
 }
 
-/// Failure while turning an event peer into its connection owner.
-#[derive(Debug)]
-pub enum EventPeerIntoConnectionError<'address, 'log> {
-    /// The peer has no owned socket.
-    Detached {
-        /// The retained peer.
-        peer: EventPeer<'address, 'log>,
-    },
-    /// The peer is currently represented by a keepalive owner.
-    Keepalive {
-        /// The retained peer.
-        peer: EventPeer<'address, 'log>,
-    },
-}
-
-impl<'address, 'log> EventPeerIntoConnectionError<'address, 'log> {
-    /// Returns the retained peer after a failed ownership transition.
-    pub fn into_peer(self) -> EventPeer<'address, 'log> {
-        match self {
-            Self::Detached { peer } | Self::Keepalive { peer } => peer,
-        }
-    }
-}
-
-impl fmt::Display for EventPeerIntoConnectionError<'_, '_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Detached { .. } => formatter.write_str("event peer has no owned connection"),
-            Self::Keepalive { .. } => {
-                formatter.write_str("event peer connection is owned by a keepalive wrapper")
-            }
-        }
-    }
-}
-
-impl error::Error for EventPeerIntoConnectionError<'_, '_> {}
-
 /// Failure while attaching an externally owned connection to a keepalive owner.
 #[derive(Debug)]
 pub enum EventPeerAttachError<'address, 'log> {
-    /// The peer already owns a connection.
-    AlreadyOwned {
-        /// The retained peer.
-        peer: EventPeer<'address, 'log>,
-    },
     /// The supplied native connection does not meet the ownership contract.
     Connection {
         /// The validation failure.
@@ -1272,7 +1178,7 @@ impl<'address, 'log> EventPeerAttachError<'address, 'log> {
     /// Returns the retained peer after a failed attach operation.
     pub fn into_peer(self) -> EventPeer<'address, 'log> {
         match self {
-            Self::AlreadyOwned { peer } | Self::Connection { peer, .. } => peer,
+            Self::Connection { peer, .. } => peer,
         }
     }
 }
@@ -1280,9 +1186,6 @@ impl<'address, 'log> EventPeerAttachError<'address, 'log> {
 impl fmt::Display for EventPeerAttachError<'_, '_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AlreadyOwned { .. } => {
-                formatter.write_str("event peer already owns a connection")
-            }
             Self::Connection { error, .. } => {
                 write!(formatter, "invalid keepalive connection: {error}")
             }
@@ -1293,6 +1196,16 @@ impl fmt::Display for EventPeerAttachError<'_, '_> {
 impl error::Error for EventPeerAttachError<'_, '_> {}
 
 /// Active owner of one native event-peer socket.
+///
+/// A connected owner cannot start another native connect.
+///
+/// ```compile_fail
+/// use ngx::event::EventPeerConnection;
+///
+/// fn reject(connection: EventPeerConnection<'_, '_>) {
+///     let _ = connection.connect();
+/// }
+/// ```
 ///
 /// ```compile_fail
 /// use ngx::event::EventPeerConnection;
@@ -1305,19 +1218,46 @@ impl error::Error for EventPeerAttachError<'_, '_> {}
 #[derive(Debug)]
 pub struct EventPeerConnection<'address, 'log> {
     peer: EventPeer<'address, 'log>,
-    state: EventPeerConnectionState,
 }
 
-/// Capability proving that nginx reported readiness or terminal state for a pending connect.
+/// Owner of a socket with a nonblocking connection in progress.
+///
+/// Pending sockets expose only connect-event operations, not active socket I/O or keepalive
+/// transfer.
+///
+/// ```compile_fail
+/// use ngx::event::EventPeerPendingConnection;
+///
+/// fn reject(mut connection: EventPeerPendingConnection<'_, '_>) {
+///     let _ = connection.with_connection(|_| ());
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::event::{EventPeerPendingConnection, EventPeerPreparation};
+///
+/// fn reject(
+///     connection: EventPeerPendingConnection<'_, '_>,
+///     preparation: EventPeerPreparation<'_>,
+/// ) {
+///     let _ = connection.into_keepalive(preparation);
+/// }
+/// ```
 #[derive(Debug)]
-pub struct EventPeerConnectReady<'connection, 'address, 'log> {
-    connection: &'connection mut EventPeerConnection<'address, 'log>,
+pub struct EventPeerPendingConnection<'address, 'log> {
+    peer: EventPeer<'address, 'log>,
+}
+
+/// Capability that owns a pending connection after nginx reports readiness or terminal state.
+#[derive(Debug)]
+pub struct EventPeerConnectReady<'address, 'log> {
+    connection: EventPeerPendingConnection<'address, 'log>,
     terminal: bool,
 }
 
-impl EventPeerConnectReady<'_, '_, '_> {
-    /// Consumes observed readiness and classifies the socket's pending `SO_ERROR` exactly once.
-    pub fn complete(self) -> Result<(), EventPeerConnectionError> {
+impl<'address, 'log> EventPeerConnectReady<'address, 'log> {
+    /// Consumes the pending owner and classifies the socket's `SO_ERROR` exactly once.
+    pub fn complete(self) -> Result<EventPeerConnection<'address, 'log>, EventPeerConnectionError> {
         let connection = self.connection.peer.connection()?;
         let fd = unsafe { connection.as_ref().fd };
         let mut socket_error: c_int = 0;
@@ -1335,30 +1275,124 @@ impl EventPeerConnectReady<'_, '_, '_> {
             return Err(EventPeerConnectionError::SocketOption(ngx_socket_errno() as _));
         }
         if length as usize != mem::size_of_val(&socket_error) {
-            self.connection.state = EventPeerConnectionState::Failed;
             return Err(EventPeerConnectionError::SocketOptionLength);
         }
         if socket_error != 0 {
-            self.connection.state = EventPeerConnectionState::Failed;
             return Err(EventPeerConnectionError::Connect(socket_error as _));
         }
         if self.terminal {
-            self.connection.state = EventPeerConnectionState::Failed;
             return Err(EventPeerConnectionError::ConnectEvent);
         }
 
-        self.connection.state = EventPeerConnectionState::Connected;
-        self.connection.peer.state = EventPeerState::Connected;
-        Ok(())
+        Ok(EventPeerConnection { peer: self.connection.peer })
+    }
+}
+
+/// A pending connection that was checked before nginx reported readiness.
+#[derive(Debug)]
+pub struct EventPeerConnectReadyError<'address, 'log> {
+    error: EventPeerConnectionError,
+    connection: EventPeerPendingConnection<'address, 'log>,
+}
+
+impl<'address, 'log> EventPeerConnectReadyError<'address, 'log> {
+    /// Returns the reason no completion capability was issued.
+    pub fn error(&self) -> EventPeerConnectionError {
+        self.error
+    }
+
+    /// Returns the pending owner so the caller can wait for another event.
+    pub fn into_connection(self) -> EventPeerPendingConnection<'address, 'log> {
+        self.connection
+    }
+}
+
+impl fmt::Display for EventPeerConnectReadyError<'_, '_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "event peer connect is not ready: {}", self.error)
+    }
+}
+
+impl error::Error for EventPeerConnectReadyError<'_, '_> {}
+
+impl<'address, 'log> EventPeerPendingConnection<'address, 'log> {
+    /// Creates a connection pool when absent, then installs log, data, idle state, and handlers.
+    pub fn prepare(
+        &mut self,
+        preparation: EventPeerPreparation<'log>,
+    ) -> Result<(), EventPeerConnectionError> {
+        self.peer.prepare(preparation)
+    }
+
+    /// Gives callback-scoped access to the write event without exposing socket I/O.
+    pub fn with_write_event<R>(
+        &mut self,
+        f: impl for<'scope> FnOnce(EventRef<'scope>) -> R,
+    ) -> Result<R, EventPeerConnectionError> {
+        let connection = self.peer.connection()?;
+        let (_, write) = checked_event_peer_events(connection)?;
+        unsafe { EventRef::with_raw(write.as_ptr(), f) }.map_err(Into::into)
+    }
+
+    /// Consumes this owner after nginx reports connect readiness or terminal state.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error returns the allocation-free pending owner"
+    )]
+    pub fn connect_ready(
+        self,
+    ) -> Result<EventPeerConnectReady<'address, 'log>, EventPeerConnectReadyError<'address, 'log>>
+    {
+        let state = self.peer.connection().and_then(|connection| {
+            let (read, write) = checked_event_peer_events(connection)?;
+            let ready = unsafe { read.as_ref().ready() != 0 || write.as_ref().ready() != 0 };
+            let terminal = unsafe {
+                connection.as_ref().error() != 0
+                    || read.as_ref().error() != 0
+                    || read.as_ref().eof() != 0
+                    || read.as_ref().timedout() != 0
+                    || write.as_ref().error() != 0
+                    || write.as_ref().eof() != 0
+                    || write.as_ref().timedout() != 0
+            };
+            if !ready && !terminal {
+                return Err(EventPeerConnectionError::NotReady);
+            }
+            Ok(terminal)
+        });
+
+        match state {
+            Ok(terminal) => Ok(EventPeerConnectReady { connection: self, terminal }),
+            Err(error) => Err(EventPeerConnectReadyError { error, connection: self }),
+        }
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn readiness_parts(
+        &self,
+    ) -> Result<(NonNull<ngx_connection_t>, NonNull<ngx_event_t>), EventPeerConnectionError> {
+        let connection = self.peer.connection()?;
+        let (_, write) = checked_event_peer_events(connection)?;
+        Ok((connection, write))
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn readiness_log(&self) -> LogRef<'log> {
+        self.peer.log()
+    }
+
+    /// Releases the selected peer exactly once and closes the pending socket.
+    pub fn release(self, state: EventPeerReleaseState) {
+        self.peer.release(state);
+    }
+
+    /// Closes the pending socket immediately.
+    pub fn close(self) {
+        drop(self);
     }
 }
 
 impl<'address, 'log> EventPeerConnection<'address, 'log> {
-    /// Returns whether this socket is connected, connecting, failed, or borrowed from storage.
-    pub fn state(&self) -> EventPeerConnectionState {
-        self.state
-    }
-
     #[cfg(feature = "async")]
     pub(crate) fn readiness_parts(
         &self,
@@ -1372,34 +1406,6 @@ impl<'address, 'log> EventPeerConnection<'address, 'log> {
     #[cfg(feature = "async")]
     pub(crate) fn readiness_log(&self) -> LogRef<'log> {
         self.peer.log()
-    }
-
-    /// Issues a completion capability after nginx reports connect readiness or terminal state.
-    pub fn connect_ready(
-        &mut self,
-    ) -> Result<EventPeerConnectReady<'_, 'address, 'log>, EventPeerConnectionError> {
-        if self.state != EventPeerConnectionState::Pending {
-            return Err(EventPeerConnectionError::NotPending);
-        }
-
-        let connection = self.peer.connection()?;
-        let (read, write) = checked_event_peer_events(connection)?;
-        let (ready, terminal) = unsafe {
-            let ready = read.as_ref().ready() != 0 || write.as_ref().ready() != 0;
-            let terminal = connection.as_ref().error() != 0
-                || read.as_ref().error() != 0
-                || read.as_ref().eof() != 0
-                || read.as_ref().timedout() != 0
-                || write.as_ref().error() != 0
-                || write.as_ref().eof() != 0
-                || write.as_ref().timedout() != 0;
-            (ready, terminal)
-        };
-        if !ready && !terminal {
-            return Err(EventPeerConnectionError::NotReady);
-        }
-
-        Ok(EventPeerConnectReady { connection: self, terminal })
     }
 
     /// Creates a connection pool when absent, then installs log, data, idle state, and handlers.
@@ -1450,12 +1456,6 @@ impl<'address, 'log> EventPeerConnection<'address, 'log> {
         EventPeerKeepalive<'address, 'idle_log>,
         EventPeerKeepaliveTransferError<'address, 'log>,
     > {
-        if !matches!(
-            self.state,
-            EventPeerConnectionState::Connected | EventPeerConnectionState::Borrowed
-        ) {
-            return Err(EventPeerKeepaliveTransferError::NotConnected { connection: self });
-        }
         if let Err(error) = self.peer.validate_keepalive() {
             return Err(EventPeerKeepaliveTransferError::Connection { error, connection: self });
         }
@@ -1475,7 +1475,6 @@ impl<'address, 'log> EventPeerConnection<'address, 'log> {
             return Err(EventPeerKeepaliveTransferError::Connection { error, connection: self });
         }
 
-        self.peer.state = EventPeerState::Keepalive;
         let peer = self.peer.rebind_log(idle_log);
         Ok(EventPeerKeepalive { peer })
     }
@@ -1489,11 +1488,6 @@ impl<'address, 'log> EventPeerConnection<'address, 'log> {
 /// Failure while moving an active connection into keepalive storage.
 #[derive(Debug)]
 pub enum EventPeerKeepaliveTransferError<'address, 'log> {
-    /// A pending or failed connect must be completed or closed instead.
-    NotConnected {
-        /// The retained active connection owner.
-        connection: EventPeerConnection<'address, 'log>,
-    },
     /// The native connection could not be validated, prepared, or registered for idle use.
     Connection {
         /// The transition failure.
@@ -1507,7 +1501,7 @@ impl<'address, 'log> EventPeerKeepaliveTransferError<'address, 'log> {
     /// Returns the retained active connection owner after a failed transfer.
     pub fn into_connection(self) -> EventPeerConnection<'address, 'log> {
         match self {
-            Self::NotConnected { connection } | Self::Connection { connection, .. } => connection,
+            Self::Connection { connection, .. } => connection,
         }
     }
 }
@@ -1515,9 +1509,6 @@ impl<'address, 'log> EventPeerKeepaliveTransferError<'address, 'log> {
 impl fmt::Display for EventPeerKeepaliveTransferError<'_, '_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotConnected { .. } => formatter.write_str(
-                "event peer incomplete or failed connect cannot enter keepalive storage",
-            ),
             Self::Connection { error, .. } => {
                 write!(formatter, "event peer keepalive transfer failed: {error}")
             }
@@ -1548,6 +1539,16 @@ pub struct EventPeerKeepaliveState {
 
 /// Owner of a reusable event-peer socket outside an active request.
 ///
+/// Idle sockets cannot perform active connection I/O.
+///
+/// ```compile_fail
+/// use ngx::event::EventPeerKeepalive;
+///
+/// fn reject(mut keepalive: EventPeerKeepalive<'_, '_>) {
+///     let _ = keepalive.with_connection(|_| ());
+/// }
+/// ```
+///
 /// ```compile_fail
 /// use ngx::event::EventPeerKeepalive;
 ///
@@ -1574,6 +1575,26 @@ pub struct EventPeerKeepalive<'address, 'log> {
 }
 
 impl<'address, 'log> EventPeerKeepalive<'address, 'log> {
+    /// Posts the idle read event for deferred disposal without exposing active socket I/O.
+    ///
+    /// # Safety
+    ///
+    /// The caller must retain this keepalive owner until nginx dispatches or cancels the posted
+    /// event, and the installed read handler must accept that dispatch.
+    pub unsafe fn post_read_event(
+        &mut self,
+        queue: PostedQueue,
+    ) -> Result<(), EventPeerConnectionError> {
+        let connection = self.peer.connection()?;
+        let (read, _) = checked_event_peer_events(connection)?;
+        unsafe {
+            EventRef::with_raw(read.as_ptr(), |mut read| {
+                read.post(queue);
+            })
+        }
+        .map_err(Into::into)
+    }
+
     /// Returns the native state that determines whether this connection is stale.
     pub fn stale_state(&self) -> Result<EventPeerKeepaliveState, EventPeerConnectionError> {
         self.peer.keepalive_state()
@@ -1582,15 +1603,6 @@ impl<'address, 'log> EventPeerKeepalive<'address, 'log> {
     /// Rejects a connection with terminal native event state or unread input.
     pub fn validate(&self) -> Result<(), EventPeerConnectionError> {
         self.peer.validate_keepalive()
-    }
-
-    /// Gives a callback-scoped mutable connection view to the caller.
-    pub fn with_connection<R>(
-        &mut self,
-        f: impl for<'scope> FnOnce(ConnectionRefMut<'scope>) -> R,
-    ) -> Result<R, EventPeerConnectionError> {
-        let connection = self.peer.connection()?;
-        unsafe { ConnectionRefMut::with_raw(connection.as_ptr(), f) }.map_err(Into::into)
     }
 
     /// Installs the active logger and transfers the socket back without allocating a new socket.
@@ -1620,9 +1632,8 @@ impl<'address, 'log> EventPeerKeepalive<'address, 'log> {
                 keepalive: self,
             });
         }
-        self.peer.state = EventPeerState::Connected;
         let peer = self.peer.rebind_log(log);
-        Ok(EventPeerConnection { peer, state: EventPeerConnectionState::Borrowed })
+        Ok(EventPeerConnection { peer })
     }
 
     /// Notifies the active selector. Returns `false` when no callback exists.
@@ -1709,11 +1720,11 @@ pub enum EventPeerConnectStatus {
 #[derive(Debug)]
 pub enum EventPeerConnectResult<'address, 'log> {
     /// nginx connected the socket immediately.
-    Connected(EventPeer<'address, 'log>),
+    Connected(EventPeerConnection<'address, 'log>),
     /// The selector returned a cached connection with `NGX_DONE`.
-    Reused(EventPeer<'address, 'log>),
+    Reused(EventPeerConnection<'address, 'log>),
     /// nginx started a nonblocking connect operation.
-    Pending(EventPeer<'address, 'log>),
+    Pending(EventPeerPendingConnection<'address, 'log>),
     /// The selector returned `NGX_AGAIN` without acquiring a peer.
     SelectionPending(EventPeer<'address, 'log>),
     /// nginx returned `NGX_BUSY` without publishing a connection.
@@ -1737,19 +1748,6 @@ impl<'address, 'log> EventPeerConnectResult<'address, 'log> {
             Self::Error(_) => EventPeerConnectStatus::Error,
         }
     }
-
-    /// Returns the peer so the caller can apply its own retry or connection policy.
-    pub fn into_peer(self) -> EventPeer<'address, 'log> {
-        match self {
-            Self::Connected(peer)
-            | Self::Reused(peer)
-            | Self::Pending(peer)
-            | Self::SelectionPending(peer)
-            | Self::Busy(peer)
-            | Self::Declined(peer)
-            | Self::Error(peer) => peer,
-        }
-    }
 }
 
 /// Native connect result that violates the checked event-peer contract.
@@ -1757,11 +1755,6 @@ impl<'address, 'log> EventPeerConnectResult<'address, 'log> {
 /// The retained peer is detached from any connection pointer that cannot be safely owned.
 #[derive(Debug)]
 pub enum EventPeerConnectError<'address, 'log> {
-    /// The peer already owns a connection and cannot start another native connect.
-    AlreadyOwned {
-        /// The retained peer.
-        peer: EventPeer<'address, 'log>,
-    },
     /// nginx returned a status outside the supported event-peer results.
     UnexpectedStatus {
         /// The raw nginx status.
@@ -1807,8 +1800,7 @@ impl<'address, 'log> EventPeerConnectError<'address, 'log> {
     /// Returns the retained detached peer after a checked failure.
     pub fn into_peer(self) -> EventPeer<'address, 'log> {
         match self {
-            Self::AlreadyOwned { peer }
-            | Self::UnexpectedStatus { peer, .. }
+            Self::UnexpectedStatus { peer, .. }
             | Self::MissingConnection { peer, .. }
             | Self::MisalignedConnection { peer, .. }
             | Self::InvalidConnection { peer, .. }
@@ -1820,9 +1812,6 @@ impl<'address, 'log> EventPeerConnectError<'address, 'log> {
 impl fmt::Display for EventPeerConnectError<'_, '_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AlreadyOwned { .. } => {
-                formatter.write_str("event peer already owns a connection")
-            }
             Self::UnexpectedStatus { status, .. } => {
                 write!(formatter, "event peer returned unexpected nginx status {status}")
             }
