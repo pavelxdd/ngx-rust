@@ -815,6 +815,8 @@ impl<'callback> ConnectionRefMut<'callback> {
     }
 
     /// Receives bytes through nginx's configured connection callback.
+    ///
+    /// A zero return is end-of-file for streams and an empty message for datagrams.
     pub fn receive(
         &mut self,
         output: &mut [u8],
@@ -832,7 +834,11 @@ impl<'callback> ConnectionRefMut<'callback> {
                 .ok_or(ConnectionIoError::ReceiveTooLarge);
         }
         if result == 0 {
-            return Ok(ConnectionReadResult::EndOfFile);
+            return Ok(if unsafe { self.raw.as_ref().type_ } == libc::SOCK_DGRAM {
+                ConnectionReadResult::Data(0)
+            } else {
+                ConnectionReadResult::EndOfFile
+            });
         }
         if result == NGX_AGAIN as _ {
             return Ok(ConnectionReadResult::Again);
@@ -842,8 +848,10 @@ impl<'callback> ConnectionRefMut<'callback> {
     }
 
     /// Sends bytes through nginx's configured connection callback.
+    ///
+    /// Empty streams complete locally, while empty datagrams reach the native callback.
     pub fn send(&mut self, input: &[u8]) -> Result<ConnectionWriteResult, ConnectionIoError> {
-        if input.is_empty() {
+        if input.is_empty() && unsafe { self.raw.as_ref().type_ } != libc::SOCK_DGRAM {
             return Ok(ConnectionWriteResult::Written(0));
         }
 
