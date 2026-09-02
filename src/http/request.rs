@@ -1796,7 +1796,7 @@ unsafe fn checked_ngx_str<'a>(value: ngx_str_t) -> Result<&'a NgxStr, RequestErr
     Ok(NgxStr::from_bytes(bytes))
 }
 
-const MAX_SUBREQUEST_DEPTH: usize = 50;
+const MAX_SUBREQUEST_PARENT_EDGES: usize = NGX_HTTP_MAX_SUBREQUESTS as usize + 1;
 
 /// Shared callback-scoped access to an nginx HTTP request.
 ///
@@ -1916,7 +1916,7 @@ impl<'callback> RequestRef<'callback> {
         }
 
         let mut request = self.raw;
-        for _ in 0..MAX_SUBREQUEST_DEPTH {
+        for _ in 0..MAX_SUBREQUEST_PARENT_EDGES {
             let parent = NonNull::new(unsafe { request.as_ref().parent })
                 .ok_or(RequestError::ForeignMain)?;
             if !parent.as_ptr().is_aligned()
@@ -1949,7 +1949,7 @@ impl<'callback> RequestRef<'callback> {
 
     /// Number of additional nested subrequests nginx permits from this request.
     pub fn subrequests_available(&self) -> u32 {
-        unsafe { self.raw.as_ref().subrequests().saturating_sub(1) }
+        unsafe { self.raw.as_ref().subrequests() }
     }
 
     /// Shared access to the root main request.
@@ -4252,6 +4252,26 @@ mod tests {
         child.parent = &raw mut parent;
         let child = unsafe { RequestRefMut::from_raw(&raw mut child).unwrap() };
         assert!(matches!(child.main(), Err(RequestError::ForeignMain)));
+    }
+
+    #[test]
+    fn deepest_native_subrequest_chain_resolves_to_main() {
+        let request_count = usize::try_from(NGX_HTTP_MAX_SUBREQUESTS).unwrap() + 2;
+        let mut requests =
+            (0..request_count).map(|_| Box::new(zeroed_request())).collect::<Vec<_>>();
+        let main = ptr::from_mut(requests[0].as_mut());
+        initialize_request(requests[0].as_mut());
+
+        for index in 1..requests.len() {
+            let parent = ptr::from_mut(requests[index - 1].as_mut());
+            let child = requests[index].as_mut();
+            child.signature = NGX_HTTP_MODULE as _;
+            child.main = main;
+            child.parent = parent;
+        }
+
+        let deepest = request_from(requests.last_mut().unwrap());
+        assert_eq!(deepest.main().unwrap().raw, NonNull::new(main).unwrap());
     }
 
     #[test]
@@ -7036,10 +7056,10 @@ mod tests {
         let mut raw = zeroed_request();
 
         raw.set_subrequests(3);
-        assert_eq!(request_from(&mut raw).subrequests_available(), 2);
+        assert_eq!(request_from(&mut raw).subrequests_available(), 3);
 
         raw.set_subrequests(1);
-        assert_eq!(request_from(&mut raw).subrequests_available(), 0);
+        assert_eq!(request_from(&mut raw).subrequests_available(), 1);
 
         raw.set_subrequests(0);
         assert_eq!(request_from(&mut raw).subrequests_available(), 0);
