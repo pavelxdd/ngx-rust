@@ -310,17 +310,14 @@ impl HttpRequestHandler for AwsSigV4HeaderHandler {
             s.sign()
         };
 
-        if request.add_header_in("authorization", signature.as_str()).is_err()
-            || request.add_header_in("X-Amz-Date", datetime_now.as_str()).is_err()
-        {
+        // SAFETY: these post-parse fields are consumed from the raw list by upstream
+        // serialization; no later phase reads their compiled input-header state.
+        let append_failed = unsafe {
+            request.add_header_in("authorization", signature.as_str()).is_err()
+                || request.add_header_in("X-Amz-Date", datetime_now.as_str()).is_err()
+        };
+        if append_failed {
             return Status::NGX_ERROR;
-        }
-
-        for (name, value) in request.headers_out_iterator() {
-            ngx_log_debug_http!(request, "headers_out {name}: {value}",);
-        }
-        for (name, value) in request.headers_in_iterator() {
-            ngx_log_debug_http!(request, "headers_in  {name}: {value}",);
         }
 
         Status::NGX_OK
