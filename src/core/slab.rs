@@ -443,6 +443,10 @@ impl<'zone> SlabGuard<'zone, '_> {
         unsafe { ngx_slab_free_locked(self.pool.raw.as_ptr(), ptr.as_ptr().cast()) }
     }
 
+    pub(crate) fn mapping_len(&self) -> usize {
+        self.pool.mapping_end - self.pool.mapping_start
+    }
+
     pub(crate) fn check_typed<T>(&self, ptr: NonNull<T>) -> Result<(), SlabError> {
         if !ptr.as_ptr().is_aligned() {
             return Err(SlabError::MisalignedPointer);

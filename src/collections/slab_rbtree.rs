@@ -36,7 +36,7 @@ pub enum SlabRbTreeError {
     BrokenParent,
     /// The entry conversion does not round-trip through its rbtree node.
     EntryNodeMismatch,
-    /// Traversal exceeded its caller-provided bound.
+    /// Traversal exceeded its output or structural bound.
     TraversalLimit,
     /// A direct or duplicated child link repeats a node.
     Cycle,
@@ -396,11 +396,13 @@ where
         }
     }
 
-    /// Iterates in nginx rbtree order without traversing more than `max_entries` records.
+    /// Iterates in nginx rbtree order without yielding more than `max_entries` records.
     ///
     /// The iterator yields [`SlabRbTreeError::TraversalLimit`] if the tree has another record
-    /// after the requested bound or if malformed links exhaust its finite traversal budget.
+    /// after the requested bound or if malformed links exhaust the mapping-derived traversal
+    /// budget.
     pub fn iter(&self, max_entries: usize) -> SlabRbTreeIter<'_, 'guard, 'zone, 'lock, T> {
+        let max_nodes = self.guard.mapping_len() / core::mem::size_of::<ngx_rbtree_node_t>();
         SlabRbTreeIter {
             tree: self,
             next: None,
@@ -408,6 +410,7 @@ where
             yielded: 0,
             max_entries,
             steps: 0,
+            max_steps: max_nodes.saturating_mul(2),
             done: false,
         }
     }
@@ -549,6 +552,7 @@ pub struct SlabRbTreeIter<'tree, 'guard, 'zone, 'lock, T: SlabRbTreeEntry> {
     yielded: usize,
     max_entries: usize,
     steps: usize,
+    max_steps: usize,
     done: bool,
 }
 
@@ -640,8 +644,7 @@ where
     }
 
     fn consume_step(&mut self) -> Result<(), SlabRbTreeError> {
-        let limit = self.max_entries.saturating_mul(4).saturating_add(1);
-        if self.steps == limit {
+        if self.steps == self.max_steps {
             return Err(SlabRbTreeError::TraversalLimit);
         }
         self.steps += 1;
