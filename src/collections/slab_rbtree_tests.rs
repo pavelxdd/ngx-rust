@@ -228,6 +228,21 @@ fn iterates_in_order_and_reports_the_bound() {
 }
 
 #[test]
+fn small_iteration_bound_allows_a_deep_valid_tree() {
+    let zone = TestZone::new();
+    let mut pool = zone.pool();
+    let mut guard = pool.lock();
+    let (mut tree, _, _) = init_tree(&mut guard);
+    for key in (1..=64).rev() {
+        insert(&mut tree, key, 0, key as i32);
+    }
+
+    let mut iter = tree.iter(1);
+    assert_eq!(*iter.next().unwrap().unwrap().payload(), 1);
+    assert!(matches!(iter.next(), Some(Err(SlabRbTreeError::TraversalLimit))));
+}
+
+#[test]
 fn removes_a_root_with_two_children_before_freeing_it() {
     let zone = TestZone::new();
     let mut pool = zone.pool();
