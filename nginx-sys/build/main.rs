@@ -1,13 +1,19 @@
 extern crate bindgen;
 
+mod link;
 mod source;
 
 use core::error::Error as StdError;
 use std::env;
+#[cfg(feature = "test-link")]
+use std::fs;
 use std::fs::{File, read_to_string};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use link::logical_makefile_lines;
+#[cfg(feature = "test-link")]
+use link::{NativeLinkInput, nginx_binary_objects, nginx_build_archives, nginx_native_link_inputs};
 use source::NginxSource;
 
 const ENV_VARS_TRIGGERING_RECOMPILE: &[&str] = &["OUT_DIR", "NGINX_BUILD_DIR", "NGINX_SOURCE_DIR"];
@@ -93,6 +99,7 @@ fn main() -> Result<(), BoxError> {
         println!("cargo:rerun-if-env-changed={var}");
     }
     println!("cargo:rerun-if-changed=build/main.rs");
+    println!("cargo:rerun-if-changed=build/link.rs");
     println!("cargo:rerun-if-changed=build/source.rs");
     println!("cargo:rerun-if-changed=build/wrapper.h");
 
@@ -362,27 +369,37 @@ fn build_test_library(
     let lines = logical_makefile_lines(&makefile);
     let objects = nginx_binary_objects(&lines);
     let mut sources = Vec::with_capacity(objects.len());
-    let mut external_sources = 0;
+    let mut replaced_inputs = Vec::with_capacity(objects.len());
+    let mut external_objects = 0;
 
     for object in objects {
-        let source = object_source(&lines, &object)
-            .unwrap_or_else(|| panic!("source file for NGINX object {object}"));
+        let Some(source) = object_source(&lines, &object) else {
+            external_objects += 1;
+            continue;
+        };
         let source = resolve_makefile_path(nginx, &source);
         let Ok(source) = dunce::canonicalize(source) else {
-            external_sources += 1;
+            external_objects += 1;
             continue;
         };
         if !source.starts_with(&nginx.source_dir) && !source.starts_with(&nginx.build_dir) {
-            external_sources += 1;
+            external_objects += 1;
             continue;
         }
+        replaced_inputs.push(object);
         if !source.ends_with("src/core/nginx.c") {
             println!("cargo:rerun-if-changed={}", source.display());
             sources.push(source);
         }
     }
-    if external_sources > 0 {
-        println!("cargo::warning=skipped {external_sources} configured external source files");
+    replaced_inputs.extend(
+        nginx_build_archives(&lines, &nginx.source_dir, &nginx.build_dir)
+            .unwrap_or_else(|error| panic!("{error}")),
+    );
+    if external_objects > 0 {
+        println!(
+            "cargo::warning=using {external_objects} configured object files without rebuilding their sources"
+        );
     }
 
     let allocation_source = dunce::canonicalize(nginx.source_dir.join("src/os/unix/ngx_alloc.c"))
@@ -669,48 +686,7 @@ ngx_rs_test_stream_proxy_protocol_addr_port(ngx_stream_session_t *session,
     build.files(sources);
     build.compile("nginx_test");
 
-    emit_nginx_link_libraries(nginx, &lines);
-}
-
-fn logical_makefile_lines(makefile: &str) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut logical = String::new();
-
-    for raw in makefile.lines() {
-        let raw = raw.trim_end();
-        if let Some(part) = raw.strip_suffix('\\') {
-            logical.push_str(part);
-            logical.push(' ');
-        } else {
-            logical.push_str(raw);
-            lines.push(core::mem::take(&mut logical));
-        }
-    }
-    if !logical.is_empty() {
-        lines.push(logical);
-    }
-
-    lines
-}
-
-#[cfg(feature = "test-link")]
-fn nginx_binary_objects(lines: &[String]) -> Vec<String> {
-    lines
-        .iter()
-        .find_map(|line| {
-            let (target, dependencies) = line.split_once(':')?;
-            let target = Path::new(target.trim());
-            if target.file_name()?.to_str()? != "nginx" {
-                return None;
-            }
-
-            let objects: Vec<_> = shlex::split(dependencies)?
-                .into_iter()
-                .filter(|dependency| dependency.ends_with(".o"))
-                .collect();
-            (!objects.is_empty()).then_some(objects)
-        })
-        .expect("NGINX binary object list")
+    emit_nginx_link_libraries(nginx, &lines, &replaced_inputs);
 }
 
 #[cfg(feature = "test-link")]
@@ -818,40 +794,82 @@ fn c_standard(lines: &[String]) -> Option<String> {
 }
 
 #[cfg(feature = "test-link")]
-fn emit_nginx_link_libraries(nginx: &NginxSource, lines: &[String]) {
-    let link = lines
-        .iter()
-        .find(|line| line.trim_start().starts_with("$(LINK) -o "))
-        .expect("NGINX link command");
-    let words = shlex::split(link).expect("NGINX link command arguments");
-    let mut search_paths = Vec::new();
-    let mut libraries = Vec::new();
-    let mut words = words.into_iter();
+fn emit_nginx_link_libraries(nginx: &NginxSource, lines: &[String], replaced_inputs: &[String]) {
+    let inputs =
+        nginx_native_link_inputs(lines, replaced_inputs).unwrap_or_else(|error| panic!("{error}"));
 
-    while let Some(word) = words.next() {
-        if let Some(path) = word.strip_prefix("-L") {
-            let path =
-                if path.is_empty() { words.next().expect("-L argument") } else { path.into() };
-            let path = resolve_makefile_path(nginx, &path);
-            if path.exists() {
-                search_paths.push(path);
+    for (position, input) in inputs.into_iter().enumerate() {
+        match input {
+            NativeLinkInput::SearchPath(path) => {
+                let path = resolve_makefile_path(nginx, &path);
+                println!("cargo::rustc-link-search=native={}", path.display());
             }
-        } else if let Some(library) = word.strip_prefix("-l") {
-            let library = if library.is_empty() {
-                words.next().expect("-l argument")
-            } else {
-                library.into()
-            };
-            libraries.push(library);
+            NativeLinkInput::Library { name, whole_archive: false } => {
+                println!("cargo::rustc-link-lib={name}");
+            }
+            NativeLinkInput::Library { name, whole_archive: true } => {
+                println!("cargo::rustc-link-lib=static:+whole-archive={name}");
+            }
+            NativeLinkInput::Archive { path, whole_archive } => {
+                emit_nginx_link_archive(nginx, &path, position, whole_archive);
+            }
+            NativeLinkInput::Object(path) => emit_nginx_link_object(nginx, &path, position),
         }
     }
+}
 
-    for path in search_paths {
-        println!("cargo::rustc-link-search=native={}", path.display());
+#[cfg(feature = "test-link")]
+fn emit_nginx_link_archive(
+    nginx: &NginxSource,
+    archive: &str,
+    position: usize,
+    whole_archive: bool,
+) {
+    let archive = dunce::canonicalize(resolve_makefile_path(nginx, archive))
+        .expect("configured NGINX native archive");
+    let file_name =
+        archive.file_name().and_then(|name| name.to_str()).expect("Unicode archive name");
+    let staged_name = format!("nginx_test_link_{position}_{file_name}");
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let staged = out_dir.join(&staged_name);
+
+    match fs::remove_file(&staged) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            panic!("failed to replace staged NGINX archive {}: {error}", staged.display())
+        }
     }
-    for library in libraries {
-        println!("cargo::rustc-link-lib={library}");
+    if fs::hard_link(&archive, &staged).is_err() {
+        fs::copy(&archive, &staged).unwrap_or_else(|error| {
+            panic!(
+                "failed to stage NGINX archive {} as {}: {error}",
+                archive.display(),
+                staged.display()
+            )
+        });
     }
+
+    println!("cargo:rerun-if-changed={}", archive.display());
+    println!("cargo::rustc-link-search=native={}", out_dir.display());
+    let modifiers = if whole_archive { "+whole-archive,+verbatim" } else { "+verbatim" };
+    println!("cargo::rustc-link-lib=static:{modifiers}={staged_name}");
+}
+
+#[cfg(feature = "test-link")]
+fn emit_nginx_link_object(nginx: &NginxSource, object: &str, position: usize) {
+    let object = dunce::canonicalize(resolve_makefile_path(nginx, object))
+        .expect("configured NGINX native object");
+    let library = format!("nginx_test_link_object_{position}");
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let mut build = cc::Build::new();
+    build.object(&object);
+    build.cargo_metadata(false);
+    build.compile(&library);
+
+    println!("cargo:rerun-if-changed={}", object.display());
+    println!("cargo::rustc-link-search=native={}", out_dir.display());
+    println!("cargo::rustc-link-lib=static:+whole-archive={library}");
 }
 
 /// Reads through the makefile generated by autoconf and finds all of the includes
