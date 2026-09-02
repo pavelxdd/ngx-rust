@@ -6,12 +6,10 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::future::Future;
 use core::mem;
-use core::panic::AssertUnwindSafe;
 use core::pin::Pin;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::task::{Context, Poll, Waker};
-use std::panic::catch_unwind;
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, ThreadId};
 
@@ -63,12 +61,12 @@ pub enum SchedulerShutdownError {
 }
 
 /// Terminal failure returned by a [`LocalTask`].
+///
+/// A panic from the task future is not recoverable and terminates the worker process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskError {
     /// The task's owner canceled it before it produced an output.
     Canceled,
-    /// The task's future panicked while being polled.
-    Panicked,
     /// The worker scheduler could no longer deliver task wakeups.
     SchedulerFailed,
     /// The task output was already consumed by an earlier poll.
@@ -82,7 +80,6 @@ enum TaskStatus {
     CancelRequested,
     Ready,
     Canceled,
-    Panicked,
     SchedulerFailed,
 }
 
@@ -93,7 +90,6 @@ impl TaskStatus {
             1 => Self::CancelRequested,
             2 => Self::Ready,
             3 => Self::Canceled,
-            4 => Self::Panicked,
             _ => Self::SchedulerFailed,
         }
     }
@@ -101,7 +97,6 @@ impl TaskStatus {
     fn error(self) -> Option<TaskError> {
         match self {
             Self::Canceled => Some(TaskError::Canceled),
-            Self::Panicked => Some(TaskError::Panicked),
             Self::SchedulerFailed => Some(TaskError::SchedulerFailed),
             Self::Active | Self::CancelRequested | Self::Ready => None,
         }
@@ -162,7 +157,6 @@ impl TaskControl {
                 TaskStatus::CancelRequested
                 | TaskStatus::Ready
                 | TaskStatus::Canceled
-                | TaskStatus::Panicked
                 | TaskStatus::SchedulerFailed => return,
             }
         }
@@ -187,10 +181,7 @@ impl TaskControl {
                         Err(next) => status = TaskStatus::from_raw(next),
                     }
                 }
-                TaskStatus::Ready
-                | TaskStatus::Canceled
-                | TaskStatus::Panicked
-                | TaskStatus::SchedulerFailed => return,
+                TaskStatus::Ready | TaskStatus::Canceled | TaskStatus::SchedulerFailed => return,
             }
         }
     }
@@ -202,10 +193,9 @@ impl TaskControl {
             let next = match status {
                 TaskStatus::Active => desired,
                 TaskStatus::CancelRequested => TaskStatus::Canceled,
-                TaskStatus::Ready
-                | TaskStatus::Canceled
-                | TaskStatus::Panicked
-                | TaskStatus::SchedulerFailed => return status,
+                TaskStatus::Ready | TaskStatus::Canceled | TaskStatus::SchedulerFailed => {
+                    return status;
+                }
             };
 
             match self.status.compare_exchange_weak(
@@ -942,7 +932,7 @@ impl<F, T> TaskRunner<F, T> {
                 self.state.resolve(Ok(output));
                 self.control.wake();
             }
-            TaskStatus::Canceled | TaskStatus::Panicked | TaskStatus::SchedulerFailed => {
+            TaskStatus::Canceled | TaskStatus::SchedulerFailed => {
                 drop(output);
                 if let Some(error) = self.control.status().error() {
                     self.state.resolve(Err(error));
@@ -970,14 +960,10 @@ where
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().get_mut();
-        match catch_unwind(AssertUnwindSafe(|| this.future.as_mut().poll(context))) {
-            Ok(Poll::Pending) => Poll::Pending,
-            Ok(Poll::Ready(output)) => {
+        match this.future.as_mut().poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(output) => {
                 this.finish_ready(output);
-                Poll::Ready(())
-            }
-            Err(_) => {
-                this.finish_error(TaskStatus::Panicked);
                 Poll::Ready(())
             }
         }
@@ -1905,22 +1891,6 @@ mod worker_tests {
 
         assert_eq!(wakes.load(Ordering::Relaxed), 1);
         assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::SchedulerFailed)));
-    }
-
-    #[test]
-    fn task_panic_is_reported_without_crossing_the_scheduler_callback() {
-        let mut worker = TestWorker::new();
-        worker.init().unwrap();
-
-        let task = spawn(async {
-            panic!("task panic");
-        })
-        .unwrap();
-        worker.process_posted();
-
-        let mut task = core::pin::pin!(task);
-        let mut context = Context::from_waker(Waker::noop());
-        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::Panicked)));
     }
 
     #[test]

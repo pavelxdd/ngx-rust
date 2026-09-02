@@ -8,11 +8,6 @@ use core::ptr::{self, NonNull};
 use core::slice;
 use core::str::FromStr;
 
-#[cfg(feature = "std")]
-use core::panic::AssertUnwindSafe;
-#[cfg(feature = "std")]
-use std::panic::catch_unwind;
-
 use crate::collections::{NgxList, list::NgxListIter};
 use crate::core::*;
 #[cfg(feature = "async")]
@@ -176,7 +171,9 @@ impl IntoHandlerStatus for HTTPStatus {
     }
 }
 
-/// Trait for static request handler.
+/// Trait for a static request handler.
+///
+/// A handler must not panic; panics terminate the worker process.
 pub trait HttpRequestHandler {
     /// The phase in which the handler is invoked.
     const PHASE: HttpPhase;
@@ -723,7 +720,8 @@ impl ClientBodyReadStatus {
 /// Static callback invoked when nginx completes a client-body read.
 ///
 /// The owner of request cancellation keeps its active state in its pinned request context and
-/// overrides [`is_active`](Self::is_active) to reject late native callbacks.
+/// overrides [`is_active`](Self::is_active) to reject late native callbacks. A callback must not
+/// panic; panics terminate the worker process.
 pub trait HttpClientBodyHandler {
     /// Returns whether the request owner still accepts a client-body callback.
     fn is_active(_request: RequestRef<'_>) -> bool {
@@ -3304,7 +3302,7 @@ impl fmt::Debug for RequestRefMut<'_> {
 }
 
 /// Runs one HTTP callback with a checked exclusive request view and converts its result to an
-/// nginx status. Panics from Rust callbacks never unwind through nginx's C ABI.
+/// nginx status. A callback must not panic; panics terminate the worker process.
 #[doc(hidden)]
 pub unsafe fn request_callback_status<R>(
     request: *mut ngx_http_request_t,
@@ -3313,29 +3311,13 @@ pub unsafe fn request_callback_status<R>(
 where
     R: IntoHandlerStatus,
 {
-    #[cfg(feature = "std")]
-    {
-        match catch_unwind(AssertUnwindSafe(|| unsafe {
-            RequestRefMut::with_raw(request, |mut request| {
-                let result = callback(&mut request);
-                result.into_handler_status(&request.view())
-            })
-        })) {
-            Ok(Ok(status)) => status,
-            Ok(Err(_)) | Err(_) => NGX_ERROR as _,
-        }
+    unsafe {
+        RequestRefMut::with_raw(request, |mut request| {
+            let result = callback(&mut request);
+            result.into_handler_status(&request.view())
+        })
     }
-
-    #[cfg(not(feature = "std"))]
-    {
-        unsafe {
-            RequestRefMut::with_raw(request, |mut request| {
-                let result = callback(&mut request);
-                result.into_handler_status(&request.view())
-            })
-        }
-        .unwrap_or(NGX_ERROR as _)
-    }
+    .unwrap_or(NGX_ERROR as _)
 }
 
 /// Iterator for [`ngx_list_t`] types.
@@ -4421,20 +4403,6 @@ mod tests {
         );
         assert_eq!(
             unsafe { request_callback_status(core::ptr::null_mut(), |_| Status::NGX_OK) },
-            NGX_ERROR as _
-        );
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn callback_boundary_catches_panics() {
-        let mut raw = zeroed_request();
-        initialize_request(&mut raw);
-
-        assert_eq!(
-            unsafe {
-                request_callback_status(&raw mut raw, |_| -> Status { panic!("callback panic") })
-            },
             NGX_ERROR as _
         );
     }

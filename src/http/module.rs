@@ -5,11 +5,6 @@ use core::marker::PhantomData;
 use core::pin::Pin;
 use core::ptr::{self, NonNull};
 
-#[cfg(feature = "std")]
-use core::panic::AssertUnwindSafe;
-#[cfg(feature = "std")]
-use std::panic::catch_unwind;
-
 use crate::core::{ModuleDescriptor, NGX_CONF_ERROR, Pool, Status};
 use crate::ffi::{NGX_LOG_EMERG, ngx_conf_t, ngx_cycle_t, ngx_int_t};
 use crate::http::{
@@ -47,6 +42,8 @@ impl From<&'static CStr> for MergeConfigError {
 }
 
 /// Merges a child configuration value with its parent.
+///
+/// A merge callback must not panic; panics terminate the worker process.
 pub trait Merge {
     /// Applies inherited values or returns a configuration error.
     fn merge(&mut self, parent: &Self) -> Result<(), MergeConfigError>;
@@ -59,6 +56,8 @@ impl Merge for () {
 }
 
 /// Initializes a module's main configuration after parsing.
+///
+/// An initialization callback must not panic; panics terminate the worker process.
 pub trait InitMainConf {
     /// Applies post-parse validation or returns a static nginx configuration error.
     fn init_main_conf(&mut self) -> Result<(), MergeConfigError>;
@@ -194,69 +193,22 @@ fn process_callback_status(
     cycle: *mut ngx_cycle_t,
     callback: impl for<'scope> FnOnce(ProcessCycle<'scope>) -> ngx_int_t,
 ) -> ngx_int_t {
-    #[cfg(feature = "std")]
-    {
-        match catch_unwind(AssertUnwindSafe(|| unsafe { ProcessCycle::with_raw(cycle, callback) }))
-        {
-            Ok(Ok(status)) => status,
-            Ok(Err(_)) | Err(_) => Status::NGX_ERROR.0,
-        }
-    }
-
-    #[cfg(not(feature = "std"))]
-    {
-        unsafe { ProcessCycle::with_raw(cycle, callback) }.unwrap_or(Status::NGX_ERROR.0)
-    }
+    unsafe { ProcessCycle::with_raw(cycle, callback) }.unwrap_or(Status::NGX_ERROR.0)
 }
 
 fn process_exit_callback(
     cycle: *mut ngx_cycle_t,
     callback: impl for<'scope> FnOnce(ProcessCycle<'scope>),
 ) {
-    #[cfg(feature = "std")]
-    {
-        let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
-            let _ = ProcessCycle::with_raw(cycle, callback);
-        }));
-    }
-
-    #[cfg(not(feature = "std"))]
-    {
-        let _ = unsafe { ProcessCycle::with_raw(cycle, callback) };
-    }
+    let _ = unsafe { ProcessCycle::with_raw(cycle, callback) };
 }
 
 pub(crate) fn configuration_callback_status(
     configuration: *mut ngx_conf_t,
     callback: impl for<'scope> FnOnce(&mut HttpConfigurationParser<'scope>) -> ngx_int_t,
 ) -> ngx_int_t {
-    #[cfg(feature = "std")]
-    {
-        match catch_unwind(AssertUnwindSafe(|| unsafe {
-            HttpConfigurationParser::with_raw(configuration, callback)
-        })) {
-            Ok(Ok(status)) => status,
-            Ok(Err(_)) => Status::NGX_ERROR.0,
-            Err(_) => {
-                if let Some(configuration) = unsafe { checked_mut(configuration) }
-                    && !configuration.log.is_null()
-                {
-                    crate::ngx_conf_log_error!(
-                        NGX_LOG_EMERG,
-                        configuration,
-                        "Rust HTTP configuration callback panicked"
-                    );
-                }
-                Status::NGX_ERROR.0
-            }
-        }
-    }
-
-    #[cfg(not(feature = "std"))]
-    {
-        unsafe { HttpConfigurationParser::with_raw(configuration, callback) }
-            .unwrap_or(Status::NGX_ERROR.0)
-    }
+    unsafe { HttpConfigurationParser::with_raw(configuration, callback) }
+        .unwrap_or(Status::NGX_ERROR.0)
 }
 
 /// C-compatible adapter for an HTTP module preconfiguration callback.
@@ -275,8 +227,8 @@ pub(crate) fn configuration_callback_status(
 /// # Safety
 ///
 /// `cf` must point to a live nginx configuration parser state for this callback invocation.
-/// Null and misaligned pointers return `NGX_ERROR`; Rust panics return `NGX_ERROR` instead of
-/// unwinding through nginx.
+/// Null and misaligned pointers return `NGX_ERROR`. A module callback must not panic; panics
+/// terminate the worker process.
 pub unsafe extern "C" fn preconfiguration<M>(cf: *mut ngx_conf_t) -> ngx_int_t
 where
     M: HttpModule,
@@ -289,8 +241,8 @@ where
 /// # Safety
 ///
 /// `cf` must point to a live nginx configuration parser state for this callback invocation.
-/// Null and misaligned pointers return `NGX_ERROR`; Rust panics return `NGX_ERROR` instead of
-/// unwinding through nginx.
+/// Null and misaligned pointers return `NGX_ERROR`. A module callback must not panic; panics
+/// terminate the worker process.
 pub unsafe extern "C" fn postconfiguration<M>(cf: *mut ngx_conf_t) -> ngx_int_t
 where
     M: HttpModule,
@@ -303,8 +255,8 @@ where
 /// # Safety
 ///
 /// `cycle` must point to the live nginx cycle supplied for this process callback. Null and
-/// misaligned pointers return `NGX_ERROR`; Rust panics return `NGX_ERROR` instead of unwinding
-/// through nginx.
+/// misaligned pointers return `NGX_ERROR`. A module callback must not panic; panics terminate the
+/// worker process.
 pub unsafe extern "C" fn init_process<M>(cycle: *mut ngx_cycle_t) -> ngx_int_t
 where
     M: HttpModule,
@@ -316,8 +268,9 @@ where
 ///
 /// # Safety
 ///
-/// `cycle` must point to the live nginx cycle supplied for this process callback. Null,
-/// misaligned pointers, and Rust panics do not cross nginx's void callback boundary.
+/// `cycle` must point to the live nginx cycle supplied for this process callback. Null and
+/// misaligned pointers are ignored. A module callback must not panic; panics terminate the worker
+/// process.
 pub unsafe extern "C" fn exit_process<M>(cycle: *mut ngx_cycle_t)
 where
     M: HttpModule,
@@ -361,22 +314,9 @@ where
         return ptr::null_mut();
     };
 
-    #[cfg(feature = "std")]
-    {
-        match pool.try_allocate_with_cleanup(|| -> Result<T, ()> {
-            catch_unwind(AssertUnwindSafe(T::default)).map_err(|_| ())
-        }) {
-            Ok(value) => value.into_non_null().as_ptr().cast(),
-            Err(_) => ptr::null_mut(),
-        }
-    }
-
-    #[cfg(not(feature = "std"))]
-    {
-        pool.allocate_with_cleanup(T::default)
-            .map(|value| value.into_non_null().as_ptr().cast())
-            .unwrap_or(ptr::null_mut())
-    }
+    pool.allocate_with_cleanup(T::default)
+        .map(|value| value.into_non_null().as_ptr().cast())
+        .unwrap_or(ptr::null_mut())
 }
 
 fn log_configuration_error(cf: *mut ngx_conf_t, action: &str, error: &dyn fmt::Display) {
@@ -412,19 +352,10 @@ where
         return NGX_CONF_ERROR;
     };
 
-    #[cfg(feature = "std")]
-    let result = catch_unwind(AssertUnwindSafe(|| conf.init_main_conf()));
-    #[cfg(not(feature = "std"))]
-    let result = Ok::<_, ()>(conf.init_main_conf());
-
-    match result {
-        Ok(Ok(())) => ptr::null_mut(),
-        Ok(Err(error)) => {
+    match conf.init_main_conf() {
+        Ok(()) => ptr::null_mut(),
+        Err(error) => {
             log_configuration_error(cf, "initialize main configuration", &error);
-            NGX_CONF_ERROR
-        }
-        Err(_) => {
-            log_configuration_error(cf, "initialize main configuration", &"callback panicked");
             NGX_CONF_ERROR
         }
     }
@@ -449,19 +380,10 @@ where
         return NGX_CONF_ERROR;
     };
 
-    #[cfg(feature = "std")]
-    let result = catch_unwind(AssertUnwindSafe(|| child.merge(parent)));
-    #[cfg(not(feature = "std"))]
-    let result = Ok::<_, ()>(child.merge(parent));
-
-    match result {
-        Ok(Ok(())) => ptr::null_mut(),
-        Ok(Err(error)) => {
+    match child.merge(parent) {
+        Ok(()) => ptr::null_mut(),
+        Err(error) => {
             log_merge_error(cf, level, &error);
-            NGX_CONF_ERROR
-        }
-        Err(_) => {
-            log_merge_error(cf, level, &"callback panicked");
             NGX_CONF_ERROR
         }
     }
@@ -471,7 +393,8 @@ where
 ///
 /// # Safety
 /// `module()` must return this type's real live global module descriptor. Nginx must have
-/// initialized its module and context indexes before any typed configuration access. Callback
+/// initialized its module and context indexes before any typed configuration access. No callback
+/// may panic; a panic terminates the worker process. Callback
 /// implementations must not unwind across nginx's C ABI.
 pub unsafe trait HttpModule {
     /// Returns the opaque identity of the global module descriptor.
@@ -708,18 +631,6 @@ mod tests {
         }
     }
 
-    struct PanicConfigurationModule;
-
-    unsafe impl HttpModule for PanicConfigurationModule {
-        fn module() -> ModuleDescriptor {
-            test_module()
-        }
-
-        fn postconfigure(_parser: &mut crate::http::HttpConfigurationParser<'_>) -> ngx_int_t {
-            panic!("configuration callback panic");
-        }
-    }
-
     static PROCESS_STARTS: AtomicUsize = AtomicUsize::new(0);
     static PROCESS_STOPS: AtomicUsize = AtomicUsize::new(0);
 
@@ -749,24 +660,6 @@ mod tests {
 
         fn init_process(_cycle: ProcessCycle<'_>) -> ngx_int_t {
             Status::NGX_ERROR.0
-        }
-    }
-
-    #[cfg(feature = "std")]
-    struct PanicProcessModule;
-
-    #[cfg(feature = "std")]
-    unsafe impl HttpModule for PanicProcessModule {
-        fn module() -> ModuleDescriptor {
-            test_module()
-        }
-
-        fn init_process(_cycle: ProcessCycle<'_>) -> ngx_int_t {
-            panic!("process startup panic");
-        }
-
-        fn exit_process(_cycle: ProcessCycle<'_>) {
-            panic!("process shutdown panic");
         }
     }
 
@@ -810,18 +703,6 @@ mod tests {
         assert_eq!(PROCESS_STOPS.load(Ordering::Relaxed), 2);
     }
 
-    #[cfg(feature = "std")]
-    #[test]
-    fn process_callbacks_catch_panics_before_crossing_nginx() {
-        let mut cycle = unsafe { mem::zeroed::<ngx_cycle_t>() };
-
-        assert_eq!(
-            unsafe { init_process::<PanicProcessModule>(&raw mut cycle) },
-            Status::NGX_ERROR.0
-        );
-        unsafe { exit_process::<PanicProcessModule>(&raw mut cycle) };
-    }
-
     #[test]
     fn default_configuration_hooks_reject_null_and_misaligned_parser_contexts() {
         assert_eq!(
@@ -845,33 +726,6 @@ mod tests {
         assert_eq!(
             unsafe { postconfiguration::<TestHttpModule>(&raw mut configuration) },
             Status::NGX_OK.0
-        );
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn configuration_callbacks_reject_invalid_contexts_and_catch_panics() {
-        assert_eq!(
-            unsafe { preconfiguration::<TestHttpModule>(ptr::null_mut()) },
-            Status::NGX_ERROR.0
-        );
-        assert_eq!(
-            unsafe { postconfiguration::<TestHttpModule>(ptr::null_mut()) },
-            Status::NGX_ERROR.0
-        );
-
-        let misaligned = ptr::without_provenance_mut::<ngx_conf_t>(1);
-        assert_eq!(unsafe { preconfiguration::<TestHttpModule>(misaligned) }, Status::NGX_ERROR.0);
-        assert_eq!(unsafe { postconfiguration::<TestHttpModule>(misaligned) }, Status::NGX_ERROR.0);
-
-        let mut configuration = unsafe { mem::zeroed::<ngx_conf_t>() };
-        assert_eq!(
-            unsafe { preconfiguration::<TestHttpModule>(&raw mut configuration) },
-            Status::NGX_OK.0
-        );
-        assert_eq!(
-            unsafe { postconfiguration::<PanicConfigurationModule>(&raw mut configuration) },
-            Status::NGX_ERROR.0
         );
     }
 
@@ -1376,141 +1230,5 @@ mod tests {
             assert!(main.is_null());
             assert_eq!(unsafe { (*pool.raw).cleanup }, cleanup);
         }
-    }
-
-    #[cfg(all(feature = "std", feature = "test-link"))]
-    struct PanicDefaultConf;
-
-    #[cfg(all(feature = "std", feature = "test-link"))]
-    impl Default for PanicDefaultConf {
-        fn default() -> Self {
-            panic!("default panic")
-        }
-    }
-
-    #[cfg(all(feature = "std", feature = "test-link"))]
-    struct PanicDefaultModule;
-
-    #[cfg(all(feature = "std", feature = "test-link"))]
-    unsafe impl HttpModule for PanicDefaultModule {
-        fn module() -> ModuleDescriptor {
-            test_module()
-        }
-    }
-
-    #[cfg(all(feature = "std", feature = "test-link"))]
-    unsafe impl HttpModuleMainConf for PanicDefaultModule {
-        type MainConf = PanicDefaultConf;
-    }
-
-    #[cfg(all(feature = "std", feature = "test-link"))]
-    #[test]
-    fn default_panic_does_not_publish_or_leave_a_cleanup_entry() {
-        let pool = TestPool::new();
-        let mut configuration = pool.configuration();
-        let cleanup = unsafe { (*pool.raw).cleanup };
-
-        assert!(unsafe { PanicDefaultModule::create_main_conf(&raw mut configuration) }.is_null());
-        assert_eq!(unsafe { (*pool.raw).cleanup }, cleanup);
-    }
-
-    #[cfg(feature = "std")]
-    struct PanicInitConf;
-
-    #[cfg(feature = "std")]
-    impl InitMainConf for PanicInitConf {
-        fn init_main_conf(&mut self) -> Result<(), MergeConfigError> {
-            panic!("init panic")
-        }
-    }
-
-    #[cfg(feature = "std")]
-    struct PanicInitModule;
-
-    #[cfg(feature = "std")]
-    unsafe impl HttpModule for PanicInitModule {
-        fn module() -> ModuleDescriptor {
-            test_module()
-        }
-    }
-
-    #[cfg(feature = "std")]
-    unsafe impl HttpModuleMainConf for PanicInitModule {
-        type MainConf = PanicInitConf;
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn init_panic_returns_nginx_configuration_error() {
-        let mut parser = unsafe { mem::zeroed::<ngx_conf_t>() };
-        let mut configuration = PanicInitConf;
-
-        assert_eq!(
-            unsafe {
-                PanicInitModule::init_main_conf(&raw mut parser, (&raw mut configuration).cast())
-            },
-            NGX_CONF_ERROR
-        );
-    }
-
-    #[cfg(feature = "std")]
-    struct PanicMergeConf;
-
-    #[cfg(feature = "std")]
-    impl Merge for PanicMergeConf {
-        fn merge(&mut self, _parent: &Self) -> Result<(), MergeConfigError> {
-            panic!("merge panic")
-        }
-    }
-
-    #[cfg(feature = "std")]
-    struct PanicMergeModule;
-
-    #[cfg(feature = "std")]
-    unsafe impl HttpModule for PanicMergeModule {
-        fn module() -> ModuleDescriptor {
-            test_module()
-        }
-    }
-
-    #[cfg(feature = "std")]
-    unsafe impl HttpModuleServerConf for PanicMergeModule {
-        type ServerConf = PanicMergeConf;
-    }
-
-    #[cfg(feature = "std")]
-    unsafe impl HttpModuleLocationConf for PanicMergeModule {
-        type LocationConf = PanicMergeConf;
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn server_and_location_merge_panics_return_nginx_configuration_error() {
-        let mut parser = unsafe { mem::zeroed::<ngx_conf_t>() };
-        let mut server_parent = PanicMergeConf;
-        let mut server_child = PanicMergeConf;
-        assert_eq!(
-            unsafe {
-                PanicMergeModule::merge_srv_conf(
-                    &raw mut parser,
-                    (&raw mut server_parent).cast(),
-                    (&raw mut server_child).cast(),
-                )
-            },
-            NGX_CONF_ERROR
-        );
-
-        let mut location_parent = PanicMergeConf;
-        let mut location_child = PanicMergeConf;
-        assert_eq!(
-            unsafe {
-                PanicMergeModule::merge_loc_conf(
-                    &raw mut parser,
-                    (&raw mut location_parent).cast(),
-                    (&raw mut location_child).cast(),
-                )
-            },
-            NGX_CONF_ERROR
-        );
     }
 }
