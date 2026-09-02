@@ -159,6 +159,15 @@ unsafe extern "C" fn send_chain_tail(
     unsafe { (*input).next }
 }
 
+unsafe extern "C" fn send_chain_record_limit(
+    connection: *mut ngx_connection_t,
+    input: *mut ngx_chain_t,
+    limit: off_t,
+) -> *mut ngx_chain_t {
+    unsafe { (*connection).sent = limit };
+    unsafe { (*input).next }
+}
+
 unsafe extern "C" fn send_chain_complete(
     _connection: *mut ngx_connection_t,
     _input: *mut ngx_chain_t,
@@ -403,6 +412,36 @@ fn connection_chain_send_preserves_the_unsent_tail_and_maps_terminal_results() {
         unsafe { connection.send_chain(input, 0) },
         Err(ConnectionChainWriteError::MissingSendChain)
     ));
+}
+
+#[test]
+fn connection_chain_send_rejects_negative_and_forwards_positive_limits() {
+    let first = b"first";
+    let second = b"second";
+    let mut first_buffer = memory_buffer(first);
+    let mut second_buffer = memory_buffer(second);
+    let mut tail = ngx_chain_t { buf: &raw mut second_buffer, next: ptr::null_mut() };
+    let mut head = ngx_chain_t { buf: &raw mut first_buffer, next: &raw mut tail };
+    let mut raw = zeroed_connection();
+    raw.send_chain = Some(send_chain_record_limit);
+
+    let result = {
+        let mut connection =
+            unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
+        let input = unsafe { ChainMut::from_raw(&raw mut head) }.unwrap();
+        unsafe { connection.send_chain(input, -1) }
+    };
+    assert_eq!(raw.sent, 0);
+    assert!(matches!(result, Err(ConnectionChainWriteError::InvalidLimit)));
+
+    let result = {
+        let mut connection =
+            unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
+        let input = unsafe { ChainMut::from_raw(&raw mut head) }.unwrap();
+        unsafe { connection.send_chain(input, 17) }
+    };
+    assert_eq!(raw.sent, 17);
+    assert_eq!(result.unwrap().into_raw(), &raw mut tail);
 }
 
 #[test]

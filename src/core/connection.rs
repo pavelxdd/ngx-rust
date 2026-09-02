@@ -107,6 +107,8 @@ impl ConnectionChainWriteResult<'_> {
 /// Failure returned by one native chain send operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionChainWriteError {
+    /// The byte limit is negative.
+    InvalidLimit,
     /// The connection has no chain-send callback.
     MissingSendChain,
     /// Nginx returned its chain error sentinel.
@@ -872,7 +874,8 @@ impl<'callback> ConnectionRefMut<'callback> {
 
     /// Sends a chain through nginx and returns the unconsumed tail, if any.
     ///
-    /// Nginx may advance the chain's buffer cursors, so the input is exclusive.
+    /// Nginx may advance the chain's buffer cursors, so the input is exclusive. A zero limit is
+    /// unlimited; negative limits are rejected before invoking nginx.
     ///
     /// # Safety
     /// Every chain link, buffer descriptor, and selected memory or file resource must remain valid
@@ -883,6 +886,10 @@ impl<'callback> ConnectionRefMut<'callback> {
         input: ChainMut<'chain>,
         limit: off_t,
     ) -> Result<ConnectionChainWriteResult<'chain>, ConnectionChainWriteError> {
+        if limit < 0 {
+            return Err(ConnectionChainWriteError::InvalidLimit);
+        }
+
         let send_chain = unsafe { self.raw.as_ref().send_chain }
             .ok_or(ConnectionChainWriteError::MissingSendChain)?;
         let tail = unsafe { send_chain(self.raw.as_ptr(), input.as_ptr(), limit) };
