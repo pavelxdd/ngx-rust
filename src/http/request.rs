@@ -1053,7 +1053,7 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
 ///
 /// fn finalize_then_append(mut request: RequestRefMut<'_>) {
 ///     let mut body = {
-///         let headers = request.headers_in_builder(1).unwrap();
+///         let headers = unsafe { request.headers_in_builder(1) }.unwrap();
 ///         headers.request_body_candidate().unwrap()
 ///     };
 ///     request.finalize(HTTPStatus::BAD_REQUEST).unwrap();
@@ -2719,8 +2719,24 @@ impl<'callback> RequestRefMut<'callback> {
         checked_header_list(unsafe { &self.raw.as_ref().headers_out.headers })
     }
 
-    /// Starts constructing a complete replacement input-header list in the request pool.
-    pub fn headers_in_builder(
+    /// Starts constructing a raw replacement input-header list in the request pool.
+    ///
+    /// The builder reconstructs the list and selected pointer slots, but it does not run nginx's
+    /// input-header processors or derive every scalar and flag they own.
+    ///
+    /// # Safety
+    ///
+    /// Before any native consumer observes a committed candidate, the caller must ensure that the
+    /// list, built-in slots, count, parsing scalars, and flags form one coherent request state.
+    ///
+    /// ```compile_fail
+    /// use ngx::http::RequestRefMut;
+    ///
+    /// fn replace_without_native_state(request: &mut RequestRefMut<'_>) {
+    ///     let _ = request.headers_in_builder(1);
+    /// }
+    /// ```
+    pub unsafe fn headers_in_builder(
         &mut self,
         capacity: usize,
     ) -> Result<HttpHeadersInBuilder<'_, 'callback>, HeaderBuildError> {
@@ -2932,8 +2948,24 @@ impl<'callback> RequestRefMut<'callback> {
         Status(unsafe { ngx_http_discard_request_body(self.raw.as_ptr()) })
     }
 
-    /// Adds an input header allocated from the request pool.
-    pub fn add_header_in(&mut self, key: &str, value: &str) -> Result<(), RequestError> {
+    /// Adds a raw input-header list entry allocated from the request pool.
+    ///
+    /// This operation does not update nginx's built-in header slots, count, parsing scalars, or
+    /// flags.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no subsequent native consumer relies on compiled input-header
+    /// state that diverges from the appended list entry.
+    ///
+    /// ```compile_fail
+    /// use ngx::http::RequestRefMut;
+    ///
+    /// fn append_without_native_state(request: &mut RequestRefMut<'_>) {
+    ///     let _ = request.add_header_in("X-Example", "value");
+    /// }
+    /// ```
+    pub unsafe fn add_header_in(&mut self, key: &str, value: &str) -> Result<(), RequestError> {
         let pool = self.pool()?.as_ptr();
         let table = unsafe { ngx_list_push(&raw mut self.raw.as_mut().headers_in.headers).cast() };
         unsafe { add_to_ngx_table(table, pool, key, value) }.ok_or(RequestError::Allocation)
@@ -4744,7 +4776,7 @@ mod tests {
 
         {
             let mut request = request_from(&mut raw);
-            let mut headers = request.headers_in_builder(1).unwrap();
+            let mut headers = unsafe { request.headers_in_builder(1) }.unwrap();
             for (key, value) in standard_headers {
                 headers.add(key, value).unwrap();
             }
@@ -4860,7 +4892,7 @@ mod tests {
 
         {
             let mut request = request_from(&mut raw);
-            let mut headers = request.headers_in_builder(2).unwrap();
+            let mut headers = unsafe { request.headers_in_builder(2) }.unwrap();
             headers.add(b"Host", b"example.test").unwrap();
             headers.add(b"User-Agent", b"").unwrap();
             headers.commit();
@@ -5198,7 +5230,7 @@ mod tests {
 
         {
             let mut request = request_from(&mut raw);
-            let mut headers = request.headers_in_builder(1).unwrap();
+            let mut headers = unsafe { request.headers_in_builder(1) }.unwrap();
             headers.add(b"Host", b"example.test").unwrap();
             headers.add(b"Content-Length", b"99").unwrap();
             headers.add(b"Transfer-Encoding", b"chunked").unwrap();
@@ -5276,7 +5308,7 @@ mod tests {
 
         {
             let mut request = request_from(&mut raw);
-            let mut headers = request.headers_in_builder(1).unwrap();
+            let mut headers = unsafe { request.headers_in_builder(1) }.unwrap();
             headers.add(b"Host", b"example.test").unwrap();
             headers.add(b"X-Keep", b"kept").unwrap();
             headers.add(b"Content-Length", b"99").unwrap();
@@ -5352,7 +5384,7 @@ mod tests {
 
         {
             let mut request = request_from(&mut raw);
-            let mut headers = request.headers_in_builder(1).unwrap();
+            let mut headers = unsafe { request.headers_in_builder(1) }.unwrap();
             headers.add(b"Host", b"example.test").unwrap();
             headers.add(b"X-Keep", b"kept").unwrap();
             headers.add(b"Content-Length", b"99").unwrap();
@@ -5399,7 +5431,7 @@ mod tests {
 
         {
             let mut request = request_from(&mut raw);
-            let headers = request.headers_in_builder(1).unwrap();
+            let headers = unsafe { request.headers_in_builder(1) }.unwrap();
             let mut body = headers.request_body_candidate().unwrap();
             body.append_copy(b"body").unwrap();
             headers.commit_with_body(body).unwrap();
@@ -5435,7 +5467,7 @@ mod tests {
             raw.pool = owner.raw;
             {
                 let mut request = request_from(&mut raw);
-                let mut headers = request.headers_in_builder(1).unwrap();
+                let mut headers = unsafe { request.headers_in_builder(1) }.unwrap();
                 headers.add(b"Host", b"example.test").unwrap();
                 headers.add(b"Content-Length", b"7").unwrap();
                 headers.add(b"Transfer-Encoding", b"chunked").unwrap();
@@ -5472,7 +5504,7 @@ mod tests {
             }
             let result = (|| -> Result<(), RequestBodyBuildError> {
                 let mut request = request_from(&mut raw);
-                let mut headers = request.headers_in_builder(1)?;
+                let mut headers = unsafe { request.headers_in_builder(1) }?;
                 headers.add(b"Host", b"replacement.test")?;
                 headers.add(b"X-Replaced", b"yes")?;
                 let mut body = headers.request_body_candidate()?;
@@ -6605,7 +6637,7 @@ mod tests {
         raw.pool = owner.raw;
         {
             let mut request = request_from(&mut raw);
-            request.headers_in_builder(1).unwrap().commit();
+            unsafe { request.headers_in_builder(1) }.unwrap().commit();
         }
 
         let mut old_temp_file: ngx_temp_file_t = unsafe { MaybeUninit::zeroed().assume_init() };
@@ -6645,7 +6677,7 @@ mod tests {
         raw.pool = owner.raw;
         {
             let mut request = request_from(&mut raw);
-            request.headers_in_builder(1).unwrap().commit();
+            unsafe { request.headers_in_builder(1) }.unwrap().commit();
         }
 
         let mut file: ngx_file_t = unsafe { MaybeUninit::zeroed().assume_init() };
@@ -6696,7 +6728,7 @@ mod tests {
         raw.pool = owner.raw;
         {
             let mut request = request_from(&mut raw);
-            request.headers_in_builder(1).unwrap().commit();
+            unsafe { request.headers_in_builder(1) }.unwrap().commit();
         }
         let foreign_pool = unsafe { Pool::from_raw(foreign_owner.raw) }.unwrap();
         let foreign_buffer = foreign_pool.copy_buffer(b"foreign", BufferFlags::default()).unwrap();
@@ -6724,7 +6756,7 @@ mod tests {
             raw.pool = owner.raw;
             {
                 let mut request = request_from(&mut raw);
-                let mut headers = request.headers_in_builder(1).unwrap();
+                let mut headers = unsafe { request.headers_in_builder(1) }.unwrap();
                 headers.add(b"Host", b"example.test").unwrap();
                 headers.add(b"Content-Length", b"7").unwrap();
                 headers.add(b"Transfer-Encoding", b"chunked").unwrap();
@@ -6833,7 +6865,7 @@ mod tests {
             }
             let result = (|| {
                 let mut request = request_from(&mut raw);
-                let mut headers = request.headers_in_builder(1)?;
+                let mut headers = unsafe { request.headers_in_builder(1) }?;
                 headers.add(b"X-First", b"one")?;
                 headers.add(b"X-Second", b"two")?;
                 headers.commit();
@@ -6942,7 +6974,7 @@ mod tests {
 
         {
             let mut request = request_from(&mut raw);
-            let mut headers = request.headers_in_builder(1).unwrap();
+            let mut headers = unsafe { request.headers_in_builder(1) }.unwrap();
             {
                 let mut key = *b"X-In";
                 let mut value = *b"input";
@@ -6984,7 +7016,7 @@ mod tests {
 
         {
             let mut request = request_from(&mut raw);
-            request.headers_in_builder(1).unwrap().commit();
+            unsafe { request.headers_in_builder(1) }.unwrap().commit();
         }
 
         assert_eq!(raw.headers_in.count, 0);
@@ -7009,10 +7041,13 @@ mod tests {
         let capacity = isize::MAX as usize / core::mem::size_of::<ngx_table_elt_t>() + 1;
         let mut request = request_from(&mut raw);
 
-        assert!(matches!(request.headers_in_builder(0), Err(HeaderBuildError::InvalidCapacity)));
+        assert!(matches!(
+            unsafe { request.headers_in_builder(0) },
+            Err(HeaderBuildError::InvalidCapacity)
+        ));
         assert!(matches!(request.headers_out_builder(0), Err(HeaderBuildError::InvalidCapacity)));
         assert!(matches!(
-            request.headers_in_builder(capacity),
+            unsafe { request.headers_in_builder(capacity) },
             Err(HeaderBuildError::InvalidCapacity)
         ));
         assert!(matches!(
