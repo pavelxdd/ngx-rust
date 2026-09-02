@@ -4,7 +4,7 @@ use core::fmt;
 use core::ptr::{self, NonNull};
 
 use crate::core::{ModuleDescriptor, NGX_CONF_ERROR, Pool, Status};
-use crate::ffi::{ngx_conf_t, ngx_int_t};
+use crate::ffi::{NGX_LOG_EMERG, ngx_conf_t, ngx_int_t};
 use crate::stream::{StreamConfigurationParser, StreamModuleMainConf, StreamModuleServerConf};
 
 /// Error returned when child configuration cannot be merged with its parent.
@@ -33,15 +33,6 @@ impl fmt::Display for MergeConfigError {
 impl From<&'static CStr> for MergeConfigError {
     fn from(message: &'static CStr) -> Self {
         Self::Message(message)
-    }
-}
-
-impl MergeConfigError {
-    fn as_conf_result(&self) -> *mut c_char {
-        match self {
-            Self::NoValue => NGX_CONF_ERROR,
-            Self::Message(message) => message.as_ptr().cast_mut(),
-        }
     }
 }
 
@@ -99,6 +90,17 @@ fn configuration_callback_status(
         .unwrap_or(Status::NGX_ERROR.0)
 }
 
+fn log_configuration_error(cf: *mut ngx_conf_t, action: &str, error: &dyn fmt::Display) {
+    let Some(configuration) = NonNull::new(cf) else {
+        return;
+    };
+    if !configuration.as_ptr().is_aligned() || unsafe { configuration.as_ref().log.is_null() } {
+        return;
+    }
+
+    crate::ngx_conf_log_error!(NGX_LOG_EMERG, cf, "failed to {action}: {error}");
+}
+
 /// Defines a concrete NGINX Stream module and its configuration lifecycle.
 ///
 /// # Safety
@@ -151,7 +153,7 @@ pub unsafe trait StreamModule {
     ///
     /// # Safety
     /// `cf` and `conf` must be the valid pointers supplied by nginx for this module.
-    unsafe extern "C" fn init_main_conf(_cf: *mut ngx_conf_t, conf: *mut c_void) -> *mut c_char
+    unsafe extern "C" fn init_main_conf(cf: *mut ngx_conf_t, conf: *mut c_void) -> *mut c_char
     where
         Self: StreamModuleMainConf,
         Self::MainConf: InitMainConf,
@@ -162,7 +164,10 @@ pub unsafe trait StreamModule {
 
         match conf.init_main_conf() {
             Ok(()) => ptr::null_mut(),
-            Err(error) => error.as_conf_result(),
+            Err(error) => {
+                log_configuration_error(cf, "initialize main configuration", &error);
+                NGX_CONF_ERROR
+            }
         }
     }
 
@@ -185,7 +190,7 @@ pub unsafe trait StreamModule {
     /// `prev` and `conf` must point to distinct initialized values of `Self::ServerConf` supplied
     /// by nginx. `cf`, when non-null, must point to the active configuration parser state.
     unsafe extern "C" fn merge_srv_conf(
-        _cf: *mut ngx_conf_t,
+        cf: *mut ngx_conf_t,
         prev: *mut c_void,
         conf: *mut c_void,
     ) -> *mut c_char
@@ -201,7 +206,10 @@ pub unsafe trait StreamModule {
 
         match child.merge(parent) {
             Ok(()) => ptr::null_mut(),
-            Err(error) => error.as_conf_result(),
+            Err(error) => {
+                log_configuration_error(cf, "merge server configuration", &error);
+                NGX_CONF_ERROR
+            }
         }
     }
 }
@@ -210,10 +218,11 @@ pub unsafe trait StreamModule {
 mod tests {
     extern crate alloc;
 
-    use alloc::boxed::Box;
+    use alloc::{boxed::Box, vec::Vec};
     use core::ffi::c_void;
     use core::mem;
     use core::ptr;
+    use core::slice;
     #[cfg(feature = "test-link")]
     use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -221,8 +230,45 @@ mod tests {
     use crate::core::{ModuleDescriptor, NGX_CONF_ERROR, Status};
     use crate::ffi::ngx_module_t;
     #[cfg(feature = "test-link")]
-    use crate::ffi::{ngx_conf_t, ngx_create_pool, ngx_destroy_pool, ngx_log_t, ngx_pool_t};
+    use crate::ffi::{
+        NGX_LOG_EMERG, ngx_conf_t, ngx_create_pool, ngx_destroy_pool, ngx_log_t, ngx_pool_t,
+        ngx_uint_t,
+    };
     use crate::stream::{StreamModuleMainConf, StreamModuleServerConf};
+
+    #[cfg(feature = "test-link")]
+    #[derive(Default)]
+    struct ConfigLogCapture {
+        records: Vec<(ngx_uint_t, Vec<u8>)>,
+    }
+
+    #[cfg(feature = "test-link")]
+    impl ConfigLogCapture {
+        fn assert_single(&self, message: &[u8]) {
+            assert_eq!(self.records.len(), 1);
+            assert_eq!(self.records[0].0, NGX_LOG_EMERG as _);
+            assert!(self.records[0].1.windows(message.len()).any(|record| record == message));
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    unsafe extern "C" fn capture_config_log(
+        log: *mut ngx_log_t,
+        level: ngx_uint_t,
+        bytes: *mut u8,
+        len: usize,
+    ) {
+        let Some(log) = (unsafe { log.as_mut() }) else {
+            return;
+        };
+        let Some(capture) = (unsafe { log.wdata.cast::<ConfigLogCapture>().as_mut() }) else {
+            return;
+        };
+        if bytes.is_null() {
+            return;
+        }
+        capture.records.push((level, unsafe { slice::from_raw_parts(bytes, len) }.to_vec()));
+    }
 
     fn test_module() -> ModuleDescriptor {
         ModuleDescriptor::from_test(ngx_module_t::default())
@@ -347,16 +393,24 @@ mod tests {
         type MainConf = RejectMainConf;
     }
 
+    #[cfg(feature = "test-link")]
     #[test]
-    fn main_configuration_initialization_preserves_static_error_message() {
+    fn main_configuration_initialization_logs_once_and_returns_the_silent_sentinel() {
+        let mut pool = TestPool::new();
+        let mut capture = ConfigLogCapture::default();
+        pool._log.log_level = NGX_LOG_EMERG as _;
+        pool._log.writer = Some(capture_config_log);
+        pool._log.wdata = (&raw mut capture).cast();
+        let mut parser = pool.configuration();
         let mut configuration = RejectMainConf;
 
         assert_eq!(
             unsafe {
-                RejectMainModule::init_main_conf(ptr::null_mut(), (&raw mut configuration).cast())
+                RejectMainModule::init_main_conf(&raw mut parser, (&raw mut configuration).cast())
             },
-            c"init rejected".as_ptr().cast_mut()
+            NGX_CONF_ERROR
         );
+        capture.assert_single(b"failed to initialize main configuration: init rejected");
     }
 
     struct RejectConf;
@@ -379,20 +433,29 @@ mod tests {
         type ServerConf = RejectConf;
     }
 
+    #[cfg(feature = "test-link")]
     #[test]
-    fn rejected_server_configuration_returns_nginx_error() {
+    fn rejected_server_configuration_logs_no_value_once() {
+        let mut pool = TestPool::new();
+        let mut capture = ConfigLogCapture::default();
+        pool._log.log_level = NGX_LOG_EMERG as _;
+        pool._log.writer = Some(capture_config_log);
+        pool._log.wdata = (&raw mut capture).cast();
+        let mut parser = pool.configuration();
         let mut parent = RejectConf;
         let mut child = RejectConf;
 
-        let result = unsafe {
-            RejectStreamModule::merge_srv_conf(
-                ptr::null_mut(),
-                (&raw mut parent).cast::<c_void>(),
-                (&raw mut child).cast::<c_void>(),
-            )
-        };
-
-        assert_eq!(result, NGX_CONF_ERROR);
+        assert_eq!(
+            unsafe {
+                RejectStreamModule::merge_srv_conf(
+                    &raw mut parser,
+                    (&raw mut parent).cast::<c_void>(),
+                    (&raw mut child).cast::<c_void>(),
+                )
+            },
+            NGX_CONF_ERROR
+        );
+        capture.assert_single(b"failed to merge server configuration: no value");
     }
 
     struct StaticRejectConf;
@@ -415,21 +478,29 @@ mod tests {
         type ServerConf = StaticRejectConf;
     }
 
+    #[cfg(feature = "test-link")]
     #[test]
-    fn server_configuration_merge_preserves_static_error_message() {
+    fn server_configuration_merge_logs_static_message_once() {
+        let mut pool = TestPool::new();
+        let mut capture = ConfigLogCapture::default();
+        pool._log.log_level = NGX_LOG_EMERG as _;
+        pool._log.writer = Some(capture_config_log);
+        pool._log.wdata = (&raw mut capture).cast();
+        let mut parser = pool.configuration();
         let mut parent = StaticRejectConf;
         let mut child = StaticRejectConf;
 
         assert_eq!(
             unsafe {
                 StaticRejectStreamModule::merge_srv_conf(
-                    ptr::null_mut(),
+                    &raw mut parser,
                     (&raw mut parent).cast(),
                     (&raw mut child).cast(),
                 )
             },
-            c"merge rejected".as_ptr().cast_mut()
+            NGX_CONF_ERROR
         );
+        capture.assert_single(b"failed to merge server configuration: merge rejected");
     }
 
     #[cfg(feature = "test-link")]
@@ -507,6 +578,7 @@ mod tests {
         fn configuration(&self) -> ngx_conf_t {
             let mut configuration = unsafe { mem::zeroed::<ngx_conf_t>() };
             configuration.pool = self.raw;
+            configuration.log = ptr::from_ref(&*self._log).cast_mut();
             configuration
         }
     }
