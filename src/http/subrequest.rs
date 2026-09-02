@@ -207,17 +207,26 @@ impl<'request, 'callback, H> SubRequestBuilder<'request, 'callback, H> {
             Some(headers)
         };
 
-        let post = if let Some(handler) = self.handler.take() {
-            let handler = pool.allocate_with_cleanup(|| Some(handler))?.into_non_null();
+        let mut handler = self
+            .handler
+            .take()
+            .map(|handler| pool.allocate_with_cleanup(|| Some(handler)))
+            .transpose()?;
+        let post = if let Some(handler_value) = handler.as_ref() {
+            let handler_data = handler_value.as_non_null().as_ptr().cast();
             let post: *mut ngx_http_post_subrequest_t =
                 pool.alloc(mem::size_of::<ngx_http_post_subrequest_t>()).cast();
             if post.is_null() {
+                if let Some(handler) = handler.take() {
+                    let removed = handler.remove();
+                    debug_assert!(removed);
+                }
                 return Err(SubRequestError::Alloc);
             }
             unsafe {
                 post.write(ngx_http_post_subrequest_t {
                     handler: Some(run_handler::<H, O>),
-                    data: handler.as_ptr().cast(),
+                    data: handler_data,
                 });
             }
             post
@@ -238,7 +247,16 @@ impl<'request, 'callback, H> SubRequestBuilder<'request, 'callback, H> {
                 self.flags,
             )
         };
-        crate::core::Status(status).into_result().map_err(|_| SubRequestError::Create(status))?;
+        if crate::core::Status(status).into_result().is_err() {
+            if let Some(handler) = handler.take() {
+                let removed = handler.remove();
+                debug_assert!(removed);
+            }
+            return Err(SubRequestError::Create(status));
+        }
+        if let Some(handler) = handler {
+            let _ = handler.into_non_null();
+        }
 
         let mut subrequest = unsafe { RequestRefMut::from_raw(subrequest) }?;
         if !self.keep_body {
@@ -389,10 +407,67 @@ where
     unsafe { request_callback_status(request, callback) }
 }
 
-#[cfg(all(test, feature = "async"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "test-link")]
+    use alloc::rc::Rc;
+    #[cfg(feature = "test-link")]
+    use core::cell::Cell;
+    #[cfg(feature = "test-link")]
+    use nginx_sys::{
+        NGX_HTTP_MODULE, ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_log_t,
+    };
+
+    #[cfg(feature = "test-link")]
+    struct DropCounter(Rc<Cell<usize>>);
+
+    #[cfg(feature = "test-link")]
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn rejected_creation_drops_handler_before_parent_pool_cleanup() {
+        let mut log = unsafe { mem::zeroed::<ngx_log_t>() };
+        let pool = unsafe { ngx_create_pool(4096, &raw mut log) };
+        assert!(!pool.is_null());
+        let mut connection = unsafe { mem::zeroed::<ngx_connection_t>() };
+        connection.log = &raw mut log;
+        let mut raw = unsafe { mem::zeroed::<ngx_http_request_t>() };
+        raw.signature = NGX_HTTP_MODULE as _;
+        raw.main = &raw mut raw;
+        raw.pool = pool;
+        raw.connection = &raw mut connection;
+        raw.set_count(1);
+        raw.set_subrequests(0);
+
+        let drops = Rc::new(Cell::new(0));
+        {
+            let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
+            let captured = DropCounter(Rc::clone(&drops));
+            let result = SubRequestBuilder::new(&mut request, "/child")
+                .unwrap()
+                .handler(move |_, _| {
+                    drop(captured);
+                    crate::core::Status::NGX_OK
+                })
+                .build();
+
+            assert!(
+                matches!(result, Err(SubRequestError::Create(status)) if status == nginx_sys::NGX_ERROR as _)
+            );
+            assert_eq!(drops.get(), 1);
+        }
+        unsafe { ngx_destroy_pool(pool) };
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[cfg(feature = "async")]
     #[test]
     fn dropping_completion_guard_cancels_future() {
         let state = Rc::new(RefCell::new(AsyncSubRequestState::<()>::new()));
