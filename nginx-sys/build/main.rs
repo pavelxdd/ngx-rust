@@ -221,12 +221,64 @@ fn generate_binding(nginx: &NginxSource) {
     let out_path = PathBuf::from(out_dir_env);
     bindings.write_to_file(out_path.join("bindings.rs")).expect("Couldn't write bindings!");
 
+    build_event_shim(&includes, &defines, &c_compiler);
+
     if build_http {
         build_http_request_shim(&includes, &defines, &c_compiler);
     }
 
     #[cfg(feature = "test-link")]
     build_test_library(nginx, &includes, &defines, build_http, &c_compiler);
+}
+
+fn build_event_shim(
+    includes: &[PathBuf],
+    defines: &[(String, Option<String>)],
+    c_compiler: &ConfiguredCCompiler,
+) {
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let shim = out_dir.join("nginx_event_shim.c");
+    let mut file = File::create(&shim).expect("NGINX event shim");
+    file.write_all(
+        br"#include <ngx_config.h>
+#include <ngx_core.h>
+#include <ngx_event.h>
+
+void
+ngx_rs_event_add_timer(ngx_event_t *ev, ngx_msec_t timer)
+{
+    ngx_add_timer(ev, timer);
+}
+
+void
+ngx_rs_event_del_timer(ngx_event_t *ev)
+{
+    ngx_del_timer(ev);
+}
+
+void
+ngx_rs_event_post(ngx_event_t *ev, ngx_queue_t *queue)
+{
+    ngx_post_event(ev, queue);
+}
+
+void
+ngx_rs_event_delete_posted(ngx_event_t *ev)
+{
+    ngx_delete_posted_event(ev);
+}
+",
+    )
+    .expect("NGINX event shim");
+
+    let mut build = cc::Build::new();
+    build.includes(includes).file(shim);
+    for (name, value) in defines {
+        build.define(name, value.as_deref());
+    }
+    c_compiler.apply(&mut build);
+    build.warnings(false);
+    build.compile("nginx_event_shim");
 }
 
 fn build_http_request_shim(
