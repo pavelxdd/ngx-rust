@@ -33,6 +33,16 @@ pub enum UpstreamCallbackError {
     NullUpstream,
     /// The upstream server-configuration pointer is misaligned.
     MisalignedUpstream,
+    /// The initializer owner has no module server configuration for this upstream.
+    MissingInitializerConfiguration,
+    /// This module slot already owns an upstream initializer for the current configuration.
+    DuplicateUpstreamInitializer,
+    /// This module slot already owns a peer initializer for the current configuration.
+    DuplicatePeerInitializer,
+    /// The upstream initializer slot does not own this callback invocation.
+    ForeignUpstreamInitializer,
+    /// The peer initializer slot does not own this callback invocation.
+    ForeignPeerInitializer,
     /// The request has no active upstream object.
     MissingRequestUpstream,
     /// The request upstream pointer is misaligned.
@@ -94,6 +104,21 @@ impl fmt::Display for UpstreamCallbackError {
             Self::NullUpstream => formatter.write_str("upstream server configuration is null"),
             Self::MisalignedUpstream => {
                 formatter.write_str("upstream server configuration is misaligned")
+            }
+            Self::MissingInitializerConfiguration => {
+                formatter.write_str("upstream initializer owner has no server configuration")
+            }
+            Self::DuplicateUpstreamInitializer => {
+                formatter.write_str("upstream initializer is already installed")
+            }
+            Self::DuplicatePeerInitializer => {
+                formatter.write_str("upstream peer initializer is already installed")
+            }
+            Self::ForeignUpstreamInitializer => {
+                formatter.write_str("upstream initializer belongs to another configuration")
+            }
+            Self::ForeignPeerInitializer => {
+                formatter.write_str("upstream peer initializer belongs to another configuration")
             }
             Self::MissingRequestUpstream => formatter.write_str("request has no upstream"),
             Self::MisalignedRequestUpstream => {
@@ -226,6 +251,100 @@ impl UpstreamConfiguration<'_> {
     }
 }
 
+/// Module-owned installation state for one upstream and peer initializer pair.
+///
+/// Embed one slot in the module's per-upstream server configuration and return it from the
+/// initializer traits. A fresh server configuration is also the generation boundary: successful
+/// installation records the owning upstream before publishing the native adapter.
+pub struct UpstreamCallbackSlot {
+    upstream: Option<NonNull<ngx_http_upstream_srv_conf_t>>,
+    upstream_handler: Option<TypeId>,
+    original_upstream: ngx_http_upstream_init_pt,
+    peer: Option<NonNull<ngx_http_upstream_srv_conf_t>>,
+    peer_handler: Option<TypeId>,
+    original_peer: ngx_http_upstream_init_peer_pt,
+}
+
+impl UpstreamCallbackSlot {
+    /// Creates an uninstalled callback slot.
+    pub const fn new() -> Self {
+        Self {
+            upstream: None,
+            upstream_handler: None,
+            original_upstream: None,
+            peer: None,
+            peer_handler: None,
+            original_peer: None,
+        }
+    }
+
+    fn install_upstream<H>(
+        &mut self,
+        upstream: NonNull<ngx_http_upstream_srv_conf_t>,
+        original: ngx_http_upstream_init_pt,
+    ) -> Result<(), UpstreamCallbackError>
+    where
+        H: HttpUpstreamInitializer,
+    {
+        if self.upstream.is_some() {
+            return Err(UpstreamCallbackError::DuplicateUpstreamInitializer);
+        }
+        self.upstream = Some(upstream);
+        self.upstream_handler = Some(TypeId::of::<H>());
+        self.original_upstream = original;
+        Ok(())
+    }
+
+    fn install_peer<H>(
+        &mut self,
+        upstream: NonNull<ngx_http_upstream_srv_conf_t>,
+        original: ngx_http_upstream_init_peer_pt,
+    ) -> Result<(), UpstreamCallbackError>
+    where
+        H: HttpUpstreamPeerHandler,
+    {
+        if self.peer.is_some() {
+            return Err(UpstreamCallbackError::DuplicatePeerInitializer);
+        }
+        self.peer = Some(upstream);
+        self.peer_handler = Some(TypeId::of::<H>());
+        self.original_peer = original;
+        Ok(())
+    }
+
+    fn original_upstream<H>(
+        &self,
+        upstream: NonNull<ngx_http_upstream_srv_conf_t>,
+    ) -> Result<OriginalUpstreamInit<H>, UpstreamCallbackError>
+    where
+        H: HttpUpstreamInitializer,
+    {
+        if self.upstream != Some(upstream) || self.upstream_handler != Some(TypeId::of::<H>()) {
+            return Err(UpstreamCallbackError::ForeignUpstreamInitializer);
+        }
+        Ok(OriginalUpstreamInit { callback: self.original_upstream, _handler: PhantomData })
+    }
+
+    fn original_peer<H>(
+        &self,
+        upstream: NonNull<ngx_http_upstream_srv_conf_t>,
+    ) -> Result<OriginalPeerInit<H>, UpstreamCallbackError>
+    where
+        H: HttpUpstreamPeerHandler,
+    {
+        if self.peer != Some(upstream) || self.peer_handler != Some(TypeId::of::<H>()) {
+            return Err(UpstreamCallbackError::ForeignPeerInitializer);
+        }
+        Ok(OriginalPeerInit { callback: self.original_peer, _handler: PhantomData })
+    }
+}
+
+impl Default for UpstreamCallbackSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Checked upstream server-configuration callback view.
 pub struct UpstreamServerConf<'callback> {
     raw: NonNull<ngx_http_upstream_srv_conf_t>,
@@ -267,42 +386,74 @@ impl<'callback> UpstreamServerConf<'callback> {
             .map(|mut value| unsafe { value.as_mut() }))
     }
 
-    /// Returns the current upstream initializer, including an absent initializer.
-    ///
-    /// During [`HttpUpstreamInitializer::init`], this is the installed typed adapter. Delegate
-    /// through the callback returned by [`install_upstream_initializer`] and retained in module
-    /// configuration instead.
-    pub fn init_upstream(&self) -> UpstreamInitCallback {
-        UpstreamInitCallback(unsafe { self.raw.as_ref().peer.init_upstream })
+    fn callback_slot<M>(
+        &mut self,
+        slot: impl FnOnce(&mut M::ServerConf) -> &mut UpstreamCallbackSlot,
+    ) -> Result<NonNull<UpstreamCallbackSlot>, UpstreamCallbackError>
+    where
+        M: HttpModuleServerConf,
+    {
+        let configuration = self
+            .module_conf_mut::<M>()?
+            .ok_or(UpstreamCallbackError::MissingInitializerConfiguration)?;
+        Ok(NonNull::from(slot(configuration)))
     }
 
-    /// Replaces the upstream initializer with a typed callback and returns the previous one.
-    pub fn replace_init_upstream<H>(&mut self) -> UpstreamInitCallback
+    fn upstream_slot<H>(&mut self) -> Result<NonNull<UpstreamCallbackSlot>, UpstreamCallbackError>
     where
         H: HttpUpstreamInitializer,
     {
-        let previous = self.init_upstream();
-        unsafe { self.raw.as_mut().peer.init_upstream = Some(raw_init_upstream::<H>) };
-        previous
+        self.callback_slot::<H::Module>(H::callback_slot)
     }
 
-    /// Returns the current request peer initializer, including an absent initializer.
-    ///
-    /// During [`HttpUpstreamPeerHandler::init`], this is the installed typed adapter. Delegate
-    /// through the callback returned by [`Self::replace_init_peer`] and retained in module
-    /// configuration instead.
-    pub fn init_peer(&self) -> UpstreamPeerInitCallback {
-        UpstreamPeerInitCallback(unsafe { self.raw.as_ref().peer.init })
-    }
-
-    /// Replaces the request peer initializer with a typed callback and returns the previous one.
-    pub fn replace_init_peer<H>(&mut self) -> UpstreamPeerInitCallback
+    fn peer_slot<H>(&mut self) -> Result<NonNull<UpstreamCallbackSlot>, UpstreamCallbackError>
     where
         H: HttpUpstreamPeerHandler,
     {
-        let previous = self.init_peer();
-        unsafe { self.raw.as_mut().peer.init = Some(raw_init_peer::<H>) };
-        previous
+        self.callback_slot::<H::Module>(H::callback_slot)
+    }
+
+    fn original_upstream<H>(&mut self) -> Result<OriginalUpstreamInit<H>, UpstreamCallbackError>
+    where
+        H: HttpUpstreamInitializer,
+    {
+        let owner = self.raw;
+        let slot = self.upstream_slot::<H>()?;
+        unsafe { slot.as_ref().original_upstream::<H>(owner) }
+    }
+
+    fn original_peer<H>(&mut self) -> Result<OriginalPeerInit<H>, UpstreamCallbackError>
+    where
+        H: HttpUpstreamPeerHandler,
+    {
+        let owner = self.raw;
+        let slot = self.peer_slot::<H>()?;
+        unsafe { slot.as_ref().original_peer::<H>(owner) }
+    }
+
+    fn install_upstream<H>(&mut self) -> Result<(), UpstreamCallbackError>
+    where
+        H: HttpUpstreamInitializer,
+    {
+        let mut owner = self.raw;
+        let original = unsafe { owner.as_ref().peer.init_upstream };
+        let mut slot = self.upstream_slot::<H>()?;
+        unsafe { slot.as_mut().install_upstream::<H>(owner, original)? };
+        unsafe { owner.as_mut().peer.init_upstream = Some(raw_init_upstream::<H>) };
+        Ok(())
+    }
+
+    /// Installs this handler's request peer initializer for the current upstream configuration.
+    pub fn install_peer_initializer<H>(&mut self) -> Result<(), UpstreamCallbackError>
+    where
+        H: HttpUpstreamPeerHandler,
+    {
+        let mut owner = self.raw;
+        let original = unsafe { owner.as_ref().peer.init };
+        let mut slot = self.peer_slot::<H>()?;
+        unsafe { slot.as_mut().install_peer::<H>(owner, original)? };
+        unsafe { owner.as_mut().peer.init = Some(raw_init_peer::<H>) };
+        Ok(())
     }
 
     /// Proves that this configured upstream has a request peer initializer.
@@ -345,23 +496,44 @@ pub enum UpstreamInitialization<'upstream> {
     Unavailable,
 }
 
-/// Saved HTTP upstream initializer that can be called through checked callback views.
-#[derive(Clone, Copy, Default)]
-pub struct UpstreamInitCallback(ngx_http_upstream_init_pt);
+/// Owner-typed capability to invoke one saved upstream initializer.
+///
+/// The installation slot constructs this capability only for its handler and upstream generation.
+/// Calling it consumes the capability, so one handler invocation cannot delegate twice.
+///
+/// ```compile_fail
+/// use ngx::http::OriginalUpstreamInit;
+///
+/// fn forge<H>() -> OriginalUpstreamInit<H> {
+///     OriginalUpstreamInit { callback: None, _handler: core::marker::PhantomData }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::http::{OriginalUpstreamInit, UpstreamConfiguration, UpstreamServerConf};
+///
+/// fn call_twice<H>(
+///     original: OriginalUpstreamInit<H>,
+///     configuration: &mut UpstreamConfiguration<'_>,
+///     upstream: &mut UpstreamServerConf<'_>,
+/// ) {
+///     let _ = original.call(configuration, upstream);
+///     let _ = original.call(configuration, upstream);
+/// }
+/// ```
+pub struct OriginalUpstreamInit<H> {
+    callback: ngx_http_upstream_init_pt,
+    _handler: PhantomData<fn() -> H>,
+}
 
-impl UpstreamInitCallback {
-    /// Returns whether nginx provided an original initializer.
-    pub fn is_present(self) -> bool {
-        self.0.is_some()
-    }
-
+impl<H> OriginalUpstreamInit<H> {
     /// Delegates to the saved initializer with its original nginx arguments.
     pub fn call(
         self,
         configuration: &mut UpstreamConfiguration<'_>,
         upstream: &mut UpstreamServerConf<'_>,
     ) -> Result<UpstreamInitStatus, UpstreamCallbackError> {
-        let callback = self.0.ok_or(UpstreamCallbackError::MissingOriginalInitUpstream)?;
+        let callback = self.callback.ok_or(UpstreamCallbackError::MissingOriginalInitUpstream)?;
         let status = unsafe { callback(configuration.raw.as_ptr(), upstream.raw.as_ptr()) };
         if status != Status::NGX_OK.0 {
             return Ok(UpstreamInitStatus::Unavailable);
@@ -380,23 +552,44 @@ pub enum UpstreamPeerInitStatus {
     Unavailable,
 }
 
-/// Saved HTTP request peer initializer that can be called through checked callback views.
-#[derive(Clone, Copy, Default)]
-pub struct UpstreamPeerInitCallback(ngx_http_upstream_init_peer_pt);
+/// Owner-typed capability to invoke one saved request peer initializer.
+///
+/// The installation slot constructs this capability only for its handler and upstream generation.
+/// Calling it consumes the capability, so one handler invocation cannot delegate twice.
+///
+/// ```compile_fail
+/// use ngx::http::OriginalPeerInit;
+///
+/// fn forge<H>() -> OriginalPeerInit<H> {
+///     OriginalPeerInit { callback: None, _handler: core::marker::PhantomData }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::http::{OriginalPeerInit, UpstreamPeerInitRequest, UpstreamServerConf};
+///
+/// fn call_twice<H>(
+///     original: OriginalPeerInit<H>,
+///     request: &mut UpstreamPeerInitRequest<'_>,
+///     upstream: &mut UpstreamServerConf<'_>,
+/// ) {
+///     let _ = original.call(request, upstream);
+///     let _ = original.call(request, upstream);
+/// }
+/// ```
+pub struct OriginalPeerInit<H> {
+    callback: ngx_http_upstream_init_peer_pt,
+    _handler: PhantomData<fn() -> H>,
+}
 
-impl UpstreamPeerInitCallback {
-    /// Returns whether nginx provided an original request peer initializer.
-    pub fn is_present(self) -> bool {
-        self.0.is_some()
-    }
-
+impl<H> OriginalPeerInit<H> {
     /// Delegates to the saved request peer initializer with its original nginx arguments.
     pub fn call(
         self,
         request: &mut UpstreamPeerInitRequest<'_>,
         upstream: &mut UpstreamServerConf<'_>,
     ) -> Result<UpstreamPeerInitStatus, UpstreamCallbackError> {
-        let callback = self.0.ok_or(UpstreamCallbackError::MissingOriginalInitPeer)?;
+        let callback = self.callback.ok_or(UpstreamCallbackError::MissingOriginalInitPeer)?;
         let status = unsafe { callback(request.request.as_ptr(), upstream.raw.as_ptr()) };
         if status != Status::NGX_OK.0 {
             return Ok(UpstreamPeerInitStatus::Unavailable);
@@ -412,7 +605,7 @@ impl UpstreamPeerInitCallback {
 /// Request peer-initialization capability without terminal request authority.
 ///
 /// Shared request operations remain available through dereferencing. The saved native peer
-/// initializer can mutate the request only through [`UpstreamPeerInitCallback::call`]:
+/// initializer can mutate the request only through [`OriginalPeerInit::call`]:
 ///
 /// ```compile_fail
 /// use ngx::http::{HTTPStatus, UpstreamPeerInitRequest};
@@ -433,28 +626,40 @@ impl<'callback> Deref for UpstreamPeerInitRequest<'callback> {
     }
 }
 
-/// Installs a typed HTTP upstream initializer and returns the original callback.
+/// Installs a typed HTTP upstream initializer in its module-owned configuration slot.
 ///
 /// Call this from the upstream directive setup after resolving nginx's upstream server
-/// configuration. The returned callback can be retained in the module's server configuration.
+/// configuration. Repeated installation in the same module configuration is rejected before the
+/// native callback changes.
 pub fn install_upstream_initializer<H>(
     upstream: &mut ngx_http_upstream_srv_conf_t,
-) -> UpstreamInitCallback
+) -> Result<(), UpstreamCallbackError>
 where
     H: HttpUpstreamInitializer,
 {
-    let mut upstream = UpstreamServerConf::from_mut(upstream);
-    upstream.replace_init_upstream::<H>()
+    UpstreamServerConf::from_mut(upstream).install_upstream::<H>()
 }
 
 /// Typed HTTP upstream initializer.
 ///
 /// An initializer must not panic; panics terminate the worker process.
-pub trait HttpUpstreamInitializer: 'static {
+pub trait HttpUpstreamInitializer: Sized + 'static {
+    /// Module that owns this initializer's per-upstream installation slot.
+    type Module: HttpModuleServerConf;
+
+    /// Selects this initializer's unique slot from its module server configuration.
+    ///
+    /// Every call for one server configuration must return the same field. Installed slot state
+    /// must not be inherited or copied into another server configuration.
+    fn callback_slot(
+        configuration: &mut <Self::Module as HttpModuleServerConf>::ServerConf,
+    ) -> &mut UpstreamCallbackSlot;
+
     /// Initializes one configured upstream without exposing a forgeable success status.
     fn init<'upstream>(
         configuration: &mut UpstreamConfiguration<'_>,
         upstream: &'upstream mut UpstreamServerConf<'_>,
+        original: OriginalUpstreamInit<Self>,
     ) -> Result<UpstreamInitialization<'upstream>, UpstreamCallbackError>;
 }
 
@@ -477,9 +682,20 @@ pub enum UpstreamPeerInit<T> {
 /// Typed request peer initializer, getter, and releaser for one upstream implementation.
 ///
 /// Peer callbacks must not panic; panics terminate the worker process.
-pub trait HttpUpstreamPeerHandler: 'static {
+pub trait HttpUpstreamPeerHandler: Sized + 'static {
+    /// Module that owns this handler's per-upstream installation slot.
+    type Module: HttpModuleServerConf;
+
     /// Request-pool data retained while nginx uses this peer callback family.
     type Data: 'static;
+
+    /// Selects this handler's unique slot from its module server configuration.
+    ///
+    /// Every call for one server configuration must return the same field. Installed slot state
+    /// must not be inherited or copied into another server configuration.
+    fn callback_slot(
+        configuration: &mut <Self::Module as HttpModuleServerConf>::ServerConf,
+    ) -> &mut UpstreamCallbackSlot;
 
     /// Initializes custom request peer data after any needed original initialization.
     ///
@@ -488,6 +704,7 @@ pub trait HttpUpstreamPeerHandler: 'static {
     fn init(
         request: &mut UpstreamPeerInitRequest<'_>,
         upstream: &mut UpstreamServerConf<'_>,
+        original: OriginalPeerInit<Self>,
     ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError>;
 
     /// Selects a peer or delegates selection to the saved original callback.
@@ -832,7 +1049,8 @@ where
     };
     match (|| {
         let mut upstream = unsafe { UpstreamServerConf::from_raw(upstream) }?;
-        match H::init(&mut configuration, &mut upstream)? {
+        let original = upstream.original_upstream::<H>()?;
+        match H::init(&mut configuration, &mut upstream, original)? {
             UpstreamInitialization::Initialized(_) => Ok(Status::NGX_OK.0),
             UpstreamInitialization::Unavailable => Ok(Status::NGX_ERROR.0),
         }
@@ -858,7 +1076,8 @@ where
             let result = (|| {
                 let mut request_upstream = RequestUpstream::from_request(&request)?;
                 let mut upstream = UpstreamServerConf::from_raw(upstream)?;
-                match H::init(&mut request, &mut upstream)? {
+                let original = upstream.original_peer::<H>()?;
+                match H::init(&mut request, &mut upstream, original)? {
                     UpstreamPeerInit::Install(value) => {
                         let pool = request.pool()?;
                         request_upstream.install::<H>(&pool, value)?;
