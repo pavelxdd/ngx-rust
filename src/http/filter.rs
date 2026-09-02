@@ -187,7 +187,8 @@ where
 ///
 /// `filter_slot` must return this module's unique static slot. The HTTP module descriptor must use
 /// [`filter_postconfiguration`] for its postconfiguration callback so nginx installs both filters
-/// after the module's [`HttpModule::postconfigure`] work succeeds.
+/// after the module's [`HttpModule::postconfigure`] work succeeds. Filter callbacks must not panic;
+/// panics terminate the worker process.
 pub unsafe trait HttpFilter: HttpModule + Sized + 'static {
     /// Whether every non-OK postconfiguration return already has a contextual nginx diagnostic.
     const LOGS_POSTCONFIGURATION_FAILURE: bool = false;
@@ -269,8 +270,9 @@ where
 ///
 /// # Safety
 ///
-/// `cf` must point to the live nginx configuration parser state. Null and misaligned pointers,
-/// invalid filter chains, and Rust panics return `NGX_ERROR` without publishing a partial pair.
+/// `cf` must point to the live nginx configuration parser state. Null and misaligned pointers or
+/// invalid filter chains return `NGX_ERROR` without publishing a partial pair. Module callbacks
+/// must not panic; panics terminate the worker process.
 pub unsafe extern "C" fn filter_postconfiguration<M>(cf: *mut ngx_conf_t) -> ngx_int_t
 where
     M: HttpFilter,
@@ -974,77 +976,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "std")]
-    static PANIC_POSTCONFIGURATION_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-    #[cfg(feature = "std")]
-    struct PanicPostconfigurationFilter;
-
-    #[cfg(feature = "std")]
-    static PANIC_POSTCONFIGURATION_SLOT: HttpFilterSlot<PanicPostconfigurationFilter> =
-        HttpFilterSlot::new();
-
-    #[cfg(feature = "std")]
-    unsafe impl HttpModule for PanicPostconfigurationFilter {
-        fn module() -> ModuleDescriptor {
-            module()
-        }
-
-        fn postconfigure(_parser: &mut crate::http::HttpConfigurationParser<'_>) -> ngx_int_t {
-            PANIC_POSTCONFIGURATION_CALLS.fetch_add(1, Ordering::Relaxed);
-            panic!("postconfiguration panic");
-        }
-    }
-
-    #[cfg(feature = "std")]
-    unsafe impl HttpFilter for PanicPostconfigurationFilter {
-        type HeaderOutput = Status;
-        type BodyOutput = Status;
-
-        fn filter_slot() -> &'static HttpFilterSlot<Self> {
-            &PANIC_POSTCONFIGURATION_SLOT
-        }
-
-        fn header_filter(_request: &mut RequestRefMut<'_>) -> Self::HeaderOutput {
-            Status::NGX_OK
-        }
-
-        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainMut<'_>) -> Self::BodyOutput {
-            Status::NGX_OK
-        }
-    }
-
-    #[cfg(feature = "std")]
-    struct PanicFilter;
-
-    #[cfg(feature = "std")]
-    static PANIC_SLOT: HttpFilterSlot<PanicFilter> = HttpFilterSlot::new();
-
-    #[cfg(feature = "std")]
-    unsafe impl HttpModule for PanicFilter {
-        fn module() -> ModuleDescriptor {
-            module()
-        }
-    }
-
-    #[cfg(feature = "std")]
-    unsafe impl HttpFilter for PanicFilter {
-        type HeaderOutput = Status;
-        type BodyOutput = Status;
-
-        fn filter_slot() -> &'static HttpFilterSlot<Self> {
-            &PANIC_SLOT
-        }
-
-        fn header_filter(_request: &mut RequestRefMut<'_>) -> Self::HeaderOutput {
-            panic!("header filter panic");
-        }
-
-        fn body_filter(_request: &mut RequestRefMut<'_>, _chain: ChainMut<'_>) -> Self::BodyOutput {
-            panic!("body filter panic");
-        }
-    }
-
     struct ReloadFilter;
 
     static RELOAD_SLOT: HttpFilterSlot<ReloadFilter> = HttpFilterSlot::new();
@@ -1658,54 +1589,6 @@ mod tests {
             Status::NGX_ERROR.0
         );
         assert_single_emergency(&capture, b"module postconfiguration rejected");
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn postconfiguration_panics_without_installing_either_filter() {
-        let _globals = FilterGlobals::new();
-        let mut cycle = unsafe { MaybeUninit::<ngx_cycle_t>::zeroed().assume_init() };
-        let mut configuration = configuration(&mut cycle);
-        PANIC_POSTCONFIGURATION_CALLS.store(0, Ordering::Relaxed);
-        assert_eq!(
-            unsafe {
-                filter_postconfiguration::<PanicPostconfigurationFilter>(&raw mut configuration)
-            },
-            Status::NGX_ERROR.0
-        );
-        assert_eq!(PANIC_POSTCONFIGURATION_CALLS.load(Ordering::Relaxed), 1);
-
-        let expected_header: HeaderFilter = next_header;
-        let expected_body: BodyFilter = next_body;
-        assert!(ptr::fn_addr_eq(
-            unsafe { nginx_sys::ngx_http_top_header_filter }.unwrap(),
-            expected_header
-        ));
-        assert!(ptr::fn_addr_eq(
-            unsafe { nginx_sys::ngx_http_top_body_filter }.unwrap(),
-            expected_body
-        ));
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn filter_trampolines_catch_panics_without_calling_the_saved_filters() {
-        let _globals = FilterGlobals::new();
-        let mut cycle = unsafe { MaybeUninit::<ngx_cycle_t>::zeroed().assume_init() };
-        let mut configuration = configuration(&mut cycle);
-        NEXT_HEADER_CALLS.store(0, Ordering::Relaxed);
-        NEXT_BODY_CALLS.store(0, Ordering::Relaxed);
-        assert_eq!(
-            unsafe { filter_postconfiguration::<PanicFilter>(&raw mut configuration) },
-            Status::NGX_OK.0
-        );
-
-        let mut request = request();
-        let mut chain = ngx_chain_t { buf: ptr::null_mut(), next: ptr::null_mut() };
-        assert_eq!(top_header(&mut request), Status::NGX_ERROR.0);
-        assert_eq!(top_body(&mut request, &raw mut chain), Status::NGX_ERROR.0);
-        assert_eq!(NEXT_HEADER_CALLS.load(Ordering::Relaxed), 0);
-        assert_eq!(NEXT_BODY_CALLS.load(Ordering::Relaxed), 0);
     }
 
     #[test]

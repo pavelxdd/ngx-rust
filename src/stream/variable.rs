@@ -4,11 +4,6 @@ use core::fmt;
 use core::marker::PhantomData;
 use core::ptr::{self, NonNull};
 
-#[cfg(feature = "std")]
-use core::panic::AssertUnwindSafe;
-#[cfg(feature = "std")]
-use std::panic::catch_unwind;
-
 use crate::allocator::Allocator;
 use crate::core::{ConnectionError, NgxStr, Pool};
 use crate::ffi::{
@@ -337,6 +332,8 @@ impl StreamVariableOutput<'_> {
 }
 
 /// Typed getter for a registered Stream variable.
+///
+/// A getter must not panic; panics terminate the worker process.
 pub trait StreamVariableHandler {
     /// Getter result converted into an nginx status.
     type Output: IntoHandlerStatus;
@@ -350,6 +347,8 @@ pub trait StreamVariableHandler {
 }
 
 /// Typed getter for a prefix-matched Stream variable.
+///
+/// A getter must not panic; panics terminate the worker process.
 pub trait StreamPrefixVariableHandler {
     /// Getter result converted into an nginx status.
     type Output: IntoHandlerStatus;
@@ -454,18 +453,7 @@ where
                 return NGX_ERROR as _;
             };
 
-            #[cfg(feature = "std")]
-            let status = catch_unwind(AssertUnwindSafe(|| {
-                H::get(&mut session, &mut value, data).into_handler_status(&session)
-            }))
-            .unwrap_or(NGX_ERROR as _);
-
-            #[cfg(not(feature = "std"))]
-            let status = {
-                // An `extern "C"` trampoline must never unwind into nginx. A no-std panic that
-                // reaches this boundary aborts rather than crossing it.
-                H::get(&mut session, &mut value, data).into_handler_status(&session)
-            };
+            let status = H::get(&mut session, &mut value, data).into_handler_status(&session);
 
             if status == NGX_OK as _ {
                 value.publish_success();
@@ -513,13 +501,6 @@ where
                 return NGX_ERROR as _;
             };
 
-            #[cfg(feature = "std")]
-            let status = catch_unwind(AssertUnwindSafe(|| {
-                H::get(&mut session, &mut value, name).into_handler_status(&session)
-            }))
-            .unwrap_or(NGX_ERROR as _);
-
-            #[cfg(not(feature = "std"))]
             let status = H::get(&mut session, &mut value, name).into_handler_status(&session);
 
             if status == NGX_OK as _ {
@@ -755,22 +736,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "std")]
-    struct PanickingVariable;
-
-    #[cfg(feature = "std")]
-    impl StreamVariableHandler for PanickingVariable {
-        type Output = Status;
-
-        fn get(
-            _session: &mut Session<'_>,
-            _value: &mut StreamVariableOutput<'_>,
-            _data: usize,
-        ) -> Self::Output {
-            panic!("variable getter panic")
-        }
-    }
-
     fn poisoned_value() -> ngx_variable_value_t {
         let mut value = unsafe { MaybeUninit::<ngx_variable_value_t>::zeroed().assume_init() };
         value.set_len(17);
@@ -874,12 +839,6 @@ mod tests {
         assert_eq!(raw_handler_status::<MissingStatusVariable>(), NGX_ERROR as _);
         assert_eq!(raw_handler_status::<ResultStatusVariable>(), Status::NGX_DECLINED.0);
         assert_eq!(raw_handler_status::<ErrorStatusVariable>(), Status::NGX_AGAIN.0);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn raw_variable_handler_converts_a_getter_panic_to_ngx_error() {
-        assert_eq!(raw_handler_status::<PanickingVariable>(), NGX_ERROR as _);
     }
 
     #[test]

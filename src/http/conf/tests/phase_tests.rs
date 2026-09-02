@@ -360,19 +360,6 @@ impl HttpRequestHandler for CountingHandler {
     }
 }
 
-#[cfg(feature = "std")]
-struct PanicHandler;
-
-#[cfg(feature = "std")]
-impl HttpRequestHandler for PanicHandler {
-    const PHASE: HttpPhase = HttpPhase::Access;
-    type Output = Status;
-
-    fn handler(_request: &mut RequestRefMut<'_>) -> Self::Output {
-        panic!("phase handler panic");
-    }
-}
-
 #[test]
 fn phase_postconfiguration_rejects_null_and_misaligned_parser_contexts() {
     assert_eq!(
@@ -561,17 +548,4 @@ fn phase_handlers_convert_statuses_and_create_fresh_request_borrows() {
     assert_eq!(unsafe { handler(&raw mut request) }, Status::NGX_DECLINED.0);
     assert_eq!(unsafe { handler(&raw mut request) }, Status::NGX_DECLINED.0);
     assert_eq!(CALLBACK_COUNT.load(Ordering::Relaxed), 2);
-}
-
-#[cfg(feature = "std")]
-#[test]
-fn phase_handler_panics_return_nginx_error() {
-    let mut fixture = PhaseFixture::new();
-    assert_eq!(fixture.register::<PanicHandler>(), Status::NGX_OK.0);
-
-    let Some(handler) = fixture.registered_handler(HttpPhase::Access, 0) else {
-        panic!("registered phase handler is missing");
-    };
-    let mut request = callback_request();
-    assert_eq!(unsafe { handler(&raw mut request) }, Status::NGX_ERROR.0);
 }

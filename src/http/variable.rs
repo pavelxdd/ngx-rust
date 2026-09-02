@@ -851,6 +851,7 @@ impl<'request, 'callback> Deref for HttpVariableRequest<'request, 'callback> {
 
 /// Typed getter for a registered HTTP variable.
 ///
+/// A getter must not panic; panics terminate the worker process.
 /// Getters receive shared access so they cannot terminate or redirect the request while nginx is
 /// still evaluating its variable:
 ///
@@ -884,6 +885,8 @@ pub trait HttpVariableHandler {
 }
 
 /// Typed getter for a prefix-matched HTTP variable.
+///
+/// A getter must not panic; panics terminate the worker process.
 pub trait HttpPrefixVariableHandler {
     /// Getter result converted into an nginx status.
     type Output: IntoHandlerStatus;
@@ -898,6 +901,7 @@ pub trait HttpPrefixVariableHandler {
 
 /// Typed setter for a registered HTTP variable.
 ///
+/// A setter must not panic; panics terminate the worker process.
 /// Setters receive only shared request access, so they cannot safely flush or re-evaluate a
 /// variable while retaining the assigned value:
 ///
@@ -1478,32 +1482,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "std")]
-    struct PanickingVariable;
-
-    #[cfg(feature = "std")]
-    impl HttpVariableHandler for PanickingVariable {
-        type Output = Status;
-
-        fn get(
-            _request: &mut HttpVariableRequest<'_, '_>,
-            _value: &mut HttpVariableOutput<'_>,
-            _data: usize,
-        ) -> Self::Output {
-            panic!("variable getter panic")
-        }
-    }
-
-    #[cfg(feature = "std")]
-    struct PanickingSetter;
-
-    #[cfg(feature = "std")]
-    impl HttpVariableSetter for PanickingSetter {
-        fn set(_request: &RequestRef<'_>, _value: HttpVariableValueRef<'_>, _data: usize) {
-            panic!("variable setter panic")
-        }
-    }
-
     fn misaligned_ptr<T>(storage: &mut [u8]) -> *mut T {
         let alignment = core::mem::align_of::<T>();
         assert!(alignment > 1);
@@ -2006,16 +1984,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
-    #[cfg(feature = "std")]
-    #[test]
-    fn raw_variable_setter_catches_a_setter_panic() {
-        let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
-        request.signature = NGX_HTTP_MODULE as _;
-        let mut value = unsafe { MaybeUninit::<ngx_variable_value_t>::zeroed().assume_init() };
-
-        unsafe { raw_set_handler::<PanickingSetter>(&raw mut request, &raw mut value, 0) };
-    }
-
     #[test]
     fn raw_variable_handler_converts_every_supported_status_output() {
         assert_eq!(raw_handler_status::<RawStatusVariable>(), Status::NGX_OK.0);
@@ -2023,12 +1991,6 @@ mod tests {
         assert_eq!(raw_handler_status::<MissingStatusVariable>(), NGX_ERROR as _);
         assert_eq!(raw_handler_status::<ResultStatusVariable>(), Status::NGX_DECLINED.0);
         assert_eq!(raw_handler_status::<ErrorStatusVariable>(), Status::NGX_AGAIN.0);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn raw_variable_handler_converts_a_getter_panic_to_ngx_error() {
-        assert_eq!(raw_handler_status::<PanickingVariable>(), NGX_ERROR as _);
     }
 
     #[test]
