@@ -19,30 +19,23 @@ use ngx::ffi::{
 use ngx::http::{
     HttpConfigurationParser, HttpModule, HttpModuleServerConf, HttpUpstreamInitializer,
     HttpUpstreamPeerHandler, Merge, MergeConfigError, NgxHttpUpstreamModule, OriginalPeerFree,
-    OriginalPeerGet, UpstreamCallbackError, UpstreamConfiguration, UpstreamInitCallback,
-    UpstreamInitStatus, UpstreamInitialization, UpstreamPeerConnection, UpstreamPeerInit,
-    UpstreamPeerInitCallback, UpstreamPeerInitRequest, UpstreamPeerInitStatus,
+    OriginalPeerGet, OriginalPeerInit, OriginalUpstreamInit, UpstreamCallbackError,
+    UpstreamCallbackSlot, UpstreamConfiguration, UpstreamInitStatus, UpstreamInitialization,
+    UpstreamPeerConnection, UpstreamPeerInit, UpstreamPeerInitRequest, UpstreamPeerInitStatus,
     UpstreamPeerSelection, UpstreamPeerState, UpstreamServerConf, install_upstream_initializer,
     postconfiguration, preconfiguration,
 };
 use ngx::{ngx_conf_log_error, ngx_log_debug_http, ngx_string};
 
-#[derive(Clone, Copy)]
 #[repr(C)]
 struct SrvConfig {
     max: u32,
-
-    original_init_upstream: UpstreamInitCallback,
-    original_init_peer: UpstreamPeerInitCallback,
+    callbacks: UpstreamCallbackSlot,
 }
 
 impl Default for SrvConfig {
     fn default() -> Self {
-        Self {
-            max: u32::MAX,
-            original_init_upstream: Default::default(),
-            original_init_peer: Default::default(),
-        }
+        Self { max: u32::MAX, callbacks: UpstreamCallbackSlot::new() }
     }
 }
 
@@ -93,29 +86,28 @@ pub static mut ngx_http_upstream_custom_module: ngx_module_t = ngx_module_t {
 struct CustomUpstream;
 
 impl HttpUpstreamInitializer for CustomUpstream {
+    type Module = Module;
+
+    fn callback_slot(configuration: &mut SrvConfig) -> &mut UpstreamCallbackSlot {
+        &mut configuration.callbacks
+    }
+
     fn init<'upstream>(
         configuration: &mut UpstreamConfiguration<'_>,
         upstream: &'upstream mut UpstreamServerConf<'_>,
+        original: OriginalUpstreamInit<Self>,
     ) -> Result<UpstreamInitialization<'upstream>, UpstreamCallbackError> {
-        let original = {
-            let Some(config) = upstream.module_conf_mut::<Module>()? else {
-                return Ok(UpstreamInitialization::Unavailable);
-            };
-            if config.max == u32::MAX {
-                config.max = 100;
-            }
-            config.original_init_upstream
+        let Some(config) = upstream.module_conf_mut::<Module>()? else {
+            return Ok(UpstreamInitialization::Unavailable);
         };
+        if config.max == u32::MAX {
+            config.max = 100;
+        }
         if original.call(configuration, upstream)? == UpstreamInitStatus::Unavailable {
             return Ok(UpstreamInitialization::Unavailable);
         }
 
-        let original_peer = upstream.init_peer();
-        let Some(config) = upstream.module_conf_mut::<Module>()? else {
-            return Ok(UpstreamInitialization::Unavailable);
-        };
-        config.original_init_peer = original_peer;
-        upstream.replace_init_peer::<CustomPeer>();
+        upstream.install_peer_initializer::<CustomPeer>()?;
         Ok(UpstreamInitialization::Initialized(upstream.initialized()?))
     }
 }
@@ -123,16 +115,18 @@ impl HttpUpstreamInitializer for CustomUpstream {
 struct CustomPeer;
 
 impl HttpUpstreamPeerHandler for CustomPeer {
+    type Module = Module;
     type Data = ();
+
+    fn callback_slot(configuration: &mut SrvConfig) -> &mut UpstreamCallbackSlot {
+        &mut configuration.callbacks
+    }
 
     fn init(
         request: &mut UpstreamPeerInitRequest<'_>,
         upstream: &mut UpstreamServerConf<'_>,
+        original: OriginalPeerInit<Self>,
     ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
-        let original = match upstream.module_conf::<Module>()? {
-            Some(config) => config.original_init_peer,
-            None => return Ok(UpstreamPeerInit::Unavailable),
-        };
         match original.call(request, upstream)? {
             UpstreamPeerInitStatus::Initialized => {
                 ngx_log_debug_http!(request, "CUSTOM UPSTREAM request peer init");
@@ -197,11 +191,6 @@ unsafe extern "C" fn ngx_http_upstream_commands_set_custom(
     }
     let config = unsafe { config.as_mut() };
 
-    if config.original_init_upstream.is_present() {
-        ngx_conf_log_error!(NGX_LOG_EMERG, configuration, "CUSTOM UPSTREAM is duplicate");
-        return ngx::core::NGX_CONF_ERROR;
-    }
-
     if let Some(value) = args.get(1) {
         if value.len == 0 || value.data.is_null() {
             ngx_conf_log_error!(NGX_LOG_EMERG, configuration, "invalid custom upstream value");
@@ -225,13 +214,11 @@ unsafe extern "C" fn ngx_http_upstream_commands_set_custom(
             if upstream.peer.init_upstream.is_none() {
                 upstream.peer.init_upstream = Some(ngx_http_upstream_init_round_robin);
             }
-            config.original_init_upstream =
-                install_upstream_initializer::<CustomUpstream>(upstream);
-            Ok(())
+            install_upstream_initializer::<CustomUpstream>(upstream).map_err(|_| ())
         })
     };
     if !matches!(result, Ok(Ok(()))) {
-        ngx_conf_log_error!(NGX_LOG_EMERG, configuration, "CUSTOM UPSTREAM no upstream srv_conf");
+        ngx_conf_log_error!(NGX_LOG_EMERG, configuration, "CUSTOM UPSTREAM installation failed");
         return ngx::core::NGX_CONF_ERROR;
     }
 
