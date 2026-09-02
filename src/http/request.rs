@@ -1142,10 +1142,9 @@ impl<'request, 'callback> RequestBodyBuilder<'request, 'callback> {
     /// Publishes the complete non-null request-body candidate and matching framing headers.
     pub fn commit(self) -> Result<(), RequestBodyBuildError> {
         let Self { request, body } = self;
-        let headers = request_body_headers_candidate(request, body.pool.as_ptr(), body.length)?;
+        let framing = request_body_framing_candidate(request, body.pool.as_ptr(), body.length)?;
         let body = body.into_raw()?;
-        publish_request_body(request, headers, body.as_ptr());
-        Ok(())
+        publish_request_body_framing(request, framing, body.as_ptr())
     }
 }
 
@@ -1489,12 +1488,11 @@ fn copy_pool_bytes(pool: *mut ngx_pool_t, bytes: &[u8]) -> Result<ngx_str_t, Hea
     Ok(ngx_str_t { len: bytes.len(), data: data.as_ptr() })
 }
 
-fn append_pool_header(
-    headers: &mut ngx_list_t,
+fn build_pool_header(
     pool: *mut ngx_pool_t,
     key: &[u8],
     value: &[u8],
-) -> Result<NonNull<ngx_table_elt_t>, HeaderBuildError> {
+) -> Result<ngx_table_elt_t, HeaderBuildError> {
     let key = copy_pool_bytes(pool, key)?;
     let value = copy_pool_bytes(pool, value)?;
     let lowcase_key = if key.len == 0 {
@@ -1509,19 +1507,21 @@ fn append_pool_header(
     } else {
         unsafe { ngx_hash_strlow(lowcase_key, key.data, key.len) }
     };
+
+    Ok(ngx_table_elt_t { hash, key, value, lowcase_key, next: ptr::null_mut() })
+}
+
+fn append_pool_header(
+    headers: &mut ngx_list_t,
+    pool: *mut ngx_pool_t,
+    key: &[u8],
+    value: &[u8],
+) -> Result<NonNull<ngx_table_elt_t>, HeaderBuildError> {
+    let value = build_pool_header(pool, key, value)?;
     repair_header_list_last(headers);
     let header = NonNull::new(unsafe { ngx_list_push(headers).cast::<ngx_table_elt_t>() })
         .ok_or(HeaderBuildError::Allocation)?;
-
-    unsafe {
-        header.as_ptr().write(ngx_table_elt_t {
-            hash,
-            key,
-            value,
-            lowcase_key,
-            next: ptr::null_mut(),
-        });
-    }
+    unsafe { header.write(value) };
     Ok(header)
 }
 
@@ -1665,29 +1665,61 @@ fn clear_headers_out_metadata(headers: &mut ngx_http_headers_out_t) {
     headers.trailers.last = &raw mut headers.trailers.part;
 }
 
-fn request_body_headers_candidate(
+struct RequestBodyFramingCandidate {
+    content_length: ngx_table_elt_t,
+    content_length_n: off_t,
+    count: ngx_uint_t,
+}
+
+fn request_body_framing_candidate(
     request: &RequestRefMut<'_>,
     pool: *mut ngx_pool_t,
     length: usize,
-) -> Result<ngx_http_headers_in_t, RequestBodyBuildError> {
-    let headers = request.headers_in()?;
-    let capacity = headers.len().checked_add(1).ok_or(HeaderBuildError::CountOverflow)?;
-    let mut candidate = unsafe { request.raw.as_ref().headers_in };
-    candidate.headers = create_header_list(pool, capacity)?;
-    candidate.count = 0;
-    candidate.content_length = ptr::null_mut();
-    candidate.transfer_encoding = ptr::null_mut();
+) -> Result<RequestBodyFramingCandidate, RequestBodyBuildError> {
+    request.headers_in()?;
+    let headers = unsafe { &request.raw.as_ref().headers_in };
+    let count = headers.count.checked_add(1).ok_or(HeaderBuildError::CountOverflow)?;
+    let content_length_n =
+        off_t::try_from(length).map_err(|_| RequestBodyBuildError::ContentLengthTooLarge)?;
+    let mut decimal = [0_u8; core::mem::size_of::<usize>() * 3];
+    let value = decimal_bytes(length, &mut decimal);
+    let content_length = build_pool_header(pool, b"Content-Length", value)?;
 
-    for header in headers.iter() {
-        let count = candidate.count.checked_add(1).ok_or(HeaderBuildError::CountOverflow)?;
-        let copied =
-            append_pool_header(&mut candidate.headers, pool, header.key(), header.value())?;
-        unsafe { (*copied.as_ptr()).hash = header.hash() };
-        candidate.count = count;
+    Ok(RequestBodyFramingCandidate { content_length, content_length_n, count })
+}
+
+fn publish_request_body_framing(
+    request: &mut RequestRefMut<'_>,
+    candidate: RequestBodyFramingCandidate,
+    body: *mut ngx_http_request_body_t,
+) -> Result<(), RequestBodyBuildError> {
+    let request = unsafe { request.raw.as_mut() };
+    let headers = &mut request.headers_in;
+    let list = unsafe { NgxList::<ngx_table_elt_t>::from_ngx_list_mut(&mut headers.headers) }
+        .ok_or(HeaderListError::InvalidList)?;
+    let content_length = NonNull::from(
+        list.push(candidate.content_length).map_err(|_| HeaderBuildError::Allocation)?,
+    );
+
+    for header in list.iter_mut() {
+        if ptr::eq(header, content_length.as_ptr()) {
+            continue;
+        }
+        let key = unsafe { header_bytes_unchecked(header.key) };
+        if key.eq_ignore_ascii_case(b"Content-Length")
+            || key.eq_ignore_ascii_case(b"Transfer-Encoding")
+        {
+            header.hash = 0;
+        }
     }
 
-    replace_request_body_framing(&mut candidate, pool, length)?;
-    Ok(candidate)
+    headers.content_length = content_length.as_ptr();
+    headers.transfer_encoding = ptr::null_mut();
+    headers.content_length_n = candidate.content_length_n;
+    headers.count = candidate.count;
+    headers.set_chunked(0);
+    request.request_body = body;
+    Ok(())
 }
 
 fn replace_request_body_framing(
@@ -2752,12 +2784,8 @@ impl<'callback> RequestRefMut<'callback> {
     /// Clears the current body pointer and publishes a zero Content-Length without transfer coding.
     pub fn clear_request_body(&mut self) -> Result<(), RequestBodyBuildError> {
         let pool = self.pool()?.as_ptr();
-        let headers = request_body_headers_candidate(self, pool, 0)?;
-        let request = unsafe { self.raw.as_mut() };
-        request.headers_in = headers;
-        request.request_body = ptr::null_mut();
-        repair_header_list_last(&mut request.headers_in.headers);
-        Ok(())
+        let framing = request_body_framing_candidate(self, pool, 0)?;
+        publish_request_body_framing(self, framing, ptr::null_mut())
     }
 
     /// Starts nginx client-body processing with one static callback type.
@@ -5266,6 +5294,60 @@ mod tests {
         assert_eq!(content_length_count, 1);
         assert_eq!(disabled_content_length_count, 1);
         assert_eq!(disabled_transfer_encoding_count, 1);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn request_body_framing_keeps_builtin_slots_in_the_live_header_list() {
+        fn assert_slots_are_live(raw: &ngx_http_request_t, expect_multiple_parts: bool) {
+            let headers = checked_header_list(&raw.headers_in.headers).unwrap();
+            let entries = headers
+                .headers
+                .iter()
+                .map(|header| ptr::from_ref(header).cast_mut())
+                .collect::<Vec<_>>();
+            let second_cookie = unsafe { (*raw.headers_in.cookie).next };
+
+            assert_eq!(!raw.headers_in.headers.part.next.is_null(), expect_multiple_parts);
+            for slot in [
+                raw.headers_in.host,
+                raw.headers_in.user_agent,
+                raw.headers_in.authorization,
+                raw.headers_in.cookie,
+                second_cookie,
+                raw.headers_in.content_length,
+            ] {
+                assert!(!slot.is_null());
+                assert!(entries.contains(&slot));
+            }
+        }
+
+        for capacity in [10, 2] {
+            let owner = TestPool::new();
+            let mut raw = zeroed_request();
+            raw.pool = owner.raw;
+
+            {
+                let mut request = request_from(&mut raw);
+                let mut headers = unsafe { request.headers_in_builder(capacity) }.unwrap();
+                headers.add(b"Host", b"example.test").unwrap();
+                headers.add(b"User-Agent", b"agent").unwrap();
+                headers.add(b"Authorization", b"scheme token").unwrap();
+                headers.add(b"Cookie", b"first=1").unwrap();
+                headers.add(b"Cookie", b"second=2").unwrap();
+                headers.add(b"Content-Length", b"99").unwrap();
+                headers.add(b"Transfer-Encoding", b"chunked").unwrap();
+                headers.commit();
+
+                let mut body = request.request_body_builder().unwrap();
+                body.append_copy(b"body").unwrap();
+                body.commit().unwrap();
+            }
+            assert_slots_are_live(&raw, capacity == 2);
+
+            request_from(&mut raw).clear_request_body().unwrap();
+            assert_slots_are_live(&raw, capacity == 2);
+        }
     }
 
     #[cfg(feature = "test-link")]
