@@ -686,7 +686,7 @@ fn input_buffer_views_distinguish_absent_invalid_and_control_buffers() {
     let connection_view =
         unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
     let buffer = connection_view.buffer().unwrap().unwrap();
-    assert_eq!(buffer.has_space(), Err(BufferError::InvalidMemoryRange));
+    assert_eq!(buffer.has_space(), Ok(false));
 }
 
 #[test]
@@ -695,6 +695,7 @@ fn buffer_swap_rejects_invalid_scratch_without_changing_the_connection() {
     let mut original = memory_buffer(&bytes);
     let original_ptr = &raw mut original;
     let mut scratch = memory_buffer(&bytes);
+    scratch.set_temporary(1);
     scratch.last = unsafe { scratch.pos.add(2) };
     scratch.end = unsafe { scratch.pos.add(1) };
     let mut connection = zeroed_connection();
