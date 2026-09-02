@@ -73,6 +73,8 @@ impl IntoHandlerStatus for Status {
 }
 
 /// A typed Stream phase handler.
+///
+/// A handler must not panic; panics terminate the worker process.
 pub trait StreamSessionHandler {
     /// Phase in which nginx invokes this handler.
     const PHASE: StreamPhase;
