@@ -140,7 +140,10 @@ impl HttpRequestHandler for SubRequestAccessHandler {
             .in_memory()
             .waited()
             .build()?;
-        subrequest.add_header_in("X-Subrequest", "1").map_err(|_| ExampleError::AddHeader)?;
+        // SAFETY: this custom field has no compiled nginx slot and is consumed only from the
+        // subrequest's raw input-header list.
+        unsafe { subrequest.add_header_in("X-Subrequest", "1") }
+            .map_err(|_| ExampleError::AddHeader)?;
 
         Ok(Status::NGX_AGAIN)
     }
