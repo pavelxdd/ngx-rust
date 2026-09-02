@@ -5000,6 +5000,7 @@ mod tests {
         let owner = TestPool::new();
         let mut raw = zeroed_request();
         raw.pool = owner.raw;
+        raw.headers_out.trailers = create_header_list(owner.raw, 1).unwrap();
 
         {
             let mut request = request_from(&mut raw);
