@@ -218,10 +218,10 @@ impl<'buffer> BufferRef<'buffer> {
         Ok(Some(bytes))
     }
 
-    /// Returns whether a memory-backed buffer has writable bytes after its visible range.
+    /// Returns whether a temporary buffer has writable bytes after its visible range.
     pub fn has_space(self) -> Result<bool, BufferError> {
         let buffer = unsafe { self.raw.as_ref() };
-        if !in_memory(buffer) {
+        if buffer.temporary() == 0 {
             return Ok(false);
         }
 
@@ -1141,15 +1141,34 @@ mod tests {
     }
 
     #[test]
-    fn memory_bytes_preserves_a_valid_empty_memory_range() {
+    fn read_only_memory_without_end_has_no_writable_space() {
         let storage = [0_u8; 1];
         let mut buffer = memory_buffer(&storage);
         buffer.last = buffer.pos;
+        buffer.end = ptr::null_mut();
 
         let view = unsafe { BufferRef::from_raw(&raw const buffer) }.unwrap();
         assert_eq!(view.memory_bytes(), Ok(Some(b"".as_slice())));
         assert_eq!(view.bytes(), Ok(None));
+        assert_eq!(view.has_space(), Ok(false));
+    }
+
+    #[test]
+    fn temporary_memory_reports_checked_writable_space() {
+        let mut storage = [0_u8; 4];
+        let mut buffer: ngx_buf_t = unsafe { mem::zeroed() };
+        buffer.pos = storage.as_mut_ptr();
+        buffer.last = unsafe { buffer.pos.add(2) };
+        buffer.start = buffer.pos;
+        buffer.end = unsafe { buffer.pos.add(storage.len()) };
+        buffer.set_temporary(1);
+
+        let view = unsafe { BufferRef::from_raw(&raw const buffer) }.unwrap();
         assert_eq!(view.has_space(), Ok(true));
+
+        buffer.end = unsafe { buffer.pos.add(1) };
+        let view = unsafe { BufferRef::from_raw(&raw const buffer) }.unwrap();
+        assert_eq!(view.has_space(), Err(BufferError::InvalidMemoryRange));
     }
 
     #[test]
