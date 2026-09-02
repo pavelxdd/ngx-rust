@@ -123,6 +123,16 @@ unsafe extern "C" fn io_end_of_file(
     0
 }
 
+unsafe extern "C" fn send_empty_datagram(
+    connection: *mut ngx_connection_t,
+    _input: *mut u8,
+    size: usize,
+) -> isize {
+    assert_eq!(size, 0);
+    unsafe { (*connection).sent += 1 };
+    0
+}
+
 unsafe extern "C" fn io_error(
     _connection: *mut ngx_connection_t,
     _buffer: *mut u8,
@@ -296,10 +306,37 @@ fn connection_io_preserves_partial_and_would_block_results() {
 }
 
 #[test]
+fn connection_io_distinguishes_zero_length_streams_and_datagrams() {
+    let mut output = [0; 1];
+
+    let mut datagram = zeroed_connection();
+    datagram.type_ = libc::SOCK_DGRAM;
+    datagram.recv = Some(io_end_of_file);
+    datagram.send = Some(send_empty_datagram);
+    {
+        let mut connection =
+            unsafe { ConnectionRefMut::from_raw(raw_connection(&mut datagram)) }.unwrap();
+        assert_eq!(connection.receive(&mut output), Ok(ConnectionReadResult::Data(0)));
+        assert_eq!(connection.send(&[]), Ok(ConnectionWriteResult::Written(0)));
+    }
+    assert_eq!(datagram.sent, 1);
+
+    let mut stream = zeroed_connection();
+    stream.type_ = libc::SOCK_STREAM;
+    stream.recv = Some(io_end_of_file);
+    stream.send = Some(io_error);
+    let mut connection =
+        unsafe { ConnectionRefMut::from_raw(raw_connection(&mut stream)) }.unwrap();
+    assert_eq!(connection.receive(&mut output), Ok(ConnectionReadResult::EndOfFile));
+    assert_eq!(connection.send(&[]), Ok(ConnectionWriteResult::Written(0)));
+}
+
+#[test]
 fn connection_io_maps_eof_failures_and_invalid_counts() {
     let mut output = [0; 4];
 
     let mut raw = zeroed_connection();
+    raw.type_ = libc::SOCK_STREAM;
     raw.recv = Some(io_end_of_file);
     raw.send = Some(io_end_of_file);
     let mut connection = unsafe { ConnectionRefMut::from_raw(raw_connection(&mut raw)) }.unwrap();
