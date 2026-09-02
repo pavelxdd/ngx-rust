@@ -12,7 +12,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::panic::catch_unwind;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, ThreadId};
 
 use async_task::{Runnable, ScheduleInfo, Task as RawTask, WithInfo};
@@ -418,6 +418,7 @@ impl WorkerScheduler {
 struct Scheduler {
     owner: ThreadId,
     inner: Mutex<SchedulerInner>,
+    task_lifetime: Condvar,
     controls: Mutex<Vec<Weak<TaskControl>>>,
     notification: Mutex<Option<libc::c_int>>,
     notification_pending: AtomicBool,
@@ -429,6 +430,8 @@ struct SchedulerInner {
     cancellations: VecDeque<Arc<TaskControl>>,
     // A local runnable may only be destroyed by its owner thread.
     quarantined: VecDeque<Runnable>,
+    // Zero proves that no runnable can still carry a worker-local future into quarantine.
+    live_tasks: usize,
     processing: bool,
 }
 
@@ -462,8 +465,10 @@ impl Scheduler {
                 queue: VecDeque::new(),
                 cancellations: VecDeque::new(),
                 quarantined: VecDeque::new(),
+                live_tasks: 0,
                 processing: false,
             }),
+            task_lifetime: Condvar::new(),
             controls: Mutex::new(Vec::new()),
             notification: Mutex::new(None),
             notification_pending: AtomicBool::new(false),
@@ -516,6 +521,18 @@ impl Scheduler {
         self.controls.lock().unwrap_or_else(|error| error.into_inner()).retain(|candidate| {
             candidate.upgrade().is_some_and(|candidate| !Arc::ptr_eq(&candidate, control))
         });
+    }
+
+    fn register_task_lifetime(&self) {
+        self.lock().live_tasks += 1;
+    }
+
+    fn release_task_lifetime(&self) {
+        let mut inner = self.lock();
+        debug_assert_ne!(inner.live_tasks, 0);
+        inner.live_tasks -= 1;
+        drop(inner);
+        self.task_lifetime.notify_all();
     }
 
     fn fail_live_tasks(&self) {
@@ -825,6 +842,7 @@ impl Scheduler {
 
     fn quarantine(&self, runnable: Runnable) {
         self.lock().quarantined.push_back(runnable);
+        self.task_lifetime.notify_all();
     }
 
     fn drain_for_shutdown(&self) -> VecDeque<Runnable> {
@@ -838,17 +856,40 @@ impl Scheduler {
         queued
     }
 
+    fn drain_task_handoffs(&self) {
+        // Dropping the registered task handles closes every future. A foreign wake that won the
+        // close race must still hand its runnable to quarantine before that future can disappear.
+        loop {
+            let mut inner = self.lock();
+            while inner.live_tasks != 0 && inner.queue.is_empty() && inner.quarantined.is_empty() {
+                inner = self.task_lifetime.wait(inner).unwrap_or_else(|error| error.into_inner());
+            }
+
+            let complete = inner.live_tasks == 0;
+            let mut queued = mem::take(&mut inner.queue);
+            queued.append(&mut inner.quarantined);
+            drop(inner);
+            drop(queued);
+
+            if complete {
+                return;
+            }
+        }
+    }
+
     fn stop_and_drop(&self) {
         self.fail_live_tasks();
         let queued = self.drain_for_shutdown();
         let processing = self.processing_on_current_worker();
-        if !processing {
-            self.cancel_all_registered_tasks();
+        if processing {
+            drop(queued);
+            return;
         }
+
+        self.cancel_all_registered_tasks();
         drop(queued);
-        if !processing {
-            self.reap_completed_tasks();
-        }
+        self.drain_task_handoffs();
+        self.reap_completed_tasks();
     }
 
     fn finish_shutdown(&self) {
@@ -857,6 +898,11 @@ impl Scheduler {
         if matches!(&inner.phase, SchedulerPhase::Stopping) {
             inner.phase = SchedulerPhase::Stopped;
         }
+    }
+
+    fn is_stopping_on_current_worker(&self) -> bool {
+        self.owner == thread::current().id()
+            && matches!(&self.lock().phase, SchedulerPhase::Stopping)
     }
 
     fn is_stopped(&self) -> bool {
@@ -941,12 +987,15 @@ where
 impl<F, T> Drop for TaskRunner<F, T> {
     fn drop(&mut self) {
         self.finish_error(TaskStatus::Canceled);
+        self.scheduler.release_task_lifetime();
     }
 }
 
 fn posted_scheduler_handler(mut event: PostedEventCallback<'_, Arc<Scheduler>>) {
     if event.state().process() {
         let _ = event.post(PostedQueue::Next);
+    } else if event.state().is_stopping_on_current_worker() {
+        event.state().stop_and_drop();
     }
 }
 
@@ -1047,7 +1096,11 @@ unsafe extern "C" fn notification_channel_handler(event: *mut ngx_event_t) {
 
     unsafe { event.as_ptr().as_mut().unwrap().set_ready(0) };
     scheduler.notification_pending.store(false, Ordering::Release);
-    if scheduler.process() && !scheduler.post_current() {
+    if scheduler.process() {
+        if !scheduler.post_current() {
+            scheduler.stop_and_drop();
+        }
+    } else if scheduler.is_stopping_on_current_worker() {
         scheduler.stop_and_drop();
     }
 }
@@ -1127,7 +1180,8 @@ pub unsafe fn init_worker(log: LogRef<'_>) -> Result<(), SchedulerInitError> {
 ///
 /// Returns `Ok(false)` when this thread has no active scheduler. Call this only after nginx has
 /// stopped invoking scheduler callbacks; calling it from a running task returns
-/// [`SchedulerShutdownError::Processing`].
+/// [`SchedulerShutdownError::Processing`]. Already-started foreign wake handoffs are drained here,
+/// and their futures are destroyed on the owning worker thread before shutdown returns.
 pub fn shutdown_worker() -> Result<bool, SchedulerShutdownError> {
     let scheduler = match WORKER_SCHEDULER.with(|worker| {
         let worker = worker.borrow();
@@ -1161,12 +1215,13 @@ pub fn shutdown_worker() -> Result<bool, SchedulerShutdownError> {
         worker.shutdown();
         Ok(worker.take_all_tasks())
     })?;
-    scheduler.finish_shutdown();
     for task in &tasks {
         task.control.finish(TaskStatus::Canceled);
     }
     scheduler.drop_registered_tasks(tasks);
     drop(queued);
+    scheduler.drain_task_handoffs();
+    scheduler.finish_shutdown();
     scheduler.reap_completed_tasks();
     clear_active_scheduler(&scheduler);
 
@@ -1185,6 +1240,7 @@ where
     let scheduler = current_scheduler()?;
     let control = TaskControl::new(&scheduler);
     let state = TaskState::new();
+    scheduler.register_task_lifetime();
     let task_scheduler = Arc::clone(&scheduler);
     let task_scheduler = WithInfo(move |runnable, info| task_scheduler.schedule(runnable, info));
     let (runnable, task) = async_task::spawn_local(
@@ -1999,46 +2055,104 @@ mod worker_tests {
     }
 
     #[test]
-    fn notification_failure_stops_admission_without_a_dormant_runnable() {
+    fn notification_failure_drains_local_tasks_on_the_owner_callback() {
         let mut worker = TestWorker::new();
         worker.init().unwrap();
         let scheduler = current_scheduler().unwrap();
-        let ready = Arc::new(AtomicBool::new(false));
+        let owner = thread::current().id();
         let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
         let (waker_tx, waker_rx) = mpsc::channel();
-        let future_ready = Arc::clone(&ready);
+        let (drop_tx, drop_rx) = mpsc::channel();
         let future_polls = Arc::clone(&polls);
 
-        let _task = spawn(poll_fn(move |context| {
-            future_polls.fetch_add(1, Ordering::Relaxed);
-            if future_ready.load(Ordering::Acquire) {
-                Poll::Ready(())
-            } else {
-                waker_tx.send(context.waker().clone()).unwrap();
-                Poll::Pending
+        struct DropThread {
+            sender: mpsc::Sender<ThreadId>,
+            dropped: Arc<AtomicUsize>,
+        }
+
+        impl Drop for DropThread {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                let _ = self.sender.send(thread::current().id());
             }
+        }
+
+        let drop_thread = DropThread { sender: drop_tx, dropped: Arc::clone(&dropped) };
+        let task = spawn(poll_fn(move |context| {
+            future_polls.fetch_add(1, Ordering::Relaxed);
+            waker_tx.send(context.waker().clone()).unwrap();
+            let _ = &drop_thread;
+            Poll::<()>::Pending
         }))
         .unwrap();
 
         worker.process_posted();
         current_scheduler().unwrap().close_notification();
         let waker = waker_rx.recv().unwrap();
-        let remote_ready = Arc::clone(&ready);
-        thread::spawn(move || {
-            remote_ready.store(true, Ordering::Release);
-            waker.wake();
-        })
-        .join()
-        .unwrap();
+        thread::spawn(move || waker.wake()).join().unwrap();
 
         assert_eq!(NOTIFY_CALLS.load(Ordering::Relaxed), 0);
         assert!(matches!(spawn(async {}), Err(SpawnError::ShuttingDown)));
         assert_eq!(polls.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+
+        worker.deliver_notification();
+
+        assert_eq!(drop_rx.try_recv().unwrap(), owner);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
         let inner = scheduler.lock();
         assert!(inner.queue.is_empty());
-        assert_eq!(inner.quarantined.len(), 1);
+        assert!(inner.quarantined.is_empty());
         drop(inner);
         assert!(worker.queues_are_empty());
+        assert!(worker.task_registry_is_empty());
+
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::SchedulerFailed)));
+    }
+
+    #[test]
+    fn shutdown_drains_a_foreign_handoff_started_after_the_first_drain() {
+        let mut worker = TestWorker::new();
+        worker.init().unwrap();
+        let scheduler = current_scheduler().unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let task = spawn(PendingDropFuture {
+            polls: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::clone(&dropped),
+            waker: None,
+        })
+        .unwrap();
+        let runnable = scheduler.lock().queue.pop_front().expect("initial runnable");
+        let foreign_scheduler = Arc::clone(&scheduler);
+        let foreign = thread::spawn(move || {
+            loop {
+                if !matches!(foreign_scheduler.lock().phase, SchedulerPhase::Running) {
+                    break;
+                }
+                thread::yield_now();
+            }
+            match foreign_scheduler.queue(runnable) {
+                ScheduleAction::RejectedForeign(runnable) => {
+                    foreign_scheduler.quarantine(runnable);
+                }
+                _ => panic!("stopping scheduler accepted a foreign runnable"),
+            }
+        });
+
+        assert_eq!(shutdown_worker(), Ok(true));
+        foreign.join().unwrap();
+
+        let inner = scheduler.lock();
+        assert!(inner.queue.is_empty());
+        assert!(inner.quarantined.is_empty());
+        drop(inner);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        let mut task = core::pin::pin!(task);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::Canceled)));
     }
 
     #[test]
