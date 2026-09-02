@@ -331,7 +331,7 @@ pub enum RequestHoldError {
     ForeignRequest,
     /// The main request no longer has a live reference count.
     InactiveMain,
-    /// The 16-bit nginx main-request count cannot be incremented.
+    /// Nginx's reserved 16-bit main-request count range cannot accept another hold.
     CountOverflow,
 }
 
@@ -1797,6 +1797,8 @@ unsafe fn checked_ngx_str<'a>(value: ngx_str_t) -> Result<&'a NgxStr, RequestErr
 }
 
 const MAX_SUBREQUEST_PARENT_EDGES: usize = NGX_HTTP_MAX_SUBREQUESTS as usize + 1;
+/// Highest main-request count a Rust hold may publish; nginx reserves the remaining 1,000.
+const MAX_REQUEST_COUNT_AFTER_HOLD: u32 = u16::MAX as u32 - 1000;
 
 /// Shared callback-scoped access to an nginx HTTP request.
 ///
@@ -2355,8 +2357,8 @@ impl<'callback> RequestRefMut<'callback> {
     ///
     /// `hold` must be the one slot in the pinned request context that owns this delayed path.
     /// Call this only after nginx reports that work will continue asynchronously; synchronous
-    /// completion leaves `hold` empty. The hold is installed only after the main request count
-    /// can be incremented.
+    /// completion leaves `hold` empty. The hold is installed only when the main request count can
+    /// be incremented without consuming nginx's reserved lifecycle range.
     ///
     /// # Safety
     ///
@@ -2372,7 +2374,7 @@ impl<'callback> RequestRefMut<'callback> {
         if count == 0 {
             return Err(RequestHoldError::InactiveMain);
         }
-        if count == u16::MAX as _ {
+        if count >= MAX_REQUEST_COUNT_AFTER_HOLD {
             return Err(RequestHoldError::CountOverflow);
         }
 
@@ -6169,7 +6171,7 @@ mod tests {
     }
 
     #[test]
-    fn request_hold_rejects_inactive_and_full_main_counts() {
+    fn request_hold_preserves_nginx_reference_reserve() {
         let mut main = zeroed_request();
         initialize_request(&mut main);
 
@@ -6182,10 +6184,17 @@ mod tests {
         assert_eq!(unsafe { request.hold(&mut hold) }, Err(RequestHoldError::InactiveMain));
         assert!(hold.is_none());
 
-        main.set_count(u16::MAX.into());
+        let native_limit = u32::from(u16::MAX) - 1000;
+        main.set_count(native_limit - 1);
+        assert_eq!(unsafe { request.hold(&mut hold) }, Ok(()));
+        assert_eq!(main.count(), native_limit);
+        assert!(RequestHold::cancel(&mut hold));
+        assert_eq!(main.count(), native_limit - 1);
+
+        main.set_count(native_limit);
         assert_eq!(unsafe { request.hold(&mut hold) }, Err(RequestHoldError::CountOverflow));
         assert!(hold.is_none());
-        assert_eq!(main.count(), u16::MAX.into());
+        assert_eq!(main.count(), native_limit);
     }
 
     #[test]
