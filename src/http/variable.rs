@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use core::alloc::Layout;
 use core::error;
 use core::fmt;
@@ -12,9 +13,9 @@ use crate::core::{NgxStr, Pool};
 use crate::ffi::{
     NGX_ERROR, NGX_HTTP_VAR_CHANGEABLE, NGX_HTTP_VAR_NOCACHEABLE, NGX_HTTP_VAR_NOHASH,
     NGX_HTTP_VAR_PREFIX, NGX_HTTP_VAR_WEAK, NGX_OK, ngx_http_add_variable,
-    ngx_http_core_main_conf_t, ngx_http_get_flushed_variable, ngx_http_get_indexed_variable,
-    ngx_http_get_variable_index, ngx_http_request_t, ngx_http_variable_t, ngx_int_t, ngx_str_t,
-    ngx_uint_t, ngx_variable_value_t,
+    ngx_http_get_flushed_variable, ngx_http_get_indexed_variable, ngx_http_get_variable_index,
+    ngx_http_request_t, ngx_http_variable_t, ngx_int_t, ngx_str_t, ngx_uint_t,
+    ngx_variable_value_t,
 };
 use crate::http::{
     HttpConfigError, HttpConfigurationParser, HttpModuleMainConf, HttpModuleRequestContext,
@@ -84,14 +85,26 @@ impl From<HttpConfigError> for HttpVariableIndexError {
     }
 }
 
-/// Opaque index for one HTTP core configuration.
+/// Opaque numeric index bound to one exact HTTP variable name.
 ///
-/// Create a new index during each configuration pass. An index is not interchangeable between
-/// independently allocated HTTP core configurations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The owned name keeps stale indexes from resolving a different variable if nginx reuses a
+/// configuration address. An index remains usable with another configuration only when the same
+/// numeric slot contains the same variable name.
+///
+/// Indexes are not implicitly copied into state unrelated to their configuration owner:
+///
+/// ```compile_fail
+/// use ngx::http::HttpVariableIndex;
+///
+/// fn duplicate(index: HttpVariableIndex) {
+///     let moved = index;
+///     let _ = (moved, index);
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpVariableIndex {
     index: ngx_uint_t,
-    core_main: NonNull<ngx_http_core_main_conf_t>,
+    name: Box<[u8]>,
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
@@ -102,7 +115,7 @@ pub enum HttpVariableCacheInvalidationError {
     Configuration(HttpConfigError),
     /// The request has no HTTP core main configuration.
     MissingCoreMainConfiguration,
-    /// A preserved index belongs to a different HTTP core configuration.
+    /// A preserved numeric index resolves to a different variable definition.
     ForeignIndex,
     /// A preserved index is outside the configured definition array.
     IndexOutOfBounds,
@@ -125,8 +138,9 @@ impl fmt::Display for HttpVariableCacheInvalidationError {
             Self::MissingCoreMainConfiguration => {
                 formatter.write_str("HTTP core main configuration is unavailable")
             }
-            Self::ForeignIndex => formatter
-                .write_str("preserved HTTP variable index belongs to another configuration"),
+            Self::ForeignIndex => {
+                formatter.write_str("preserved HTTP variable index resolves to another definition")
+            }
             Self::IndexOutOfBounds => {
                 formatter.write_str("preserved HTTP variable index is out of bounds")
             }
@@ -186,11 +200,13 @@ impl<'preserved, 'callback> HttpVariableCacheInvalidation<'preserved, 'callback>
             return Err(HttpVariableCacheInvalidationError::InvalidDefinitionArray);
         }
         for index in preserved {
-            if !ptr::eq(core_main, index.core_main.as_ptr()) {
-                return Err(HttpVariableCacheInvalidationError::ForeignIndex);
-            }
             if index.index >= variables.nelts {
                 return Err(HttpVariableCacheInvalidationError::IndexOutOfBounds);
+            }
+            let definition =
+                unsafe { &*variables.elts.cast::<ngx_http_variable_t>().add(index.index) };
+            if definition.name.as_bytes() != index.name.as_ref() {
+                return Err(HttpVariableCacheInvalidationError::ForeignIndex);
             }
         }
 
@@ -253,7 +269,7 @@ pub enum HttpVariableLookupError {
     Configuration(HttpConfigError),
     /// The request has no HTTP core main configuration.
     MissingCoreMainConfiguration,
-    /// The index belongs to a different HTTP core configuration.
+    /// The numeric index resolves to a different variable definition.
     ForeignConfiguration,
     /// The indexed variable is outside the configured definition array.
     IndexOutOfBounds,
@@ -281,7 +297,7 @@ impl fmt::Display for HttpVariableLookupError {
                 formatter.write_str("HTTP core main configuration is unavailable")
             }
             Self::ForeignConfiguration => {
-                formatter.write_str("HTTP variable index belongs to another configuration")
+                formatter.write_str("HTTP variable index resolves to another definition")
             }
             Self::IndexOutOfBounds => formatter.write_str("HTTP variable index is out of bounds"),
             Self::InvalidDefinitionArray => {
@@ -738,10 +754,6 @@ impl HttpVariableIndex {
             let core_main = request_view
                 .main_conf::<NgxHttpCoreModule>()?
                 .ok_or(HttpVariableLookupError::MissingCoreMainConfiguration)?;
-            if !ptr::eq(core_main, self.core_main.as_ptr()) {
-                return Err(HttpVariableLookupError::ForeignConfiguration);
-            }
-
             let variables = &core_main.variables;
             if index >= variables.nelts {
                 return Err(HttpVariableLookupError::IndexOutOfBounds);
@@ -755,6 +767,9 @@ impl HttpVariableIndex {
             }
 
             let definition = unsafe { &*variables.elts.cast::<ngx_http_variable_t>().add(index) };
+            if definition.name.as_bytes() != self.name.as_ref() {
+                return Err(HttpVariableLookupError::ForeignConfiguration);
+            }
             if definition.get_handler.is_none() {
                 return Err(HttpVariableLookupError::MissingHandler);
             }
@@ -1060,7 +1075,8 @@ pub fn get_variable_index(
         .ok_or(HttpVariableIndexError::MissingCoreMainConfiguration)?;
     let original_nelts = core_main.variables.nelts;
     let variables_nelts = &raw mut core_main.variables.nelts;
-    let core_main = NonNull::from(core_main);
+    let mut owned_name = Box::<[u8]>::from(name.as_bytes());
+    owned_name.make_ascii_lowercase();
     let mut name = name.as_ngx_str();
     let index = unsafe { ngx_http_get_variable_index(parser.as_raw(), &raw mut name) };
     if index == NGX_ERROR as _ {
@@ -1069,7 +1085,7 @@ pub fn get_variable_index(
     }
     let index = ngx_uint_t::try_from(index).map_err(|_| HttpVariableIndexError::Registration)?;
 
-    Ok(HttpVariableIndex { index, core_main, _not_thread_safe: PhantomData })
+    Ok(HttpVariableIndex { index, name: owned_name, _not_thread_safe: PhantomData })
 }
 
 /// C-compatible adapter for a typed HTTP variable getter.

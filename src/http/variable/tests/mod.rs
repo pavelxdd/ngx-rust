@@ -10,12 +10,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::MutexGuard;
 
 use super::{
-    HttpPrefixVariableHandler, HttpVariableCacheInvalidation, HttpVariableFlags,
-    HttpVariableHandler, HttpVariableIndex, HttpVariableIndexError, HttpVariableLookupError,
-    HttpVariableOutput, HttpVariableOutputError, HttpVariablePoolBytes, HttpVariableRequest,
-    HttpVariableSetter, HttpVariableValueRef, add_prefix_variable, add_variable,
-    add_variable_with_setter, get_variable_index, raw_get_handler, raw_prefix_get_handler,
-    raw_set_handler,
+    HttpPrefixVariableHandler, HttpVariableCacheInvalidation, HttpVariableCacheInvalidationError,
+    HttpVariableFlags, HttpVariableHandler, HttpVariableIndex, HttpVariableIndexError,
+    HttpVariableLookupError, HttpVariableOutput, HttpVariableOutputError, HttpVariablePoolBytes,
+    HttpVariableRequest, HttpVariableSetter, HttpVariableValueRef, add_prefix_variable,
+    add_variable, add_variable_with_setter, get_variable_index, raw_get_handler,
+    raw_prefix_get_handler, raw_set_handler,
 };
 use crate::core::{NgxStr, Status};
 use crate::ffi::{
