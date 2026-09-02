@@ -15,10 +15,9 @@ fn variable_index_rejects_missing_http_context() {
 
 #[test]
 fn indexed_lookup_rejects_missing_request_configuration() {
-    let mut core = unsafe { MaybeUninit::<ngx_http_core_main_conf_t>::zeroed().assume_init() };
     let index = HttpVariableIndex {
         index: 0,
-        core_main: NonNull::from(&mut core),
+        name: Box::from(b"ngx_rs_index".as_slice()),
         _not_thread_safe: PhantomData,
     };
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
@@ -77,6 +76,29 @@ fn indexed_lookup_preserves_nginx_cache_and_flush_semantics() {
 
 #[cfg(feature = "test-link")]
 #[test]
+fn variable_index_uses_the_canonical_lowercase_definition_name() {
+    let mut fixture = VariableFixture::new();
+    add_variable::<IndexedVariable>(
+        &mut fixture.configuration(),
+        NgxStr::from_bytes(b"ngx_rs_case_insensitive"),
+        HttpVariableFlags::empty(),
+        0,
+    )
+    .unwrap();
+    let index = get_variable_index(
+        &mut fixture.configuration(),
+        NgxStr::from_bytes(b"NGX_RS_CASE_INSENSITIVE"),
+    )
+    .unwrap();
+    fixture.configuration.finalize_variables();
+
+    fixture.configuration.with_request(|request| {
+        assert_eq!(index.get_cached(request).unwrap().bytes(), Some(&b"indexed"[..]));
+    });
+}
+
+#[cfg(feature = "test-link")]
+#[test]
 fn variable_cache_invalidation_refreshes_getters_but_preserves_assigned_and_excluded_values() {
     let mut fixture = VariableFixture::new();
     let definitions = [
@@ -106,8 +128,8 @@ fn variable_cache_invalidation_refreshes_getters_but_preserves_assigned_and_excl
         }
         assert_eq!(INDEXED_VARIABLE_CALLS.load(Ordering::Relaxed), 4);
 
-        let preserved = [indexes[3]];
-        let invalidation = HttpVariableCacheInvalidation::prepare(request, &preserved).unwrap();
+        let preserved = core::slice::from_ref(&indexes[3]);
+        let invalidation = HttpVariableCacheInvalidation::prepare(request, preserved).unwrap();
         invalidation.commit(request).unwrap();
 
         assert_eq!(indexes[0].get_cached(request).unwrap().bytes(), Some(&b"indexed"[..]));
@@ -259,7 +281,7 @@ fn indexed_lookup_rejects_invalid_bounds_and_request_storage() {
     .unwrap();
     fixture.configuration.finalize_variables();
 
-    let mut out_of_bounds = index;
+    let mut out_of_bounds = index.clone();
     out_of_bounds.index = fixture.configuration.main.variables.nelts;
     fixture.configuration.with_request(|request| {
         assert!(matches!(
@@ -336,7 +358,47 @@ fn indexed_lookup_maps_a_failed_native_getter_to_a_null_result() {
 
 #[cfg(feature = "test-link")]
 #[test]
-fn variable_indexes_are_recreated_for_a_reload_configuration() {
+fn variable_index_rejects_a_foreign_definition_at_a_reused_configuration_address() {
+    let mut fixture = VariableFixture::new();
+    for name in [b"ngx_rs_stale_index".as_slice(), b"ngx_rs_current_index".as_slice()] {
+        add_variable::<IndexedVariable>(
+            &mut fixture.configuration(),
+            NgxStr::from_bytes(name),
+            HttpVariableFlags::empty(),
+            0,
+        )
+        .unwrap();
+    }
+    let stale_index =
+        get_variable_index(&mut fixture.configuration(), NgxStr::from_bytes(b"ngx_rs_stale_index"))
+            .unwrap();
+    let mut current_index = get_variable_index(
+        &mut fixture.configuration(),
+        NgxStr::from_bytes(b"ngx_rs_current_index"),
+    )
+    .unwrap();
+    fixture.configuration.finalize_variables();
+
+    let current_definition = *fixture.configuration.indexed_variable_mut(current_index.index);
+    *fixture.configuration.indexed_variable_mut(stale_index.index) = current_definition;
+    current_index.index = stale_index.index;
+
+    fixture.configuration.with_request(|request| {
+        assert!(matches!(
+            HttpVariableCacheInvalidation::prepare(request, core::slice::from_ref(&stale_index)),
+            Err(HttpVariableCacheInvalidationError::ForeignIndex)
+        ));
+        assert!(matches!(
+            stale_index.get_cached(request),
+            Err(HttpVariableLookupError::ForeignConfiguration)
+        ));
+        assert_eq!(current_index.get_cached(request).unwrap().bytes(), Some(&b"indexed"[..]));
+    });
+}
+
+#[cfg(feature = "test-link")]
+#[test]
+fn variable_indexes_follow_the_same_definition_across_reload_configurations() {
     let mut fixture = VariableFixture::new();
     add_variable::<IndexedVariable>(
         &mut fixture.configuration(),
@@ -368,11 +430,10 @@ fn variable_indexes_are_recreated_for_a_reload_configuration() {
     INDEXED_VARIABLE_CALLS.store(0, Ordering::Relaxed);
 
     reloaded.with_request(|request| {
-        assert!(matches!(
-            old_index.get_cached(request),
-            Err(HttpVariableLookupError::ForeignConfiguration)
-        ));
-
+        {
+            let value = old_index.get_cached(request).unwrap();
+            assert_eq!(value.bytes(), Some(&b"indexed"[..]));
+        }
         {
             let value = new_index.get_cached(request).unwrap();
             assert_eq!(value.bytes(), Some(&b"indexed"[..]));
