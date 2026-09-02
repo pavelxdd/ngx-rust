@@ -10,8 +10,8 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use crate::event::{
-    EventPeerConnection, EventPeerConnectionError, EventPeerConnectionState, EventRef, PostedQueue,
-    Timer, TimerCallback,
+    EventPeerConnection, EventPeerConnectionError, EventPeerPendingConnection, EventRef,
+    PostedQueue, Timer, TimerCallback,
 };
 use crate::ffi::{
     NGX_OK, ngx_connection_t, ngx_event_handler_pt, ngx_event_t, ngx_handle_read_event,
@@ -300,9 +300,34 @@ fn same_handler(
 ///     require_send(connection.wait_read(None));
 /// }
 /// ```
+enum EventReadinessConnection<'connection, 'address, 'log> {
+    Connected(&'connection mut EventPeerConnection<'address, 'log>),
+    Pending(&'connection mut EventPeerPendingConnection<'address, 'log>),
+}
+
+impl<'address, 'log> EventReadinessConnection<'_, 'address, 'log> {
+    fn parts(
+        &self,
+        write: bool,
+    ) -> Result<(NonNull<ngx_connection_t>, NonNull<ngx_event_t>), EventPeerConnectionError> {
+        match self {
+            Self::Connected(connection) => connection.readiness_parts(write),
+            Self::Pending(connection) => connection.readiness_parts(),
+        }
+    }
+
+    fn log(&self) -> crate::log::LogRef<'log> {
+        match self {
+            Self::Connected(connection) => connection.readiness_log(),
+            Self::Pending(connection) => connection.readiness_log(),
+        }
+    }
+}
+
+/// Future that exclusively waits for one event owned by a connected or pending peer.
 #[must_use = "futures do nothing unless polled or awaited"]
 pub struct EventReadiness<'connection, 'address, 'log> {
-    connection: &'connection mut EventPeerConnection<'address, 'log>,
+    connection: EventReadinessConnection<'connection, 'address, 'log>,
     kind: WaitKind,
     timeout_remaining: Option<u128>,
     timeout_armed: u128,
@@ -316,11 +341,11 @@ pub struct EventReadiness<'connection, 'address, 'log> {
 
 impl<'connection, 'address, 'log> EventReadiness<'connection, 'address, 'log> {
     fn new(
-        connection: &'connection mut EventPeerConnection<'address, 'log>,
+        connection: EventReadinessConnection<'connection, 'address, 'log>,
         kind: WaitKind,
         timeout: Option<Duration>,
     ) -> Self {
-        let log = connection.readiness_log();
+        let log = connection.log();
         Self {
             connection,
             kind,
@@ -370,29 +395,14 @@ impl<'connection, 'address, 'log> EventReadiness<'connection, 'address, 'log> {
         }
 
         if self.kind == WaitKind::Connect {
-            return match self.connection.state() {
-                EventPeerConnectionState::Pending => match self.connection.connect_ready() {
-                    Ok(ready) => {
-                        Some(ready.complete().map(|()| Readiness::Connect).map_err(Into::into))
-                    }
-                    Err(EventPeerConnectionError::NotReady) => None,
-                    Err(error) => Some(Err(error.into())),
-                },
-                EventPeerConnectionState::Connected | EventPeerConnectionState::Borrowed => {
-                    let error =
-                        unsafe { connection.as_ref().error() != 0 || event.as_ref().error() != 0 };
-                    if error {
-                        Some(Err(ReadinessError::Connection))
-                    } else if unsafe { event.as_ref().eof() != 0 } {
-                        Some(Err(ReadinessError::EndOfFile))
-                    } else {
-                        Some(Ok(Readiness::Connect))
-                    }
-                }
-                EventPeerConnectionState::Failed => {
-                    Some(Err(EventPeerConnectionError::NotPending.into()))
-                }
+            let ready = unsafe {
+                event.as_ref().ready() != 0
+                    || connection.as_ref().error() != 0
+                    || event.as_ref().error() != 0
+                    || event.as_ref().eof() != 0
+                    || event.as_ref().timedout() != 0
             };
+            return ready.then_some(Ok(Readiness::Connect));
         }
 
         let ready = unsafe {
@@ -488,14 +498,13 @@ impl Future for EventReadiness<'_, '_, '_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        let (connection, event) =
-            match this.connection.readiness_parts(this.kind.uses_write_event()) {
-                Ok(parts) => parts,
-                Err(error) => {
-                    this.finish(false);
-                    return Poll::Ready(Err(error.into()));
-                }
-            };
+        let (connection, event) = match this.connection.parts(this.kind.uses_write_event()) {
+            Ok(parts) => parts,
+            Err(error) => {
+                this.finish(false);
+                return Poll::Ready(Err(error.into()));
+            }
+        };
         if let Some(result) = this.event_result(connection, event) {
             this.finish(false);
             return Poll::Ready(result);
@@ -543,7 +552,7 @@ impl<'address, 'log> EventPeerConnection<'address, 'log> {
         &mut self,
         timeout: Option<Duration>,
     ) -> EventReadiness<'_, 'address, 'log> {
-        EventReadiness::new(self, WaitKind::Read, timeout)
+        EventReadiness::new(EventReadinessConnection::Connected(self), WaitKind::Read, timeout)
     }
 
     /// Waits for the peer write event, optionally bounded by an nginx timer.
@@ -556,10 +565,16 @@ impl<'address, 'log> EventPeerConnection<'address, 'log> {
         &mut self,
         timeout: Option<Duration>,
     ) -> EventReadiness<'_, 'address, 'log> {
-        EventReadiness::new(self, WaitKind::Write, timeout)
+        EventReadiness::new(EventReadinessConnection::Connected(self), WaitKind::Write, timeout)
     }
+}
 
-    /// Waits for a pending nonblocking peer connection and validates `SO_ERROR` on readiness.
+impl<'address, 'log> EventPeerPendingConnection<'address, 'log> {
+    /// Waits until nginx reports readiness or terminal state for this pending connection.
+    ///
+    /// A successful wait reports event readiness only. Consume the pending owner with
+    /// [`EventPeerPendingConnection::connect_ready`] and complete its returned capability to
+    /// validate `SO_ERROR` and obtain an active connection.
     ///
     /// # Safety
     ///
@@ -569,6 +584,6 @@ impl<'address, 'log> EventPeerConnection<'address, 'log> {
         &mut self,
         timeout: Option<Duration>,
     ) -> EventReadiness<'_, 'address, 'log> {
-        EventReadiness::new(self, WaitKind::Connect, timeout)
+        EventReadiness::new(EventReadinessConnection::Pending(self), WaitKind::Connect, timeout)
     }
 }
