@@ -1,11 +1,11 @@
-#[cfg(ngx_feature = "debug")]
-use ::core::ptr;
+use crate::{bindings, ngx_event_t, ngx_int_t, ngx_msec_t, ngx_queue_t};
 
-use crate::{
-    NGX_TIMER_LAZY_DELAY, bindings, ngx_current_msec, ngx_event_t, ngx_event_timer_rbtree,
-    ngx_int_t, ngx_msec_int_t, ngx_msec_t, ngx_queue_insert_before, ngx_queue_remove, ngx_queue_t,
-    ngx_rbtree_delete, ngx_rbtree_insert,
-};
+unsafe extern "C" {
+    fn ngx_rs_event_add_timer(ev: *mut ngx_event_t, timer: ngx_msec_t);
+    fn ngx_rs_event_del_timer(ev: *mut ngx_event_t);
+    fn ngx_rs_event_post(ev: *mut ngx_event_t, queue: *mut ngx_queue_t);
+    fn ngx_rs_event_delete_posted(ev: *mut ngx_event_t);
+}
 
 /// Native event type for read readiness.
 pub const NGX_READ_EVENT: ngx_int_t = bindings::NGX_RS_READ_EVENT as _;
@@ -20,29 +20,7 @@ pub const NGX_WRITE_EVENT: ngx_int_t = bindings::NGX_RS_WRITE_EVENT as _;
 /// `ev` must be a valid pointer to an `ngx_event_t`.
 #[inline]
 pub unsafe fn ngx_add_timer(ev: *mut ngx_event_t, timer: ngx_msec_t) {
-    unsafe {
-        let key: ngx_msec_t = ngx_current_msec.wrapping_add(timer);
-
-        if (*ev).timer_set() != 0 {
-            /*
-             * Use a previous timer value if difference between it and a new
-             * value is less than NGX_TIMER_LAZY_DELAY milliseconds: this allows
-             * to minimize the rbtree operations for fast connections.
-             */
-            let difference = key.wrapping_sub((*ev).timer.key) as ngx_msec_int_t;
-            if difference.unsigned_abs() < NGX_TIMER_LAZY_DELAY as _ {
-                return;
-            }
-
-            ngx_del_timer(ev);
-        }
-
-        (*ev).timer.key = key;
-
-        ngx_rbtree_insert(&raw mut ngx_event_timer_rbtree, &raw mut (*ev).timer);
-
-        (*ev).set_timer_set(1);
-    }
+    unsafe { ngx_rs_event_add_timer(ev, timer) }
 }
 
 /// Deletes a previously set timeout.
@@ -52,18 +30,7 @@ pub unsafe fn ngx_add_timer(ev: *mut ngx_event_t, timer: ngx_msec_t) {
 /// `ev` must be a valid pointer to an `ngx_event_t`, previously armed with [ngx_add_timer].
 #[inline]
 pub unsafe fn ngx_del_timer(ev: *mut ngx_event_t) {
-    unsafe {
-        ngx_rbtree_delete(&raw mut ngx_event_timer_rbtree, &raw mut (*ev).timer);
-
-        #[cfg(ngx_feature = "debug")]
-        {
-            (*ev).timer.left = ptr::null_mut();
-            (*ev).timer.right = ptr::null_mut();
-            (*ev).timer.parent = ptr::null_mut();
-        }
-
-        (*ev).set_timer_set(0);
-    }
+    unsafe { ngx_rs_event_del_timer(ev) }
 }
 
 /// Post the event `ev` to the post queue `q`.
@@ -74,12 +41,7 @@ pub unsafe fn ngx_del_timer(ev: *mut ngx_event_t) {
 /// `q` is a valid pointer to a queue head.
 #[inline]
 pub unsafe fn ngx_post_event(ev: *mut ngx_event_t, q: *mut ngx_queue_t) {
-    unsafe {
-        if (*ev).posted() == 0 {
-            (*ev).set_posted(1);
-            ngx_queue_insert_before(q, &raw mut (*ev).queue);
-        }
-    }
+    unsafe { ngx_rs_event_post(ev, q) }
 }
 
 /// Deletes the event `ev` from the queue it's currently posted in.
@@ -90,10 +52,7 @@ pub unsafe fn ngx_post_event(ev: *mut ngx_event_t, q: *mut ngx_queue_t) {
 /// `ev` must be currently posted to an initialized queue.
 #[inline]
 pub unsafe fn ngx_delete_posted_event(ev: *mut ngx_event_t) {
-    unsafe {
-        (*ev).set_posted(0);
-        ngx_queue_remove(&raw mut (*ev).queue);
-    }
+    unsafe { ngx_rs_event_delete_posted(ev) }
 }
 
 #[cfg(all(test, feature = "test-link"))]
@@ -109,9 +68,10 @@ mod tests {
 
     use super::{ngx_add_timer, ngx_del_timer, ngx_delete_posted_event, ngx_post_event};
     use crate::{
-        NGX_TIMER_LAZY_DELAY, ngx_current_msec, ngx_event_expire_timers, ngx_event_t,
-        ngx_event_timer_init, ngx_log_t, ngx_msec_t, ngx_posted_events, ngx_posted_next_events,
-        ngx_queue_empty, ngx_queue_init, ngx_queue_t,
+        NGX_LOG_DEBUG_CORE, NGX_LOG_DEBUG_EVENT, NGX_TIMER_LAZY_DELAY, ngx_connection_t,
+        ngx_current_msec, ngx_event_expire_timers, ngx_event_t, ngx_event_timer_init, ngx_log_t,
+        ngx_msec_t, ngx_posted_events, ngx_posted_next_events, ngx_queue_empty, ngx_queue_init,
+        ngx_queue_t, ngx_uint_t,
     };
 
     unsafe extern "C" {
@@ -153,15 +113,63 @@ mod tests {
         }
     }
 
+    struct LogCapture {
+        bytes: [u8; 2048],
+        len: usize,
+    }
+
+    impl Default for LogCapture {
+        fn default() -> Self {
+            Self { bytes: [0; 2048], len: 0 }
+        }
+    }
+
+    impl LogCapture {
+        fn contains(&self, expected: &[u8]) -> bool {
+            self.bytes[..self.len].windows(expected.len()).any(|window| window == expected)
+        }
+    }
+
+    unsafe extern "C" fn capture_log(
+        log: *mut ngx_log_t,
+        _level: ngx_uint_t,
+        bytes: *mut u8,
+        len: usize,
+    ) {
+        let Some(log) = (unsafe { log.as_mut() }) else {
+            return;
+        };
+        let Some(capture) = (unsafe { log.wdata.cast::<LogCapture>().as_mut() }) else {
+            return;
+        };
+        if bytes.is_null() {
+            return;
+        }
+
+        let available = capture.bytes.len().saturating_sub(capture.len);
+        let copied = len.min(available);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes,
+                capture.bytes.as_mut_ptr().add(capture.len),
+                copied,
+            );
+        }
+        capture.len += copied;
+    }
+
     struct TestEvent {
         event: ngx_event_t,
         log: ngx_log_t,
+        connection: ngx_connection_t,
     }
 
     impl TestEvent {
         fn new() -> Box<Self> {
             let mut event = Box::new(unsafe { MaybeUninit::<Self>::zeroed().assume_init() });
             event.event.log = &raw mut event.log;
+            event.connection.fd = -1;
+            event.event.data = (&raw mut event.connection).cast();
             event
         }
 
@@ -279,6 +287,27 @@ mod tests {
         assert!(rust.timedout);
     }
 
+    #[test]
+    fn timer_helpers_preserve_native_debug_diagnostics() {
+        let _globals = EventGlobals::lock();
+        let mut capture = LogCapture::default();
+        let mut event = TestEvent::new();
+        event.log.log_level = NGX_LOG_DEBUG_EVENT as _;
+        event.log.writer = Some(capture_log);
+        event.log.wdata = (&raw mut capture).cast();
+
+        unsafe {
+            ngx_current_msec = 100;
+            ngx_add_timer(event.raw(), 50);
+            ngx_add_timer(event.raw(), 100);
+            ngx_del_timer(event.raw());
+        }
+
+        assert!(capture.contains(b"event timer add: -1: 50:150"));
+        assert!(capture.contains(b"event timer: -1, old: 150, new: 200"));
+        assert!(capture.contains(b"event timer del: -1: 150"));
+    }
+
     unsafe extern "C" fn record_timer_expiry(event: *mut ngx_event_t) {
         unsafe {
             TIMER_CALLBACKS.fetch_add(1, Ordering::Relaxed);
@@ -366,5 +395,27 @@ mod tests {
         let _globals = EventGlobals::lock();
         assert_posted_queue_behavior(true);
         assert_posted_queue_behavior(false);
+    }
+
+    #[test]
+    fn posted_helpers_preserve_native_debug_diagnostics() {
+        let _globals = EventGlobals::lock();
+        let mut capture = LogCapture::default();
+        let mut event = TestEvent::new();
+        event.log.log_level = NGX_LOG_DEBUG_CORE as _;
+        event.log.writer = Some(capture_log);
+        event.log.wdata = (&raw mut capture).cast();
+        let mut queue = unsafe { MaybeUninit::<ngx_queue_t>::zeroed().assume_init() };
+        unsafe { ngx_queue_init(&raw mut queue) };
+
+        unsafe {
+            ngx_post_event(event.raw(), &raw mut queue);
+            ngx_post_event(event.raw(), &raw mut queue);
+            ngx_delete_posted_event(event.raw());
+        }
+
+        assert!(capture.contains(b"post event "));
+        assert!(capture.contains(b"update posted event "));
+        assert!(capture.contains(b"delete posted event "));
     }
 }
