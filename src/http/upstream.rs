@@ -4,10 +4,11 @@ mod url;
 
 pub use callback::{
     HttpUpstreamInitializer, HttpUpstreamPeerHandler, OriginalPeerFree, OriginalPeerGet,
-    SelectedUpstreamPeer, UpstreamCallbackError, UpstreamConfiguration, UpstreamInitCallback,
-    UpstreamInitStatus, UpstreamInitialization, UpstreamInitialized, UpstreamPeerConnection,
-    UpstreamPeerInit, UpstreamPeerInitCallback, UpstreamPeerInitRequest, UpstreamPeerInitStatus,
-    UpstreamPeerSelection, UpstreamPeerState, UpstreamServerConf, install_upstream_initializer,
+    OriginalPeerInit, OriginalUpstreamInit, SelectedUpstreamPeer, UpstreamCallbackError,
+    UpstreamCallbackSlot, UpstreamConfiguration, UpstreamInitStatus, UpstreamInitialization,
+    UpstreamInitialized, UpstreamPeerConnection, UpstreamPeerInit, UpstreamPeerInitRequest,
+    UpstreamPeerInitStatus, UpstreamPeerSelection, UpstreamPeerState, UpstreamServerConf,
+    install_upstream_initializer,
 };
 pub use state::{UpstreamState, UpstreamStateError, UpstreamStates};
 pub use url::{
