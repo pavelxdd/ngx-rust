@@ -23,6 +23,7 @@ targets = []
 
 [dev-dependencies]
 dunce = "1.0.5"
+shlex = "2.0.1"
 tempfile = { version = "3.27.0", default-features = false }
 
 [target.'cfg(not(windows))'.dependencies]
