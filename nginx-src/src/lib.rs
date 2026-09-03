@@ -61,6 +61,7 @@ pub fn print_cargo_metadata() {
     for file in ["lib.rs", "download.rs", "verifier.rs"] {
         println!("cargo::rerun-if-changed={path}/src/{file}", path = env!("CARGO_MANIFEST_DIR"))
     }
+    println!("cargo::rerun-if-changed={}/nginx/src/core/nginx.h", env!("CARGO_MANIFEST_DIR"));
 
     for var in ENV_VARS_TRIGGERING_RECOMPILE {
         println!("cargo::rerun-if-env-changed={var}");
@@ -73,6 +74,9 @@ pub fn build(build_dir: impl AsRef<Path>) -> io::Result<(PathBuf, PathBuf)> {
     let build_dir = build_dir.as_ref().to_owned();
 
     let (source_dir, vendored_flags) = download::prepare(&source_dir, &build_dir)?;
+    if source_dir == Path::new(NGINX_DEFAULT_SOURCE_DIR) {
+        validate_bundled_source_version(&source_dir)?;
+    }
 
     let flags = nginx_configure_flags(&vendored_flags);
 
@@ -83,11 +87,65 @@ pub fn build(build_dir: impl AsRef<Path>) -> io::Result<(PathBuf, PathBuf)> {
     Ok((source_dir, build_dir))
 }
 
-/// Returns the options NGINX was built with
-fn build_info(source_dir: &Path, configure_flags: &[String]) -> String {
-    // Flags should contain strings pointing to OS/platform as well as dependency versions,
-    // so if any of that changes, it can trigger a rebuild
-    format!("{:?}|{}", source_dir, configure_flags.join(" "))
+/// Returns the selected NGINX source version.
+fn nginx_source_version(source_dir: &Path) -> io::Result<String> {
+    let header = std::fs::read_to_string(source_dir.join("src/core/nginx.h"))?;
+
+    for line in header.lines() {
+        let mut words = line.split_whitespace();
+        if words.next() != Some("#define") || words.next() != Some("NGINX_VERSION") {
+            continue;
+        }
+        let Some(version) = words.next().and_then(|value| value.strip_prefix('"')) else {
+            break;
+        };
+        let Some(version) = version.strip_suffix('"').filter(|version| !version.is_empty()) else {
+            break;
+        };
+        return Ok(version.to_owned());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "NGINX_VERSION is missing or malformed in {}/src/core/nginx.h",
+            source_dir.display()
+        ),
+    ))
+}
+
+fn package_nginx_version() -> io::Result<&'static str> {
+    env!("CARGO_PKG_VERSION")
+        .split_once('+')
+        .map(|(_, version)| version)
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "nginx-src package version has no NGINX version metadata",
+            )
+        })
+}
+
+fn validate_bundled_source_version(source_dir: &Path) -> io::Result<()> {
+    let source_version = nginx_source_version(source_dir)?;
+    let package_version = package_nginx_version()?;
+    if source_version != package_version {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "bundled NGINX version {source_version} does not match nginx-src package metadata {package_version}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn build_info(source_dir: &Path, configure_flags: &[String]) -> io::Result<String> {
+    let source_version = nginx_source_version(source_dir)?;
+    // Flags contain platform and dependency selections; the source version invalidates a build
+    // when the source tree is updated in place.
+    Ok(format!("{:?}|{source_version}|{}", source_dir, configure_flags.join(" ")))
 }
 
 /// Generate the flags to use with autoconf `configure` for NGINX.
@@ -115,7 +173,7 @@ fn nginx_configure_flags(vendored: &[String]) -> Vec<String> {
 
 /// Runs external process invoking autoconf `configure` for NGINX.
 fn configure(source_dir: &Path, build_dir: &Path, flags: &[String]) -> io::Result<()> {
-    let build_info = build_info(source_dir, flags);
+    let build_info = build_info(source_dir, flags)?;
 
     if build_dir.join("Makefile").is_file()
         && build_dir.join(NGINX_BINARY).is_file()
@@ -211,4 +269,45 @@ where
     }
 
     Err(io::ErrorKind::NotFound.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::{NGINX_DEFAULT_SOURCE_DIR, build_info, validate_bundled_source_version};
+
+    #[test]
+    fn configure_cache_identity_changes_when_source_version_changes_in_place() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("nginx");
+        fs::create_dir_all(source.join("src/core")).unwrap();
+        let header = source.join("src/core/nginx.h");
+        fs::write(&header, "#define NGINX_VERSION \"1.30.3\"\n").unwrap();
+        let before = build_info(&source, &[]).unwrap();
+
+        fs::write(&header, "#define NGINX_VERSION \"1.30.4\"\n").unwrap();
+        let after = build_info(&source, &[]).unwrap();
+
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn bundled_source_version_matches_package_metadata() {
+        validate_bundled_source_version(std::path::Path::new(NGINX_DEFAULT_SOURCE_DIR)).unwrap();
+    }
+
+    #[test]
+    fn bundled_source_version_mismatch_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("nginx");
+        fs::create_dir_all(source.join("src/core")).unwrap();
+        fs::write(source.join("src/core/nginx.h"), "#define NGINX_VERSION \"1.30.3\"\n").unwrap();
+
+        let error = validate_bundled_source_version(&source).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("does not match"), "{error}");
+    }
 }
