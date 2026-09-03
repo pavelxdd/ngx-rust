@@ -28,13 +28,14 @@ static NGINX_CONFIGURE_BASE: &[&str] = &[
     "--with-threads",
 ];
 
-const ENV_VARS_TRIGGERING_RECOMPILE: [&str; 10] = [
+const ENV_VARS_TRIGGERING_RECOMPILE: [&str; 11] = [
     "CACHE_DIR",
     "CARGO_MANIFEST_DIR",
     "CARGO_TARGET_TMPDIR",
     "NGX_CONFIGURE_ARGS",
     "NGX_CFLAGS",
     "NGX_LDFLAGS",
+    "NGX_NO_SIGNATURE_CHECK",
     "NGX_VERSION",
     "OPENSSL_VERSION",
     "PCRE2_VERSION",
