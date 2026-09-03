@@ -67,11 +67,13 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     use super::{ngx_add_timer, ngx_del_timer, ngx_delete_posted_event, ngx_post_event};
+    #[cfg(ngx_feature = "debug")]
+    use crate::{NGX_LOG_DEBUG_CORE, NGX_LOG_DEBUG_EVENT, ngx_uint_t};
     use crate::{
-        NGX_LOG_DEBUG_CORE, NGX_LOG_DEBUG_EVENT, NGX_TIMER_LAZY_DELAY, ngx_connection_t,
+        NGX_TIMER_LAZY_DELAY, ngx_connection_t,
         ngx_current_msec, ngx_event_expire_timers, ngx_event_t, ngx_event_timer_init, ngx_log_t,
         ngx_msec_t, ngx_posted_events, ngx_posted_next_events, ngx_queue_empty, ngx_queue_init,
-        ngx_queue_t, ngx_uint_t,
+        ngx_queue_t,
     };
 
     unsafe extern "C" {
@@ -113,23 +115,27 @@ mod tests {
         }
     }
 
+    #[cfg(ngx_feature = "debug")]
     struct LogCapture {
         bytes: [u8; 2048],
         len: usize,
     }
 
+    #[cfg(ngx_feature = "debug")]
     impl Default for LogCapture {
         fn default() -> Self {
             Self { bytes: [0; 2048], len: 0 }
         }
     }
 
+    #[cfg(ngx_feature = "debug")]
     impl LogCapture {
         fn contains(&self, expected: &[u8]) -> bool {
             self.bytes[..self.len].windows(expected.len()).any(|window| window == expected)
         }
     }
 
+    #[cfg(ngx_feature = "debug")]
     unsafe extern "C" fn capture_log(
         log: *mut ngx_log_t,
         _level: ngx_uint_t,
@@ -287,6 +293,7 @@ mod tests {
         assert!(rust.timedout);
     }
 
+    #[cfg(ngx_feature = "debug")]
     #[test]
     fn timer_helpers_preserve_native_debug_diagnostics() {
         let _globals = EventGlobals::lock();
@@ -397,6 +404,7 @@ mod tests {
         assert_posted_queue_behavior(false);
     }
 
+    #[cfg(ngx_feature = "debug")]
     #[test]
     fn posted_helpers_preserve_native_debug_diagnostics() {
         let _globals = EventGlobals::lock();

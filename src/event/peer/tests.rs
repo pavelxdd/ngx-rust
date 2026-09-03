@@ -515,7 +515,7 @@ fn builder_initializes_every_configured_peer_field() {
         .tries(ngx_uint_t::MAX)
         .start_time(37)
         .socket_type(SocketType::Datagram)
-        .buffer_sizes(1024, 2048)
+        .receive_buffer(1024)
         .unwrap()
         .cached(true)
         .transparent(true)
@@ -543,7 +543,6 @@ fn builder_initializes_every_configured_peer_field() {
     assert_eq!(raw.local, (&raw const local.raw).cast_mut());
     assert_eq!(raw.type_, libc::SOCK_DGRAM);
     assert_eq!(raw.rcvbuf, 1024);
-    assert_eq!(raw.sndbuf, 2048);
     assert_eq!(raw.log, (&raw const log).cast_mut());
     #[cfg(any(ngx_feature = "http_upstream_sid", ngx_feature = "compat"))]
     {
@@ -657,7 +656,6 @@ fn builder_defaults_to_a_fresh_stream_peer() {
     assert!(raw.local.is_null());
     assert_eq!(raw.type_, libc::SOCK_STREAM);
     assert_eq!(raw.rcvbuf, 0);
-    assert_eq!(raw.sndbuf, 0);
     assert_eq!(raw.cached(), 0);
     assert_eq!(raw.transparent(), 0);
     assert_eq!(raw.so_keepalive(), 0);
@@ -775,15 +773,11 @@ fn unselected_callback_statuses_do_not_release_peer() {
 }
 
 #[test]
-fn builder_rejects_negative_socket_buffers() {
+fn builder_rejects_a_negative_receive_buffer() {
     let remote = TestAddress::ipv4([192, 0, 2, 10], 8443);
     assert!(matches!(
-        EventPeerBuilder::new(remote.peer_address()).buffer_sizes(-1, 0),
+        EventPeerBuilder::new(remote.peer_address()).receive_buffer(-1),
         Err(EventPeerBuildError::NegativeReceiveBuffer)
-    ));
-    assert!(matches!(
-        EventPeerBuilder::new(remote.peer_address()).buffer_sizes(0, -1),
-        Err(EventPeerBuildError::NegativeSendBuffer)
     ));
 }
 

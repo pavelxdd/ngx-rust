@@ -633,40 +633,6 @@ ngx_rs_test_resolve_name_done_count(void)
     .expect("NGINX resolver test wrapper");
     sources.push(resolver_wrapper);
 
-    #[cfg(feature = "stream")]
-    {
-        let stream_variables =
-            dunce::canonicalize(nginx.source_dir.join("src/stream/ngx_stream_variables.c"))
-                .expect("configured nginx stream variables source");
-        if let Some(index) = sources.iter().position(|source| source == &stream_variables) {
-            sources.remove(index);
-
-            let stream_wrapper = out_dir.join("nginx_test_stream_variables.c");
-            let mut file =
-                File::create(&stream_wrapper).expect("NGINX stream variables test wrapper");
-            file.write_all(
-                br"#include <ngx_config.h>
-#include <ngx_core.h>
-#include <ngx_stream.h>
-
-#define ngx_stream_variable_proxy_protocol_addr_port \
-    ngx_rs_test_stream_proxy_protocol_addr_port_impl
-#include <ngx_stream_variables.c>
-#undef ngx_stream_variable_proxy_protocol_addr_port
-
-ngx_int_t
-ngx_rs_test_stream_proxy_protocol_addr_port(ngx_stream_session_t *session,
-    ngx_stream_variable_value_t *value, uintptr_t data)
-{
-    return ngx_rs_test_stream_proxy_protocol_addr_port_impl(session, value, data);
-}
-",
-            )
-            .expect("NGINX stream variables test wrapper");
-            sources.push(stream_wrapper);
-        }
-    }
-
     let mut build = cc::Build::new();
     build.include(nginx.source_dir.join("src/core"));
     build.include(nginx.source_dir.join("src/os/unix"));

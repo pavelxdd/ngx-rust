@@ -1,6 +1,8 @@
 use core::ffi::c_int;
+use core::fmt::{self, Write};
 use core::marker::PhantomData;
 use core::mem::{offset_of, size_of};
+use core::net::{Ipv4Addr, Ipv6Addr};
 use core::ptr::{self, NonNull};
 use core::slice;
 
@@ -11,11 +13,9 @@ use crate::event::{EventError, EventRef};
 #[cfg(unix)]
 use crate::ffi::sockaddr_un;
 use crate::ffi::{
-    NGX_AGAIN, NGX_DECLINED, NGX_ERROR, NGX_OK, NGX_PROXY_PROTOCOL_MAX_HEADER, in_addr, in6_addr,
-    in6_addr__bindgen_ty_1, ngx_buf_t, ngx_chain_t, ngx_connection_local_sockaddr,
-    ngx_connection_t, ngx_int_t, ngx_listening_t, ngx_proxy_protocol_lookup_tlv,
-    ngx_proxy_protocol_t, ngx_sin_addr_t, ngx_sock_ntop, ngx_str_t, off_t, sa_family_t, sockaddr,
-    sockaddr_in, sockaddr_in6, socklen_t,
+    NGX_AGAIN, NGX_ERROR, NGX_PROXY_PROTOCOL_MAX_HEADER, ngx_buf_t, ngx_chain_t,
+    ngx_connection_local_sockaddr, ngx_connection_t, ngx_listening_t, ngx_proxy_protocol_t,
+    ngx_str_t, off_t, sa_family_t, sockaddr, sockaddr_in, sockaddr_in6, socklen_t,
 };
 use crate::log::LogRef;
 
@@ -31,7 +31,7 @@ pub enum SocketAddressError {
     /// The reported address length does not match the address family.
     InvalidLength,
     /// Nginx reported an address family this API does not support.
-    UnsupportedFamily(u16),
+    UnsupportedFamily(c_int),
 }
 
 /// Failure returned while validating a native nginx connection view.
@@ -219,10 +219,8 @@ impl SocketPort {
 pub enum ProxyProtocolError {
     /// The metadata pointer does not satisfy `ngx_proxy_protocol_t` alignment.
     MisalignedMetadata,
-    /// Nginx reported an unsupported PROXY address family.
-    UnsupportedFamily(c_int),
-    /// Nginx reported an unsupported PROXY transport.
-    UnsupportedTransport(c_int),
+    /// Nginx stored an address that is not canonical IPv4 or IPv6 text.
+    InvalidAddressText,
     /// A nonempty metadata field has no backing bytes.
     MissingData,
     /// A metadata field is too large to form a Rust slice.
@@ -242,14 +240,8 @@ pub enum ProxyProtocolError {
     CanonicalText,
     /// Nginx could not allocate pool-owned metadata.
     Allocation,
-    /// The connection has no logger for nginx's TLV parser diagnostics.
-    MissingConnectionLog,
     /// A checked connection operation failed.
     Connection(ConnectionError),
-    /// The nginx TLV lookup returned an unexpected status.
-    UnexpectedLookupStatus(ngx_int_t),
-    /// The nginx TLV lookup returned bytes outside the configured TLV slice.
-    LookupValueOutsideTlvs,
 }
 
 /// A binary Internet endpoint stored in PROXY protocol metadata.
@@ -510,7 +502,6 @@ impl SocketAddress<'_> {
 /// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProxyProtocolRef<'callback> {
-    connection: NonNull<ngx_connection_t>,
     source: ProxyProtocolAddress,
     destination: ProxyProtocolAddress,
     transport: SocketType,
@@ -552,41 +543,12 @@ impl<'callback> ProxyProtocolRef<'callback> {
         self.tlvs
     }
 
-    /// Looks up one PROXY TLV through nginx's configured parser.
+    /// Looks up one top-level PROXY protocol v2 TLV.
     pub fn lookup_tlv(
         &self,
         type_: u8,
     ) -> Result<ProxyProtocolTlvLookup<'callback>, ProxyProtocolError> {
-        // SAFETY: this checked PROXY protocol owner keeps the connection logger live for
-        // `'callback`.
-        let log: Option<LogRef<'callback>> =
-            unsafe { connection_log(self.connection) }.map_err(ProxyProtocolError::Connection)?;
-        if log.is_none() {
-            return Err(ProxyProtocolError::MissingConnectionLog);
-        }
-
-        let mut tlvs = ngx_str_t { len: self.tlvs.len(), data: self.tlvs.as_ptr().cast_mut() };
-        let mut value = ngx_str_t::empty();
-        let status = unsafe {
-            ngx_proxy_protocol_lookup_tlv(
-                self.connection.as_ptr(),
-                &raw mut tlvs,
-                type_.into(),
-                &raw mut value,
-            )
-        };
-
-        if status == NGX_OK as ngx_int_t {
-            return checked_tlv_lookup_value(self.tlvs, value).map(ProxyProtocolTlvLookup::Ok);
-        }
-        if status == NGX_DECLINED as ngx_int_t {
-            return Ok(ProxyProtocolTlvLookup::Declined);
-        }
-        if status == NGX_ERROR as ngx_int_t {
-            return Ok(ProxyProtocolTlvLookup::Error);
-        }
-
-        Err(ProxyProtocolError::UnexpectedLookupStatus(status))
+        Ok(lookup_proxy_protocol_tlv(self.tlvs, type_))
     }
 }
 
@@ -795,6 +757,16 @@ impl<'callback> ConnectionRefMut<'callback> {
         Ok(f(connection))
     }
 
+    /// Returns the wrapped native connection pointer for FFI interoperation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must not use the pointer to create an aliasing Rust view, outlive this callback,
+    /// move access to another thread, or violate any ownership represented by this exclusive view.
+    pub unsafe fn as_ptr(&mut self) -> *mut ngx_connection_t {
+        self.raw.as_ptr()
+    }
+
     /// Returns a shared reborrow of this connection.
     pub fn view(&self) -> ConnectionRef<'_> {
         ConnectionRef { raw: self.raw, _callback: PhantomData, _not_thread_safe: PhantomData }
@@ -1000,7 +972,7 @@ impl<'callback> ConnectionRefMut<'callback> {
 impl ProxyProtocolBuilder<'_> {
     fn attach(self, connection: &mut ConnectionRefMut<'_>) -> Result<(), ProxyProtocolError> {
         let carrier = connection.socket_type().map_err(ProxyProtocolError::Connection)?;
-        if carrier != self.transport && !connection_has_unix_listener(connection)? {
+        if carrier != self.transport {
             return Err(ProxyProtocolError::TransportMismatch {
                 connection: carrier,
                 metadata: self.transport,
@@ -1034,10 +1006,6 @@ impl ProxyProtocolBuilder<'_> {
             (*metadata).src_port = self.source.port().host_order();
             (*metadata).dst_port = self.destination.port().host_order();
             (*metadata).tlvs = tlvs;
-            (*metadata).family = proxy_protocol_family(self.source);
-            (*metadata).transport = socket_type_raw(self.transport);
-            write_proxy_protocol_address(&mut (*metadata).src_sa, self.source);
-            write_proxy_protocol_address(&mut (*metadata).dst_sa, self.destination);
             connection.raw.as_mut().proxy_protocol = metadata;
         }
 
@@ -1203,18 +1171,17 @@ fn connection_proxy_protocol<'callback>(
     }
 
     let metadata = unsafe { metadata.as_ref() };
-    let source = proxy_protocol_address(metadata, true)?;
-    let destination = proxy_protocol_address(metadata, false)?;
-    let transport = proxy_protocol_transport(metadata.transport)?;
     let source_text = checked_proxy_protocol_bytes(metadata.src_addr)?;
     let destination_text = checked_proxy_protocol_bytes(metadata.dst_addr)?;
+    let source = proxy_protocol_address(source_text, metadata.src_port)?;
+    let destination = proxy_protocol_address(destination_text, metadata.dst_port)?;
+    let transport = connection_socket_type(connection).map_err(ProxyProtocolError::Connection)?;
     let tlvs = checked_proxy_protocol_bytes(metadata.tlvs)?;
     if tlvs.len() > proxy_protocol_tlv_limit(source, transport) {
         return Err(ProxyProtocolError::TlvsTooLong);
     }
 
     Ok(Some(ProxyProtocolRef {
-        connection,
         source,
         destination,
         transport,
@@ -1227,56 +1194,20 @@ fn connection_proxy_protocol<'callback>(
 }
 
 fn proxy_protocol_address(
-    metadata: &ngx_proxy_protocol_t,
-    source: bool,
+    text: &[u8],
+    port: u16,
 ) -> Result<ProxyProtocolAddress, ProxyProtocolError> {
-    let port = if source { metadata.src_port } else { metadata.dst_port };
+    let text = core::str::from_utf8(text).map_err(|_| ProxyProtocolError::InvalidAddressText)?;
     let port = SocketPort::from_host_order(port);
 
-    if metadata.family == libc::AF_INET {
-        let octets = unsafe {
-            if source {
-                metadata.src_sa.addr4.s_addr.to_ne_bytes()
-            } else {
-                metadata.dst_sa.addr4.s_addr.to_ne_bytes()
-            }
-        };
-        return Ok(ProxyProtocolAddress::Ipv4 { octets, port });
+    if let Ok(address) = text.parse::<Ipv4Addr>() {
+        return Ok(ProxyProtocolAddress::Ipv4 { octets: address.octets(), port });
     }
-    if metadata.family == libc::AF_INET6 {
-        let octets = unsafe {
-            if source {
-                metadata.src_sa.addr6.__in6_u.__u6_addr8
-            } else {
-                metadata.dst_sa.addr6.__in6_u.__u6_addr8
-            }
-        };
-        return Ok(ProxyProtocolAddress::Ipv6 { octets, port });
+    if let Ok(address) = text.parse::<Ipv6Addr>() {
+        return Ok(ProxyProtocolAddress::Ipv6 { octets: address.octets(), port });
     }
 
-    Err(ProxyProtocolError::UnsupportedFamily(metadata.family))
-}
-
-fn proxy_protocol_family(address: ProxyProtocolAddress) -> c_int {
-    match address {
-        ProxyProtocolAddress::Ipv4 { .. } => libc::AF_INET,
-        ProxyProtocolAddress::Ipv6 { .. } => libc::AF_INET6,
-    }
-}
-
-fn proxy_protocol_transport(transport: c_int) -> Result<SocketType, ProxyProtocolError> {
-    match transport {
-        libc::SOCK_STREAM => Ok(SocketType::Stream),
-        libc::SOCK_DGRAM => Ok(SocketType::Datagram),
-        transport => Err(ProxyProtocolError::UnsupportedTransport(transport)),
-    }
-}
-
-fn socket_type_raw(socket_type: SocketType) -> c_int {
-    match socket_type {
-        SocketType::Stream => libc::SOCK_STREAM,
-        SocketType::Datagram => libc::SOCK_DGRAM,
-    }
+    Err(ProxyProtocolError::InvalidAddressText)
 }
 
 fn proxy_protocol_tlv_limit(address: ProxyProtocolAddress, transport: SocketType) -> usize {
@@ -1306,100 +1237,62 @@ fn checked_proxy_protocol_bytes<'callback>(
     Ok(unsafe { slice::from_raw_parts(data.as_ptr(), value.len) })
 }
 
-fn checked_tlv_lookup_value(tlvs: &[u8], value: ngx_str_t) -> Result<&[u8], ProxyProtocolError> {
-    if value.len == 0 {
-        return Ok(&[]);
-    }
-    if value.len > isize::MAX as usize {
-        return Err(ProxyProtocolError::DataTooLong);
-    }
-    let data = NonNull::new(value.data).ok_or(ProxyProtocolError::MissingData)?;
-    let tlvs_start = tlvs.as_ptr() as usize;
-    let tlvs_end =
-        tlvs_start.checked_add(tlvs.len()).ok_or(ProxyProtocolError::LookupValueOutsideTlvs)?;
-    let value_start = data.as_ptr() as usize;
-    let value_end =
-        value_start.checked_add(value.len).ok_or(ProxyProtocolError::LookupValueOutsideTlvs)?;
-    if value_start < tlvs_start || value_end > tlvs_end {
-        return Err(ProxyProtocolError::LookupValueOutsideTlvs);
+fn lookup_proxy_protocol_tlv(tlvs: &[u8], type_: u8) -> ProxyProtocolTlvLookup<'_> {
+    let mut remaining = tlvs;
+
+    while !remaining.is_empty() {
+        if remaining.len() < 3 {
+            return ProxyProtocolTlvLookup::Error;
+        }
+
+        let entry_type = remaining[0];
+        let value_len = usize::from(u16::from_be_bytes([remaining[1], remaining[2]]));
+        remaining = &remaining[3..];
+        if remaining.len() < value_len {
+            return ProxyProtocolTlvLookup::Error;
+        }
+
+        let (value, tail) = remaining.split_at(value_len);
+        if entry_type == type_ {
+            return ProxyProtocolTlvLookup::Ok(value);
+        }
+        remaining = tail;
     }
 
-    Ok(unsafe { slice::from_raw_parts(data.as_ptr(), value.len) })
-}
-
-fn connection_has_unix_listener(
-    connection: &ConnectionRefMut<'_>,
-) -> Result<bool, ProxyProtocolError> {
-    #[cfg(unix)]
-    {
-        let listener = match connection.listener() {
-            Ok(listener) => listener,
-            Err(ConnectionError::MissingListener) => return Ok(false),
-            Err(error) => return Err(ProxyProtocolError::Connection(error)),
-        };
-        Ok(matches!(
-            listener.address().map_err(ProxyProtocolError::Connection)?,
-            SocketAddress::Unix { .. }
-        ))
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = connection;
-        Ok(false)
-    }
+    ProxyProtocolTlvLookup::Declined
 }
 
 fn canonical_proxy_protocol_text(
     address: ProxyProtocolAddress,
 ) -> Result<([u8; PROXY_PROTOCOL_TEXT_CAPACITY], usize), ProxyProtocolError> {
-    let mut text = [0_u8; PROXY_PROTOCOL_TEXT_CAPACITY];
-    let len = match address {
-        ProxyProtocolAddress::Ipv4 { octets, .. } => {
-            let mut address: sockaddr_in = unsafe { core::mem::zeroed() };
-            address.sin_family = libc::AF_INET as _;
-            address.sin_addr = in_addr { s_addr: u32::from_ne_bytes(octets) };
-            unsafe {
-                ngx_sock_ntop(
-                    (&raw mut address).cast(),
-                    size_of::<sockaddr_in>() as socklen_t,
-                    text.as_mut_ptr(),
-                    text.len(),
-                    0,
-                )
-            }
-        }
-        ProxyProtocolAddress::Ipv6 { octets, .. } => {
-            let mut address: sockaddr_in6 = unsafe { core::mem::zeroed() };
-            address.sin6_family = libc::AF_INET6 as _;
-            address.sin6_addr = in6_addr { __in6_u: in6_addr__bindgen_ty_1 { __u6_addr8: octets } };
-            unsafe {
-                ngx_sock_ntop(
-                    (&raw mut address).cast(),
-                    size_of::<sockaddr_in6>() as socklen_t,
-                    text.as_mut_ptr(),
-                    text.len(),
-                    0,
-                )
-            }
-        }
-    };
-
-    if len == 0 || len > text.len() {
-        return Err(ProxyProtocolError::CanonicalText);
+    let mut text = ProxyProtocolText::default();
+    match address {
+        ProxyProtocolAddress::Ipv4 { octets, .. } => write!(text, "{}", Ipv4Addr::from(octets)),
+        ProxyProtocolAddress::Ipv6 { octets, .. } => write!(text, "{}", Ipv6Addr::from(octets)),
     }
+    .map_err(|_| ProxyProtocolError::CanonicalText)?;
 
-    Ok((text, len))
+    Ok((text.bytes, text.len))
 }
 
-fn write_proxy_protocol_address(target: &mut ngx_sin_addr_t, address: ProxyProtocolAddress) {
-    match address {
-        ProxyProtocolAddress::Ipv4 { octets, .. } => {
-            target.addr4 = in_addr { s_addr: u32::from_ne_bytes(octets) };
-        }
-        ProxyProtocolAddress::Ipv6 { octets, .. } => {
-            target.addr6 = in6_addr { __in6_u: in6_addr__bindgen_ty_1 { __u6_addr8: octets } };
-        }
+struct ProxyProtocolText {
+    bytes: [u8; PROXY_PROTOCOL_TEXT_CAPACITY],
+    len: usize,
+}
+
+impl Default for ProxyProtocolText {
+    fn default() -> Self {
+        Self { bytes: [0; PROXY_PROTOCOL_TEXT_CAPACITY], len: 0 }
+    }
+}
+
+impl Write for ProxyProtocolText {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        let end = self.len.checked_add(value.len()).ok_or(fmt::Error)?;
+        let destination = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        destination.copy_from_slice(value.as_bytes());
+        self.len = end;
+        Ok(())
     }
 }
 
@@ -1447,7 +1340,7 @@ pub unsafe fn parse_socket_address<'callback>(
     if c_int::from(family) == libc::AF_UNIX {
         return parse_unix_address(address, len);
     }
-    Err(SocketAddressError::UnsupportedFamily(family))
+    Err(SocketAddressError::UnsupportedFamily(c_int::from(family)))
 }
 
 fn parse_ipv4_address<'callback>(

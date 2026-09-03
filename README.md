@@ -158,7 +158,7 @@ Add `--features=linux` to build Linux specific modules.
 For example (all examples plus linux specific):
 
 ```sh
-cargo build --package=examples --examples --features=linux
+cargo build --package=examples --examples --features=async,linux,stream
 ```
 
 [examples]: https://github.com/nginx/ngx-rust/tree/main/examples

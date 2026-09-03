@@ -452,8 +452,6 @@ pub enum EventPeerBuildError {
     MissingGetCallback,
     /// The requested receive-buffer size is negative.
     NegativeReceiveBuffer,
-    /// The requested send-buffer size is negative.
-    NegativeSendBuffer,
 }
 
 impl fmt::Display for EventPeerBuildError {
@@ -465,7 +463,6 @@ impl fmt::Display for EventPeerBuildError {
             Self::NegativeReceiveBuffer => {
                 formatter.write_str("event peer receive buffer is negative")
             }
-            Self::NegativeSendBuffer => formatter.write_str("event peer send buffer is negative"),
         }
     }
 }
@@ -483,7 +480,6 @@ pub struct EventPeerBuilder<'address, 'log> {
     start_time: ngx_msec_t,
     socket_type: SocketType,
     receive_buffer: c_int,
-    send_buffer: c_int,
     cached: bool,
     transparent: bool,
     keepalive: bool,
@@ -505,7 +501,6 @@ impl<'address, 'log> EventPeerBuilder<'address, 'log> {
             start_time: 0,
             socket_type: SocketType::Stream,
             receive_buffer: 0,
-            send_buffer: 0,
             cached: false,
             transparent: false,
             keepalive: false,
@@ -577,20 +572,12 @@ impl<'address, 'log> EventPeerBuilder<'address, 'log> {
         self
     }
 
-    /// Sets optional native receive/send socket-buffer sizes.
-    pub fn buffer_sizes(
-        mut self,
-        receive: c_int,
-        send: c_int,
-    ) -> Result<Self, EventPeerBuildError> {
-        if receive < 0 {
+    /// Sets the optional native receive socket-buffer size.
+    pub fn receive_buffer(mut self, size: c_int) -> Result<Self, EventPeerBuildError> {
+        if size < 0 {
             return Err(EventPeerBuildError::NegativeReceiveBuffer);
         }
-        if send < 0 {
-            return Err(EventPeerBuildError::NegativeSendBuffer);
-        }
-        self.receive_buffer = receive;
-        self.send_buffer = send;
+        self.receive_buffer = size;
         Ok(self)
     }
 
@@ -648,7 +635,6 @@ impl<'address, 'log> EventPeerBuilder<'address, 'log> {
         raw.local = self.local.map_or(ptr::null_mut(), |address| address.as_ptr().cast_mut());
         raw.type_ = socket_type_raw(self.socket_type);
         raw.rcvbuf = self.receive_buffer;
-        raw.sndbuf = self.send_buffer;
         raw.log = log.as_ptr();
         #[cfg(any(ngx_feature = "http_upstream_sid", ngx_feature = "compat"))]
         {

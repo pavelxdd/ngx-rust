@@ -1130,8 +1130,10 @@ mod event_tests {
         TimerError, notify,
     };
     use crate::core::Pool;
+    #[cfg(ngx_feature = "debug")]
+    use crate::ffi::NGX_LOG_DEBUG_EVENT;
     use crate::ffi::{
-        NGX_AGAIN, NGX_LOG_DEBUG_EVENT, NGX_OK, NGX_READ_EVENT, NGX_WRITE_EVENT, ngx_create_pool,
+        NGX_AGAIN, NGX_OK, NGX_READ_EVENT, NGX_WRITE_EVENT, ngx_create_pool,
         ngx_current_msec, ngx_cycle_t, ngx_destroy_pool, ngx_event_actions,
         ngx_event_expire_timers, ngx_event_handler_pt, ngx_event_move_posted_next,
         ngx_event_no_timers_left, ngx_event_process_posted, ngx_event_t, ngx_event_timer_init,
@@ -1153,23 +1155,27 @@ mod event_tests {
     static EVENT_DELETE_CALLS: AtomicUsize = AtomicUsize::new(0);
     static EVENT_DELETE_KIND: AtomicUsize = AtomicUsize::new(usize::MAX);
 
+    #[cfg(ngx_feature = "debug")]
     struct LogCapture {
         len: usize,
         bytes: [u8; 256],
     }
 
+    #[cfg(ngx_feature = "debug")]
     impl Default for LogCapture {
         fn default() -> Self {
             Self { len: 0, bytes: [0; 256] }
         }
     }
 
+    #[cfg(ngx_feature = "debug")]
     impl LogCapture {
         fn contains(&self, expected: &[u8]) -> bool {
             self.bytes[..self.len].windows(expected.len()).any(|window| window == expected)
         }
     }
 
+    #[cfg(ngx_feature = "debug")]
     unsafe extern "C" fn capture_log(
         log: *mut ngx_log_t,
         _level: ngx_uint_t,
@@ -1874,6 +1880,7 @@ mod event_tests {
         assert_eq!(wrapping_calls.get(), 1);
     }
 
+    #[cfg(ngx_feature = "debug")]
     #[test]
     fn timer_expiry_logs_the_invalid_connection_identity() {
         let _globals = EventGlobals::lock();
