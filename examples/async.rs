@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::string::ToString;
+use core::cell::RefCell;
 use core::ffi::{c_char, c_void};
 use core::ptr;
 use core::time::Duration;
@@ -19,6 +20,11 @@ use ngx::http::{
 use ngx::{async_ as ngx_async, ngx_conf_log_error, ngx_log_debug_http, ngx_string};
 
 struct Module;
+
+std::thread_local! {
+    static WORKER_SCHEDULER_LEASE: RefCell<Option<ngx_async::WorkerSchedulerLease>> =
+        const { RefCell::new(None) };
+}
 
 unsafe impl http::HttpModule for Module {
     fn module() -> ModuleDescriptor {
@@ -41,16 +47,23 @@ unsafe impl http::HttpModule for Module {
             return Status::NGX_ERROR.0;
         };
         // SAFETY: nginx retains the process-cycle logger until the matching exit hook.
-        if unsafe { ngx_async::init_worker(log) }.is_err() {
+        let Ok(lease) = (unsafe { ngx_async::acquire_worker(log) }) else {
             return Status::NGX_ERROR.0;
-        }
+        };
+        WORKER_SCHEDULER_LEASE.with(|current| {
+            *current.borrow_mut() = Some(lease);
+        });
 
         log::info!("async log facade initialized");
         Status::NGX_OK.0
     }
 
     fn exit_process(_cycle: http::ProcessCycle<'_>) {
-        let _ = ngx_async::shutdown_worker();
+        WORKER_SCHEDULER_LEASE.with(|current| {
+            if let Some(mut lease) = current.borrow_mut().take() {
+                let _ = lease.release();
+            }
+        });
     }
 }
 

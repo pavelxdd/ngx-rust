@@ -15,7 +15,7 @@ pub(crate) use self::spawn::AttachedTask;
 pub(crate) use self::spawn::SCHEDULER_TESTS;
 pub use self::spawn::{
     CancellationHandle, LocalTask, SchedulerInitError, SchedulerShutdownError, SpawnError,
-    TaskError, init_worker, shutdown_worker, spawn,
+    TaskError, WorkerSchedulerLease, acquire_worker, spawn,
 };
 pub use crate::event::{EventReadiness, Readiness, ReadinessError};
 

@@ -306,9 +306,9 @@ where
 
 /// Registers an asynchronous HTTP phase handler.
 ///
-/// Call this function from the module's postconfiguration callback. The owning module must call
-/// [`crate::async_::init_worker`] from its process-start hook and
-/// [`crate::async_::shutdown_worker`] from its process-exit hook.
+/// Call this function from the module's postconfiguration callback. The owning module must retain
+/// a [`crate::async_::WorkerSchedulerLease`] from its process-start hook until its process-exit
+/// hook.
 pub fn add_async_phase_handler<H>(
     parser: &mut crate::http::HttpConfigurationParser<'_>,
 ) -> Result<(), AsyncHandlerRegistrationError>
@@ -766,7 +766,6 @@ mod tests {
         fn new() -> Self {
             let nginx = lock(&crate::TEST_NGINX_GLOBALS);
             let scheduler = lock(&crate::async_::SCHEDULER_TESTS);
-            assert_eq!(crate::async_::shutdown_worker(), Ok(false));
             let previous = unsafe {
                 let core = &raw const nginx_sys::ngx_http_core_module;
                 GlobalState {
@@ -795,7 +794,6 @@ mod tests {
 
     impl Drop for TestGlobals {
         fn drop(&mut self) {
-            let _ = crate::async_::shutdown_worker();
             reset_event_globals();
             unsafe {
                 nginx_sys::ngx_max_module = self.previous.max_module;
@@ -859,6 +857,7 @@ mod tests {
     struct TestWorker {
         _globals: TestGlobals,
         cycle: Box<TestCycle>,
+        lease: Option<crate::async_::WorkerSchedulerLease>,
     }
 
     impl TestWorker {
@@ -872,12 +871,12 @@ mod tests {
                 ngx_event_actions.del = Some(test_delete_event);
                 ngx_event_flags = NGX_USE_CLEAR_EVENT as _;
             }
-            Self { _globals: globals, cycle }
+            Self { _globals: globals, cycle, lease: None }
         }
 
         fn init(&mut self) {
             let log = unsafe { LogRef::from_raw(&raw mut self.cycle.log) }.expect("test logger");
-            unsafe { crate::async_::init_worker(log) }.unwrap();
+            self.lease = Some(unsafe { crate::async_::acquire_worker(log) }.unwrap());
         }
 
         fn process_posted(&mut self) {
@@ -895,7 +894,9 @@ mod tests {
 
     impl Drop for TestWorker {
         fn drop(&mut self) {
-            let _ = crate::async_::shutdown_worker();
+            if let Some(mut lease) = self.lease.take() {
+                let _ = lease.release();
+            }
         }
     }
 
