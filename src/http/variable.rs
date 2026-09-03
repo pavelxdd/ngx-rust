@@ -839,6 +839,18 @@ impl<'request, 'callback> HttpVariableRequest<'request, 'callback> {
         self.request.pinned_module_context_mut::<M>()
     }
 
+    /// Returns a movable request context, inserting a pool-owned value when absent.
+    pub fn get_or_insert_module_context_with<M>(
+        &mut self,
+        constructor: impl FnOnce() -> M::RequestContext,
+    ) -> Result<&mut M::RequestContext, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+        M::RequestContext: Unpin,
+    {
+        self.request.get_or_insert_module_context_with::<M>(constructor)
+    }
+
     /// Looks up the value currently cached for this request.
     pub fn get_cached<'value>(
         &'value mut self,

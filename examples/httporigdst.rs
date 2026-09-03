@@ -3,7 +3,7 @@ use core::mem;
 use core::ptr;
 
 use libc::sockaddr_storage;
-use ngx::core::{ModuleDescriptor, NgxStr, Pool, SocketType, Status};
+use ngx::core::{ModuleDescriptor, NgxStr, Pool, SocketAddressFamily, SocketType, Status};
 use ngx::ffi::{
     NGX_HTTP_MODULE, in_port_t, ngx_http_module_t, ngx_inet_get_port, ngx_int_t, ngx_module_t,
     ngx_sock_ntop, ngx_str_t, sockaddr,
@@ -100,25 +100,24 @@ pub static mut ngx_http_orig_dst_module: ngx_module_t = ngx_module_t {
     ..ngx_module_t::default()
 };
 
-fn ngx_get_origdst(request: &mut http::RequestRefMut<'_>) -> Result<(String, in_port_t), Status> {
-    {
-        let mut connection = request.connection_mut().map_err(|_| Status::NGX_ERROR)?;
-        if !matches!(connection.socket_type(), Ok(SocketType::Stream)) {
-            ngx_log_debug_http!(request, "httporigdst: connection is not type SOCK_STREAM");
-            return Err(Status::NGX_DECLINED);
-        }
-        if connection.refresh_local_address().is_err() {
-            ngx_log_debug_http!(request, "httporigdst: no local sockaddr from connection");
-            return Err(Status::NGX_ERROR);
-        }
+fn ngx_get_origdst(request: &http::RequestRefMut<'_>) -> Result<(String, in_port_t), Status> {
+    let connection = request.connection().map_err(|_| Status::NGX_ERROR)?;
+    if !matches!(connection.socket_type(), Ok(SocketType::Stream)) {
+        ngx_log_debug_http!(request, "httporigdst: connection is not type SOCK_STREAM");
+        return Err(Status::NGX_DECLINED);
     }
+    let family = connection
+        .listener()
+        .and_then(|listener| listener.address())
+        .map(|address| address.family())
+        .map_err(|_| Status::NGX_ERROR)?;
 
     let c = unsafe { (*request.as_ptr()).connection };
 
     let level: c_int;
     let optname: c_int;
-    match unsafe { (*(*c).local_sockaddr).sa_family } as i32 {
-        libc::AF_INET => {
+    match family {
+        SocketAddressFamily::Ipv4 => {
             level = libc::SOL_IP;
             optname = libc::SO_ORIGINAL_DST;
         }
