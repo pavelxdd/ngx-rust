@@ -617,6 +617,16 @@ impl<'callback> ConnectionRef<'callback> {
         Ok(f(connection))
     }
 
+    /// Returns the wrapped native connection pointer for FFI interoperation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must not use the pointer to create an aliasing mutable Rust view, outlive this
+    /// callback, move access to another thread, or violate any ownership represented by this view.
+    pub unsafe fn as_ptr(&self) -> *const ngx_connection_t {
+        self.raw.as_ptr()
+    }
+
     /// Returns the connection memory pool.
     pub fn pool(&self) -> Result<Pool<'callback>, ConnectionError> {
         connection_pool(self.raw)
