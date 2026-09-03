@@ -23,6 +23,7 @@ rust-version.workspace = true
 [dependencies]
 duct = "1.1.1"
 flate2 = "1.1.9"
+shlex = "2.0.1"
 tar = "0.4.46"
 ureq = "3.2"
 
