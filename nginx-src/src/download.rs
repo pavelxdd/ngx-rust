@@ -135,54 +135,134 @@ static CACHE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
     cache_dir
 });
 
-/// Downloads a tarball from the specified URL into the `.cache` directory.
-fn download(cache_dir: &Path, url: &str) -> Result<PathBuf, Box<dyn StdError + Send + Sync>> {
-    fn proceed_with_download(file_path: &Path) -> bool {
-        // File does not exist or is zero bytes
-        !file_path.exists() || file_path.metadata().is_ok_and(|m| m.len() < 1)
-    }
-    let filename = url.split('/').next_back().unwrap();
-    let file_path = cache_dir.join(filename);
-    if proceed_with_download(&file_path) {
-        println!("Downloading: {} -> {}", url, file_path.display());
-        let mut response = ureq::get(url).call()?;
-        let mut reader = response.body_mut().as_reader();
-        let mut file = File::create(&file_path)?;
-        std::io::copy(&mut reader, &mut file)?;
+static NEXT_DOWNLOAD_ID: AtomicU64 = AtomicU64::new(0);
+
+struct DownloadCacheEntry {
+    final_path: PathBuf,
+    staged_path: Option<PathBuf>,
+}
+
+impl DownloadCacheEntry {
+    fn path(&self) -> &Path {
+        self.staged_path.as_deref().unwrap_or(&self.final_path)
     }
 
-    if !file_path.exists() {
-        return Err(
-            format!("Downloaded file was not written to the expected location: {url}",).into()
-        );
+    fn publish(mut self) -> io::Result<PathBuf> {
+        if let Some(staged_path) = &self.staged_path {
+            fs::rename(staged_path, &self.final_path)?;
+            self.staged_path = None;
+        }
+        Ok(self.final_path.clone())
     }
-    Ok(file_path)
+
+    fn remove(&mut self) {
+        if let Some(staged_path) = self.staged_path.take() {
+            let _ = fs::remove_file(staged_path);
+        }
+        let _ = fs::remove_file(&self.final_path);
+    }
+}
+
+impl Drop for DownloadCacheEntry {
+    fn drop(&mut self) {
+        if let Some(staged_path) = &self.staged_path {
+            let _ = fs::remove_file(staged_path);
+        }
+    }
+}
+
+fn create_download_staging_file(final_path: &Path) -> io::Result<(PathBuf, File)> {
+    let parent = final_path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "download cache path has no parent")
+    })?;
+    let file_name = final_path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "download cache path has no file name")
+    })?;
+
+    for _ in 0..100 {
+        let id = NEXT_DOWNLOAD_ID.fetch_add(1, Ordering::Relaxed);
+        let staged_path = parent.join(format!(
+            ".{}.downloading-{}-{id}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        ));
+        match File::options().write(true).create_new(true).open(&staged_path) {
+            Ok(file) => return Ok((staged_path, file)),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("unable to create a staging file for {}", final_path.display()),
+    ))
+}
+
+fn write_download(file_path: &Path, reader: &mut impl io::Read) -> io::Result<DownloadCacheEntry> {
+    let (staged_path, mut file) = create_download_staging_file(file_path)?;
+    let pending =
+        DownloadCacheEntry { final_path: file_path.to_owned(), staged_path: Some(staged_path) };
+    let result = std::io::copy(reader, &mut file);
+    drop(file);
+    result?;
+    Ok(pending)
+}
+
+/// Downloads a tarball from the specified URL into the `.cache` directory.
+fn download(
+    cache_dir: &Path,
+    url: &str,
+) -> Result<DownloadCacheEntry, Box<dyn StdError + Send + Sync>> {
+    let filename = url.split('/').next_back().unwrap();
+    let file_path = cache_dir.join(filename);
+    match fs::symlink_metadata(&file_path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() > 0 => {
+            return Ok(DownloadCacheEntry { final_path: file_path, staged_path: None });
+        }
+        Ok(_) => fs::remove_file(&file_path)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    println!("Downloading: {} -> {}", url, file_path.display());
+    let mut response = ureq::get(url).call()?;
+    let mut reader = response.body_mut().as_reader();
+    Ok(write_download(&file_path, &mut reader)?)
+}
+
+fn remove_download_pair(archive: &mut DownloadCacheEntry, signature: &mut DownloadCacheEntry) {
+    archive.remove();
+    signature.remove();
 }
 
 /// Gets a given tarball and signature file from a remote URL and copies it to the `.cache`
 /// directory.
 fn get_archive(cache_dir: &Path, source: &SourceSpec, version: &str) -> io::Result<PathBuf> {
     let archive_url = (source.url)(version);
-    let archive = download(cache_dir, &archive_url).map_err(io::Error::other)?;
+    let mut archive = download(cache_dir, &archive_url).map_err(io::Error::other)?;
 
     if let Some(verifier) = &*VERIFIER {
-        let signature = format!("{archive_url}.{}", source.signature);
+        let signature_url = format!("{archive_url}.{}", source.signature);
+        let mut signature = download(cache_dir, &signature_url).map_err(io::Error::other)?;
 
         let verify = || -> io::Result<()> {
-            let signature = download(cache_dir, &signature).map_err(io::Error::other)?;
             verifier.import_keys(source.keyserver, source.key_ids)?;
-            verifier.verify_signature(&archive, &signature)?;
+            verifier.verify_signature(archive.path(), signature.path())?;
             Ok(())
         };
 
         if let Err(err) = verify() {
-            let _ = fs::remove_file(&archive);
-            let _ = fs::remove_file(&signature);
+            remove_download_pair(&mut archive, &mut signature);
             return Err(err);
         }
+
+        let archive = archive.publish()?;
+        signature.publish()?;
+        return Ok(archive);
     }
 
-    Ok(archive)
+    archive.publish()
 }
 
 const EXTRACTION_MARKER: &str = ".ngx-rust-extracted";
@@ -409,7 +489,7 @@ pub fn prepare(source_dir: &Path, build_dir: &Path) -> io::Result<(PathBuf, Vec<
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File};
-    use std::io;
+    use std::io::{self, Read};
     use std::path::PathBuf;
 
     use flate2::Compression;
@@ -417,7 +497,21 @@ mod tests {
     use tar::{Builder, EntryType, Header};
     use tempfile::TempDir;
 
-    use super::extract_archive;
+    use super::{DownloadCacheEntry, extract_archive, remove_download_pair, write_download};
+
+    struct InterruptedReader {
+        bytes: Option<&'static [u8]>,
+    }
+
+    impl Read for InterruptedReader {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if let Some(bytes) = self.bytes.take() {
+                output[..bytes.len()].copy_from_slice(bytes);
+                return Ok(bytes.len());
+            }
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "interrupted response"))
+        }
+    }
 
     struct TestEntry<'a> {
         path: &'a str,
@@ -463,6 +557,51 @@ mod tests {
 
     fn file<'a>(path: &'a str, contents: &'static [u8]) -> TestEntry<'a> {
         TestEntry { path, entry_type: EntryType::Regular, link_name: None, contents }
+    }
+
+    #[test]
+    fn interrupted_download_is_not_published() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let cached = temp_dir.path().join("source.tar.gz");
+        let mut reader = InterruptedReader { bytes: Some(b"partial") };
+
+        assert!(write_download(&cached, &mut reader).is_err());
+        assert!(!cached.exists());
+        assert_eq!(fs::read_dir(temp_dir.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn completed_download_is_published_only_after_commit() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let cached = temp_dir.path().join("source.tar.gz");
+        let mut bytes = &b"complete"[..];
+
+        let pending = write_download(&cached, &mut bytes)?;
+        assert!(!cached.exists());
+
+        assert_eq!(pending.publish()?, cached);
+        assert_eq!(fs::read(&cached)?, b"complete");
+        Ok(())
+    }
+
+    #[test]
+    fn failed_verification_removes_both_resolved_cache_entries() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive_path = temp_dir.path().join("source.tar.gz");
+        let signature_path = temp_dir.path().join("source.tar.gz.asc");
+        fs::write(&archive_path, b"archive")?;
+        fs::write(&signature_path, b"signature")?;
+        let mut archive =
+            DownloadCacheEntry { final_path: archive_path.clone(), staged_path: None };
+        let mut signature =
+            DownloadCacheEntry { final_path: signature_path.clone(), staged_path: None };
+
+        remove_download_pair(&mut archive, &mut signature);
+
+        assert!(!archive_path.exists());
+        assert!(!signature_path.exists());
+        Ok(())
     }
 
     #[test]
