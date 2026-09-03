@@ -5,6 +5,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::future::Future;
+use core::marker::PhantomData;
 use core::mem;
 use core::pin::Pin;
 use core::ptr::NonNull;
@@ -58,6 +59,34 @@ pub enum SchedulerShutdownError {
     WrongWorker,
     /// A scheduler callback is currently polling queued tasks.
     Processing,
+}
+
+/// One module's ownership of the async scheduler on the current nginx worker.
+#[must_use = "the owning module must retain this lease until its process-exit hook"]
+pub struct WorkerSchedulerLease {
+    scheduler: Arc<Scheduler>,
+    active: bool,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl WorkerSchedulerLease {
+    fn new(scheduler: Arc<Scheduler>) -> Self {
+        Self { scheduler, active: true, _not_send: PhantomData }
+    }
+
+    /// Releases this module's scheduler ownership.
+    ///
+    /// Returns `Ok(true)` only when this was the final lease and the scheduler was stopped.
+    /// Call this from the module's process-exit hook after cancelling its own tasks.
+    pub fn release(&mut self) -> Result<bool, SchedulerShutdownError> {
+        release_worker_lease(self)
+    }
+}
+
+impl Drop for WorkerSchedulerLease {
+    fn drop(&mut self) {
+        let _ = release_worker_lease(self);
+    }
 }
 
 /// Terminal failure returned by a [`LocalTask`].
@@ -338,6 +367,7 @@ struct WorkerScheduler {
     notification: Option<NonNull<ngx_connection_t>>,
     tasks: Vec<RegisteredTask>,
     completed: Vec<Arc<TaskControl>>,
+    leases: usize,
 }
 
 impl WorkerScheduler {
@@ -355,11 +385,12 @@ impl WorkerScheduler {
             notification: Some(notification),
             tasks: Vec::new(),
             completed: Vec::new(),
+            leases: 1,
         })
     }
 
     fn post(&mut self) -> bool {
-        // WorkerScheduler exists only between init_worker and shutdown_worker on its owner thread.
+        // WorkerScheduler exists while at least one worker lease is held on its owner thread.
         unsafe { self.posted.as_mut().post(PostedQueue::Next) }.is_ok()
     }
 
@@ -1113,25 +1144,47 @@ fn clear_active_scheduler(scheduler: &Arc<Scheduler>) {
     }
 }
 
-/// Initializes the async scheduler for the current nginx worker.
+/// Acquires one module's lease on the async scheduler for the current nginx worker.
 ///
-/// Call this from the module's process-start hook before calling [`spawn`]. The selected nginx
-/// worker must have an available connection slot so the private notification socket can be
-/// registered for cloned wakers invoked from a foreign thread.
+/// Call this from the module's process-start hook before calling [`spawn`]. The first participant
+/// creates the worker scheduler and requires an available connection slot for its private
+/// notification socket. Later participants on the same worker share that scheduler. Every
+/// successful acquisition must remain owned until the matching process-exit hook calls
+/// [`WorkerSchedulerLease::release`].
 ///
 /// # Safety
 ///
-/// This must run from the nginx worker process-start hook on the initialized event-loop thread.
-/// `log` must remain live and usable on that thread until [`shutdown_worker`] completes.
-pub unsafe fn init_worker(log: LogRef<'_>) -> Result<(), SchedulerInitError> {
-    let stopped = WORKER_SCHEDULER.with(|worker| match worker.borrow().as_ref() {
-        None => Ok(false),
-        Some(worker) if worker.scheduler.is_stopped() => Ok(true),
-        Some(_) => Err(SchedulerInitError::AlreadyInitialized),
+/// This must run from an nginx module process-start hook on the initialized event-loop thread.
+/// `log` must remain live and usable on that thread until every worker lease is released.
+pub unsafe fn acquire_worker(log: LogRef<'_>) -> Result<WorkerSchedulerLease, SchedulerInitError> {
+    let existing = WORKER_SCHEDULER.with(|current| {
+        let mut current = current.borrow_mut();
+        let Some(worker) = current.as_mut() else {
+            return Ok(None);
+        };
+        if worker.scheduler.check_spawn().is_ok() {
+            worker.leases =
+                worker.leases.checked_add(1).ok_or(SchedulerInitError::AlreadyInitialized)?;
+            return Ok(Some(Arc::clone(&worker.scheduler)));
+        }
+        if worker.scheduler.is_stopped() && worker.leases == 0 {
+            return Ok(None);
+        }
+        Err(SchedulerInitError::AlreadyInitialized)
     })?;
+    if let Some(scheduler) = existing {
+        return Ok(WorkerSchedulerLease::new(scheduler));
+    }
+
+    let stopped = WORKER_SCHEDULER.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .is_some_and(|worker| worker.scheduler.is_stopped() && worker.leases == 0)
+    });
     if stopped {
         let mut worker = WORKER_SCHEDULER
-            .with(|worker| worker.borrow_mut().take())
+            .with(|current| current.borrow_mut().take())
             .ok_or(SchedulerInitError::AlreadyInitialized)?;
         let scheduler = Arc::clone(&worker.scheduler);
         let queued = scheduler.drain_for_shutdown();
@@ -1159,40 +1212,42 @@ pub unsafe fn init_worker(log: LogRef<'_>) -> Result<(), SchedulerInitError> {
         *current.borrow_mut() = Some(worker);
     });
 
-    Ok(())
+    Ok(WorkerSchedulerLease::new(scheduler))
 }
 
-/// Stops the async scheduler for the current nginx worker.
-///
-/// Returns `Ok(false)` when this thread has no active scheduler. Call this only after nginx has
-/// stopped invoking scheduler callbacks; calling it from a running task returns
-/// [`SchedulerShutdownError::Processing`]. Already-started foreign wake handoffs are drained here,
-/// and their futures are destroyed on the owning worker thread before shutdown returns.
-pub fn shutdown_worker() -> Result<bool, SchedulerShutdownError> {
-    let scheduler = match WORKER_SCHEDULER.with(|worker| {
-        let worker = worker.borrow();
-        let Some(worker) = worker.as_ref() else {
-            return Ok(None);
+fn release_worker_lease(lease: &mut WorkerSchedulerLease) -> Result<bool, SchedulerShutdownError> {
+    if !lease.active {
+        return Ok(false);
+    }
+
+    let final_release = WORKER_SCHEDULER.with(|current| {
+        let mut current = current.borrow_mut();
+        let Some(worker) = current.as_mut() else {
+            return Err(SchedulerShutdownError::WrongWorker);
         };
+        if !Arc::ptr_eq(&worker.scheduler, &lease.scheduler) {
+            return Err(SchedulerShutdownError::WrongWorker);
+        }
         if worker.scheduler.processing_on_current_worker() {
             return Err(SchedulerShutdownError::Processing);
         }
-        Ok(Some(Arc::clone(&worker.scheduler)))
-    }) {
-        Ok(Some(scheduler)) => scheduler,
-        Ok(None) => {
-            if active_scheduler().lock().unwrap_or_else(|error| error.into_inner()).is_some() {
-                return Err(SchedulerShutdownError::WrongWorker);
-            }
-            return Ok(false);
-        }
-        Err(error) => return Err(error),
-    };
+        let Some(leases) = worker.leases.checked_sub(1) else {
+            return Err(SchedulerShutdownError::WrongWorker);
+        };
+        worker.leases = leases;
+        Ok(leases == 0)
+    })?;
+    lease.active = false;
+    if !final_release {
+        return Ok(false);
+    }
+
+    let scheduler = Arc::clone(&lease.scheduler);
     let was_stopped = scheduler.is_stopped();
     let queued = scheduler.drain_for_shutdown();
-    let tasks = WORKER_SCHEDULER.with(|worker| {
-        let mut worker = worker.borrow_mut();
-        let Some(worker) = worker.as_mut() else {
+    let tasks = WORKER_SCHEDULER.with(|current| {
+        let mut current = current.borrow_mut();
+        let Some(worker) = current.as_mut() else {
             return Err(SchedulerShutdownError::WrongWorker);
         };
         if !Arc::ptr_eq(&worker.scheduler, &scheduler) {
@@ -1216,8 +1271,9 @@ pub fn shutdown_worker() -> Result<bool, SchedulerShutdownError> {
 
 /// Creates a new task running on the NGINX event loop.
 ///
-/// This function must be called after [`init_worker`] on the owning nginx worker thread. The task
-/// is always polled on that thread even when its waker is invoked from another thread.
+/// This function must be called while the owning module holds a [`WorkerSchedulerLease`] on the
+/// nginx worker thread. The task is always polled on that thread even when its waker is invoked
+/// from another thread.
 pub fn spawn<F, T>(future: F) -> Result<LocalTask<T>, SpawnError>
 where
     F: Future<Output = T> + 'static,
@@ -1309,7 +1365,6 @@ mod worker_tests {
         fn new() -> Self {
             let nginx = crate::TEST_NGINX_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
             let scheduler = SCHEDULER_TESTS.lock().unwrap_or_else(|error| error.into_inner());
-            assert_eq!(shutdown_worker(), Ok(false));
 
             let previous_cycle = unsafe { ngx_cycle };
             let previous_actions = unsafe { ngx_event_actions };
@@ -1331,7 +1386,6 @@ mod worker_tests {
 
     impl Drop for TestGlobals {
         fn drop(&mut self) {
-            let _ = shutdown_worker();
             reset_event_globals();
             unsafe {
                 ngx_cycle = self.previous_cycle;
@@ -1370,6 +1424,7 @@ mod worker_tests {
     struct TestWorker {
         _globals: TestGlobals,
         cycle: Box<TestCycle>,
+        lease: Option<WorkerSchedulerLease>,
     }
 
     impl TestWorker {
@@ -1384,12 +1439,26 @@ mod worker_tests {
                 ngx_event_actions.notify = Some(test_notify);
                 ngx_event_flags = NGX_USE_CLEAR_EVENT as _;
             }
-            Self { _globals: globals, cycle }
+            Self { _globals: globals, cycle, lease: None }
         }
 
         fn init(&mut self) -> Result<(), SchedulerInitError> {
             let log = unsafe { LogRef::from_raw(&raw mut self.cycle.log) }.expect("test logger");
-            unsafe { init_worker(log) }
+            self.lease = Some(unsafe { acquire_worker(log) }?);
+            Ok(())
+        }
+
+        fn release(&mut self) -> Result<bool, SchedulerShutdownError> {
+            let Some(mut lease) = self.lease.take() else {
+                return Ok(false);
+            };
+            match lease.release() {
+                Ok(stopped) => Ok(stopped),
+                Err(error) => {
+                    self.lease = Some(lease);
+                    Err(error)
+                }
+            }
         }
 
         fn process_posted(&mut self) {
@@ -1427,7 +1496,7 @@ mod worker_tests {
 
     impl Drop for TestWorker {
         fn drop(&mut self) {
-            let _ = shutdown_worker();
+            let _ = self.release();
         }
     }
 
@@ -1517,6 +1586,28 @@ mod worker_tests {
 
         assert_eq!(worker.init(), Err(SchedulerInitError::NotificationChannel));
         assert!(matches!(spawn(async { 1 }), Err(SpawnError::Uninitialized)));
+    }
+
+    #[test]
+    fn worker_leases_share_one_scheduler_until_the_last_release() {
+        let mut worker = TestWorker::new();
+        let log = unsafe { LogRef::from_raw(&raw mut worker.cycle.log) }.expect("test logger");
+        let mut first = unsafe { acquire_worker(log) }.expect("first scheduler participant");
+        let mut second = unsafe { acquire_worker(log) }.expect("second scheduler participant");
+
+        let first_task = spawn(async { 1 }).expect("first participant task");
+        worker.process_posted();
+        let mut first_task = core::pin::pin!(first_task);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(first_task.as_mut().poll(&mut context), Poll::Ready(Ok(1)));
+
+        let second_task = spawn(async { 2 }).expect("second participant task");
+        assert_eq!(first.release(), Ok(false));
+        worker.process_posted();
+        let mut second_task = core::pin::pin!(second_task);
+        assert_eq!(second_task.as_mut().poll(&mut context), Poll::Ready(Ok(2)));
+        assert_eq!(second.release(), Ok(true));
+        assert!(matches!(spawn(async { 3 }), Err(SpawnError::Uninitialized)));
     }
 
     #[test]
@@ -1826,7 +1917,7 @@ mod worker_tests {
         assert_eq!(attached_dropped.load(Ordering::Relaxed), 0);
         assert_eq!(detached_dropped.load(Ordering::Relaxed), 0);
         assert!(!worker.task_registry_is_empty());
-        assert_eq!(shutdown_worker(), Ok(true));
+        assert_eq!(worker.release(), Ok(true));
         assert_eq!(attached_dropped.load(Ordering::Relaxed), 1);
         assert_eq!(detached_dropped.load(Ordering::Relaxed), 1);
         cancellation.cancel();
@@ -1862,7 +1953,7 @@ mod worker_tests {
         let mut context = Context::from_waker(Waker::noop());
         assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Err(TaskError::SchedulerFailed)));
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
-        assert_eq!(shutdown_worker(), Ok(true));
+        assert_eq!(worker.release(), Ok(true));
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 
@@ -1923,9 +2014,9 @@ mod worker_tests {
         assert_eq!(first.as_mut().poll(&mut context), Poll::Ready(Ok(1)));
         assert_eq!(second.as_mut().poll(&mut context), Poll::Ready(Ok(2)));
 
-        assert_eq!(shutdown_worker(), Ok(true));
+        assert_eq!(worker.release(), Ok(true));
         assert!(worker.queues_are_empty());
-        assert_eq!(shutdown_worker(), Ok(false));
+        assert_eq!(worker.release(), Ok(false));
 
         worker.init().unwrap();
         let task = spawn(async { 3 }).unwrap();
@@ -2112,7 +2203,7 @@ mod worker_tests {
             }
         });
 
-        assert_eq!(shutdown_worker(), Ok(true));
+        assert_eq!(worker.release(), Ok(true));
         foreign.join().unwrap();
 
         let inner = scheduler.lock();
@@ -2138,7 +2229,7 @@ mod worker_tests {
         .unwrap();
 
         worker.process_posted();
-        assert_eq!(shutdown_worker(), Ok(true));
+        assert_eq!(worker.release(), Ok(true));
         let waker = waker_rx.recv().unwrap();
         thread::spawn(move || waker.wake()).join().unwrap();
 
@@ -2193,7 +2284,7 @@ mod worker_tests {
 
         task.detach();
         assert_eq!(dropped.load(Ordering::Relaxed), 0);
-        assert_eq!(shutdown_worker(), Ok(true));
+        assert_eq!(worker.release(), Ok(true));
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
         assert!(queue_unlocked.load(Ordering::Acquire));
         assert!(worker.queues_are_empty());
@@ -2222,12 +2313,14 @@ mod worker_tests {
     fn shutdown_waits_for_scheduler_callbacks_to_stop() {
         let mut worker = TestWorker::new();
         worker.init().unwrap();
+        let lease = Rc::new(RefCell::new(worker.lease.take().expect("worker lease")));
         let result = Arc::new(Mutex::new(None));
         let future_result = Arc::clone(&result);
+        let future_lease = Rc::clone(&lease);
 
         let task = spawn(poll_fn(move |_| -> Poll<()> {
             *future_result.lock().unwrap_or_else(|error| error.into_inner()) =
-                Some(shutdown_worker());
+                Some(future_lease.borrow_mut().release());
             Poll::Pending
         }))
         .unwrap();
@@ -2238,25 +2331,24 @@ mod worker_tests {
             Some(Err(SchedulerShutdownError::Processing))
         );
         drop(task);
-        assert_eq!(shutdown_worker(), Ok(true));
+        assert_eq!(lease.borrow_mut().release(), Ok(true));
     }
 
     #[test]
     fn shutdown_allows_a_different_worker_to_initialize() {
         let mut worker = TestWorker::new();
         worker.init().unwrap();
-        assert_eq!(shutdown_worker(), Ok(true));
+        assert_eq!(worker.release(), Ok(true));
 
         let result = thread::spawn(|| {
             let mut log = unsafe { MaybeUninit::<ngx_log_t>::zeroed().assume_init() };
             let log = unsafe { LogRef::from_raw(&raw mut log) }.expect("test logger");
-            let init = unsafe { init_worker(log) };
-            let shutdown = shutdown_worker();
-            (init, shutdown)
+            let mut lease = unsafe { acquire_worker(log) }.expect("foreign worker lease");
+            lease.release()
         })
         .join()
         .unwrap();
 
-        assert_eq!(result, (Ok(()), Ok(true)));
+        assert_eq!(result, Ok(true));
     }
 }
