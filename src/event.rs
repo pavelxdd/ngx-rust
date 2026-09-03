@@ -1133,12 +1133,12 @@ mod event_tests {
     #[cfg(ngx_feature = "debug")]
     use crate::ffi::NGX_LOG_DEBUG_EVENT;
     use crate::ffi::{
-        NGX_AGAIN, NGX_OK, NGX_READ_EVENT, NGX_WRITE_EVENT, ngx_create_pool,
-        ngx_current_msec, ngx_cycle_t, ngx_destroy_pool, ngx_event_actions,
-        ngx_event_expire_timers, ngx_event_handler_pt, ngx_event_move_posted_next,
-        ngx_event_no_timers_left, ngx_event_process_posted, ngx_event_t, ngx_event_timer_init,
-        ngx_int_t, ngx_log_t, ngx_msec_int_t, ngx_msec_t, ngx_pool_t, ngx_posted_events,
-        ngx_posted_next_events, ngx_queue_empty, ngx_queue_init, ngx_queue_t, ngx_uint_t,
+        NGX_AGAIN, NGX_OK, NGX_READ_EVENT, NGX_WRITE_EVENT, ngx_create_pool, ngx_current_msec,
+        ngx_cycle_t, ngx_destroy_pool, ngx_event_actions, ngx_event_expire_timers,
+        ngx_event_handler_pt, ngx_event_move_posted_next, ngx_event_no_timers_left,
+        ngx_event_process_posted, ngx_event_t, ngx_event_timer_init, ngx_int_t, ngx_log_t,
+        ngx_msec_int_t, ngx_msec_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events,
+        ngx_queue_empty, ngx_queue_init, ngx_queue_t, ngx_uint_t,
     };
     use crate::log::LogRef;
 

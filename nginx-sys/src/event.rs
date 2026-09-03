@@ -70,10 +70,9 @@ mod tests {
     #[cfg(ngx_feature = "debug")]
     use crate::{NGX_LOG_DEBUG_CORE, NGX_LOG_DEBUG_EVENT, ngx_uint_t};
     use crate::{
-        NGX_TIMER_LAZY_DELAY, ngx_connection_t,
-        ngx_current_msec, ngx_event_expire_timers, ngx_event_t, ngx_event_timer_init, ngx_log_t,
-        ngx_msec_t, ngx_posted_events, ngx_posted_next_events, ngx_queue_empty, ngx_queue_init,
-        ngx_queue_t,
+        NGX_TIMER_LAZY_DELAY, ngx_connection_t, ngx_current_msec, ngx_event_expire_timers,
+        ngx_event_t, ngx_event_timer_init, ngx_log_t, ngx_msec_t, ngx_posted_events,
+        ngx_posted_next_events, ngx_queue_empty, ngx_queue_init, ngx_queue_t,
     };
 
     unsafe extern "C" {
