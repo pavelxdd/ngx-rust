@@ -431,7 +431,7 @@ fn rejects_missing_nginx_source_build_and_makefile() {
 }
 
 #[test]
-fn rejects_duplicate_module_and_target_names() {
+fn rejects_duplicate_module_names() {
     let fixture = Fixture::new();
     let one = fixture.addon("one addon", "crate-one", "target_one", &[]);
     let two = fixture.addon("two addon", "crate-two", "target_two", &[]);
@@ -441,14 +441,47 @@ fn rejects_duplicate_module_and_target_names() {
         register_module("two", &two, "target_two", "ngx_http_same_module", "", "STATIC"),
     );
     assert_failed_with(fixture.run(&body, &[]), "duplicate nginx module name");
+}
 
+#[test]
+fn allows_matching_target_names_in_distinct_addons() {
     let fixture = Fixture::new();
-    let one = fixture.addon("one addon", "crate-one", "target_one", &[]);
-    let two = fixture.addon("two addon", "crate-two", "target_two", &[]);
+    let one = fixture.addon("one addon", "crate-one", "same_target", &[]);
+    let two = fixture.addon("two addon", "crate-two", "same_target", &[]);
     let body = format!(
-        "{}{}",
+        "{}{}{}{}\nprintf '\\nall: %s\\n' \"$LINK_DEPS\" >> \"$NGX_MAKEFILE\"\n",
         register_module("one", &one, "same_target", "ngx_http_one_module", "", "STATIC"),
         register_module("two", &two, "same_target", "ngx_http_two_module", "", "STATIC"),
+        emit_make("one", &one),
+        emit_make("two", &two),
+    );
+    let output = fixture.run(&body, &[]);
+    assert!(output.status.success(), "{}", output_text(&output));
+
+    let makefile = fs::read_to_string(fixture.source.join("objs/Makefile")).unwrap();
+    for addon in ["one", "two"] {
+        assert!(makefile.contains(&format!("objs/{addon}/ngx-release/libsame_target.a")));
+        assert!(makefile.contains(&format!("--target-dir \"objs/{addon}\"")));
+    }
+
+    let output = fixture.make();
+    assert!(output.status.success(), "{}", output_text(&output));
+    let calls = fs::read_to_string(&fixture.cargo_log)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("rustc\t"))
+        .count();
+    assert_eq!(calls, 2);
+}
+
+#[test]
+fn rejects_duplicate_target_name_within_one_addon() {
+    let fixture = Fixture::new();
+    let addon = fixture.addon("one addon", "crate-one", "same_target", &[]);
+    let body = format!(
+        "{}{}",
+        register_module("one", &addon, "same_target", "ngx_http_one_module", "", "STATIC"),
+        register_module("one", &addon, "same_target", "ngx_http_two_module", "", "STATIC"),
     );
     assert_failed_with(fixture.run(&body, &[]), "duplicate Rust target name");
 }
