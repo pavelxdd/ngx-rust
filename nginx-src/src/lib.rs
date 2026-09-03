@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
+use core::fmt::Write as _;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -78,7 +79,7 @@ pub fn build(build_dir: impl AsRef<Path>) -> io::Result<(PathBuf, PathBuf)> {
         validate_bundled_source_version(&source_dir)?;
     }
 
-    let flags = nginx_configure_flags(&vendored_flags);
+    let flags = nginx_configure_flags(&vendored_flags)?;
 
     configure(&source_dir, &build_dir, &flags)?;
 
@@ -143,21 +144,29 @@ fn validate_bundled_source_version(source_dir: &Path) -> io::Result<()> {
 
 fn build_info(source_dir: &Path, configure_flags: &[String]) -> io::Result<String> {
     let source_version = nginx_source_version(source_dir)?;
-    // Flags contain platform and dependency selections; the source version invalidates a build
-    // when the source tree is updated in place.
-    Ok(format!("{:?}|{source_version}|{}", source_dir, configure_flags.join(" ")))
+    let mut identity = format!("{:?}|{source_version}|", source_dir);
+    for flag in configure_flags {
+        write!(identity, "{}:", flag.len()).expect("writing to a String cannot fail");
+        identity.push_str(flag);
+    }
+    Ok(identity)
+}
+
+fn parse_configure_args(value: &str) -> io::Result<Vec<String>> {
+    shlex::split(value).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "NGX_CONFIGURE_ARGS contains malformed quoting")
+    })
 }
 
 /// Generate the flags to use with autoconf `configure` for NGINX.
-fn nginx_configure_flags(vendored: &[String]) -> Vec<String> {
+fn nginx_configure_flags(vendored: &[String]) -> io::Result<Vec<String>> {
     let mut nginx_opts: Vec<String> =
         NGINX_CONFIGURE_BASE.iter().map(|x| String::from(*x)).collect();
 
     nginx_opts.extend(vendored.iter().map(Into::into));
 
     if let Ok(extra_args) = env::var("NGX_CONFIGURE_ARGS") {
-        // FIXME: shell style split?
-        nginx_opts.extend(extra_args.split_whitespace().map(Into::into));
+        nginx_opts.extend(parse_configure_args(&extra_args)?);
     }
 
     if let Ok(cflags) = env::var("NGX_CFLAGS") {
@@ -168,7 +177,7 @@ fn nginx_configure_flags(vendored: &[String]) -> Vec<String> {
         nginx_opts.push(format!("--with-ld-opt={ldflags}"));
     }
 
-    nginx_opts
+    Ok(nginx_opts)
 }
 
 /// Runs external process invoking autoconf `configure` for NGINX.
@@ -277,7 +286,41 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{NGINX_DEFAULT_SOURCE_DIR, build_info, validate_bundled_source_version};
+    use super::{
+        NGINX_DEFAULT_SOURCE_DIR, build_info, parse_configure_args, validate_bundled_source_version,
+    };
+
+    #[test]
+    fn configure_arguments_preserve_shell_quoted_boundaries() {
+        let arguments = parse_configure_args(
+            "--with-debug --with-openssl-opt='no-asm no-tests' '--prefix=/tmp/nginx build'",
+        )
+        .unwrap();
+
+        assert_eq!(
+            arguments,
+            ["--with-debug", "--with-openssl-opt=no-asm no-tests", "--prefix=/tmp/nginx build"]
+        );
+    }
+
+    #[test]
+    fn malformed_configure_arguments_are_rejected() {
+        let error = parse_configure_args("--prefix='/tmp/nginx build").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn configure_cache_identity_preserves_argument_boundaries() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("nginx");
+        fs::create_dir_all(source.join("src/core")).unwrap();
+        fs::write(source.join("src/core/nginx.h"), "#define NGINX_VERSION \"1.30.4\"\n").unwrap();
+
+        let embedded = build_info(&source, &["--with-opt=value other".into()]).unwrap();
+        let separate = build_info(&source, &["--with-opt=value".into(), "other".into()]).unwrap();
+
+        assert_ne!(embedded, separate);
+    }
 
     #[test]
     fn configure_cache_identity_changes_when_source_version_changes_in_place() {

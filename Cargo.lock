@@ -526,6 +526,7 @@ version = "1.30.0+1.30.4"
 dependencies = [
  "duct",
  "flate2",
+ "shlex 2.0.1",
  "tar",
  "tempfile",
  "ureq",
