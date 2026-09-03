@@ -37,7 +37,7 @@ RUN --mount=type=cache,id=target,target=target \
     --mount=type=cache,id=cache,target=.cache \
     --mount=type=cache,id=cargo,target=/usr/local/cargo/registry \
     mkdir -p /out && \
-    cargo build --release --package examples --examples && \
+    cargo build --release --package examples --examples --features async,linux,stream && \
     mv /project/target/release/examples/*.so /out
 
 # --- copy dynamic modules into official nginx image from builderclear

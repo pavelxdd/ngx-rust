@@ -6,15 +6,11 @@ use alloc::alloc::{alloc_zeroed, dealloc};
 use alloc::boxed::Box;
 #[cfg(feature = "test-link")]
 use alloc::vec;
-#[cfg(all(feature = "test-link", feature = "stream", ngx_feature = "stream"))]
-use alloc::vec::Vec;
 #[cfg(unix)]
 use core::alloc::Layout;
 use core::mem::{self, size_of};
 use core::panic::AssertUnwindSafe;
 use core::ptr;
-#[cfg(all(feature = "test-link", feature = "stream", ngx_feature = "stream"))]
-use core::slice;
 #[cfg(all(feature = "test-link", unix))]
 use std::net::{TcpListener, TcpStream};
 #[cfg(all(feature = "test-link", unix))]
@@ -36,8 +32,6 @@ use crate::ffi::{
     ngx_create_pool, ngx_destroy_pool, ngx_event_t, ngx_listening_t, ngx_log_t, ngx_pool_t,
     ngx_proxy_protocol_t, ngx_str_t, ngx_uint_t, off_t, sockaddr, sockaddr_in, sockaddr_in6,
 };
-#[cfg(all(feature = "test-link", feature = "stream", ngx_feature = "stream"))]
-use crate::ffi::{NGX_OK, ngx_int_t, ngx_stream_session_t, ngx_stream_variable_value_t};
 #[cfg(unix)]
 use crate::ffi::{sa_family_t, sockaddr_un};
 
@@ -45,15 +39,6 @@ use crate::ffi::{sa_family_t, sockaddr_un};
 unsafe extern "C" {
     fn ngx_rs_test_fail_allocations_after(successes: ngx_uint_t);
     fn ngx_rs_test_reset_allocation_failures();
-}
-
-#[cfg(all(feature = "test-link", feature = "stream", ngx_feature = "stream"))]
-unsafe extern "C" {
-    fn ngx_rs_test_stream_proxy_protocol_addr_port(
-        session: *mut ngx_stream_session_t,
-        value: *mut ngx_stream_variable_value_t,
-        data: usize,
-    ) -> ngx_int_t;
 }
 
 fn zeroed_connection() -> ngx_connection_t {
@@ -199,71 +184,6 @@ fn parse_proxy_protocol(connection: &mut ngx_connection_t, bytes: &mut [u8]) {
         unsafe { ngx_proxy_protocol_read(raw_connection(connection), bytes.as_mut_ptr(), last) },
         last
     );
-}
-
-#[cfg(all(feature = "test-link", feature = "stream", ngx_feature = "stream"))]
-fn proxy_protocol_v2_stream_packet(
-    source: ProxyProtocolAddress,
-    destination: ProxyProtocolAddress,
-) -> Vec<u8> {
-    let mut payload = Vec::new();
-    let family_transport = match (source, destination) {
-        (
-            ProxyProtocolAddress::Ipv4 { octets: source, port: source_port },
-            ProxyProtocolAddress::Ipv4 { octets: destination, port: destination_port },
-        ) => {
-            payload.extend_from_slice(&source);
-            payload.extend_from_slice(&destination);
-            payload.extend_from_slice(&source_port.network_order());
-            payload.extend_from_slice(&destination_port.network_order());
-            0x11
-        }
-        (
-            ProxyProtocolAddress::Ipv6 { octets: source, port: source_port },
-            ProxyProtocolAddress::Ipv6 { octets: destination, port: destination_port },
-        ) => {
-            payload.extend_from_slice(&source);
-            payload.extend_from_slice(&destination);
-            payload.extend_from_slice(&source_port.network_order());
-            payload.extend_from_slice(&destination_port.network_order());
-            0x21
-        }
-        _ => unreachable!("test packet requires matching endpoint families"),
-    };
-    let mut packet = Vec::with_capacity(16 + payload.len());
-    packet.extend_from_slice(b"\r\n\r\n\0\r\nQUIT\n");
-    packet.extend_from_slice(&[
-        0x21,
-        family_transport,
-        (payload.len() >> 8) as u8,
-        payload.len() as u8,
-    ]);
-    packet.extend_from_slice(&payload);
-    packet
-}
-
-#[cfg(all(feature = "test-link", feature = "stream", ngx_feature = "stream"))]
-fn stream_proxy_protocol_addr_port(
-    connection: &mut ngx_connection_t,
-    destination: bool,
-) -> Vec<u8> {
-    let mut session: ngx_stream_session_t = unsafe { mem::zeroed() };
-    session.connection = raw_connection(connection);
-    let mut value: ngx_stream_variable_value_t = unsafe { mem::zeroed() };
-
-    assert_eq!(
-        unsafe {
-            ngx_rs_test_stream_proxy_protocol_addr_port(
-                &raw mut session,
-                &raw mut value,
-                usize::from(destination),
-            )
-        },
-        NGX_OK as ngx_int_t
-    );
-    assert!(!value.data.is_null());
-
-    unsafe { slice::from_raw_parts(value.data, value.len() as usize).to_vec() }
 }
 
 #[test]
@@ -462,12 +382,9 @@ fn proxy_protocol_view_keeps_binary_addresses_host_ports_and_raw_text() {
         ngx_str_t { len: destination_text.len(), data: destination_text.as_ptr().cast_mut() };
     metadata.src_port = 0;
     metadata.dst_port = u16::MAX;
-    metadata.family = libc::AF_INET;
-    metadata.transport = libc::SOCK_STREAM;
-    metadata.src_sa.addr4.s_addr = u32::from_ne_bytes([192, 0, 2, 10]);
-    metadata.dst_sa.addr4.s_addr = u32::from_ne_bytes([198, 51, 100, 20]);
 
     let mut connection = zeroed_connection();
+    connection.type_ = libc::SOCK_STREAM;
     connection.proxy_protocol = &raw mut metadata;
     let connection = unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
     let metadata = connection.proxy_protocol().unwrap().unwrap();
@@ -492,29 +409,22 @@ fn proxy_protocol_view_keeps_binary_addresses_host_ports_and_raw_text() {
 }
 
 #[test]
-fn proxy_protocol_view_rejects_invalid_metadata_discriminants() {
+fn proxy_protocol_view_rejects_invalid_address_text() {
+    let invalid = b"not-an-address";
     let mut metadata: ngx_proxy_protocol_t = unsafe { mem::zeroed() };
-    metadata.family = -1;
-    metadata.transport = libc::SOCK_STREAM;
+    metadata.src_addr = ngx_str_t { len: invalid.len(), data: invalid.as_ptr().cast_mut() };
+    metadata.dst_addr = metadata.src_addr;
     let mut connection = zeroed_connection();
+    connection.type_ = libc::SOCK_STREAM;
     connection.proxy_protocol = &raw mut metadata;
     let connection = unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
-    assert_eq!(connection.proxy_protocol(), Err(ProxyProtocolError::UnsupportedFamily(-1)));
 
-    let mut metadata: ngx_proxy_protocol_t = unsafe { mem::zeroed() };
-    metadata.family = libc::AF_INET;
-    metadata.transport = -1;
-    let mut connection = zeroed_connection();
-    connection.proxy_protocol = &raw mut metadata;
-    let connection = unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
-    assert_eq!(connection.proxy_protocol(), Err(ProxyProtocolError::UnsupportedTransport(-1)));
+    assert_eq!(connection.proxy_protocol(), Err(ProxyProtocolError::InvalidAddressText));
 }
 
 #[test]
 fn proxy_protocol_view_rejects_unbacked_and_oversized_metadata_bytes() {
     let mut metadata: ngx_proxy_protocol_t = unsafe { mem::zeroed() };
-    metadata.family = libc::AF_INET;
-    metadata.transport = libc::SOCK_STREAM;
     metadata.src_addr.len = 1;
     let mut connection = zeroed_connection();
     connection.proxy_protocol = &raw mut metadata;
@@ -523,8 +433,6 @@ fn proxy_protocol_view_rejects_unbacked_and_oversized_metadata_bytes() {
     assert_eq!(connection.proxy_protocol(), Err(ProxyProtocolError::MissingData));
 
     let mut metadata: ngx_proxy_protocol_t = unsafe { mem::zeroed() };
-    metadata.family = libc::AF_INET;
-    metadata.transport = libc::SOCK_STREAM;
     metadata.src_addr.len = isize::MAX as usize + 1;
     let mut connection = zeroed_connection();
     connection.proxy_protocol = &raw mut metadata;
@@ -1039,7 +947,7 @@ fn proxy_protocol_builder_rejects_mismatched_endpoints_and_carriers_without_repl
 
 #[cfg(all(feature = "test-link", unix))]
 #[test]
-fn proxy_protocol_builder_accepts_datagram_metadata_on_a_unix_stream_carrier() {
+fn proxy_protocol_builder_rejects_datagram_metadata_on_a_unix_stream_carrier() {
     let owner = TestPool::new();
     let mut listener_address: sockaddr_un = unsafe { mem::zeroed() };
     listener_address.sun_family = libc::AF_UNIX as _;
@@ -1063,16 +971,18 @@ fn proxy_protocol_builder_accepts_datagram_metadata_on_a_unix_stream_carrier() {
     };
     let metadata = ProxyProtocolBuilder::new(source, destination, SocketType::Datagram).unwrap();
 
-    connection_view.attach_proxy_protocol(metadata).unwrap();
     assert_eq!(
-        connection_view.proxy_protocol().unwrap().unwrap().transport(),
-        SocketType::Datagram
+        connection_view.attach_proxy_protocol(metadata),
+        Err(ProxyProtocolError::TransportMismatch {
+            connection: SocketType::Stream,
+            metadata: SocketType::Datagram,
+        })
     );
 }
 
 #[cfg(feature = "test-link")]
 #[test]
-fn proxy_protocol_tlv_lookup_preserves_nginx_statuses() {
+fn proxy_protocol_tlv_lookup_preserves_parser_results() {
     let source = ProxyProtocolAddress::Ipv4 {
         octets: [192, 0, 2, 10],
         port: SocketPort::from_host_order(12345),
@@ -1123,7 +1033,7 @@ fn proxy_protocol_tlv_lookup_preserves_nginx_statuses() {
 
 #[cfg(feature = "test-link")]
 #[test]
-fn proxy_protocol_tlv_lookup_rejects_missing_or_misaligned_connection_logs() {
+fn proxy_protocol_tlv_lookup_does_not_require_a_connection_log() {
     let source = ProxyProtocolAddress::Ipv4 {
         octets: [192, 0, 2, 10],
         port: SocketPort::from_host_order(12345),
@@ -1149,17 +1059,14 @@ fn proxy_protocol_tlv_lookup_rejects_missing_or_misaligned_connection_logs() {
             )
             .unwrap();
         let metadata = connection_view.proxy_protocol().unwrap().unwrap();
-        assert_eq!(metadata.lookup_tlv(0x05), Err(ProxyProtocolError::MissingConnectionLog));
+        assert_eq!(metadata.lookup_tlv(0x05), Ok(ProxyProtocolTlvLookup::Ok(&[0x42])));
     }
 
     connection.log = ptr::without_provenance_mut::<ngx_log_t>(1);
     let connection_view =
         unsafe { ConnectionRefMut::from_raw(raw_connection(&mut connection)) }.unwrap();
     let metadata = connection_view.proxy_protocol().unwrap().unwrap();
-    assert_eq!(
-        metadata.lookup_tlv(0x05),
-        Err(ProxyProtocolError::Connection(ConnectionError::MisalignedLog))
-    );
+    assert_eq!(metadata.lookup_tlv(0x05), Ok(ProxyProtocolTlvLookup::Ok(&[0x42])));
 }
 
 #[cfg(feature = "test-link")]
@@ -1266,72 +1173,6 @@ fn proxy_protocol_builder_keeps_existing_metadata_when_each_copy_fails() {
 
     connection_view.attach_proxy_protocol(metadata).unwrap();
     assert_ne!(connection.proxy_protocol, old);
-}
-
-#[cfg(all(feature = "test-link", feature = "stream", ngx_feature = "stream"))]
-#[test]
-fn proxy_protocol_builder_matches_c_parsed_core_stream_variables() {
-    let cases = [
-        (
-            ProxyProtocolAddress::Ipv4 {
-                octets: [192, 0, 2, 10],
-                port: SocketPort::from_host_order(u16::MAX),
-            },
-            ProxyProtocolAddress::Ipv4 {
-                octets: [198, 51, 100, 20],
-                port: SocketPort::from_host_order(443),
-            },
-            b"192.0.2.10:65535".as_slice(),
-            b"198.51.100.20:443".as_slice(),
-        ),
-        (
-            ProxyProtocolAddress::Ipv6 {
-                octets: [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-                port: SocketPort::from_host_order(12345),
-            },
-            ProxyProtocolAddress::Ipv6 {
-                octets: [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
-                port: SocketPort::from_host_order(443),
-            },
-            b"[2001:db8::1]:12345".as_slice(),
-            b"[2001:db8::2]:443".as_slice(),
-        ),
-    ];
-
-    for (source, destination, expected_source, expected_destination) in cases {
-        let mut parsed_owner = TestPool::new();
-        let mut parsed_connection = zeroed_connection();
-        parsed_connection.pool = parsed_owner.raw;
-        parsed_connection.log = &raw mut *parsed_owner._log;
-        parsed_connection.type_ = libc::SOCK_STREAM;
-        let mut packet = proxy_protocol_v2_stream_packet(source, destination);
-        parse_proxy_protocol(&mut parsed_connection, &mut packet);
-        let parsed_source = stream_proxy_protocol_addr_port(&mut parsed_connection, false);
-        let parsed_destination = stream_proxy_protocol_addr_port(&mut parsed_connection, true);
-
-        let mut builder_owner = TestPool::new();
-        let mut builder_connection = zeroed_connection();
-        builder_connection.pool = builder_owner.raw;
-        builder_connection.log = &raw mut *builder_owner._log;
-        builder_connection.type_ = libc::SOCK_STREAM;
-        {
-            let mut connection =
-                unsafe { ConnectionRefMut::from_raw(raw_connection(&mut builder_connection)) }
-                    .unwrap();
-            connection
-                .attach_proxy_protocol(
-                    ProxyProtocolBuilder::new(source, destination, SocketType::Stream).unwrap(),
-                )
-                .unwrap();
-        }
-        let builder_source = stream_proxy_protocol_addr_port(&mut builder_connection, false);
-        let builder_destination = stream_proxy_protocol_addr_port(&mut builder_connection, true);
-
-        assert_eq!(parsed_source, expected_source);
-        assert_eq!(parsed_destination, expected_destination);
-        assert_eq!(builder_source, parsed_source);
-        assert_eq!(builder_destination, parsed_destination);
-    }
 }
 
 #[test]

@@ -23,7 +23,7 @@ use ngx::core::{
 use ngx::http::{
     HttpConfigurationParser, HttpModule, HttpModuleMainConf, HttpVariableFlags,
     HttpVariableHandler, HttpVariableOutput, HttpVariableRequest, HttpVariableSetter,
-    HttpVariableValueRef, RequestRef, RequestRefMut, add_variable_with_setter,
+    HttpVariableValueRef, RequestRef, add_variable_with_setter,
 };
 use ngx::{ngx_conf_log_error, ngx_log_debug, ngx_string};
 
