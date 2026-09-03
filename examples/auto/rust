@@ -75,11 +75,11 @@
 # - NGX_RUSTC_OPT passes additional options to "cargo rustc"
 
 # Prevent duplicate invocation unless it is a newer library version
-if [ "${NGX_RUST_AUTO_VER:-0}" -ge 2 ]; then
+if [ "${NGX_RUST_AUTO_VER:-0}" -ge 3 ]; then
     return
 fi
 
-NGX_RUST_AUTO_VER=2
+NGX_RUST_AUTO_VER=3
 
 ngx_rust_error() {
     echo
@@ -331,9 +331,11 @@ ngx_rust_module () {
         NGX_RUST_MODULE_NAMES="$NGX_RUST_MODULE_NAMES $ngx_rust_name"
     done
 
-    case " $NGX_RUST_TARGET_NAMES " in
+    ngx_rust_target_key=$ngx_addon_name:$ngx_rust_target_name
 
-        *" $ngx_rust_target_name "*)
+    case " $NGX_RUST_TARGET_KEYS " in
+
+        *" $ngx_rust_target_key "*)
             ngx_rust_error "duplicate Rust target name: $ngx_rust_target_name"
         ;;
 
@@ -349,7 +351,7 @@ ngx_rust_module () {
         esac
     done
 
-    NGX_RUST_TARGET_NAMES="$NGX_RUST_TARGET_NAMES $ngx_rust_target_name"
+    NGX_RUST_TARGET_KEYS="$NGX_RUST_TARGET_KEYS $ngx_rust_target_key"
 
     ngx_addon_id=$(echo "$ngx_addon_name" | sed -e 's/[^A-Za-z0-9_]/_/g')
 
