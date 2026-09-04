@@ -519,6 +519,8 @@ pub enum RequestTempFileError {
     },
     /// The state belongs to a different nginx request.
     ForeignRequest,
+    /// The live temporary file has no matching request-pool cleanup.
+    MissingCleanup,
 }
 
 impl From<RequestError> for RequestTempFileError {
@@ -1248,6 +1250,58 @@ impl RequestTempFileState {
         Ok(output)
     }
 
+    /// Releases the temporary file after every returned file buffer has been discarded.
+    ///
+    /// This consumes the state, disables the matching request-pool cleanup, and invokes that
+    /// cleanup immediately. A state that has not created a file is a no-op. A missing cleanup
+    /// leaves the request-pool cleanup list unchanged.
+    ///
+    /// # Safety
+    ///
+    /// No file-backed buffer returned by this state may be read or passed to nginx after release.
+    pub unsafe fn release(
+        mut self,
+        request: &RequestRefMut<'_>,
+    ) -> Result<(), RequestTempFileError> {
+        let pool = self.checked_pool(request)?;
+        let Some(mut temp_file) = self.temp_file.take() else {
+            return Ok(());
+        };
+        let fd = unsafe { temp_file.as_ref().file.fd };
+        if fd == NGX_INVALID_FILE as _ {
+            return Ok(());
+        }
+
+        let mut current = unsafe { (*pool.as_ptr()).cleanup };
+        while let Some(mut cleanup) = NonNull::new(current) {
+            let cleanup_ref = unsafe { cleanup.as_mut() };
+            current = cleanup_ref.next;
+            let Some(handler) = cleanup_ref.handler else {
+                continue;
+            };
+            if !is_temp_file_cleanup_handler(handler) {
+                continue;
+            }
+            let Some(cleanup_file) =
+                NonNull::new(cleanup_ref.data.cast::<ngx_pool_cleanup_file_t>())
+            else {
+                continue;
+            };
+            if !cleanup_file.as_ptr().is_aligned() || unsafe { cleanup_file.as_ref().fd } != fd {
+                continue;
+            }
+
+            cleanup_ref.handler = None;
+            unsafe {
+                handler(cleanup_ref.data);
+                temp_file.as_mut().file.fd = NGX_INVALID_FILE as _;
+            }
+            return Ok(());
+        }
+
+        Err(RequestTempFileError::MissingCleanup)
+    }
+
     /// Appends one checked buffer into its request-pool-owned representation.
     ///
     /// Nonempty memory is written to the persistent temporary file. File and control buffers are
@@ -1359,6 +1413,11 @@ impl RequestTempFileState {
 
         Ok(pool)
     }
+}
+
+fn is_temp_file_cleanup_handler(handler: unsafe extern "C" fn(*mut c_void)) -> bool {
+    ptr::fn_addr_eq(handler, ngx_pool_cleanup_file as unsafe extern "C" fn(*mut c_void))
+        || ptr::fn_addr_eq(handler, ngx_pool_delete_file as unsafe extern "C" fn(*mut c_void))
 }
 
 fn temp_file_range(offset: off_t, length: usize) -> Result<(off_t, off_t), RequestTempFileError> {
@@ -5792,6 +5851,102 @@ mod tests {
         assert_eq!(native.offset, 6);
         #[cfg(unix)]
         assert_eq!(temp_file_bytes(native), b"onetwo");
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn temp_file_state_release_closes_and_disarms_the_pool_cleanup() {
+        let mut fixture = TempFileFixture::new();
+        let mut state = request_from(&mut fixture.request).temp_file_state().unwrap();
+        unsafe {
+            RequestRefMut::with_raw(&raw mut fixture.request, |request| {
+                let pool = request.pool().unwrap();
+                let input = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
+                state.append_buffer(&request, input.view(), input.view().flags()).unwrap();
+            })
+        }
+        .unwrap();
+        let mut temp_file = state.temp_file.unwrap();
+        let fd = unsafe { temp_file.as_ref().file.fd };
+        #[cfg(unix)]
+        assert_ne!(unsafe { fcntl(fd, F_GETFD) }, -1);
+
+        unsafe { state.release(&request_from(&mut fixture.request)) }.unwrap();
+
+        assert_eq!(unsafe { temp_file.as_mut().file.fd }, NGX_INVALID_FILE as _);
+        #[cfg(unix)]
+        assert_eq!(unsafe { fcntl(fd, F_GETFD) }, -1);
+        let mut cleanup = unsafe { (*fixture.pool.raw).cleanup };
+        let mut cleanup_still_armed = false;
+        while let Some(current) = NonNull::new(cleanup) {
+            let cleanup_ref = unsafe { current.as_ref() };
+            cleanup = cleanup_ref.next;
+            let Some(handler) = cleanup_ref.handler else {
+                continue;
+            };
+            if !is_temp_file_cleanup_handler(handler) {
+                continue;
+            }
+            let Some(file) = NonNull::new(cleanup_ref.data.cast::<ngx_pool_cleanup_file_t>())
+            else {
+                continue;
+            };
+            if unsafe { file.as_ref().fd } == fd {
+                cleanup_still_armed = true;
+            }
+        }
+        assert!(!cleanup_still_armed);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn temp_file_state_release_reports_a_missing_pool_cleanup() {
+        let mut fixture = TempFileFixture::new();
+        let mut state = request_from(&mut fixture.request).temp_file_state().unwrap();
+        unsafe {
+            RequestRefMut::with_raw(&raw mut fixture.request, |request| {
+                let pool = request.pool().unwrap();
+                let input = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
+                state.append_buffer(&request, input.view(), input.view().flags()).unwrap();
+            })
+        }
+        .unwrap();
+        let fd = unsafe { state.temp_file.unwrap().as_ref().file.fd };
+        let mut cleanup = unsafe { (*fixture.pool.raw).cleanup };
+        let (mut cleanup, handler) = loop {
+            let mut current = NonNull::new(cleanup).expect("temp-file cleanup");
+            let cleanup_ref = unsafe { current.as_mut() };
+            cleanup = cleanup_ref.next;
+            let Some(handler) = cleanup_ref.handler else {
+                continue;
+            };
+            if !is_temp_file_cleanup_handler(handler) {
+                continue;
+            }
+            let file = NonNull::new(cleanup_ref.data.cast::<ngx_pool_cleanup_file_t>())
+                .expect("temp-file cleanup data");
+            if unsafe { file.as_ref().fd } == fd {
+                cleanup_ref.handler = None;
+                break (current, handler);
+            }
+        };
+
+        assert_eq!(
+            unsafe { state.release(&request_from(&mut fixture.request)) },
+            Err(RequestTempFileError::MissingCleanup)
+        );
+        #[cfg(unix)]
+        assert_ne!(unsafe { fcntl(fd, F_GETFD) }, -1);
+        unsafe { cleanup.as_mut().handler = Some(handler) };
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn temp_file_state_release_without_a_created_file_is_a_noop() {
+        let mut fixture = TempFileFixture::new();
+        let state = request_from(&mut fixture.request).temp_file_state().unwrap();
+
+        assert_eq!(unsafe { state.release(&request_from(&mut fixture.request)) }, Ok(()));
     }
 
     #[cfg(feature = "test-link")]
