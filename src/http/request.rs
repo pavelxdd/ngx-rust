@@ -6836,19 +6836,9 @@ mod tests {
     #[test]
     fn client_body_read_invokes_once_and_releases_each_start_reference() {
         let mut fixture = TerminalRequestFixture::new();
-        let mut body: ngx_http_request_body_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        fixture.request.request_body = &raw mut body;
+        fixture.request.headers_in.content_length_n = -1;
 
         BODY_CALLBACKS.store(0, Ordering::Relaxed);
-        BODY_CALLBACK_ACTIVE.store(false, Ordering::Relaxed);
-        let mut request = request_from(&mut fixture.request);
-        let start = request.read_client_body::<BodyCallback>();
-        assert_eq!(start.status(), &ClientBodyReadStatus::Ok);
-        assert_eq!(unsafe { start.request.raw.as_ref().count() }, 2);
-        start.release();
-        assert_eq!(fixture.request.count(), 1);
-        assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 0);
-
         BODY_CALLBACK_ACTIVE.store(true, Ordering::Relaxed);
         let mut request = request_from(&mut fixture.request);
         let start = request.read_client_body::<BodyCallback>();
@@ -6857,6 +6847,25 @@ mod tests {
         start.release();
         assert_eq!(fixture.request.count(), 1);
         assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 1);
+        assert!(!fixture.request.request_body.is_null());
+
+        BODY_CALLBACK_ACTIVE.store(false, Ordering::Relaxed);
+        let mut request = request_from(&mut fixture.request);
+        let start = request.read_client_body::<BodyCallback>();
+        assert_eq!(start.status(), &ClientBodyReadStatus::Ok);
+        assert_eq!(unsafe { start.request.raw.as_ref().count() }, 2);
+        start.release();
+        assert_eq!(fixture.request.count(), 1);
+        assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 1);
+
+        BODY_CALLBACK_ACTIVE.store(true, Ordering::Relaxed);
+        let mut request = request_from(&mut fixture.request);
+        let start = request.read_client_body::<BodyCallback>();
+        assert_eq!(start.status(), &ClientBodyReadStatus::Ok);
+        assert_eq!(unsafe { start.request.raw.as_ref().count() }, 2);
+        start.release();
+        assert_eq!(fixture.request.count(), 1);
+        assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 2);
 
         BODY_CALLBACK_ACTIVE.store(false, Ordering::Relaxed);
         unsafe { raw_client_body_handler::<BodyCallback>(&raw mut *fixture.request) };
@@ -6866,6 +6875,40 @@ mod tests {
                 + core::mem::align_of::<ngx_http_request_t>()];
         unsafe { raw_client_body_handler::<BodyCallback>(storage.as_mut_ptr().add(1).cast()) };
         assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 1);
+
+        request_from(&mut fixture.request).finalize(Status::NGX_DONE).unwrap();
+        fixture.disarm_nginx_pools();
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn inherited_subrequest_body_releases_to_the_main_request_baseline() {
+        let mut fixture = TerminalRequestFixture::new();
+        let mut body: ngx_http_request_body_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        fixture.request.request_body = &raw mut body;
+        fixture.request.set_count(2);
+        let mut child = Box::new(zeroed_request());
+        child.main = &raw mut *fixture.request;
+        child.parent = &raw mut *fixture.request;
+        child.pool = fixture.request.pool;
+        child.connection = fixture.request.connection;
+        child.loc_conf = fixture.request.loc_conf;
+        child.main_conf = fixture.request.main_conf;
+        child.request_body = &raw mut body;
+        child.set_logged(1);
+
+        BODY_CALLBACKS.store(0, Ordering::Relaxed);
+        BODY_CALLBACK_ACTIVE.store(true, Ordering::Relaxed);
+        let mut request = request_from(&mut child);
+        let start = request.read_client_body::<BodyCallback>();
+        assert_eq!(start.status(), &ClientBodyReadStatus::Ok);
+        assert_eq!(fixture.request.count(), 3);
+        assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 1);
+
+        start.release();
+        assert_eq!(fixture.request.count(), 2);
+        request_from(&mut child).finalize(Status::NGX_DONE).unwrap();
+        assert_eq!(fixture.request.count(), 1);
 
         request_from(&mut fixture.request).finalize(Status::NGX_DONE).unwrap();
         fixture.disarm_nginx_pools();
