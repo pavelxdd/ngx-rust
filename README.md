@@ -63,8 +63,8 @@ providing a `config` script implementation and passing the `--add-module`/
 See the following example integration scripts: [`examples/config`] and
 [`examples/config.make`].
 
-[`examples/config`]: https://github.com/bavshin-f5/ngx-rust/blob/main/examples/config
-[`examples/config.make`]: https://github.com/bavshin-f5/ngx-rust/blob/main/examples/config.make
+[`examples/config`]: examples/config
+[`examples/config.make`]: examples/config.make
 
 ### Building with vendored NGINX sources
 
