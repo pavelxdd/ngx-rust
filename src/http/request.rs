@@ -3300,16 +3300,19 @@ impl RequestContinuation<'_> {
     ///
     /// Use this only when a fallible terminal operation returned before transferring ownership to
     /// nginx. The restored hold can then be retried or cancelled through its original owner.
+    /// Rejection returns the still-active continuation to the caller.
     pub fn restore(
         mut self,
         slot: &mut Option<RequestHold>,
-    ) -> Result<(), RequestContinuationError> {
-        self.ensure_active()?;
+    ) -> Result<(), (RequestContinuationError, Self)> {
+        if let Err(error) = self.ensure_active() {
+            return Err((error, self));
+        }
         if self.header_continued || self.body_continued {
-            return Err(RequestContinuationError::FilterAlreadyContinued);
+            return Err((RequestContinuationError::FilterAlreadyContinued, self));
         }
         if slot.is_some() {
-            return Err(RequestHoldError::AlreadyHeld.into());
+            return Err((RequestHoldError::AlreadyHeld.into(), self));
         }
         self.restore_hold(slot);
         Ok(())
@@ -6732,7 +6735,7 @@ mod tests {
             Err(RequestContinuationError::Request(expected))
         );
         assert_eq!(main.count(), 2);
-        continuation.restore(&mut hold).unwrap();
+        assert!(continuation.restore(&mut hold).is_ok());
         assert!(hold.is_some());
         assert!(RequestHold::cancel(&mut hold));
         assert_eq!(main.count(), 1);
