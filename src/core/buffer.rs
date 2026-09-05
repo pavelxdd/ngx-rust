@@ -1141,15 +1141,16 @@ mod tests {
     }
 
     #[test]
-    fn read_only_memory_without_end_has_no_writable_space() {
-        let storage = [0_u8; 1];
-        let mut buffer = memory_buffer(&storage);
-        buffer.last = buffer.pos;
-        buffer.end = ptr::null_mut();
+    fn read_only_memory_without_start_or_end_has_no_writable_space() {
+        let storage = *b"read-only";
+        let mut buffer: ngx_buf_t = unsafe { mem::zeroed() };
+        buffer.pos = storage.as_ptr().cast_mut();
+        buffer.last = unsafe { buffer.pos.add(storage.len()) };
+        buffer.set_memory(1);
 
         let view = unsafe { BufferRef::from_raw(&raw const buffer) }.unwrap();
-        assert_eq!(view.memory_bytes(), Ok(Some(b"".as_slice())));
-        assert_eq!(view.bytes(), Ok(None));
+        assert_eq!(view.memory_bytes(), Ok(Some(storage.as_slice())));
+        assert_eq!(view.bytes(), Ok(Some(storage.as_slice())));
         assert_eq!(view.has_space(), Ok(false));
     }
 
