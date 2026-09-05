@@ -122,9 +122,7 @@ where
             state.output.take();
         }
         unsafe { Pin::new_unchecked(&mut *continuation) }.shutdown();
-        // SAFETY: this context is dropped only by request-pool cleanup after nginx has made the
-        // delayed phase continuation impossible and assumed ownership of count teardown.
-        unsafe { RequestHold::disarm_for_cleanup(&mut continuation.state().borrow_mut().hold) };
+        RequestHold::cancel(&mut continuation.state().borrow_mut().hold);
     }
 }
 
@@ -1441,7 +1439,9 @@ mod tests {
         let mut request = TestRequest::new();
 
         start_handler::<PendingHandler>(&mut request);
+        assert_eq!(request.main_count(), 2);
         remove_handler_context::<PendingHandler>(&mut request);
+        assert_eq!(request.main_count(), 1);
         worker.process_posted();
 
         assert_eq!(state.polls.get(), 0);
@@ -1512,14 +1512,14 @@ mod tests {
     }
 
     #[test]
-    fn request_context_mismatch_cancels_completion_without_posting_a_phase() {
+    fn request_context_mismatch_retains_completion_for_retry() {
         let mut worker = TestWorker::new();
         worker.init();
         let mut request = TestRequest::new();
 
         start_handler::<ReadyHandler>(&mut request);
         worker.process_posted();
-        let continuation = {
+        let mut continuation = {
             let mut request_ref = request.borrow();
             continuation_for::<ReadyHandler>(&mut request_ref)
         };
@@ -1533,10 +1533,25 @@ mod tests {
         worker.process_posted();
 
         assert_eq!(request.write_is_posted(), 0);
+        {
+            let state = unsafe { continuation.as_ref() }.state().borrow();
+            assert!(state.active);
+            assert!(state.output.is_some());
+            assert!(state.hold.is_some());
+            assert!(!state.phase_posted);
+        }
+        assert_eq!(request.request.count(), 2);
+
+        request.request.main = &raw mut *request.request;
+        unsafe {
+            Pin::new_unchecked(continuation.as_mut()).post(PostedQueue::Next).unwrap();
+        }
+        worker.process_posted();
+
         let state = unsafe { continuation.as_ref() }.state().borrow();
-        assert!(!state.active);
-        assert!(state.output.is_none());
+        assert!(state.phase_posted);
         assert!(state.hold.is_none());
+        assert_eq!(request.main_count(), 1);
         drop(state);
         remove_handler_context::<ReadyHandler>(&mut request);
     }
