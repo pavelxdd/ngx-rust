@@ -36,7 +36,16 @@ unsafe extern "C" {
 /// to values with an independent lifetime, unlike [`crate::core::Pool`], whose allocations are
 /// released with the pool.
 ///
-/// The allocator cannot outlive the [`LogRef`] supplied to [`new`](Self::new).
+/// The allocator cannot outlive the [`LogRef`] supplied to [`new`](Self::new). An ordinary shared
+/// reference cannot grant native mutable access:
+///
+/// ```compile_fail
+/// # use ngx::allocator::NginxAllocator;
+/// # use ngx::ffi::ngx_log_t;
+/// # fn from_shared(log: &ngx_log_t) {
+/// let _allocator = NginxAllocator::new(log);
+/// # }
+/// ```
 ///
 /// A raw logger pointer is callback-scoped through [`with_raw`](Self::with_raw):
 ///
@@ -255,7 +264,7 @@ mod tests {
 
     use std::sync::Mutex;
 
-    use nginx_sys::{NGX_ALIGNMENT, ngx_log_t, ngx_uint_t};
+    use nginx_sys::{NGX_ALIGNMENT, NGX_LOG_DEBUG_ALLOC, ngx_log_t, ngx_uint_t};
 
     use super::{Allocator, LogRef, NginxAllocator};
 
@@ -265,6 +274,15 @@ mod tests {
     }
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    unsafe extern "C" fn mutate_logger(
+        log: *mut ngx_log_t,
+        _level: ngx_uint_t,
+        _buffer: *mut u8,
+        _len: usize,
+    ) {
+        unsafe { (*log).connection += 1 };
+    }
 
     struct TestLogger {
         raw: Box<ngx_log_t>,
@@ -279,6 +297,21 @@ mod tests {
             let log = unsafe { LogRef::from_raw(&raw mut *self.raw) }.unwrap();
             NginxAllocator::new(log)
         }
+    }
+
+    #[test]
+    fn allocation_allows_the_native_debug_writer_to_mutate_the_logger() {
+        let mut logger = TestLogger::new();
+        logger.raw.log_level = NGX_LOG_DEBUG_ALLOC as _;
+        logger.raw.writer = Some(mutate_logger);
+        {
+            let allocator = logger.allocator();
+            let layout = Layout::from_size_align(32, NGX_ALIGNMENT).unwrap();
+            let allocation = allocator.allocate(layout).unwrap().cast::<u8>();
+            unsafe { allocator.deallocate(allocation, layout) };
+        }
+
+        assert_eq!(logger.raw.connection, 1);
     }
 
     #[test]
