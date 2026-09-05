@@ -6,7 +6,7 @@ use core::ptr::NonNull;
 
 use crate::async_::{AttachedTask, spawn};
 use crate::event::{PostedEvent, PostedEventCallback, PostedQueue};
-use crate::ffi::{NGX_DONE, NGX_ERROR, ngx_int_t};
+use crate::ffi::{NGX_DONE, NGX_ERROR, ngx_http_posted_request_t, ngx_int_t};
 use crate::http::{
     HttpModuleRequestContext, HttpPhase, HttpRequestHandler, IntoHandlerStatus, RequestHold,
     RequestRefMut, add_phase_handler,
@@ -67,6 +67,7 @@ where
     task: Option<AttachedTask<()>>,
     output: Option<H::Output>,
     hold: Option<RequestHold>,
+    posted_request: NonNull<ngx_http_posted_request_t>,
     active: bool,
     phase_posted: bool,
 }
@@ -75,8 +76,15 @@ impl<H> AsyncContinuationState<H>
 where
     H: AsyncHttpRequestHandler,
 {
-    fn new() -> Self {
-        Self { task: None, output: None, hold: None, active: true, phase_posted: false }
+    fn new(posted_request: NonNull<ngx_http_posted_request_t>) -> Self {
+        Self {
+            task: None,
+            output: None,
+            hold: None,
+            posted_request,
+            active: true,
+            phase_posted: false,
+        }
     }
 }
 
@@ -180,11 +188,20 @@ where
             // SAFETY: the continuation is owned and cancelled by this request pool, which also
             // owns the connection logger.
             let log = unsafe { LogRef::from_raw(log.as_ptr()) }.expect("request logger");
+            let Some(posted_request) = NonNull::new(pool.calloc_type()) else {
+                ngx_log_error!(
+                    crate::ffi::NGX_LOG_ERR,
+                    log,
+                    "async handler {} posted request allocation failed",
+                    H::name()
+                );
+                return NGX_ERROR as ngx_int_t;
+            };
             let continuation = match unsafe {
                 AsyncContinuation::allocate_in_pool(
                     &pool,
                     log,
-                    RefCell::new(AsyncContinuationState::new()),
+                    RefCell::new(AsyncContinuationState::new(posted_request)),
                     async_phase_continuation::<H> as AsyncContinuationCallback<H>,
                 )
             } {
@@ -292,15 +309,10 @@ where
 
     let resumed = {
         let state = &mut *state;
-        RequestHold::resume_phase(&mut state.hold).is_ok()
+        RequestHold::resume_phase(&mut state.hold, unsafe { state.posted_request.as_mut() }).is_ok()
     };
     if resumed {
         state.phase_posted = true;
-    } else {
-        state.active = false;
-        state.task.take();
-        state.output.take();
-        RequestHold::cancel(&mut state.hold);
     }
 }
 
@@ -354,6 +366,11 @@ mod tests {
         ngx_pool_t, ngx_posted_events, ngx_posted_next_events, ngx_queue_init, ngx_uint_t,
     };
     use crate::http::{HttpModule, HttpModuleRequestContext};
+
+    unsafe extern "C" {
+        fn ngx_rs_test_fail_allocations_after(successes: ngx_uint_t);
+        fn ngx_rs_test_reset_allocation_failures();
+    }
 
     static mut TEST_MODULE: MaybeUninit<ngx_module_t> = MaybeUninit::uninit();
     static TEST_MODULE_INIT: Once = Once::new();
@@ -1265,10 +1282,26 @@ mod tests {
         request._connection.data = (&raw mut *main).cast();
         log_context.connection = &raw mut *request._connection;
 
-        complete_handler::<ReadyHandler>(&mut worker, &mut request);
+        start_handler::<ReadyHandler>(&mut request);
+        worker.process_posted();
+        unsafe {
+            (*request._pool.raw).d.last = (*request._pool.raw).d.end;
+            (*request._pool.raw).max = 0;
+            ngx_rs_test_fail_allocations_after(0);
+        }
+        worker.process_posted();
+        unsafe { ngx_rs_test_reset_allocation_failures() };
 
         assert!(!main.posted_requests.is_null());
         assert_eq!(unsafe { (*main.posted_requests).request }, &raw mut *request.request);
+        let posted_request = {
+            let mut request_ref = request.borrow();
+            let continuation = continuation_for::<ReadyHandler>(&mut request_ref);
+            let posted_request =
+                unsafe { continuation.as_ref() }.state().borrow().posted_request.as_ptr();
+            posted_request
+        };
+        assert_eq!(main.posted_requests, posted_request);
         assert_eq!(request.write_is_posted(), 1);
 
         request.request.write_event_handler = Some(record_posted_request);
@@ -1276,6 +1309,42 @@ mod tests {
 
         assert_eq!(POSTED_REQUEST.load(Ordering::Relaxed), (&raw mut *request.request) as usize);
         assert!(main.posted_requests.is_null());
+    }
+
+    #[test]
+    fn failed_completion_resume_retains_its_owner_for_retry() {
+        let mut worker = TestWorker::new();
+        worker.init();
+        reset_ready_state();
+        let mut request = TestRequest::new();
+        request.request.phase_handler = -1;
+
+        start_handler::<ReadyHandler>(&mut request);
+        worker.process_posted();
+        worker.process_posted();
+        let mut continuation = {
+            let mut request_ref = request.borrow();
+            continuation_for::<ReadyHandler>(&mut request_ref)
+        };
+        {
+            let state = unsafe { continuation.as_ref() }.state().borrow();
+            assert!(state.active);
+            assert!(state.output.is_some());
+            assert!(state.hold.is_some());
+            assert!(!state.phase_posted);
+        }
+        assert_eq!(request.main_count(), 2);
+
+        request.request.phase_handler = 0;
+        unsafe {
+            Pin::new_unchecked(continuation.as_mut()).post(PostedQueue::Next).unwrap();
+        }
+        worker.process_posted();
+
+        let state = unsafe { continuation.as_ref() }.state().borrow();
+        assert!(state.phase_posted);
+        assert!(state.hold.is_none());
+        assert_eq!(request.main_count(), 1);
     }
 
     #[test]
