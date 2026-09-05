@@ -27,9 +27,10 @@ use crate::ffi::{
     NGX_AGAIN, NGX_BUSY, NGX_DECLINED, NGX_DONE, NGX_ERROR, NGX_OK, NGX_USE_CLEAR_EVENT,
     ngx_addr_t, ngx_atomic_t, ngx_close_connection, ngx_connection_counter, ngx_connection_t,
     ngx_current_msec, ngx_cycle, ngx_cycle_t, ngx_event_actions, ngx_event_actions_t,
-    ngx_event_connect_peer, ngx_event_flags, ngx_event_handler_pt, ngx_event_t,
-    ngx_event_timer_init, ngx_int_t, ngx_log_t, ngx_peer_connection_t, ngx_pool_t, ngx_str_t,
-    ngx_uint_t, sockaddr_in, sockaddr_in6,
+    ngx_event_connect_peer, ngx_event_flags, ngx_event_handler_pt, ngx_event_process_posted,
+    ngx_event_t, ngx_event_timer_init, ngx_int_t, ngx_log_t, ngx_peer_connection_t, ngx_pool_t,
+    ngx_post_event, ngx_posted_events, ngx_queue_init, ngx_str_t, ngx_uint_t, sockaddr_in,
+    sockaddr_in6,
 };
 use crate::log::LogRef;
 
@@ -1535,10 +1536,11 @@ fn keepalive_attach_transfers_external_socket_and_rejects_invalid_connection() {
 
 #[test]
 fn keepalive_attach_quiesces_previous_handlers_data_and_timers() {
-    let globals = PeerGlobals::new(true, add_event_ok);
+    let mut globals = PeerGlobals::new(true, add_event_ok);
     unsafe {
         assert_eq!(ngx_event_timer_init(ptr::null_mut()), NGX_OK as _);
         ngx_current_msec = 0;
+        ngx_queue_init(&raw mut ngx_posted_events);
     }
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
@@ -1572,6 +1574,7 @@ fn keepalive_attach_quiesces_previous_handlers_data_and_timers() {
     unsafe {
         (*(*raw).read).set_active(1);
         (*(*raw).write).set_active(1);
+        ngx_post_event((*raw).read, &raw mut ngx_posted_events);
     }
     source.peer.raw.connection = ptr::null_mut();
     drop(source);
@@ -1592,6 +1595,11 @@ fn keepalive_attach_quiesces_previous_handlers_data_and_timers() {
     assert_eq!(unsafe { (*(*raw).write).active() }, 1);
     assert_eq!(unsafe { (*(*raw).read).timer_set() }, 0);
     assert_eq!(unsafe { (*(*raw).write).timer_set() }, 0);
+    assert_ne!(unsafe { (*(*raw).read).posted() }, 0);
+    unsafe {
+        ngx_event_process_posted(&raw mut *globals.cycle, &raw mut ngx_posted_events);
+    }
+    assert_eq!(unsafe { (*(*raw).read).posted() }, 0);
     unsafe { (*(*raw).read).handler.unwrap()((*raw).read) };
     unsafe { (*(*raw).write).handler.unwrap()((*raw).write) };
     assert_eq!(EVENT_HANDLER_CALLS.load(Ordering::Relaxed), 0);
@@ -1606,6 +1614,7 @@ fn keepalive_attach_rejects_ssl_connection_without_taking_ownership() {
     let globals = PeerGlobals::new(true, add_event_ok);
     let remote = TestAddress::ipv4([127, 0, 0, 1], 9);
     let log: ngx_log_t = unsafe { mem::zeroed() };
+    let mut source_data = 1_u8;
     let mut source = connected_peer(
         EventPeerBuilder::new(remote.peer_address())
             .log(unsafe { LogRef::from_raw((&raw const log).cast_mut()).unwrap() })
@@ -1619,7 +1628,12 @@ fn keepalive_attach_rejects_ssl_connection_without_taking_ownership() {
     let raw = source.peer.raw.connection;
     source.peer.raw.connection = ptr::null_mut();
     drop(source);
-    unsafe { (*raw).ssl = core::ptr::NonNull::<u8>::dangling().as_ptr().cast() };
+    unsafe {
+        (*raw).data = (&raw mut source_data).cast();
+        (*(*raw).read).handler = Some(active_read_handler);
+        (*(*raw).write).handler = Some(active_write_handler);
+        (*raw).ssl = core::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+    }
 
     let result = unsafe {
         EventPeerBuilder::new(remote.peer_address())
@@ -1634,6 +1648,9 @@ fn keepalive_attach_rejects_ssl_connection_without_taking_ownership() {
             error: EventPeerConnectionError::SslConnection,
             peer,
         }) => {
+            assert_eq!(unsafe { (*raw).data }, (&raw mut source_data).cast());
+            assert!(same_event_handler(unsafe { (*(*raw).read).handler }, active_read_handler));
+            assert!(same_event_handler(unsafe { (*(*raw).write).handler }, active_write_handler));
             drop(peer);
             unsafe {
                 (*raw).ssl = ptr::null_mut();
