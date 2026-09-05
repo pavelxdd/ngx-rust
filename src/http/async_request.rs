@@ -148,6 +148,10 @@ where
                 };
                 let continuation = context.as_ref().get_ref().continuation;
                 let mut state = unsafe { continuation.as_ref() }.state().borrow_mut();
+                if !state.phase_posted {
+                    ngx_log_debug_http!(request, "async handler {} pending", H::name());
+                    return async_phase_pending_status();
+                }
                 let Some(output) = state.output.take() else {
                     ngx_log_debug_http!(request, "async handler {} pending", H::name());
                     return async_phase_pending_status();
@@ -1214,6 +1218,54 @@ mod tests {
     }
 
     #[test]
+    fn ready_output_waits_for_continuation_dispatch_before_finish() {
+        let mut worker = TestWorker::new();
+        worker.init();
+        reset_ready_state();
+        let mut request = TestRequest::new();
+
+        start_handler::<ReadyHandler>(&mut request);
+        worker.process_posted();
+        let continuation = {
+            let mut request_ref = request.borrow();
+            continuation_for::<ReadyHandler>(&mut request_ref)
+        };
+        {
+            let state = unsafe { continuation.as_ref() }.state().borrow();
+            assert!(state.active);
+            assert!(state.output.is_some());
+            assert!(state.hold.is_some());
+            assert!(!state.phase_posted);
+        }
+        assert!(unsafe { continuation.as_ref() }.is_posted());
+        assert_eq!(request.write_is_posted(), 0);
+        assert_eq!(request.main_count(), 2);
+
+        {
+            let mut request_ref = request.borrow();
+            assert_eq!(AsyncPhaseHandler::<ReadyHandler>::handler(&mut request_ref), NGX_DONE as _);
+            assert!(request_ref.module_context::<ReadyModule>().unwrap().is_some());
+        }
+        assert_eq!(READY_FINISHES.load(Ordering::Relaxed), 0);
+        {
+            let state = unsafe { continuation.as_ref() }.state().borrow();
+            assert!(state.output.is_some());
+            assert!(state.hold.is_some());
+            assert!(!state.phase_posted);
+        }
+        assert_eq!(request.main_count(), 2);
+
+        worker.process_posted();
+        assert_eq!(request.write_is_posted(), 1);
+        assert_eq!(request.main_count(), 1);
+        {
+            let mut request_ref = request.borrow();
+            assert_eq!(AsyncPhaseHandler::<ReadyHandler>::handler(&mut request_ref), NGX_OK as _);
+        }
+        assert_eq!(READY_FINISHES.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn completion_schedules_the_request_write_event_once() {
         let mut worker = TestWorker::new();
         worker.init();
@@ -1282,6 +1334,24 @@ mod tests {
 
         start_handler::<ReadyHandler>(&mut request);
         worker.process_posted();
+        let continuation = {
+            let mut request_ref = request.borrow();
+            continuation_for::<ReadyHandler>(&mut request_ref)
+        };
+        {
+            let state = unsafe { continuation.as_ref() }.state().borrow();
+            assert!(state.output.is_some());
+            assert!(state.hold.is_some());
+            assert!(!state.phase_posted);
+        }
+        {
+            let mut request_ref = request.borrow();
+            assert_eq!(AsyncPhaseHandler::<ReadyHandler>::handler(&mut request_ref), NGX_DONE as _);
+            assert!(request_ref.module_context::<ReadyModule>().unwrap().is_some());
+        }
+        assert_eq!(READY_FINISHES.load(Ordering::Relaxed), 0);
+        assert_eq!(main.count(), 2);
+
         unsafe {
             (*request._pool.raw).d.last = (*request._pool.raw).d.end;
             (*request._pool.raw).max = 0;
@@ -1292,13 +1362,8 @@ mod tests {
 
         assert!(!main.posted_requests.is_null());
         assert_eq!(unsafe { (*main.posted_requests).request }, &raw mut *request.request);
-        let posted_request = {
-            let mut request_ref = request.borrow();
-            let continuation = continuation_for::<ReadyHandler>(&mut request_ref);
-            let posted_request =
-                unsafe { continuation.as_ref() }.state().borrow().posted_request.as_ptr();
-            posted_request
-        };
+        let posted_request =
+            unsafe { continuation.as_ref() }.state().borrow().posted_request.as_ptr();
         assert_eq!(main.posted_requests, posted_request);
         assert_eq!(request.write_is_posted(), 1);
 
@@ -1307,6 +1372,11 @@ mod tests {
 
         assert_eq!(POSTED_REQUEST.load(Ordering::Relaxed), (&raw mut *request.request) as usize);
         assert!(main.posted_requests.is_null());
+        {
+            let mut request_ref = request.borrow();
+            assert_eq!(AsyncPhaseHandler::<ReadyHandler>::handler(&mut request_ref), NGX_OK as _);
+        }
+        assert_eq!(READY_FINISHES.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1485,8 +1555,25 @@ mod tests {
             continuation_for::<ReadyHandler>(&mut request_ref)
         };
         assert!(unsafe { continuation.as_ref() }.is_posted());
+        {
+            let state = unsafe { continuation.as_ref() }.state().borrow();
+            assert!(state.active);
+            assert!(state.output.is_some());
+            assert!(state.hold.is_some());
+            assert!(!state.phase_posted);
+        }
+        assert_eq!(request.main_count(), 2);
+
         remove_handler_context::<ReadyHandler>(&mut request);
         assert!(unsafe { continuation.as_ref() }.is_shutdown());
+        {
+            let state = unsafe { continuation.as_ref() }.state().borrow();
+            assert!(!state.active);
+            assert!(state.output.is_none());
+            assert!(state.hold.is_none());
+            assert!(!state.phase_posted);
+        }
+        assert_eq!(request.main_count(), 1);
         worker.process_posted();
 
         assert_eq!(request.write_is_posted(), 0);
