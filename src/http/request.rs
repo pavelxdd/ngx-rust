@@ -2298,6 +2298,21 @@ impl fmt::Debug for RequestRef<'_> {
 ///     let _ = unsafe { RequestRefMut::with_raw(raw, |request| require_sync(&request)) };
 /// }
 /// ```
+///
+/// Raw nginx complex-value descriptors contain unchecked script pointers and are not accepted by
+/// the safe request API.
+///
+/// ```compile_fail
+/// use ngx::ffi::ngx_http_complex_value_t;
+/// use ngx::http::RequestRefMut;
+///
+/// fn reject_raw_complex_value(
+///     request: &mut RequestRefMut<'_>,
+///     value: &ngx_http_complex_value_t,
+/// ) {
+///     let _ = request.get_complex_value(value);
+/// }
+/// ```
 pub struct RequestRefMut<'callback> {
     raw: NonNull<ngx_http_request_t>,
     _callback: PhantomData<&'callback mut ngx_http_request_t>,
@@ -2988,26 +3003,6 @@ impl<'callback> RequestRefMut<'callback> {
     /// Marks whether nginx has sent the response headers.
     pub fn set_header_sent(&mut self, header_sent: bool) {
         unsafe { ngx_rs_http_request_set_header_sent(self.raw.as_ptr(), header_sent.into()) };
-    }
-
-    /// Gets the value of a complex value.
-    pub fn get_complex_value(
-        &mut self,
-        value: &ngx_http_complex_value_t,
-    ) -> Result<Option<&NgxStr>, RequestError> {
-        let mut output = ngx_str_t::default();
-        let status = unsafe {
-            ngx_http_complex_value(
-                self.raw.as_ptr(),
-                ptr::from_ref(value).cast_mut(),
-                &raw mut output,
-            )
-        };
-        if Status(status).into_result().is_err() {
-            return Ok(None);
-        }
-
-        unsafe { checked_ngx_str(output) }.map(Some)
     }
 
     /// Discards the request body.
