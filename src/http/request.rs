@@ -360,6 +360,8 @@ pub enum RequestContinuationError {
     HeaderAlreadyContinued,
     /// The saved body filter has already been called for this continuation.
     BodyAlreadyContinued,
+    /// A continuation that called a saved filter cannot be restored for a terminal retry.
+    FilterAlreadyContinued,
 }
 
 impl From<RequestError> for RequestContinuationError {
@@ -3231,14 +3233,17 @@ impl RequestHold {
     }
 
     #[cfg(feature = "async")]
-    pub(crate) fn resume_phase(hold: &mut Option<Self>) -> Result<(), RequestContinuationError> {
+    pub(crate) fn resume_phase(
+        hold: &mut Option<Self>,
+        posted_request: &mut ngx_http_posted_request_t,
+    ) -> Result<(), RequestContinuationError> {
         let request = hold.as_ref().ok_or(RequestHoldError::Missing)?.request;
         let request = unsafe { RequestRefMut::from_raw(request.as_ptr()) }?;
         let mut continuation = Self::take(hold, request)?;
-        match continuation.resume_phase() {
+        match continuation.resume_phase(posted_request) {
             Ok(()) => Ok(()),
             Err(error) => {
-                continuation.restore(hold);
+                continuation.restore_hold(hold);
                 Err(error)
             }
         }
@@ -3285,10 +3290,29 @@ impl RequestContinuation<'_> {
         self.consumed = true;
     }
 
-    fn restore(&mut self, slot: &mut Option<RequestHold>) {
+    fn restore_hold(&mut self, slot: &mut Option<RequestHold>) {
         debug_assert!(slot.is_none());
         *slot = self.hold.take();
         self.consumed = true;
+    }
+
+    /// Restores this active continuation to an empty request-hold slot.
+    ///
+    /// Use this only when a fallible terminal operation returned before transferring ownership to
+    /// nginx. The restored hold can then be retried or cancelled through its original owner.
+    pub fn restore(
+        mut self,
+        slot: &mut Option<RequestHold>,
+    ) -> Result<(), RequestContinuationError> {
+        self.ensure_active()?;
+        if self.header_continued || self.body_continued {
+            return Err(RequestContinuationError::FilterAlreadyContinued);
+        }
+        if slot.is_some() {
+            return Err(RequestHoldError::AlreadyHeld.into());
+        }
+        self.restore_hold(slot);
+        Ok(())
     }
 
     /// Cancels this terminal owner and releases its retained request reference.
@@ -3369,6 +3393,18 @@ impl RequestContinuation<'_> {
         Ok(())
     }
 
+    /// Resumes nginx processing with `NGX_DECLINED` after releasing the retained reference.
+    ///
+    /// Validation errors leave this continuation active for retry or explicit cancellation.
+    pub fn resume_declined(&mut self) -> Result<(), RequestContinuationError> {
+        self.ensure_active()?;
+        self.ensure_releasable_hold()?;
+        self.request.validate_terminal_operation()?;
+        self.release_for_resume();
+        unsafe { ngx_http_finalize_request(self.request.raw.as_ptr(), NGX_DECLINED as _) };
+        Ok(())
+    }
+
     /// Resumes PREACCESS processing and releases the retained reference before entering nginx.
     ///
     /// Validation errors leave this continuation active for retry or explicit cancellation.
@@ -3382,7 +3418,10 @@ impl RequestContinuation<'_> {
     }
 
     #[cfg(feature = "async")]
-    fn resume_phase(&mut self) -> Result<(), RequestContinuationError> {
+    fn resume_phase(
+        &mut self,
+        posted_request: &mut ngx_http_posted_request_t,
+    ) -> Result<(), RequestContinuationError> {
         self.ensure_active()?;
         self.ensure_releasable_hold()?;
         {
@@ -3400,7 +3439,7 @@ impl RequestContinuation<'_> {
                 let mut connection = request.connection_mut()?;
                 let mut event = connection.write_event()?;
                 if !request_is_current
-                    && unsafe { ngx_http_post_request(request_raw, ptr::null_mut()) } != NGX_OK as _
+                    && unsafe { ngx_http_post_request(request_raw, posted_request) } != NGX_OK as _
                 {
                     return Err(RequestError::Allocation);
                 }
@@ -6538,7 +6577,9 @@ mod tests {
             continuation.resume_preaccess(),
             Err(RequestContinuationError::Hold(RequestHoldError::InactiveMain))
         );
-        core::mem::forget(continuation);
+        main.set_count(2);
+        continuation.cancel().unwrap();
+        assert_eq!(main.count(), 1);
     }
 
     #[test]
@@ -6691,7 +6732,9 @@ mod tests {
             Err(RequestContinuationError::Request(expected))
         );
         assert_eq!(main.count(), 2);
-        continuation.cancel().unwrap();
+        continuation.restore(&mut hold).unwrap();
+        assert!(hold.is_some());
+        assert!(RequestHold::cancel(&mut hold));
         assert_eq!(main.count(), 1);
 
         let mut resume_main = zeroed_request();
