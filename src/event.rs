@@ -1671,6 +1671,7 @@ mod event_tests {
             Box::pin(PostedEvent::new(static_log_ref(), DropState(drops.clone()), move |event| {
                 assert_eq!(event.state().0.get(), 0);
                 drop(callback_owner.borrow_mut().take());
+                assert_eq!(event.state().0.get(), 0);
                 finished.set(true);
             }));
         let raw = unsafe { &raw mut posted.as_mut().get_unchecked_mut().event };
