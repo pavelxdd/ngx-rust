@@ -400,6 +400,17 @@ pub unsafe trait StreamModuleServerConf: StreamModule {
     /// let _ = M::server_conf_mut(cf);
     /// # }
     /// ```
+    ///
+    /// A live mutable slot borrow prevents a second mutable access through the parser:
+    ///
+    /// ```compile_fail
+    /// # use ngx::stream::{StreamConfigurationParser, StreamModuleServerConf};
+    /// fn alias<M: StreamModuleServerConf>(parser: &mut StreamConfigurationParser<'_>) {
+    ///     let first = M::server_conf_mut(parser).unwrap().unwrap();
+    ///     let second = M::server_conf_mut(parser).unwrap().unwrap();
+    ///     let _ = (first, second);
+    /// }
+    /// ```
     fn server_conf_mut<'a>(
         parser: &'a mut StreamConfigurationParser<'_>,
     ) -> Result<Option<&'a mut Self::ServerConf>, StreamConfigError> {
