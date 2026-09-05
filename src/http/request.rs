@@ -2513,6 +2513,16 @@ impl<'callback> RequestRefMut<'callback> {
     ///     pool.allocate_with_cleanup(|| ()).unwrap();
     /// }
     /// ```
+    ///
+    /// ```compile_fail
+    /// use ngx::http::RequestRefMut;
+    ///
+    /// fn resume_then_allocate(request: RequestRefMut<'_>) {
+    ///     let pool = request.pool().unwrap();
+    ///     request.resume_preaccess().unwrap();
+    ///     pool.allocate_with_cleanup(|| ()).unwrap();
+    /// }
+    /// ```
     pub fn pool(&self) -> Result<Pool<'_>, RequestError> {
         let pool = unsafe { self.raw.as_ref().pool };
         if pool.is_null() {
