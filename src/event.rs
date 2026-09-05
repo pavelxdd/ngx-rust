@@ -1129,16 +1129,16 @@ mod event_tests {
         EventError, EventRef, NotifyError, PostedEvent, PostedEventError, PostedQueue, Timer,
         TimerError, notify,
     };
-    use crate::core::Pool;
+    use crate::core::{ConnectionRefMut, Pool};
     #[cfg(ngx_feature = "debug")]
     use crate::ffi::NGX_LOG_DEBUG_EVENT;
     use crate::ffi::{
-        NGX_AGAIN, NGX_OK, NGX_READ_EVENT, NGX_WRITE_EVENT, ngx_create_pool, ngx_current_msec,
-        ngx_cycle_t, ngx_destroy_pool, ngx_event_actions, ngx_event_expire_timers,
-        ngx_event_handler_pt, ngx_event_move_posted_next, ngx_event_no_timers_left,
-        ngx_event_process_posted, ngx_event_t, ngx_event_timer_init, ngx_int_t, ngx_log_t,
-        ngx_msec_int_t, ngx_msec_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events,
-        ngx_queue_empty, ngx_queue_init, ngx_queue_t, ngx_uint_t,
+        NGX_AGAIN, NGX_OK, NGX_READ_EVENT, NGX_WRITE_EVENT, ngx_connection_t, ngx_create_pool,
+        ngx_current_msec, ngx_cycle_t, ngx_destroy_pool, ngx_event_actions,
+        ngx_event_expire_timers, ngx_event_handler_pt, ngx_event_move_posted_next,
+        ngx_event_no_timers_left, ngx_event_process_posted, ngx_event_t, ngx_event_timer_init,
+        ngx_int_t, ngx_log_t, ngx_msec_int_t, ngx_msec_t, ngx_pool_t, ngx_posted_events,
+        ngx_posted_next_events, ngx_queue_empty, ngx_queue_init, ngx_queue_t, ngx_uint_t,
     };
     use crate::log::LogRef;
 
@@ -1377,31 +1377,43 @@ mod event_tests {
     }
 
     #[test]
-    fn event_ref_derives_unregister_direction_from_the_native_write_bit() {
+    fn event_ref_derives_unregister_direction_and_preserves_the_sibling_event() {
         let _globals = EventGlobals::lock();
         let _delete = EventDeleteOverride::install(delete_active_event);
+        let mut read = TestEvent::new();
+        read.event.set_active(1);
+        let mut write = TestEvent::new();
+        write.event.set_write(1);
+        write.event.set_active(1);
+        let mut raw: ngx_connection_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        raw.read = read.raw();
+        raw.write = write.raw();
+        let mut connection = unsafe { ConnectionRefMut::from_raw(&raw mut raw) }.unwrap();
 
-        for (write, expected) in [(0, NGX_READ_EVENT), (1, NGX_WRITE_EVENT)] {
-            EVENT_DELETE_CALLS.store(0, Ordering::Relaxed);
-            EVENT_DELETE_KIND.store(usize::MAX, Ordering::Relaxed);
-
-            let mut event = TestEvent::new();
-            event.event.set_write(write);
-            event.event.set_active(1);
-
-            unsafe {
-                EventRef::with_raw(event.raw(), |mut event| {
-                    assert!(event.is_active());
-                    assert_eq!(event.unregister(), Ok(true));
-                    assert!(!event.is_active());
-                    assert_eq!(event.unregister(), Ok(false));
-                })
-                .expect("valid test event");
-            }
-
-            assert_eq!(EVENT_DELETE_CALLS.load(Ordering::Relaxed), 1);
-            assert_eq!(EVENT_DELETE_KIND.load(Ordering::Relaxed), expected as usize);
+        EVENT_DELETE_CALLS.store(0, Ordering::Relaxed);
+        EVENT_DELETE_KIND.store(usize::MAX, Ordering::Relaxed);
+        {
+            let mut event = connection.read_event().unwrap();
+            assert_eq!(event.unregister(), Ok(true));
+            assert_eq!(event.unregister(), Ok(false));
         }
+        assert_eq!(EVENT_DELETE_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(EVENT_DELETE_KIND.load(Ordering::Relaxed), NGX_READ_EVENT as usize);
+        assert_eq!(read.event.active(), 0);
+        assert_ne!(write.event.active(), 0);
+
+        read.event.set_active(1);
+        EVENT_DELETE_CALLS.store(0, Ordering::Relaxed);
+        EVENT_DELETE_KIND.store(usize::MAX, Ordering::Relaxed);
+        {
+            let mut event = connection.write_event().unwrap();
+            assert_eq!(event.unregister(), Ok(true));
+            assert_eq!(event.unregister(), Ok(false));
+        }
+        assert_eq!(EVENT_DELETE_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(EVENT_DELETE_KIND.load(Ordering::Relaxed), NGX_WRITE_EVENT as usize);
+        assert_ne!(read.event.active(), 0);
+        assert_eq!(write.event.active(), 0);
     }
 
     #[test]
