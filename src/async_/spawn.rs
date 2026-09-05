@@ -1535,8 +1535,7 @@ mod worker_tests {
         NATIVE_HANDLER_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[test]
-    fn private_channel_delivers_rust_and_competing_native_notifications() {
+    fn assert_private_channel_delivers_with_competing_native_notification(native_first: bool) {
         let mut worker = TestWorker::new();
         *NOTIFIED_HANDLER.lock().unwrap_or_else(|error| error.into_inner()) =
             Some(native_notification_handler);
@@ -1555,14 +1554,22 @@ mod worker_tests {
         .unwrap();
         worker.process_posted();
         let waker = waker_rx.recv().unwrap();
+        let wake_task = || {
+            thread::spawn(move || {
+                ready.store(true, Ordering::Release);
+                waker.wake();
+            })
+            .join()
+            .unwrap();
+        };
 
-        thread::spawn(move || {
-            ready.store(true, Ordering::Release);
-            waker.wake();
-        })
-        .join()
-        .unwrap();
-        unsafe { test_notify(Some(native_notification_handler)) };
+        if native_first {
+            unsafe { test_notify(Some(native_notification_handler)) };
+            wake_task();
+        } else {
+            wake_task();
+            unsafe { test_notify(Some(native_notification_handler)) };
+        }
 
         worker.deliver_notification();
         let native = NOTIFIED_HANDLER
@@ -1576,6 +1583,12 @@ mod worker_tests {
         let mut task = core::pin::pin!(task);
         let mut context = Context::from_waker(Waker::noop());
         assert_eq!(task.as_mut().poll(&mut context), Poll::Ready(Ok(7)));
+    }
+
+    #[test]
+    fn private_channel_delivers_both_notification_orders() {
+        assert_private_channel_delivers_with_competing_native_notification(false);
+        assert_private_channel_delivers_with_competing_native_notification(true);
     }
 
     #[test]
