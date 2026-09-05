@@ -3827,7 +3827,8 @@ mod tests {
     #[cfg(feature = "test-link")]
     use crate::ffi::{
         ngx_create_pool, ngx_current_msec, ngx_cycle_t, ngx_destroy_pool, ngx_event_expire_timers,
-        ngx_event_move_posted_next, ngx_event_process_posted, ngx_event_timer_init, ngx_log_t,
+        ngx_event_move_posted_next, ngx_event_process_posted, ngx_event_timer_init,
+        ngx_http_conf_ctx_t, ngx_http_core_srv_conf_t, ngx_http_phase_handler_t, ngx_log_t,
         ngx_pool_t, ngx_posted_events, ngx_posted_next_events, ngx_queue_init, ngx_uint_t,
     };
 
@@ -6511,6 +6512,55 @@ mod tests {
         assert_eq!(unsafe { request.hold(&mut hold) }, Err(RequestHoldError::CountOverflow));
         assert!(hold.is_none());
         assert_eq!(main.count(), native_limit);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn request_hold_reserve_survives_native_body_read_and_redirect_increments() {
+        let mut fixture = TerminalRequestFixture::new();
+        let native_limit = u32::from(u16::MAX) - 1000;
+        fixture.request.set_count(native_limit);
+        fixture.request.headers_in.content_length_n = -1;
+        let mut hold = None;
+
+        let mut request = request_from(&mut fixture.request);
+        assert_eq!(unsafe { request.hold(&mut hold) }, Err(RequestHoldError::CountOverflow));
+        assert!(hold.is_none());
+        assert_eq!(fixture.request.count(), native_limit);
+
+        BODY_CALLBACKS.store(0, Ordering::Relaxed);
+        BODY_CALLBACK_ACTIVE.store(true, Ordering::Relaxed);
+        let mut request = request_from(&mut fixture.request);
+        let start = request.read_client_body::<BodyCallback>();
+        assert_eq!(start.status(), &ClientBodyReadStatus::Ok);
+        assert_eq!(unsafe { start.request.raw.as_ref().count() }, native_limit + 1);
+        assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 1);
+        start.release();
+        assert_eq!(fixture.request.count(), native_limit);
+
+        let mut phase_handlers =
+            Box::new([unsafe { MaybeUninit::<ngx_http_phase_handler_t>::zeroed().assume_init() }]);
+        fixture._main_conf.phase_engine.handlers = phase_handlers.as_mut_ptr();
+        fixture._main_conf.phase_engine.server_rewrite_index = 0;
+        let mut http_context = Box::new(ngx_http_conf_ctx_t {
+            main_conf: fixture._main_conf_slots.as_mut_ptr(),
+            srv_conf: ptr::null_mut(),
+            loc_conf: fixture._loc_conf.as_mut_ptr(),
+        });
+        let mut server =
+            Box::new(unsafe { MaybeUninit::<ngx_http_core_srv_conf_t>::zeroed().assume_init() });
+        server.ctx = &raw mut *http_context;
+        let mut server_slots = Box::new([(&raw mut *server).cast::<c_void>()]);
+        http_context.srv_conf = server_slots.as_mut_ptr();
+        fixture.request.srv_conf = server_slots.as_mut_ptr();
+        fixture.request.uri_changes = 2;
+
+        let mut request = request_from(&mut fixture.request);
+        assert_eq!(request.internal_redirect("/redirect"), Ok(Status::NGX_DONE));
+        assert_eq!(unsafe { request.raw.as_ref().count() }, native_limit + 1);
+        request.finalize(Status::NGX_DONE).unwrap();
+        assert_eq!(fixture.request.count(), native_limit);
+        assert!(hold.is_none());
     }
 
     #[test]
