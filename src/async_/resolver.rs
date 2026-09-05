@@ -1185,10 +1185,12 @@ mod tests {
         first_sockaddr.sin_port = 8443_u16.to_be();
         first_sockaddr.sin_addr = libc::in_addr { s_addr: u32::from_be_bytes([192, 0, 2, 1]) };
         let mut second_sockaddr =
-            unsafe { MaybeUninit::<libc::sockaddr_in>::zeroed().assume_init() };
-        second_sockaddr.sin_family = libc::AF_INET as _;
-        second_sockaddr.sin_port = 5353_u16.to_be();
-        second_sockaddr.sin_addr = libc::in_addr { s_addr: u32::from_be_bytes([198, 51, 100, 2]) };
+            unsafe { MaybeUninit::<libc::sockaddr_in6>::zeroed().assume_init() };
+        second_sockaddr.sin6_family = libc::AF_INET6 as _;
+        second_sockaddr.sin6_port = 5353_u16.to_be();
+        second_sockaddr.sin6_addr = libc::in6_addr {
+            s6_addr: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+        };
         let first_sockaddr_copy = unsafe {
             core::slice::from_raw_parts(
                 core::ptr::from_ref(&first_sockaddr).cast::<u8>(),
@@ -1199,7 +1201,7 @@ mod tests {
         let second_sockaddr_copy = unsafe {
             core::slice::from_raw_parts(
                 core::ptr::from_ref(&second_sockaddr).cast::<u8>(),
-                mem::size_of::<libc::sockaddr_in>(),
+                mem::size_of::<libc::sockaddr_in6>(),
             )
             .to_vec()
         };
@@ -1219,7 +1221,7 @@ mod tests {
             },
             ngx_resolver_addr_t {
                 sockaddr: second_sockaddr_pointer,
-                socklen: mem::size_of::<libc::sockaddr_in>() as _,
+                socklen: mem::size_of::<libc::sockaddr_in6>() as _,
                 name: ngx_str_t { data: second_name_pointer, len: second_name.len() },
                 priority: 0,
                 weight: 0,
@@ -1249,7 +1251,7 @@ mod tests {
                 assert_eq!(globals.done_count(), 1);
 
                 first_sockaddr.sin_port = 0;
-                second_sockaddr.sin_port = 0;
+                second_sockaddr.sin6_port = 0;
                 first_name.fill(b'x');
                 second_name.fill(b'x');
 
@@ -1281,6 +1283,15 @@ mod tests {
                 );
                 assert_eq!(addresses[0].name().as_bytes(), b"first.example");
                 assert_eq!(addresses[1].name().as_bytes(), b"second.example");
+                let first = addresses[0].socket_address().unwrap();
+                assert_eq!(first.ipv4_octets(), Some([192, 0, 2, 1]));
+                assert_eq!(first.port().unwrap().host_order(), 8443);
+                let second = addresses[1].socket_address().unwrap();
+                assert_eq!(
+                    second.ipv6_octets(),
+                    Some([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2])
+                );
+                assert_eq!(second.port().unwrap().host_order(), 5353);
 
                 unsafe { ResolutionOwner::handler(context) };
                 assert_eq!(globals.done_count(), 1);
