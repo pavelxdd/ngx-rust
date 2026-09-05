@@ -665,23 +665,21 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn resize_moves_the_last_allocation_when_growth_exceeds_the_pool_block() {
+    fn pool_vec_growth_moves_the_last_allocation_beyond_the_pool_block() {
         let owner = TestPool::new();
         let pool = owner.handle();
-        let initial = Layout::from_size_align(16, 8).unwrap();
-        let ptr = pool.allocate(initial).unwrap().cast::<u8>();
-        unsafe { ptr.as_ptr().write_bytes(0x5a, initial.size()) };
+        let mut bytes = crate::collections::Vec::<u8, _>::new_in(pool);
+        bytes.try_reserve_exact(16).unwrap();
+        bytes.extend([0x5a; 16]);
+        let initial_ptr = bytes.as_ptr();
         let available =
-            unsafe { (*owner.raw).d.end }.addr().checked_sub(ptr.as_ptr().addr()).unwrap();
-        let grown = Layout::from_size_align(available.checked_add(1).unwrap(), 8).unwrap();
+            unsafe { (*owner.raw).d.end }.addr().checked_sub(initial_ptr.addr()).unwrap();
+        let additional = available.checked_add(1).unwrap().checked_sub(bytes.len()).unwrap();
 
-        let grown_ptr = unsafe { pool.grow(ptr, initial, grown) }.unwrap().cast::<u8>();
+        bytes.try_reserve_exact(additional).unwrap();
 
-        assert_ne!(grown_ptr, ptr);
-        assert_eq!(
-            unsafe { core::slice::from_raw_parts(grown_ptr.as_ptr(), initial.size()) },
-            [0x5a; 16]
-        );
+        assert_ne!(bytes.as_ptr(), initial_ptr);
+        assert_eq!(bytes.as_slice(), [0x5a; 16]);
     }
 
     #[cfg(feature = "test-link")]
