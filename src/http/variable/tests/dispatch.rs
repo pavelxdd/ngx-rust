@@ -61,15 +61,19 @@ fn raw_variable_setter_reads_a_checked_input_value() {
     RAW_SET_VARIABLE_DATA.store(0, Ordering::Relaxed);
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
     request.signature = NGX_HTTP_MODULE as _;
+    request.headers_out.status = 418;
     let mut value = unsafe { MaybeUninit::<ngx_variable_value_t>::zeroed().assume_init() };
     value.data = b"set value".as_ptr().cast_mut();
     value.set_len(b"set value".len() as _);
     value.set_valid(1);
+    let input = (value.data, value.len(), value.valid());
 
     unsafe { raw_set_handler::<SetVariable>(&raw mut request, &raw mut value, usize::MAX) };
 
     assert_eq!(RAW_SET_VARIABLE_CALLS.load(Ordering::Relaxed), 1);
     assert_eq!(RAW_SET_VARIABLE_DATA.load(Ordering::Relaxed), usize::MAX);
+    assert_eq!((value.data, value.len(), value.valid()), input);
+    assert_eq!(request.headers_out.status, 418);
 }
 
 #[test]
