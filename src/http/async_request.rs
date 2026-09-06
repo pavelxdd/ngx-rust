@@ -388,10 +388,10 @@ mod tests {
         ngx_delete_posted_event, ngx_destroy_pool, ngx_event_actions, ngx_event_actions_t,
         ngx_event_flags, ngx_event_move_posted_next, ngx_event_process_posted, ngx_event_t,
         ngx_http_conf_ctx_t, ngx_http_core_loc_conf_t, ngx_http_core_main_conf_t,
-        ngx_http_core_srv_conf_t, ngx_http_handler_pt, ngx_http_log_ctx_t,
-        ngx_http_phase_handler_t, ngx_http_request_t, ngx_http_run_posted_requests, ngx_int_t,
-        ngx_log_t, ngx_module_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events,
-        ngx_queue_init, ngx_uint_t,
+        ngx_http_core_srv_conf_t, ngx_http_finalize_request, ngx_http_handler_pt,
+        ngx_http_log_ctx_t, ngx_http_phase_handler_t, ngx_http_request_t,
+        ngx_http_run_posted_requests, ngx_int_t, ngx_log_t, ngx_module_t, ngx_pool_t,
+        ngx_posted_events, ngx_posted_next_events, ngx_queue_init, ngx_uint_t,
     };
     use crate::http::{HttpModule, HttpModuleRequestContext};
 
@@ -952,11 +952,15 @@ mod tests {
         NGX_OK as _
     }
 
+    unsafe extern "C" fn blocked_write_handler(_request: *mut ngx_http_request_t) {}
+
     struct TestRequest {
         _pool: TestPool,
         _contexts: Box<[*mut c_void; 1]>,
         write_event: Box<ngx_event_t>,
         _connection: Box<ngx_connection_t>,
+        _core_loc: Box<ngx_http_core_loc_conf_t>,
+        loc_conf: Box<[*mut c_void; 1]>,
         request: Box<ngx_http_request_t>,
     }
 
@@ -970,6 +974,10 @@ mod tests {
                 Box::new(unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() });
             connection.write = &raw mut *write_event;
             connection.log = (&raw const *pool.log).cast_mut();
+            let mut core_loc = Box::new(unsafe {
+                MaybeUninit::<ngx_http_core_loc_conf_t>::zeroed().assume_init()
+            });
+            let mut loc_conf = Box::new([(&raw mut *core_loc).cast::<c_void>()]);
             let mut request =
                 Box::new(unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() });
             request.signature = NGX_HTTP_MODULE as _;
@@ -977,10 +985,19 @@ mod tests {
             request.pool = pool.raw;
             request.connection = &raw mut *connection;
             request.ctx = contexts.as_mut_ptr();
+            request.loc_conf = loc_conf.as_mut_ptr();
             request.set_count(1);
             connection.data = (&raw mut *request).cast();
 
-            Self { _pool: pool, _contexts: contexts, write_event, _connection: connection, request }
+            Self {
+                _pool: pool,
+                _contexts: contexts,
+                write_event,
+                _connection: connection,
+                _core_loc: core_loc,
+                loc_conf,
+                request,
+            }
         }
 
         fn borrow(&mut self) -> RequestRefMut<'_> {
@@ -1601,6 +1618,99 @@ mod tests {
         remove_handler_context::<PendingHandler>(&mut request);
         assert_eq!(replacement.drops.get(), 1);
         assert_eq!(request.main_count(), 1);
+    }
+
+    #[test]
+    fn native_termination_cancels_pending_main_before_late_wake() {
+        let mut worker = TestWorker::new();
+        worker.init();
+        PENDING_FINISHES.store(0, Ordering::Relaxed);
+        let state = install_local_state();
+        let mut request = TestRequest::new();
+
+        start_handler::<PendingHandler>(&mut request);
+        worker.process_posted();
+        assert_eq!(state.polls.get(), 1);
+        let waker = state.waker.borrow_mut().take().unwrap();
+        assert_eq!(request.main_count(), 2);
+        request.request.set_blocked(1);
+        request.request.write_event_handler = Some(blocked_write_handler);
+
+        unsafe { ngx_http_finalize_request(&raw mut *request.request, NGX_ERROR as _) };
+
+        assert_ne!(request.request.terminated(), 0);
+        assert!(request._contexts[0].is_null());
+        assert_eq!(request.main_count(), 1);
+        waker.wake();
+        worker.process_posted();
+        assert_eq!(state.drops.get(), 1);
+        assert_eq!(PENDING_FINISHES.load(Ordering::Relaxed), 0);
+        assert_eq!(request.write_is_posted(), 0);
+        assert_eq!(request.main_count(), 1);
+
+        let finalizer = request.request.write_event_handler.expect("native request finalizer");
+        request.request.set_blocked(0);
+        unsafe { finalizer(&raw mut *request.request) };
+        assert!(!request.request.posted_requests.is_null());
+        assert_eq!(request.main_count(), 1);
+        request.request.posted_requests = ptr::null_mut();
+        request.request.write_event_handler = None;
+        drop(request);
+        assert_eq!(state.drops.get(), 1);
+    }
+
+    #[test]
+    fn native_termination_cancels_done_noncurrent_subrequest_before_late_wake() {
+        let mut worker = TestWorker::new();
+        worker.init();
+        PENDING_FINISHES.store(0, Ordering::Relaxed);
+        let state = install_local_state();
+        let mut main = TestRequest::new();
+        let mut contexts = Box::new([ptr::null_mut()]);
+        let mut subrequest =
+            Box::new(unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() });
+        subrequest.signature = NGX_HTTP_MODULE as _;
+        subrequest.main = &raw mut *main.request;
+        subrequest.parent = &raw mut *main.request;
+        subrequest.pool = main._pool.raw;
+        subrequest.connection = &raw mut *main._connection;
+        subrequest.ctx = contexts.as_mut_ptr();
+        subrequest.loc_conf = main.loc_conf.as_mut_ptr();
+        subrequest.set_done(1);
+
+        {
+            let mut request = unsafe { RequestRefMut::from_raw(&raw mut *subrequest).unwrap() };
+            assert_eq!(AsyncPhaseHandler::<PendingHandler>::handler(&mut request), NGX_DONE as _);
+        }
+        worker.process_posted();
+        assert_eq!(state.polls.get(), 1);
+        let waker = state.waker.borrow_mut().take().unwrap();
+        assert_eq!(main.main_count(), 2);
+        main.request.set_blocked(1);
+        main.request.write_event_handler = Some(blocked_write_handler);
+
+        unsafe { ngx_http_finalize_request(&raw mut *subrequest, NGX_ERROR as _) };
+
+        assert_ne!(main.request.terminated(), 0);
+        assert_ne!(subrequest.done(), 0);
+        assert!(contexts[0].is_null());
+        assert_eq!(main.main_count(), 1);
+        waker.wake();
+        worker.process_posted();
+        assert_eq!(state.drops.get(), 1);
+        assert_eq!(PENDING_FINISHES.load(Ordering::Relaxed), 0);
+        assert_eq!(main.write_is_posted(), 0);
+        assert_eq!(main.main_count(), 1);
+
+        let finalizer = main.request.write_event_handler.expect("native request finalizer");
+        main.request.set_blocked(0);
+        unsafe { finalizer(&raw mut *main.request) };
+        assert!(!main.request.posted_requests.is_null());
+        assert_eq!(main.main_count(), 1);
+        main.request.posted_requests = ptr::null_mut();
+        main.request.write_event_handler = None;
+        drop(main);
+        assert_eq!(state.drops.get(), 1);
     }
 
     #[test]

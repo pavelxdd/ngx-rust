@@ -524,7 +524,8 @@ pub unsafe trait HttpModuleRequestContext: HttpModule {
     /// Value stored in the module's per-request context slot.
     type RequestContext: 'static;
 
-    /// Cancels context-owned work before an ordinary context removal or native slot reset.
+    /// Cancels context-owned work before ordinary removal, native slot reset, or request
+    /// termination.
     ///
     /// The request context slot is already empty when this hook runs. Unlike pool cleanup, this
     /// path must release any request reference held by the context.
