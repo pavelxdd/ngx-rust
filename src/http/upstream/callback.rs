@@ -615,8 +615,8 @@ impl<H> OriginalPeerInit<H> {
 
 /// Request peer-initialization capability without terminal request authority.
 ///
-/// Shared request operations remain available through dereferencing. The saved native peer
-/// initializer can mutate the request only through [`OriginalPeerInit::call`]:
+/// Only callback-safe logging is exposed. The saved native peer initializer can mutate the
+/// request only through [`OriginalPeerInit::call`]:
 ///
 /// ```compile_fail
 /// use ngx::http::{HTTPStatus, UpstreamPeerInitRequest};
@@ -690,6 +690,8 @@ impl<'callback> PeerInitLiveness<'callback> {
     ) -> Result<Self, UpstreamCallbackError> {
         let cleanup = NonNull::new(unsafe { ngx_pool_cleanup_add(pool.as_ptr(), 0) })
             .ok_or(UpstreamCallbackError::Allocation)?;
+        // The cleanup is disabled before `live` leaves this stack frame. If native code destroys
+        // the pool during initialization, the cleanup only marks the request inaccessible.
         unsafe {
             (*cleanup.as_ptr()).data = ptr::from_ref(live).cast_mut().cast();
             (*cleanup.as_ptr()).handler = Some(mark_peer_init_request_destroyed);
