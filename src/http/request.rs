@@ -3446,8 +3446,14 @@ impl<'callback> RequestRefMut<'callback> {
     /// ```
     pub unsafe fn add_header_in(&mut self, key: &str, value: &str) -> Result<(), RequestError> {
         let pool = self.pool()?.as_ptr();
-        let table = unsafe { ngx_list_push(&raw mut self.raw.as_mut().headers_in.headers).cast() };
-        unsafe { add_to_ngx_table(table, pool, key, value) }.ok_or(RequestError::Allocation)
+        append_pool_header(
+            unsafe { &mut self.raw.as_mut().headers_in.headers },
+            pool,
+            key.as_bytes(),
+            value.as_bytes(),
+        )
+        .map(|_| ())
+        .map_err(|_| RequestError::Allocation)
     }
 
     pub(crate) fn reset_headers_in(&mut self, headers: ngx_list_t) {
@@ -3466,8 +3472,14 @@ impl<'callback> RequestRefMut<'callback> {
     /// Adds an output header allocated from the request pool.
     pub fn add_header_out(&mut self, key: &str, value: &str) -> Result<(), RequestError> {
         let pool = self.pool()?.as_ptr();
-        let table = unsafe { ngx_list_push(&raw mut self.raw.as_mut().headers_out.headers).cast() };
-        unsafe { add_to_ngx_table(table, pool, key, value) }.ok_or(RequestError::Allocation)
+        append_pool_header(
+            unsafe { &mut self.raw.as_mut().headers_out.headers },
+            pool,
+            key.as_bytes(),
+            value.as_bytes(),
+        )
+        .map(|_| ())
+        .map_err(|_| RequestError::Allocation)
     }
 
     /// Sets the response Content-Length.
@@ -4266,8 +4278,8 @@ mod tests {
         ngx_create_pool, ngx_current_msec, ngx_cycle_t, ngx_destroy_pool, ngx_event_expire_timers,
         ngx_event_move_posted_next, ngx_event_process_posted, ngx_event_timer_init,
         ngx_http_conf_ctx_t, ngx_http_core_srv_conf_t, ngx_http_output_header_filter_pt,
-        ngx_http_phase_handler_t, ngx_log_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events,
-        ngx_queue_init, ngx_uint_t,
+        ngx_http_phase_handler_t, ngx_log_t, ngx_palloc, ngx_pool_t, ngx_posted_events,
+        ngx_posted_next_events, ngx_queue_init, ngx_reset_pool, ngx_uint_t,
     };
 
     #[cfg(feature = "test-link")]
@@ -4652,6 +4664,20 @@ mod tests {
                 unsafe { ngx_destroy_pool(self.raw) };
             }
         }
+    }
+
+    #[cfg(feature = "test-link")]
+    fn poisoned_header_list(pool: *mut ngx_pool_t) -> ngx_list_t {
+        let size = mem::size_of::<ngx_table_elt_t>();
+        let storage = unsafe { ngx_palloc(pool, size) };
+        assert!(!storage.is_null());
+        unsafe {
+            ptr::write_bytes(storage, 0xa5, size);
+            ngx_reset_pool(pool);
+        }
+        let headers = create_header_list(pool, 1).unwrap();
+        assert_eq!(headers.part.elts, storage);
+        headers
     }
 
     #[cfg(feature = "test-link")]
@@ -5350,6 +5376,173 @@ mod tests {
             pool: core::ptr::null_mut(),
         };
         assert!(matches!(request_from(&mut raw).headers_out(), Err(HeaderListError::InvalidList)));
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn direct_header_additions_initialize_poisoned_entries() {
+        for input in [true, false] {
+            let owner = TestPool::new();
+            let mut raw = zeroed_request();
+            raw.pool = owner.raw;
+            if input {
+                raw.headers_in.headers = poisoned_header_list(owner.raw);
+            } else {
+                raw.headers_out.headers = poisoned_header_list(owner.raw);
+            }
+
+            let mut request = request_from(&mut raw);
+            let result = if input {
+                unsafe { request.add_header_in("X-Direct", "input") }
+            } else {
+                request.add_header_out("X-Direct", "output")
+            };
+            assert_eq!(result, Ok(()));
+
+            let entry = if input {
+                unsafe { &*raw.headers_in.headers.part.elts.cast::<ngx_table_elt_t>() }
+            } else {
+                unsafe { &*raw.headers_out.headers.part.elts.cast::<ngx_table_elt_t>() }
+            };
+            assert!(entry.next.is_null());
+            {
+                let request = request_from(&mut raw);
+                let headers = if input {
+                    request.headers_in().unwrap()
+                } else {
+                    request.headers_out().unwrap()
+                };
+                let header = headers.iter().next().unwrap();
+                assert_eq!(header.key(), b"X-Direct");
+                assert_eq!(
+                    header.value(),
+                    if input { b"input".as_slice() } else { b"output".as_slice() }
+                );
+            }
+            let request = request_from(&mut raw);
+            assert_eq!(
+                if input {
+                    request.headers_in_iterator().count()
+                } else {
+                    request.headers_out_iterator().count()
+                },
+                1
+            );
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn direct_header_allocation_failures_preserve_the_readable_list() {
+        for input in [true, false] {
+            let mut reached_success = false;
+
+            for successes in 0..6 {
+                let owner = TestPool::new();
+                let mut raw = zeroed_request();
+                raw.pool = owner.raw;
+                if input {
+                    raw.headers_in.headers = poisoned_header_list(owner.raw);
+                } else {
+                    raw.headers_out.headers = poisoned_header_list(owner.raw);
+                }
+                {
+                    let mut request = request_from(&mut raw);
+                    if input {
+                        unsafe { request.add_header_in("X-Existing", "old") }.unwrap();
+                    } else {
+                        request.add_header_out("X-Existing", "old").unwrap();
+                    }
+                }
+                let headers =
+                    if input { &raw.headers_in.headers } else { &raw.headers_out.headers };
+                let original =
+                    (headers.part.elts, headers.part.nelts, headers.part.next, headers.last);
+
+                unsafe {
+                    (*owner.raw).d.last = (*owner.raw).d.end;
+                    (*owner.raw).max = 0;
+                    ngx_rs_test_fail_allocations_after(successes);
+                }
+                let result = {
+                    let mut request = request_from(&mut raw);
+                    if input {
+                        unsafe { request.add_header_in("X-Replacement", "new") }
+                    } else {
+                        request.add_header_out("X-Replacement", "new")
+                    }
+                };
+                unsafe { ngx_rs_test_reset_allocation_failures() };
+
+                let headers =
+                    if input { &raw.headers_in.headers } else { &raw.headers_out.headers };
+                if result.is_ok() {
+                    {
+                        let request = request_from(&mut raw);
+                        let headers = if input {
+                            request.headers_in().unwrap()
+                        } else {
+                            request.headers_out().unwrap()
+                        };
+                        let mut headers = headers.iter();
+                        assert_eq!(headers.next().unwrap().key(), b"X-Existing");
+                        let added = headers.next().unwrap();
+                        assert_eq!(added.key(), b"X-Replacement");
+                        assert_eq!(added.value(), b"new");
+                        assert!(headers.next().is_none());
+                    }
+                    let added = unsafe {
+                        if input {
+                            (*raw.headers_in.headers.part.next).elts.cast::<ngx_table_elt_t>()
+                        } else {
+                            (*raw.headers_out.headers.part.next).elts.cast::<ngx_table_elt_t>()
+                        }
+                    };
+                    assert!(unsafe { (*added).next.is_null() });
+                    let request = request_from(&mut raw);
+                    assert_eq!(
+                        if input {
+                            request.headers_in_iterator().count()
+                        } else {
+                            request.headers_out_iterator().count()
+                        },
+                        2
+                    );
+                    reached_success = true;
+                    break;
+                }
+                assert_eq!(result, Err(RequestError::Allocation));
+                assert_eq!(
+                    (headers.part.elts, headers.part.nelts, headers.part.next, headers.last,),
+                    original
+                );
+                {
+                    let request = request_from(&mut raw);
+                    let headers = if input {
+                        request.headers_in().unwrap()
+                    } else {
+                        request.headers_out().unwrap()
+                    };
+                    let mut headers = headers.iter();
+                    let existing = headers.next().unwrap();
+                    assert_eq!(existing.key(), b"X-Existing");
+                    assert_eq!(existing.value(), b"old");
+                    assert!(unsafe { (*original.0.cast::<ngx_table_elt_t>()).next.is_null() });
+                    assert!(headers.next().is_none());
+                }
+                let request = request_from(&mut raw);
+                assert_eq!(
+                    if input {
+                        request.headers_in_iterator().count()
+                    } else {
+                        request.headers_out_iterator().count()
+                    },
+                    1
+                );
+            }
+
+            assert!(reached_success);
+        }
     }
 
     #[cfg(feature = "test-link")]
