@@ -178,7 +178,6 @@ where
             return H::finish(request, output).into_handler_status(&request.view());
         }
 
-        let future = H::start(request);
         let log = match request.log() {
             Ok(Some(log)) => log,
             Ok(None) | Err(_) => return NGX_ERROR as ngx_int_t,
@@ -240,6 +239,8 @@ where
             }
         };
         unsafe { continuation.as_ref() }.state().borrow_mut().context = Some(context);
+        // H::start may publish callbacks in this pool, so install their cancellation owner first.
+        let future = H::start(request);
         let started = match spawn(handler_future(future, continuation)) {
             Ok(task) => {
                 let mut state = unsafe { continuation.as_ref() }.state().borrow_mut();
@@ -381,7 +382,7 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::core::ModuleDescriptor;
+    use crate::core::{ModuleDescriptor, Status};
     use crate::ffi::{
         NGX_DECLINED, NGX_DONE, NGX_ERROR, NGX_HTTP_MODULE, NGX_OK, NGX_USE_CLEAR_EVENT,
         ngx_array_t, ngx_conf_t, ngx_connection_t, ngx_create_pool, ngx_cycle, ngx_cycle_t,
@@ -393,6 +394,7 @@ mod tests {
         ngx_http_run_posted_requests, ngx_int_t, ngx_log_t, ngx_module_t, ngx_pool_t,
         ngx_posted_events, ngx_posted_next_events, ngx_queue_init, ngx_uint_t,
     };
+    use crate::http::subrequest::{SubRequestBuilder, SubRequestError};
     use crate::http::{HttpModule, HttpModuleRequestContext};
 
     unsafe extern "C" {
@@ -645,6 +647,113 @@ mod tests {
 
         fn finish(_request: &mut RequestRefMut<'_>, _output: Self::Output) -> Self::Result {
             PENDING_FINISHES.fetch_add(1, Ordering::Relaxed);
+            NGX_OK as _
+        }
+    }
+
+    struct AsyncSubrequestModule;
+
+    unsafe impl HttpModule for AsyncSubrequestModule {
+        fn module() -> ModuleDescriptor {
+            test_module()
+        }
+    }
+
+    unsafe impl HttpModuleRequestContext for AsyncSubrequestModule {
+        type RequestContext = AsyncHandlerContext<AsyncSubrequestHandler>;
+    }
+
+    struct AsyncSubrequestState {
+        subrequest: Cell<*mut ngx_http_request_t>,
+        callbacks: Cell<usize>,
+        completion_drops: Cell<usize>,
+        task_drops: Cell<usize>,
+    }
+
+    impl AsyncSubrequestState {
+        fn new() -> Self {
+            Self {
+                subrequest: Cell::new(ptr::null_mut()),
+                callbacks: Cell::new(0),
+                completion_drops: Cell::new(0),
+                task_drops: Cell::new(0),
+            }
+        }
+    }
+
+    struct CompletionCapture(Rc<AsyncSubrequestState>);
+
+    impl Drop for CompletionCapture {
+        fn drop(&mut self) {
+            self.0.completion_drops.set(self.0.completion_drops.get() + 1);
+        }
+    }
+
+    struct TaskCapture(Rc<AsyncSubrequestState>);
+
+    impl Drop for TaskCapture {
+        fn drop(&mut self) {
+            self.0.task_drops.set(self.0.task_drops.get() + 1);
+        }
+    }
+
+    std::thread_local! {
+        static ASYNC_SUBREQUEST_STATE: RefCell<Option<Rc<AsyncSubrequestState>>> = const { RefCell::new(None) };
+    }
+
+    fn install_async_subrequest_state() -> Rc<AsyncSubrequestState> {
+        let state = Rc::new(AsyncSubrequestState::new());
+        ASYNC_SUBREQUEST_STATE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none());
+            *slot = Some(Rc::clone(&state));
+        });
+        state
+    }
+
+    static ASYNC_SUBREQUEST_SAW_CONTEXT: AtomicBool = AtomicBool::new(false);
+    static ASYNC_SUBREQUEST_FINISHES: AtomicUsize = AtomicUsize::new(0);
+
+    struct AsyncSubrequestHandler;
+
+    impl AsyncHttpRequestHandler for AsyncSubrequestHandler {
+        const PHASE: HttpPhase = HttpPhase::Access;
+        type Module = AsyncSubrequestModule;
+        type Output = Result<(), SubRequestError>;
+        type Result = ngx_int_t;
+
+        fn start(request: &mut RequestRefMut<'_>) -> impl Future<Output = Self::Output> + 'static {
+            ASYNC_SUBREQUEST_SAW_CONTEXT.store(
+                request.module_context::<AsyncSubrequestModule>().unwrap().is_some(),
+                Ordering::Relaxed,
+            );
+            let state = ASYNC_SUBREQUEST_STATE
+                .with(|slot| slot.borrow_mut().take())
+                .expect("async subrequest state was not installed");
+            let completion = CompletionCapture(Rc::clone(&state));
+            let callback_state = Rc::clone(&state);
+            let (future, subrequest) = SubRequestBuilder::new(request, "/delayed")
+                .unwrap()
+                .keep_body()
+                .init_headers_in(0)
+                .waited()
+                .background()
+                .build_async(move |_, _| {
+                    callback_state.callbacks.set(callback_state.callbacks.get() + 1);
+                    drop(completion);
+                    ((), Status::NGX_OK)
+                })
+                .unwrap();
+            state.subrequest.set(unsafe { subrequest.as_ptr() });
+
+            async move {
+                let _task = TaskCapture(Rc::clone(&state));
+                future.await
+            }
+        }
+
+        fn finish(_request: &mut RequestRefMut<'_>, _output: Self::Output) -> Self::Result {
+            ASYNC_SUBREQUEST_FINISHES.fetch_add(1, Ordering::Relaxed);
             NGX_OK as _
         }
     }
@@ -1711,6 +1820,73 @@ mod tests {
         main.request.write_event_handler = None;
         drop(main);
         assert_eq!(state.drops.get(), 1);
+    }
+
+    #[test]
+    fn native_termination_cancels_waited_subrequest_before_late_completion() {
+        let mut worker = TestWorker::new();
+        worker.init();
+        ASYNC_SUBREQUEST_SAW_CONTEXT.store(false, Ordering::Relaxed);
+        ASYNC_SUBREQUEST_FINISHES.store(0, Ordering::Relaxed);
+        let state = install_async_subrequest_state();
+        let mut request = TestRequest::new();
+        let mut main_conf =
+            Box::new(unsafe { MaybeUninit::<ngx_http_core_main_conf_t>::zeroed().assume_init() });
+        let mut main_conf_slots = Box::new([(&raw mut *main_conf).cast::<c_void>()]);
+        let mut http_context = Box::new(ngx_http_conf_ctx_t {
+            main_conf: main_conf_slots.as_mut_ptr(),
+            srv_conf: ptr::null_mut(),
+            loc_conf: request.loc_conf.as_mut_ptr(),
+        });
+        let mut server =
+            Box::new(unsafe { MaybeUninit::<ngx_http_core_srv_conf_t>::zeroed().assume_init() });
+        server.ctx = &raw mut *http_context;
+        let mut server_slots = Box::new([(&raw mut *server).cast::<c_void>()]);
+        http_context.srv_conf = server_slots.as_mut_ptr();
+        request.request.main_conf = main_conf_slots.as_mut_ptr();
+        request.request.srv_conf = server_slots.as_mut_ptr();
+        request.request.set_subrequests(2);
+
+        start_handler::<AsyncSubrequestHandler>(&mut request);
+        assert!(ASYNC_SUBREQUEST_SAW_CONTEXT.load(Ordering::Relaxed));
+        assert_eq!(request.main_count(), 3);
+        worker.process_posted();
+        assert_eq!(state.task_drops.get(), 0);
+        assert_eq!(state.completion_drops.get(), 0);
+
+        request.request.set_blocked(1);
+        request.request.write_event_handler = Some(blocked_write_handler);
+        unsafe { ngx_http_finalize_request(&raw mut *request.request, NGX_ERROR as _) };
+
+        assert_ne!(request.request.terminated(), 0);
+        assert!(request._contexts[0].is_null());
+        assert_eq!(request.main_count(), 2);
+        assert_eq!(state.task_drops.get(), 1);
+        assert_eq!(state.callbacks.get(), 0);
+        assert_eq!(state.completion_drops.get(), 0);
+
+        let subrequest = state.subrequest.get();
+        assert!(!subrequest.is_null());
+        request._connection.set_error(0);
+        unsafe { ngx_http_finalize_request(subrequest, NGX_OK as _) };
+        assert_ne!(unsafe { (*subrequest).done() }, 0);
+        assert_eq!(request.main_count(), 1);
+        assert_eq!(state.callbacks.get(), 0);
+        assert_eq!(state.completion_drops.get(), 1);
+
+        worker.process_posted();
+        worker.process_posted();
+        assert_eq!(ASYNC_SUBREQUEST_FINISHES.load(Ordering::Relaxed), 0);
+        assert_eq!(request.write_is_posted(), 0);
+        assert_eq!(state.task_drops.get(), 1);
+        assert_eq!(state.completion_drops.get(), 1);
+
+        request.request.set_blocked(0);
+        request.request.posted_requests = ptr::null_mut();
+        request.request.write_event_handler = None;
+        drop(request);
+        assert_eq!(state.task_drops.get(), 1);
+        assert_eq!(state.completion_drops.get(), 1);
     }
 
     #[test]
