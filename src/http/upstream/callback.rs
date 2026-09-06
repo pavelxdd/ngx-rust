@@ -1,17 +1,17 @@
 use core::any::TypeId;
+use core::cell::Cell;
 use core::error;
 use core::ffi::c_void;
 use core::fmt;
 use core::marker::PhantomData;
-use core::ops::Deref;
-use core::ptr::NonNull;
+use core::ptr::{self, NonNull};
 
 use crate::core::{Pool, Status};
 use crate::ffi::{
     NGX_LOG_EMERG, NGX_LOG_ERR, ngx_conf_t, ngx_event_free_peer_pt, ngx_event_get_peer_pt,
     ngx_event_notify_peer_pt, ngx_http_request_t, ngx_http_upstream_init_peer_pt,
     ngx_http_upstream_init_pt, ngx_http_upstream_srv_conf_t, ngx_http_upstream_t, ngx_int_t,
-    ngx_peer_connection_t, ngx_uint_t,
+    ngx_peer_connection_t, ngx_pool_cleanup_add, ngx_pool_cleanup_t, ngx_uint_t,
 };
 #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
 use crate::ffi::{ngx_event_save_peer_session_pt, ngx_event_set_peer_session_pt};
@@ -47,6 +47,10 @@ pub enum UpstreamCallbackError {
     MissingRequestUpstream,
     /// The request upstream pointer is misaligned.
     MisalignedRequestUpstream,
+    /// The request pool was destroyed during peer initialization.
+    RequestDestroyedDuringPeerInitialization,
+    /// The request changed to a different upstream owner during peer initialization.
+    ReplacedRequestUpstream,
     /// nginx supplied no peer-connection pointer.
     NullPeer,
     /// The peer-connection pointer is misaligned.
@@ -123,6 +127,12 @@ impl fmt::Display for UpstreamCallbackError {
             Self::MissingRequestUpstream => formatter.write_str("request has no upstream"),
             Self::MisalignedRequestUpstream => {
                 formatter.write_str("request upstream is misaligned")
+            }
+            Self::RequestDestroyedDuringPeerInitialization => {
+                formatter.write_str("request was destroyed during peer initialization")
+            }
+            Self::ReplacedRequestUpstream => {
+                formatter.write_str("request changed upstream owner during peer initialization")
             }
             Self::NullPeer => formatter.write_str("upstream peer is null"),
             Self::MisalignedPeer => formatter.write_str("upstream peer is misaligned"),
@@ -591,6 +601,7 @@ impl<H> OriginalPeerInit<H> {
     ) -> Result<UpstreamPeerInitStatus, UpstreamCallbackError> {
         let callback = self.callback.ok_or(UpstreamCallbackError::MissingOriginalInitPeer)?;
         let status = unsafe { callback(request.request.as_ptr(), upstream.raw.as_ptr()) };
+        request.ensure_live()?;
         if status != Status::NGX_OK.0 {
             return Ok(UpstreamPeerInitStatus::Unavailable);
         }
@@ -614,15 +625,94 @@ impl<H> OriginalPeerInit<H> {
 ///     request.finalize(HTTPStatus::BAD_REQUEST).unwrap();
 /// }
 /// ```
+///
+/// ```compile_fail
+/// use ngx::http::UpstreamPeerInitRequest;
+///
+/// fn cannot_borrow_main(request: &UpstreamPeerInitRequest<'_>) {
+///     let _main = request.main().unwrap();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::http::UpstreamPeerInitRequest;
+///
+/// fn cannot_access_raw_request(request: &UpstreamPeerInitRequest<'_>) {
+///     let _raw = request.as_ptr();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::http::UpstreamPeerInitRequest;
+///
+/// fn cannot_redirect(request: &mut UpstreamPeerInitRequest<'_>) {
+///     request.internal_redirect("/other").unwrap();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::core::PoolChain;
+/// use ngx::http::UpstreamPeerInitRequest;
+///
+/// fn cannot_send_output(request: &mut UpstreamPeerInitRequest<'_>, chain: PoolChain<'_>) {
+///     request.output_filter(chain).unwrap();
+/// }
+/// ```
 pub struct UpstreamPeerInitRequest<'callback> {
     request: RequestRefMut<'callback>,
+    live: &'callback Cell<bool>,
 }
 
-impl<'callback> Deref for UpstreamPeerInitRequest<'callback> {
-    type Target = RequestRefMut<'callback>;
+impl UpstreamPeerInitRequest<'_> {
+    fn ensure_live(&self) -> Result<(), UpstreamCallbackError> {
+        if !self.live.get() {
+            return Err(UpstreamCallbackError::RequestDestroyedDuringPeerInitialization);
+        }
+        Ok(())
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.request
+    /// Returns the live request's connection logger.
+    pub fn log(&self) -> Result<Option<LogRef<'_>>, UpstreamCallbackError> {
+        self.ensure_live()?;
+        self.request.log().map_err(Into::into)
+    }
+}
+
+struct PeerInitLiveness<'callback> {
+    live: &'callback Cell<bool>,
+    cleanup: NonNull<ngx_pool_cleanup_t>,
+}
+
+impl<'callback> PeerInitLiveness<'callback> {
+    fn register(
+        pool: &Pool<'_>,
+        live: &'callback Cell<bool>,
+    ) -> Result<Self, UpstreamCallbackError> {
+        let cleanup = NonNull::new(unsafe { ngx_pool_cleanup_add(pool.as_ptr(), 0) })
+            .ok_or(UpstreamCallbackError::Allocation)?;
+        unsafe {
+            (*cleanup.as_ptr()).data = ptr::from_ref(live).cast_mut().cast();
+            (*cleanup.as_ptr()).handler = Some(mark_peer_init_request_destroyed);
+        }
+        Ok(Self { live, cleanup })
+    }
+}
+
+impl Drop for PeerInitLiveness<'_> {
+    fn drop(&mut self) {
+        if !self.live.get() {
+            return;
+        }
+        unsafe {
+            (*self.cleanup.as_ptr()).handler = None;
+            (*self.cleanup.as_ptr()).data = ptr::null_mut();
+        }
+    }
+}
+
+unsafe extern "C" fn mark_peer_init_request_destroyed(data: *mut c_void) {
+    if let Some(live) = NonNull::new(data.cast::<Cell<bool>>()) {
+        unsafe { live.as_ref() }.set(false);
     }
 }
 
@@ -961,6 +1051,7 @@ struct RequestUpstream {
 
 impl RequestUpstream {
     fn from_request(request: &UpstreamPeerInitRequest<'_>) -> Result<Self, UpstreamCallbackError> {
+        request.ensure_live()?;
         let request = unsafe { request.request.as_ptr() };
         let raw = NonNull::new(unsafe { (*request).upstream })
             .ok_or(UpstreamCallbackError::MissingRequestUpstream)?;
@@ -1072,24 +1163,50 @@ where
 {
     unsafe {
         RequestRefMut::with_raw(request, |request| {
-            let mut request = UpstreamPeerInitRequest { request };
+            let pool = match request.pool() {
+                Ok(pool) => pool.as_ptr(),
+                Err(error) => {
+                    let error = UpstreamCallbackError::Request(error);
+                    log_request_failure(&request, "peer initialization", &error);
+                    return Status::NGX_ERROR.0;
+                }
+            };
+            let pool = Pool::from_raw(pool).expect("checked request pool");
+            let live = Cell::new(true);
+            let liveness = match PeerInitLiveness::register(&pool, &live) {
+                Ok(liveness) => liveness,
+                Err(error) => {
+                    log_request_failure(&request, "peer initialization", &error);
+                    return Status::NGX_ERROR.0;
+                }
+            };
+            let mut request = UpstreamPeerInitRequest { request, live: &live };
             let result = (|| {
                 let mut request_upstream = RequestUpstream::from_request(&request)?;
                 let mut upstream = UpstreamServerConf::from_raw(upstream)?;
                 let original = upstream.original_peer::<H>()?;
-                match H::init(&mut request, &mut upstream, original)? {
+                let initialized = H::init(&mut request, &mut upstream, original)?;
+                request.ensure_live()?;
+                let current_upstream = RequestUpstream::from_request(&request)?;
+                if current_upstream.raw != request_upstream.raw {
+                    return Err(UpstreamCallbackError::ReplacedRequestUpstream);
+                }
+                match initialized {
                     UpstreamPeerInit::Install(value) => {
-                        let pool = request.pool()?;
                         request_upstream.install::<H>(&pool, value)?;
                         Ok(Status::NGX_OK.0)
                     }
                     UpstreamPeerInit::Unavailable => Ok(Status::NGX_ERROR.0),
                 }
             })();
+            let request_live = request.ensure_live().is_ok();
+            drop(liveness);
             match result {
                 Ok(status) => status,
                 Err(error) => {
-                    log_request_failure(&request, "peer initialization", &error);
+                    if request_live {
+                        log_request_failure(&request.request, "peer initialization", &error);
+                    }
                     Status::NGX_ERROR.0
                 }
             }
