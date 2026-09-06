@@ -1844,6 +1844,13 @@ fn decimal_bytes(mut value: usize, buffer: &mut [u8]) -> &[u8] {
 #[repr(C)]
 struct RequestContextRegistry {
     first: *mut RequestContextRegistration,
+    main: NonNull<ngx_http_request_t>,
+}
+
+#[repr(C)]
+struct RequestContextRegistryOwner {
+    registry: RequestContextRegistry,
+    request_cleanup: ngx_http_cleanup_t,
 }
 
 #[repr(C)]
@@ -1872,6 +1879,16 @@ impl RequestContextRegistry {
             {
                 registration.cancel();
             }
+            current = next;
+        }
+    }
+
+    fn cancel_all(&mut self) {
+        let mut current = self.first;
+        while let Some(registration) = NonNull::new(current) {
+            let registration = unsafe { &mut *registration.as_ptr() };
+            let next = registration.next;
+            registration.cancel();
             current = next;
         }
     }
@@ -1909,6 +1926,14 @@ impl RequestContextRegistration {
     }
 }
 
+unsafe extern "C" fn terminate_request_context_registry(data: *mut c_void) {
+    let registry = data.cast::<RequestContextRegistry>();
+    // Normal completion reaches pool cleanup; early termination must cancel delayed owners first.
+    if unsafe { (*registry).main.as_ref().terminated() } != 0 {
+        unsafe { (*registry).cancel_all() };
+    }
+}
+
 unsafe extern "C" fn cleanup_request_context_registry(data: *mut c_void) {
     let registry = data.cast::<RequestContextRegistry>();
     debug_assert!(unsafe { (*registry).first.is_null() });
@@ -1935,6 +1960,7 @@ fn find_request_context_registry(
 
 fn get_or_create_request_context_registry(
     pool: &Pool<'_>,
+    mut main: NonNull<ngx_http_request_t>,
 ) -> Result<(NonNull<RequestContextRegistry>, bool), RequestContextError> {
     let raw = NonNull::new(pool.as_ptr()).expect("checked request pool must have a pointer");
     if let Some(registry) = find_request_context_registry(raw) {
@@ -1942,17 +1968,51 @@ fn get_or_create_request_context_registry(
     }
 
     let cleanup = NonNull::new(unsafe {
-        ngx_pool_cleanup_add(raw.as_ptr(), mem::size_of::<RequestContextRegistry>())
+        ngx_pool_cleanup_add(raw.as_ptr(), mem::size_of::<RequestContextRegistryOwner>())
     })
     .ok_or(RequestContextError::Allocation)?;
-    let registry: NonNull<RequestContextRegistry> =
+    let mut owner: NonNull<RequestContextRegistryOwner> =
         NonNull::new(unsafe { cleanup.as_ref().data.cast() })
             .ok_or(RequestContextError::Allocation)?;
+    let registry = unsafe { NonNull::new_unchecked(ptr::addr_of_mut!((*owner.as_ptr()).registry)) };
     unsafe {
-        registry.as_ptr().write(RequestContextRegistry { first: ptr::null_mut() });
+        owner.as_ptr().write(RequestContextRegistryOwner {
+            registry: RequestContextRegistry { first: ptr::null_mut(), main },
+            request_cleanup: ngx_http_cleanup_t {
+                handler: Some(terminate_request_context_registry),
+                data: registry.as_ptr().cast(),
+                next: main.as_ref().cleanup,
+            },
+        });
+        main.as_mut().cleanup = &raw mut owner.as_mut().request_cleanup;
         (*cleanup.as_ptr()).handler = Some(cleanup_request_context_registry);
     }
     Ok((registry, true))
+}
+
+fn remove_request_context_registry(
+    pool: &Pool<'_>,
+    registry: NonNull<RequestContextRegistry>,
+    mut main: NonNull<ngx_http_request_t>,
+) {
+    let owner = registry.cast::<RequestContextRegistryOwner>();
+    let request_cleanup = unsafe { ptr::addr_of_mut!((*owner.as_ptr()).request_cleanup) };
+    let mut link = unsafe { &raw mut main.as_mut().cleanup };
+    loop {
+        let current = unsafe { *link };
+        if current.is_null() {
+            break;
+        }
+        if ptr::eq(current, request_cleanup) {
+            unsafe {
+                *link = (*current).next;
+                (*current).next = ptr::null_mut();
+            }
+            break;
+        }
+        link = unsafe { &raw mut (*current).next };
+    }
+    debug_assert!(unsafe { pool.remove_cleanup(registry) });
 }
 
 fn cancel_stale_request_contexts(raw: NonNull<ngx_http_request_t>) {
@@ -2844,9 +2904,9 @@ impl<'callback> RequestRefMut<'callback> {
     /// Returns a pinned module context, inserting a pool-owned value when absent.
     ///
     /// The request context slot is published only after the context, its request registry entry,
-    /// and its pool cleanup are initialized. An ordinary removal or native slot reset calls
-    /// [`HttpModuleRequestContext::cancel`] before dropping the value; pool teardown calls
-    /// [`HttpModuleRequestContext::cleanup`] instead.
+    /// and its pool cleanup are initialized. Ordinary removal, native slot reset, or request
+    /// termination calls [`HttpModuleRequestContext::cancel`] before dropping the value; pool
+    /// teardown calls [`HttpModuleRequestContext::cleanup`] instead.
     ///
     /// ```compile_fail
     /// use core::marker::PhantomPinned;
@@ -2925,7 +2985,8 @@ impl<'callback> RequestRefMut<'callback> {
         }
 
         let pool = self.pool()?;
-        let (mut registry, registry_created) = get_or_create_request_context_registry(&pool)?;
+        let main = self.view().main_raw()?;
+        let (mut registry, registry_created) = get_or_create_request_context_registry(&pool, main)?;
         let owner = match pool.try_allocate_with_cleanup(|| {
             constructor().map(|context| RequestContextOwner {
                 context: ManuallyDrop::new(context),
@@ -2943,7 +3004,7 @@ impl<'callback> RequestRefMut<'callback> {
             Ok(owner) => owner.into_non_null(),
             Err(error) => {
                 if registry_created {
-                    unsafe { pool.remove_cleanup(registry) };
+                    remove_request_context_registry(&pool, registry, main);
                 }
                 return Err(error.into());
             }
@@ -3435,11 +3496,16 @@ impl RequestHold {
         }
         self.active = false;
 
-        let count = unsafe { self.main.as_ref().count() };
+        let main = unsafe { self.main.as_ref() };
+        if main.pool.is_null() {
+            return;
+        }
+
+        let count = main.count();
         if count > 1 {
             let mut main = self.main;
             unsafe { main.as_mut().set_count(count - 1) };
-        } else if count == 1 {
+        } else if count == 1 && main.terminated() == 0 {
             unsafe { ngx_http_finalize_request(self.request.as_ptr(), NGX_DONE as _) };
         }
     }
@@ -7096,6 +7162,29 @@ mod tests {
         );
         main.set_count(2);
         continuation.cancel().unwrap();
+        assert_eq!(main.count(), 1);
+    }
+
+    #[test]
+    fn request_hold_termination_release_does_not_reenter_native_finalization() {
+        let mut pool = zeroed_pool();
+        let mut main = zeroed_request();
+        initialize_request(&mut main);
+        main.pool = &raw mut pool;
+        main.set_count(1);
+        main.set_terminated(1);
+
+        let mut raw = zeroed_request();
+        raw.main = &raw mut main;
+        raw.parent = &raw mut main;
+        let mut hold = None;
+        {
+            let mut request = request_from(&mut raw);
+            unsafe { request.hold(&mut hold) }.unwrap();
+        }
+        main.set_count(1);
+
+        assert!(RequestHold::cancel(&mut hold));
         assert_eq!(main.count(), 1);
     }
 
