@@ -205,14 +205,26 @@ unsafe extern "C" fn raw_client_body_handler<H>(request: *mut ngx_http_request_t
 where
     H: HttpClientBodyHandler,
 {
-    let _ = unsafe {
-        request_callback_status(request, |request| {
-            if H::is_active(request.view()) {
-                H::body_read(request);
-            }
-            Status::NGX_OK
-        })
+    let Ok(raw) = checked_request_ptr(request) else {
+        return;
     };
+    cancel_stale_request_contexts(raw);
+    match take_client_body_read::<H>(raw) {
+        ClientBodyCallbackState::Current => {
+            let _ = unsafe {
+                request_callback_status(request, |request| {
+                    if H::is_active(request.view()) {
+                        H::body_read(request);
+                    }
+                    Status::NGX_OK
+                })
+            };
+        }
+        ClientBodyCallbackState::Stale => unsafe {
+            ngx_http_finalize_request(request, NGX_ERROR as _);
+        },
+        ClientBodyCallbackState::Missing => {}
+    }
 }
 
 /// Failure returned while creating or using a checked HTTP request view.
@@ -677,10 +689,10 @@ pub enum ClientBodyReadStatus {
 
 /// Start-side ownership returned by nginx client-body processing.
 ///
-/// For every non-special native status, nginx retains one main-request reference while the body
-/// callback owns asynchronous processing. [`release`](Self::release) consumes this token and
-/// releases the caller-side reference exactly once. A special response was already released by
-/// nginx and needs no finalization.
+/// When nginx is called and returns a non-special status, it retains one main-request reference
+/// while the body callback owns asynchronous processing. [`release`](Self::release) consumes this
+/// token exactly once. A special response, a registration failure, or an already pending read has
+/// no start-side reference to release.
 #[must_use = "client-body start ownership must be released after handling its status"]
 pub struct ClientBodyReadStart<'request> {
     request: RequestRefMut<'request>,
@@ -724,9 +736,9 @@ impl ClientBodyReadStatus {
 
 /// Static callback invoked when nginx completes a client-body read.
 ///
-/// The owner of request cancellation keeps its active state in its pinned request context and
-/// overrides [`is_active`](Self::is_active) to reject late native callbacks. A callback must not
-/// panic; panics terminate the worker process.
+/// The SDK rejects callbacks displaced by a safe request redirect before invoking this trait. The
+/// owner may additionally keep cancellation state in its pinned request context and override
+/// [`is_active`](Self::is_active). A callback must not panic; panics terminate the worker process.
 pub trait HttpClientBodyHandler {
     /// Returns whether the request owner still accepts a client-body callback.
     fn is_active(_request: RequestRef<'_>) -> bool {
@@ -1845,12 +1857,30 @@ fn decimal_bytes(mut value: usize, buffer: &mut [u8]) -> &[u8] {
 struct RequestContextRegistry {
     first: *mut RequestContextRegistration,
     main: NonNull<ngx_http_request_t>,
+    generation: u64,
+    next_client_body_read_id: u64,
+    client_body_read: Option<ClientBodyReadOperation>,
 }
 
 #[repr(C)]
 struct RequestContextRegistryOwner {
     registry: RequestContextRegistry,
     request_cleanup: ngx_http_cleanup_t,
+}
+
+type ClientBodyCallback = unsafe extern "C" fn(*mut ngx_http_request_t);
+
+#[derive(Clone, Copy)]
+struct ClientBodyReadOperation {
+    id: u64,
+    generation: u64,
+    callback: ClientBodyCallback,
+}
+
+enum ClientBodyCallbackState {
+    Current,
+    Stale,
+    Missing,
 }
 
 #[repr(C)]
@@ -1869,7 +1899,8 @@ impl RequestContextRegistry {
         self.first = registration;
     }
 
-    fn cancel_stale(&mut self) {
+    fn cancel_stale(&mut self) -> bool {
+        let mut cancelled = false;
         let mut current = self.first;
         while let Some(registration) = NonNull::new(current) {
             let registration = unsafe { &mut *registration.as_ptr() };
@@ -1878,9 +1909,15 @@ impl RequestContextRegistry {
                 && !ptr::eq(unsafe { *registration.slot.as_ptr() }, registration.context.as_ptr())
             {
                 registration.cancel();
+                cancelled = true;
             }
             current = next;
         }
+        cancelled
+    }
+
+    fn advance_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn cancel_all(&mut self) {
@@ -1930,7 +1967,10 @@ unsafe extern "C" fn terminate_request_context_registry(data: *mut c_void) {
     let registry = data.cast::<RequestContextRegistry>();
     // Normal completion reaches pool cleanup; early termination must cancel delayed owners first.
     if unsafe { (*registry).main.as_ref().terminated() } != 0 {
-        unsafe { (*registry).cancel_all() };
+        unsafe {
+            (*registry).client_body_read = None;
+            (*registry).cancel_all();
+        }
     }
 }
 
@@ -1977,7 +2017,13 @@ fn get_or_create_request_context_registry(
     let registry = unsafe { NonNull::new_unchecked(ptr::addr_of_mut!((*owner.as_ptr()).registry)) };
     unsafe {
         owner.as_ptr().write(RequestContextRegistryOwner {
-            registry: RequestContextRegistry { first: ptr::null_mut(), main },
+            registry: RequestContextRegistry {
+                first: ptr::null_mut(),
+                main,
+                generation: 0,
+                next_client_body_read_id: 0,
+                client_body_read: None,
+            },
             request_cleanup: ngx_http_cleanup_t {
                 handler: Some(terminate_request_context_registry),
                 data: registry.as_ptr().cast(),
@@ -2022,7 +2068,89 @@ fn cancel_stale_request_contexts(raw: NonNull<ngx_http_request_t>) {
     let Some(mut registry) = find_request_context_registry(pool) else {
         return;
     };
-    unsafe { registry.as_mut().cancel_stale() };
+    let registry = unsafe { registry.as_mut() };
+    if registry.cancel_stale() {
+        registry.advance_generation();
+    }
+}
+
+fn advance_request_generation(raw: NonNull<ngx_http_request_t>) {
+    let Some(pool) = NonNull::new(unsafe { raw.as_ref().pool }) else {
+        return;
+    };
+    let Some(mut registry) = find_request_context_registry(pool) else {
+        return;
+    };
+    unsafe { registry.as_mut().advance_generation() };
+}
+
+fn take_client_body_read<H>(raw: NonNull<ngx_http_request_t>) -> ClientBodyCallbackState
+where
+    H: HttpClientBodyHandler,
+{
+    let Some(pool) = NonNull::new(unsafe { raw.as_ref().pool }) else {
+        return ClientBodyCallbackState::Missing;
+    };
+    let Some(mut registry) = find_request_context_registry(pool) else {
+        return ClientBodyCallbackState::Missing;
+    };
+    let registry = unsafe { registry.as_mut() };
+    let Some(operation) = registry.client_body_read.take() else {
+        return ClientBodyCallbackState::Missing;
+    };
+    let expected = raw_client_body_handler::<H> as ClientBodyCallback;
+    if !ptr::fn_addr_eq(operation.callback, expected) {
+        registry.client_body_read = Some(operation);
+        return ClientBodyCallbackState::Missing;
+    }
+    if operation.generation == registry.generation {
+        ClientBodyCallbackState::Current
+    } else {
+        ClientBodyCallbackState::Stale
+    }
+}
+
+fn clear_client_body_read<H>(raw: NonNull<ngx_http_request_t>, id: u64)
+where
+    H: HttpClientBodyHandler,
+{
+    let Some(pool) = NonNull::new(unsafe { raw.as_ref().pool }) else {
+        return;
+    };
+    let Some(mut registry) = find_request_context_registry(pool) else {
+        return;
+    };
+    let registry = unsafe { registry.as_mut() };
+    let expected = raw_client_body_handler::<H> as ClientBodyCallback;
+    if registry.client_body_read.is_some_and(|operation| {
+        operation.id == id && ptr::fn_addr_eq(operation.callback, expected)
+    }) {
+        registry.client_body_read = None;
+    }
+}
+
+fn register_client_body_read<H>(
+    raw: NonNull<ngx_http_request_t>,
+) -> Result<Option<u64>, RequestContextError>
+where
+    H: HttpClientBodyHandler,
+{
+    let request = RequestRef { raw, _callback: PhantomData, _not_thread_safe: PhantomData };
+    let pool = request.pool()?;
+    let main = request.main_raw()?;
+    let (mut registry, _) = get_or_create_request_context_registry(&pool, main)?;
+    let registry = unsafe { registry.as_mut() };
+    if registry.client_body_read.is_some() {
+        return Ok(None);
+    }
+    let id = registry.next_client_body_read_id;
+    registry.next_client_body_read_id = id.wrapping_add(1);
+    registry.client_body_read = Some(ClientBodyReadOperation {
+        id,
+        generation: registry.generation,
+        callback: raw_client_body_handler::<H>,
+    });
+    Ok(Some(id))
 }
 
 fn request_context_generation(raw: NonNull<ngx_http_request_t>) -> *mut RequestContextRegistration {
@@ -3147,16 +3275,34 @@ impl<'callback> RequestRefMut<'callback> {
 
     /// Starts nginx client-body processing with one static callback type.
     ///
-    /// An immediate special response is returned without invoking `H`. The callback's owner keeps
-    /// cancellation state in its pinned request context through [`HttpClientBodyHandler::is_active`].
-    /// The returned token must be released after its status has been handled.
+    /// An immediate special response is returned without invoking `H`. A read already pending
+    /// from this or an older request generation returns [`ClientBodyReadStatus::Again`] without
+    /// calling nginx again. A late callback from an older generation terminates the request rather
+    /// than dispatching `H` against replacement state. The returned token must be released after
+    /// its status has been handled.
     pub fn read_client_body<'request, H: HttpClientBodyHandler>(
         &'request mut self,
     ) -> ClientBodyReadStart<'request> {
-        let status = ClientBodyReadStatus::from_raw(unsafe {
-            ngx_http_read_client_request_body(self.raw.as_ptr(), Some(raw_client_body_handler::<H>))
-        });
-        let release_required = !matches!(&status, ClientBodyReadStatus::Special(_));
+        let (status, release_required) = match register_client_body_read::<H>(self.raw) {
+            Ok(Some(id)) => {
+                let status = ClientBodyReadStatus::from_raw(unsafe {
+                    ngx_http_read_client_request_body(
+                        self.raw.as_ptr(),
+                        Some(raw_client_body_handler::<H>),
+                    )
+                });
+                let release_required = !matches!(&status, ClientBodyReadStatus::Special(_));
+                if matches!(
+                    status,
+                    ClientBodyReadStatus::Special(_) | ClientBodyReadStatus::Error(_)
+                ) {
+                    clear_client_body_read::<H>(self.raw, id);
+                }
+                (status, release_required)
+            }
+            Ok(None) => (ClientBodyReadStatus::Again, false),
+            Err(_) => (ClientBodyReadStatus::Error(Status::NGX_ERROR), false),
+        };
         let request = unsafe { RequestRefMut::from_raw(self.raw.as_ptr()) }
             .expect("a client-body start reborrows its validated request");
         ClientBodyReadStart { request, status, release_required }
@@ -3382,6 +3528,7 @@ impl<'callback> RequestRefMut<'callback> {
         };
 
         let generation = request_context_generation(self.raw);
+        advance_request_generation(self.raw);
         let status = if location.starts_with('@') {
             unsafe { ngx_http_named_location(self.raw.as_ptr(), &raw mut uri) }
         } else {
@@ -4188,6 +4335,9 @@ mod tests {
             BODY_CALLBACKS.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    #[cfg(feature = "test-link")]
+    unsafe extern "C" fn blocked_request_handler(_request: *mut ngx_http_request_t) {}
 
     #[cfg(feature = "test-link")]
     struct PinnedContext {
@@ -7437,6 +7587,67 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
+    fn internal_redirect_rejects_replacement_read_and_stale_body_callback() {
+        let mut fixture = TerminalRequestFixture::new();
+        let mut contexts: [*mut c_void; 1] = [ptr::null_mut()];
+        fixture.request.ctx = contexts.as_mut_ptr();
+        let mut body: ngx_http_request_body_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        body.rest = 1;
+        body.post_handler = Some(raw_client_body_handler::<BodyCallback>);
+        fixture.request.request_body = &raw mut body;
+        BODY_CALLBACKS.store(0, Ordering::Relaxed);
+        BODY_CALLBACK_ACTIVE.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            register_client_body_read::<BodyCallback>(NonNull::from(&mut *fixture.request)),
+            Ok(Some(_))
+        ));
+
+        let mut phase_handlers =
+            Box::new([unsafe { MaybeUninit::<ngx_http_phase_handler_t>::zeroed().assume_init() }]);
+        phase_handlers[0].checker = Some(stop_phase_engine);
+        fixture._main_conf.phase_engine.handlers = phase_handlers.as_mut_ptr();
+        fixture._main_conf.phase_engine.server_rewrite_index = 0;
+        let mut http_context = Box::new(ngx_http_conf_ctx_t {
+            main_conf: fixture._main_conf_slots.as_mut_ptr(),
+            srv_conf: ptr::null_mut(),
+            loc_conf: fixture._loc_conf.as_mut_ptr(),
+        });
+        let mut server =
+            Box::new(unsafe { MaybeUninit::<ngx_http_core_srv_conf_t>::zeroed().assume_init() });
+        server.ctx = &raw mut *http_context;
+        let mut server_slots = Box::new([(&raw mut *server).cast::<c_void>()]);
+        http_context.srv_conf = server_slots.as_mut_ptr();
+        fixture.request.srv_conf = server_slots.as_mut_ptr();
+        fixture.request.set_uri_changes(2);
+
+        let mut request = request_from(&mut fixture.request);
+        assert_eq!(request.internal_redirect("/replacement"), Ok(Status::NGX_DONE));
+        request.finalize(Status::NGX_DONE).unwrap();
+        assert_eq!(fixture.request.count(), 1);
+
+        let mut request = request_from(&mut fixture.request);
+        let start = request.read_client_body::<BodyCallback>();
+        assert_eq!(start.status(), &ClientBodyReadStatus::Again);
+        assert!(!start.release_required);
+        start.release();
+        assert_eq!(fixture.request.count(), 1);
+        assert_eq!(fixture.request.request_body, &raw mut body);
+        assert_eq!(body.rest, 1);
+
+        fixture.request.set_blocked(1);
+        fixture.request.write_event_handler = Some(blocked_request_handler);
+        body.rest = 0;
+        let late_callback = body.post_handler.expect("native body callback");
+        unsafe { late_callback(&raw mut *fixture.request) };
+        assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 0);
+        assert_ne!(fixture.request.terminated(), 0);
+        assert_eq!(fixture.request.count(), 1);
+        fixture.request.set_blocked(0);
+        fixture.request.write_event_handler = None;
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
     fn client_body_read_invokes_once_and_releases_each_start_reference() {
         let mut fixture = TerminalRequestFixture::new();
         fixture.request.headers_in.content_length_n = -1;
@@ -7477,7 +7688,7 @@ mod tests {
             core::mem::size_of::<ngx_http_request_t>()
                 + core::mem::align_of::<ngx_http_request_t>()];
         unsafe { raw_client_body_handler::<BodyCallback>(storage.as_mut_ptr().add(1).cast()) };
-        assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 1);
+        assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 2);
 
         request_from(&mut fixture.request).finalize(Status::NGX_DONE).unwrap();
         fixture.disarm_nginx_pools();
@@ -7519,6 +7730,30 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
+    fn client_body_read_registration_failure_does_not_acquire_native_count() {
+        let _globals = RequestGlobals::new(0, 0);
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        raw.headers_in.content_length_n = -1;
+        BODY_CALLBACKS.store(0, Ordering::Relaxed);
+        unsafe {
+            (*owner.raw).max = 0;
+            ngx_rs_test_fail_allocations_after(0);
+        }
+        let mut request = request_from(&mut raw);
+        let start = request.read_client_body::<BodyCallback>();
+        unsafe { ngx_rs_test_reset_allocation_failures() };
+
+        assert_eq!(start.status(), &ClientBodyReadStatus::Error(Status::NGX_ERROR));
+        assert_eq!(unsafe { start.request.raw.as_ref().count() }, 0);
+        start.release();
+        assert_eq!(raw.count(), 0);
+        assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
     fn client_body_read_propagates_native_special_response_without_callback() {
         let _globals = RequestGlobals::new(0, 0);
         let owner = TestPool::new();
@@ -7527,6 +7762,11 @@ mod tests {
         raw.headers_in.content_length_n = -1;
         BODY_CALLBACKS.store(0, Ordering::Relaxed);
         BODY_CALLBACK_ACTIVE.store(true, Ordering::Relaxed);
+        initialize_request(&mut raw);
+        let id = register_client_body_read::<BodyCallback>(NonNull::from(&mut raw))
+            .unwrap()
+            .expect("body operation");
+        clear_client_body_read::<BodyCallback>(NonNull::from(&mut raw), id);
         unsafe {
             (*owner.raw).max = 0;
             ngx_rs_test_fail_allocations_after(0);
