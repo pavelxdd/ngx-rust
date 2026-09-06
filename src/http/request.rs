@@ -6002,9 +6002,13 @@ mod tests {
 
             assert_eq!(raw.headers_out.content_length_n, 91);
             let request = request_from(&mut raw);
-            let headers = request.headers_out().unwrap().iter().collect::<Vec<_>>();
+            let header_list = request.headers_out().unwrap();
+            let headers = header_list.iter().collect::<Vec<_>>();
             assert_eq!(headers.len(), 1);
-            assert_eq!((headers[0].key(), headers[0].value()), (b"X-Original", b"kept"));
+            assert_eq!(
+                (headers[0].key(), headers[0].value()),
+                (b"X-Original".as_slice(), b"kept".as_slice())
+            );
         }
     }
 
