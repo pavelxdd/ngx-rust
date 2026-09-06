@@ -26,11 +26,17 @@ impl TestPool {
     pub(super) fn pool(&self) -> Pool<'_> {
         unsafe { Pool::from_raw(self.raw) }.unwrap()
     }
+
+    pub(super) fn disarm(&mut self) {
+        self.raw = core::ptr::null_mut();
+    }
 }
 
 #[cfg(feature = "test-link")]
 impl Drop for TestPool {
     fn drop(&mut self) {
-        unsafe { ngx_destroy_pool(self.raw) };
+        if !self.raw.is_null() {
+            unsafe { ngx_destroy_pool(self.raw) };
+        }
     }
 }

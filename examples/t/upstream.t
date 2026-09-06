@@ -72,8 +72,8 @@ $t->stop();
 SKIP: {
 	skip "no --with-debug", 1 unless $t->has_module('--with-debug');
 
-	like($t->read_file('e_debug.log'), qr/CUSTOM UPSTREAM request/,
-		'log - custom upstream');
+	like($t->read_file('e_debug.log'), qr/CUSTOM UPSTREAM request peer init/,
+		'log - native request peer initializer');
 }
 
 ###############################################################################
