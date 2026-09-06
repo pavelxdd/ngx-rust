@@ -8,6 +8,7 @@ use core::pin::Pin;
 use core::ptr::{self, NonNull};
 use core::slice;
 use core::str::FromStr;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::collections::{NgxList, list::NgxListIter};
 use crate::core::*;
@@ -503,6 +504,8 @@ pub enum RequestTempFileError {
     Request(RequestError),
     /// The HTTP core module configuration could not be resolved.
     Configuration(HttpConfigError),
+    /// The request owner registry could not be created.
+    Owner(RequestContextError),
     /// Nginx did not install a core location configuration for this request.
     MissingCoreLocationConfiguration,
     /// The core location configuration has no client-body temporary path.
@@ -532,7 +535,7 @@ pub enum RequestTempFileError {
         /// Number of bytes reported as written by nginx.
         written: usize,
     },
-    /// The state belongs to a different nginx request.
+    /// The handle belongs to a different request owner or generation.
     ForeignRequest,
     /// The live temporary file has no matching request-pool cleanup.
     MissingCleanup,
@@ -547,6 +550,12 @@ impl From<RequestError> for RequestTempFileError {
 impl From<HttpConfigError> for RequestTempFileError {
     fn from(error: HttpConfigError) -> Self {
         Self::Configuration(error)
+    }
+}
+
+impl From<RequestContextError> for RequestTempFileError {
+    fn from(error: RequestContextError) -> Self {
+        Self::Owner(error)
     }
 }
 
@@ -568,19 +577,30 @@ impl From<BufferError> for RequestTempFileError {
 /// cleanup, and creates its file descriptor only when a nonempty memory buffer is appended.
 /// File-backed input is copied into the returned request-pool chain without a second disk write.
 pub struct RequestTempFile<'callback> {
-    state: RequestTempFileState,
+    state: RequestTempFileHandle,
     pool: Pool<'callback>,
 }
 
-/// Request-pool state for a temporary file retained across HTTP callbacks.
-///
-/// Store this only in a request-pool context. Every append requires the same current request and
-/// returns callback-scoped output.
-pub struct RequestTempFileState {
-    request: NonNull<ngx_http_request_t>,
-    pool: *mut ngx_pool_t,
+struct RequestTempFileState {
     path: NonNull<ngx_path_t>,
     log: NonNull<ngx_log_t>,
+}
+
+/// Checked handle for request-pool temporary-file state retained across HTTP callbacks.
+///
+/// Store this handle in a request-pool context. Every operation verifies the current request owner
+/// and generation before accessing the private pool-backed state, and returns callback-scoped
+/// output.
+///
+/// ```compile_fail
+/// use ngx::http::RequestTempFileState;
+/// ```
+pub struct RequestTempFileHandle {
+    request: NonNull<ngx_http_request_t>,
+    pool: *mut ngx_pool_t,
+    owner: usize,
+    generation: u64,
+    state: RequestTempFileState,
     temp_file: Option<NonNull<ngx_temp_file_t>>,
     _not_thread_safe: PhantomData<*mut ()>,
 }
@@ -1170,7 +1190,7 @@ static REQUEST_TEMP_FILE_WARNING: &[u8] = b"an HTTP body is buffered to a tempor
 impl<'request> RequestTempFile<'request> {
     fn new(request: &'request RequestRefMut<'_>) -> Result<Self, RequestTempFileError> {
         let pool = request.pool()?;
-        let state = RequestTempFileState::new(request)?;
+        let state = RequestTempFileHandle::new(request)?;
         Ok(Self { state, pool })
     }
 
@@ -1187,7 +1207,7 @@ impl<'request> RequestTempFile<'request> {
     }
 }
 
-impl RequestTempFileState {
+impl RequestTempFileHandle {
     fn new(request: &RequestRefMut<'_>) -> Result<Self, RequestTempFileError> {
         let pool = request.pool()?;
         let request_view = request.view();
@@ -1201,11 +1221,19 @@ impl RequestTempFileState {
         }
         let log = request.log()?.ok_or(RequestTempFileError::MissingLog)?;
 
+        let main = request_view.main_raw()?;
+        let (registry, _) = get_or_create_request_context_registry(&pool, main)?;
+        let registry = unsafe { registry.as_ref() };
+
         Ok(Self {
             request: request.raw,
             pool: pool.as_ptr(),
-            path,
-            log: NonNull::new(log.as_ptr()).expect("request logger"),
+            owner: registry.owner,
+            generation: registry.generation,
+            state: RequestTempFileState {
+                path,
+                log: NonNull::new(log.as_ptr()).expect("request logger"),
+            },
             temp_file: None,
             _not_thread_safe: PhantomData,
         })
@@ -1405,8 +1433,8 @@ impl RequestTempFileState {
         unsafe {
             let temp_file_ref = temp_file.as_mut();
             temp_file_ref.file.fd = NGX_INVALID_FILE as _;
-            temp_file_ref.file.log = self.log.as_ptr();
-            temp_file_ref.path = self.path.as_ptr();
+            temp_file_ref.file.log = self.state.log.as_ptr();
+            temp_file_ref.path = self.state.path.as_ptr();
             temp_file_ref.pool = self.pool;
             temp_file_ref.warn = REQUEST_TEMP_FILE_WARNING.as_ptr().cast_mut();
             temp_file_ref.access = 0o600;
@@ -1422,7 +1450,18 @@ impl RequestTempFileState {
         request: &'request RequestRefMut<'_>,
     ) -> Result<Pool<'request>, RequestTempFileError> {
         let pool = request.pool()?;
-        if self.request != request.raw || self.pool != pool.as_ptr() {
+        let Some(registry) = find_request_context_registry(
+            NonNull::new(pool.as_ptr()).expect("checked request pool must have a pointer"),
+        ) else {
+            return Err(RequestTempFileError::ForeignRequest);
+        };
+        let registry = unsafe { registry.as_ref() };
+        if registry.has_stale()
+            || self.owner != registry.owner
+            || self.generation != registry.generation
+            || self.request != request.raw
+            || self.pool != pool.as_ptr()
+        {
             return Err(RequestTempFileError::ForeignRequest);
         }
 
@@ -1853,10 +1892,13 @@ fn decimal_bytes(mut value: usize, buffer: &mut [u8]) -> &[u8] {
     }
 }
 
+static NEXT_REQUEST_OWNER: AtomicUsize = AtomicUsize::new(1);
+
 #[repr(C)]
 struct RequestContextRegistry {
     first: *mut RequestContextRegistration,
     main: NonNull<ngx_http_request_t>,
+    owner: usize,
     generation: u64,
     next_client_body_read_id: u64,
     client_body_read: Option<ClientBodyReadOperation>,
@@ -1897,6 +1939,20 @@ impl RequestContextRegistry {
     fn insert(&mut self, registration: &mut RequestContextRegistration) {
         registration.next = self.first;
         self.first = registration;
+    }
+
+    fn has_stale(&self) -> bool {
+        let mut current = self.first;
+        while let Some(registration) = NonNull::new(current) {
+            let registration = unsafe { registration.as_ref() };
+            if registration.active
+                && !ptr::eq(unsafe { *registration.slot.as_ptr() }, registration.context.as_ptr())
+            {
+                return true;
+            }
+            current = registration.next;
+        }
+        false
     }
 
     fn cancel_stale(&mut self) -> bool {
@@ -2007,6 +2063,9 @@ fn get_or_create_request_context_registry(
         return Ok((registry, false));
     }
 
+    let identity = NEXT_REQUEST_OWNER
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |owner| owner.checked_add(1))
+        .map_err(|_| RequestContextError::Allocation)?;
     let cleanup = NonNull::new(unsafe {
         ngx_pool_cleanup_add(raw.as_ptr(), mem::size_of::<RequestContextRegistryOwner>())
     })
@@ -2020,6 +2079,7 @@ fn get_or_create_request_context_registry(
             registry: RequestContextRegistry {
                 first: ptr::null_mut(),
                 main,
+                owner: identity,
                 generation: 0,
                 next_client_body_read_id: 0,
                 client_body_read: None,
@@ -3251,12 +3311,12 @@ impl<'callback> RequestRefMut<'callback> {
         RequestTempFile::new(self)
     }
 
-    /// Creates request-pool state for a temporary file retained by a module context.
+    /// Creates a checked handle for temporary-file state retained by a request-pool context.
     ///
-    /// The state can be reused by later callbacks for this request; each append still requires a
+    /// The handle can be reused by later callbacks for this request; each append still requires a
     /// current callback-scoped request view and returns callback-scoped output.
-    pub fn temp_file_state(&self) -> Result<RequestTempFileState, RequestTempFileError> {
-        RequestTempFileState::new(self)
+    pub fn temp_file_state(&self) -> Result<RequestTempFileHandle, RequestTempFileError> {
+        RequestTempFileHandle::new(self)
     }
 
     /// Starts constructing a complete request-pool body and framing-header replacement.
@@ -6553,16 +6613,24 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
-    fn temp_file_state_reuses_one_file_across_callback_scopes() {
+    fn temp_file_state_reuses_one_pool_owned_handle_across_callback_scopes() {
         let mut fixture = TempFileFixture::new();
-        let mut state = request_from(&mut fixture.request).temp_file_state().unwrap();
+        let mut state = {
+            let request = request_from(&mut fixture.request);
+            let pool = request.pool().unwrap();
+            pool.allocate_with_cleanup(|| request.temp_file_state().unwrap())
+                .unwrap()
+                .into_non_null()
+        };
 
         let first = unsafe {
             RequestRefMut::with_raw(&raw mut fixture.request, |request| {
                 let pool = request.pool().unwrap();
                 let input = pool.copy_buffer(b"one", BufferFlags::default()).unwrap();
-                let output =
-                    state.append_buffer(&request, input.view(), input.view().flags()).unwrap();
+                let output = state
+                    .as_mut()
+                    .append_buffer(&request, input.view(), input.view().flags())
+                    .unwrap();
                 let file = output.iter().next().unwrap().unwrap().file().unwrap().unwrap();
                 (file.start(), file.end())
             })
@@ -6573,21 +6641,33 @@ mod tests {
             RequestRefMut::with_raw(&raw mut fixture.request, |request| {
                 let pool = request.pool().unwrap();
                 let input = pool.copy_buffer(b"two", BufferFlags::default()).unwrap();
-                let output =
-                    state.append_buffer(&request, input.view(), input.view().flags()).unwrap();
+                let output = state
+                    .as_mut()
+                    .append_buffer(&request, input.view(), input.view().flags())
+                    .unwrap();
                 let file = output.iter().next().unwrap().unwrap().file().unwrap().unwrap();
                 (file.start(), file.end())
             })
         }
         .unwrap();
 
-        let temp = state.temp_file.unwrap();
+        let temp = unsafe { state.as_ref().temp_file.unwrap() };
         let native = unsafe { temp.as_ref() };
         assert_eq!(first, (0, 3));
         assert_eq!(second, (3, 6));
         assert_eq!(native.offset, 6);
         #[cfg(unix)]
         assert_eq!(temp_file_bytes(native), b"onetwo");
+        let path = temp_file_path(native);
+        #[cfg(unix)]
+        let fd = native.file.fd;
+
+        let TempFileFixture { pool, temp_dir, .. } = fixture;
+        drop(pool);
+        assert!(!path.exists());
+        #[cfg(unix)]
+        assert_eq!(unsafe { fcntl(fd, F_GETFD) }, -1);
+        drop(temp_dir);
     }
 
     #[cfg(feature = "test-link")]
@@ -6726,6 +6806,53 @@ mod tests {
             Err(RequestTempFileError::ForeignRequest)
         ));
         assert!(state.temp_file.is_none());
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn temp_file_handle_rejects_stale_generation_before_pool_state_access() {
+        let mut fixture = TempFileFixture::new();
+        let mut state = request_from(&mut fixture.request).temp_file_state().unwrap();
+        advance_request_generation(state.request);
+        state.state.path = NonNull::dangling();
+        state.state.log = NonNull::dangling();
+        state.temp_file = Some(NonNull::dangling());
+        let request = request_from(&mut fixture.request);
+        let pool = request.pool().unwrap();
+        let input = pool.control_buffer(BufferFlags::default()).unwrap();
+
+        assert!(matches!(
+            state.append_buffer(&request, input.view(), input.view().flags()),
+            Err(RequestTempFileError::ForeignRequest)
+        ));
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn temp_file_handle_rejects_replaced_owner_at_the_same_request_addresses() {
+        let mut fixture = TempFileFixture::new();
+        let mut state = request_from(&mut fixture.request).temp_file_state().unwrap();
+        let pool = unsafe { Pool::from_raw(fixture.pool.raw) }.unwrap();
+        let main = NonNull::new(&raw mut fixture.request).unwrap();
+        let registry = find_request_context_registry(NonNull::new(pool.as_ptr()).unwrap()).unwrap();
+        let original_owner = unsafe { registry.as_ref().owner };
+        remove_request_context_registry(&pool, registry, main);
+        let (replacement, created) = get_or_create_request_context_registry(&pool, main).unwrap();
+        assert!(created);
+        assert_ne!(unsafe { replacement.as_ref().owner }, original_owner);
+        assert_eq!(state.request, main);
+        assert_eq!(state.pool, fixture.pool.raw);
+
+        state.state.path = NonNull::dangling();
+        state.state.log = NonNull::dangling();
+        state.temp_file = Some(NonNull::dangling());
+        let request = request_from(&mut fixture.request);
+        let input = pool.control_buffer(BufferFlags::default()).unwrap();
+
+        assert!(matches!(
+            state.append_buffer(&request, input.view(), input.view().flags()),
+            Err(RequestTempFileError::ForeignRequest)
+        ));
     }
 
     #[cfg(feature = "test-link")]

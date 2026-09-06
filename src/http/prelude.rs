@@ -24,7 +24,7 @@ pub use crate::http::{
     RequestBodyBuilder, RequestBodyError, RequestBodyRef, RequestBodySize,
     RequestContextCreateError, RequestContextError, RequestContinuation, RequestContinuationError,
     RequestError, RequestHold, RequestHoldError, RequestPhaseResumeError, RequestRef,
-    RequestRefMut, RequestTempFile, RequestTempFileError, RequestTempFileState,
+    RequestRefMut, RequestTempFile, RequestTempFileError, RequestTempFileHandle,
     SelectedUpstreamPeer, UpstreamAddress, UpstreamAddresses, UpstreamCallbackError,
     UpstreamCallbackSlot, UpstreamConfiguration, UpstreamInitStatus, UpstreamInitialization,
     UpstreamInitialized, UpstreamPeerConnection, UpstreamPeerInit, UpstreamPeerInitRequest,
