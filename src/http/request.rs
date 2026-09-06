@@ -10,7 +10,7 @@ use core::slice;
 use core::str::FromStr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::collections::{NgxList, list::NgxListIter};
+use crate::collections::{NgxList, list::NgxListRawIter};
 use crate::core::*;
 #[cfg(feature = "async")]
 use crate::event::PostedQueue;
@@ -864,41 +864,64 @@ impl HttpHeaderRef<'_> {
     }
 }
 
-/// Checked byte-oriented view over an nginx HTTP header list.
+#[derive(Clone, Copy, Debug)]
+enum HttpHeaderSource {
+    Input,
+    Output,
+}
+
+/// Checked byte-oriented view over enabled entries in an nginx HTTP header list.
 #[derive(Debug)]
 pub struct HttpHeaderList<'header> {
-    headers: &'header NgxList<ngx_table_elt_t>,
+    headers: &'header ngx_list_t,
+    source: HttpHeaderSource,
+    len: usize,
 }
 
 impl HttpHeaderList<'_> {
-    /// Returns the total number of entries across all nginx list parts.
+    /// Returns the number of enabled entries across all nginx list parts.
     pub fn len(&self) -> usize {
-        self.headers.len()
+        self.len
     }
 
-    /// Returns whether the list contains no entries.
+    /// Returns whether the list contains no enabled entries.
     pub fn is_empty(&self) -> bool {
-        self.headers.is_empty()
+        self.len == 0
     }
 
-    /// Iterates over checked byte-oriented header entries in list order.
+    /// Iterates over checked enabled header entries in list order.
     pub fn iter(&self) -> HttpHeaderIter<'_> {
-        HttpHeaderIter(self.headers.iter())
+        let headers = unsafe { NgxList::<ngx_table_elt_t>::raw_iter(self.headers) }
+            .expect("validated HTTP header list");
+        HttpHeaderIter { headers, source: self.source, remaining: self.len }
     }
 }
 
-/// Iterator over [`HttpHeaderList`] entries.
-pub struct HttpHeaderIter<'header>(NgxListIter<'header, ngx_table_elt_t>);
+/// Iterator over enabled [`HttpHeaderList`] entries.
+pub struct HttpHeaderIter<'header> {
+    headers: NgxListRawIter<'header, ngx_table_elt_t>,
+    source: HttpHeaderSource,
+    remaining: usize,
+}
 
 impl<'header> Iterator for HttpHeaderIter<'header> {
     type Item = HttpHeaderRef<'header>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().map(|header| unsafe { http_header_from_raw(header) })
+        for header in self.headers.by_ref() {
+            let hash = unsafe { ptr::addr_of!((*header.as_ptr()).hash).read() };
+            if hash == 0 {
+                continue;
+            }
+
+            self.remaining -= 1;
+            return Some(unsafe { http_header_from_raw(header, self.source, hash) });
+        }
+        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.0.size_hint()
+        (self.remaining, Some(self.remaining))
     }
 }
 
@@ -1526,23 +1549,30 @@ fn check_temp_file_write(expected: usize, written: isize) -> Result<(), RequestT
     Ok(())
 }
 
-fn checked_header_list(headers: &ngx_list_t) -> Result<HttpHeaderList<'_>, HeaderListError> {
-    let headers = unsafe { NgxList::<ngx_table_elt_t>::from_ngx_list(headers) }
+fn checked_header_list(
+    headers: &ngx_list_t,
+    source: HttpHeaderSource,
+) -> Result<HttpHeaderList<'_>, HeaderListError> {
+    let entries = unsafe { NgxList::<ngx_table_elt_t>::raw_iter(headers) }
         .ok_or(HeaderListError::InvalidList)?;
-    for header in headers.iter() {
+    let mut len = 0_usize;
+    for header in entries {
+        let hash = unsafe { ptr::addr_of!((*header.as_ptr()).hash).read() };
+        if hash == 0 {
+            continue;
+        }
+
+        let key = unsafe { ptr::addr_of!((*header.as_ptr()).key).read() };
+        checked_header_bytes(key, HeaderListError::MissingKeyData, HeaderListError::KeyTooLong)?;
         checked_header_bytes(
-            header.key,
-            HeaderListError::MissingKeyData,
-            HeaderListError::KeyTooLong,
-        )?;
-        checked_header_bytes(
-            header.value,
+            unsafe { ptr::addr_of!((*header.as_ptr()).value).read() },
             HeaderListError::MissingValueData,
             HeaderListError::ValueTooLong,
         )?;
+        len = len.checked_add(1).ok_or(HeaderListError::InvalidList)?;
     }
 
-    Ok(HttpHeaderList { headers })
+    Ok(HttpHeaderList { headers, source, len })
 }
 
 fn checked_header_bytes<'header>(
@@ -1561,13 +1591,29 @@ fn checked_header_bytes<'header>(
     Ok(unsafe { slice::from_raw_parts(data.as_ptr(), value.len) })
 }
 
-unsafe fn http_header_from_raw(header: &ngx_table_elt_t) -> HttpHeaderRef<'_> {
-    let key = unsafe { header_bytes_unchecked(header.key) };
-    let value = unsafe { header_bytes_unchecked(header.value) };
-    let lowercase_key = NonNull::new(header.lowcase_key)
-        .map(|key| unsafe { slice::from_raw_parts(key.as_ptr(), header.key.len) });
+unsafe fn http_header_from_raw<'header>(
+    header: NonNull<ngx_table_elt_t>,
+    source: HttpHeaderSource,
+    hash: ngx_uint_t,
+) -> HttpHeaderRef<'header> {
+    let key = unsafe { ptr::addr_of!((*header.as_ptr()).key).read() };
+    let value = unsafe { ptr::addr_of!((*header.as_ptr()).value).read() };
+    let lowercase_key = match source {
+        HttpHeaderSource::Input => {
+            let lowercase_key = unsafe { ptr::addr_of!((*header.as_ptr()).lowcase_key).read() };
+            NonNull::new(lowercase_key).map(|lowercase_key| unsafe {
+                slice::from_raw_parts(lowercase_key.as_ptr(), key.len)
+            })
+        }
+        HttpHeaderSource::Output => None,
+    };
 
-    HttpHeaderRef { key, value, lowercase_key, hash: header.hash }
+    HttpHeaderRef {
+        key: unsafe { header_bytes_unchecked(key) },
+        value: unsafe { header_bytes_unchecked(value) },
+        lowercase_key,
+        hash,
+    }
 }
 
 unsafe fn header_bytes_unchecked<'header>(value: ngx_str_t) -> &'header [u8] {
@@ -1606,15 +1652,23 @@ fn clone_header_list(
     source: &ngx_list_t,
     additional_capacity: usize,
 ) -> Result<ngx_list_t, HeaderBuildError> {
-    let source = checked_header_list(source).map_err(HeaderBuildError::InvalidSource)?;
+    let source = checked_header_list(source, HttpHeaderSource::Output)
+        .map_err(HeaderBuildError::InvalidSource)?;
     let capacity =
         source.len().checked_add(additional_capacity).ok_or(HeaderBuildError::CountOverflow)?;
     let mut candidate = create_header_list(pool, capacity)?;
-    for header in source.headers.iter() {
-        repair_header_list_last(&mut candidate);
-        let target = NonNull::new(unsafe { ngx_list_push(&raw mut candidate).cast() })
-            .ok_or(HeaderBuildError::Allocation)?;
-        unsafe { ptr::copy_nonoverlapping(header, target.as_ptr(), 1) };
+    for header in source.iter() {
+        let value = ngx_table_elt_t {
+            hash: header.hash(),
+            key: ngx_str_t { len: header.key().len(), data: header.key().as_ptr().cast_mut() },
+            value: ngx_str_t {
+                len: header.value().len(),
+                data: header.value().as_ptr().cast_mut(),
+            },
+            lowcase_key: ptr::null_mut(),
+            next: ptr::null_mut(),
+        };
+        append_header(&mut candidate, value)?;
     }
     Ok(candidate)
 }
@@ -1653,6 +1707,17 @@ fn build_pool_header(
     Ok(ngx_table_elt_t { hash, key, value, lowcase_key, next: ptr::null_mut() })
 }
 
+fn append_header(
+    headers: &mut ngx_list_t,
+    value: ngx_table_elt_t,
+) -> Result<NonNull<ngx_table_elt_t>, HeaderBuildError> {
+    repair_header_list_last(headers);
+    let header = NonNull::new(unsafe { ngx_list_push(headers).cast::<ngx_table_elt_t>() })
+        .ok_or(HeaderBuildError::Allocation)?;
+    unsafe { header.write(value) };
+    Ok(header)
+}
+
 fn append_pool_header(
     headers: &mut ngx_list_t,
     pool: *mut ngx_pool_t,
@@ -1660,11 +1725,7 @@ fn append_pool_header(
     value: &[u8],
 ) -> Result<NonNull<ngx_table_elt_t>, HeaderBuildError> {
     let value = build_pool_header(pool, key, value)?;
-    repair_header_list_last(headers);
-    let header = NonNull::new(unsafe { ngx_list_push(headers).cast::<ngx_table_elt_t>() })
-        .ok_or(HeaderBuildError::Allocation)?;
-    unsafe { header.write(value) };
-    Ok(header)
+    append_header(headers, value)
 }
 
 fn repair_header_list_last(headers: &mut ngx_list_t) {
@@ -1807,20 +1868,32 @@ fn clear_headers_out_metadata(headers: &mut ngx_http_headers_out_t) {
     headers.trailers.last = &raw mut headers.trailers.part;
 }
 
-fn disable_output_framing_headers(
-    headers: &mut ngx_http_headers_out_t,
+fn disable_framing_headers(
+    headers: &mut ngx_list_t,
+    source: HttpHeaderSource,
 ) -> Result<(), HeaderListError> {
-    checked_header_list(&headers.headers)?;
-    let list = unsafe { NgxList::<ngx_table_elt_t>::from_ngx_list_mut(&mut headers.headers) }
+    checked_header_list(headers, source)?;
+    let entries = unsafe { NgxList::<ngx_table_elt_t>::raw_iter_mut(headers) }
         .ok_or(HeaderListError::InvalidList)?;
-    for header in list.iter_mut() {
-        let key = unsafe { header_bytes_unchecked(header.key) };
+    for header in entries {
+        let hash = unsafe { ptr::addr_of!((*header.as_ptr()).hash).read() };
+        if hash == 0 {
+            continue;
+        }
+        let key = unsafe { header_bytes_unchecked(ptr::addr_of!((*header.as_ptr()).key).read()) };
         if key.eq_ignore_ascii_case(b"Content-Length")
             || key.eq_ignore_ascii_case(b"Transfer-Encoding")
         {
-            header.hash = 0;
+            unsafe { ptr::addr_of_mut!((*header.as_ptr()).hash).write(0) };
         }
     }
+    Ok(())
+}
+
+fn disable_output_framing_headers(
+    headers: &mut ngx_http_headers_out_t,
+) -> Result<(), HeaderListError> {
+    disable_framing_headers(&mut headers.headers, HttpHeaderSource::Output)?;
     headers.content_length = ptr::null_mut();
     Ok(())
 }
@@ -1855,23 +1928,8 @@ fn publish_request_body_framing(
 ) -> Result<(), RequestBodyBuildError> {
     let request = unsafe { request.raw.as_mut() };
     let headers = &mut request.headers_in;
-    let list = unsafe { NgxList::<ngx_table_elt_t>::from_ngx_list_mut(&mut headers.headers) }
-        .ok_or(HeaderListError::InvalidList)?;
-    let content_length = NonNull::from(
-        list.push(candidate.content_length).map_err(|_| HeaderBuildError::Allocation)?,
-    );
-
-    for header in list.iter_mut() {
-        if ptr::eq(header, content_length.as_ptr()) {
-            continue;
-        }
-        let key = unsafe { header_bytes_unchecked(header.key) };
-        if key.eq_ignore_ascii_case(b"Content-Length")
-            || key.eq_ignore_ascii_case(b"Transfer-Encoding")
-        {
-            header.hash = 0;
-        }
-    }
+    disable_framing_headers(&mut headers.headers, HttpHeaderSource::Input)?;
+    let content_length = append_header(&mut headers.headers, candidate.content_length)?;
 
     headers.content_length = content_length.as_ptr();
     headers.transfer_encoding = ptr::null_mut();
@@ -1889,17 +1947,7 @@ fn replace_request_body_framing(
 ) -> Result<(), RequestBodyBuildError> {
     let content_length =
         off_t::try_from(length).map_err(|_| RequestBodyBuildError::ContentLengthTooLarge)?;
-    repair_header_list_last(&mut headers.headers);
-    let list = unsafe { NgxList::<ngx_table_elt_t>::from_ngx_list_mut(&mut headers.headers) }
-        .ok_or(HeaderListError::InvalidList)?;
-    for header in list.iter_mut() {
-        let key = unsafe { header_bytes_unchecked(header.key) };
-        if key.eq_ignore_ascii_case(b"Content-Length")
-            || key.eq_ignore_ascii_case(b"Transfer-Encoding")
-        {
-            header.hash = 0;
-        }
-    }
+    disable_framing_headers(&mut headers.headers, HttpHeaderSource::Input)?;
 
     headers.content_length = ptr::null_mut();
     headers.transfer_encoding = ptr::null_mut();
@@ -2646,7 +2694,10 @@ impl<'callback> RequestRef<'callback> {
 
     /// Returns a checked byte-oriented view over input headers.
     pub fn headers_in(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
-        checked_header_list(unsafe { &self.raw.as_ref().headers_in.headers })
+        checked_header_list(
+            unsafe { &self.raw.as_ref().headers_in.headers },
+            HttpHeaderSource::Input,
+        )
     }
 
     /// Returns a checked callback-scoped view over the current request body, when nginx has one.
@@ -2661,12 +2712,18 @@ impl<'callback> RequestRef<'callback> {
 
     /// Returns a checked byte-oriented view over output headers.
     pub fn headers_out(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
-        checked_header_list(unsafe { &self.raw.as_ref().headers_out.headers })
+        checked_header_list(
+            unsafe { &self.raw.as_ref().headers_out.headers },
+            HttpHeaderSource::Output,
+        )
     }
 
     /// Returns a checked byte-oriented view over output trailers.
     pub fn trailers_out(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
-        checked_header_list(unsafe { &self.raw.as_ref().headers_out.trailers })
+        checked_header_list(
+            unsafe { &self.raw.as_ref().headers_out.trailers },
+            HttpHeaderSource::Output,
+        )
     }
 
     /// Returns the active upstream pointer for an explicit nginx FFI operation.
@@ -3298,12 +3355,18 @@ impl<'callback> RequestRefMut<'callback> {
 
     /// Returns a checked byte-oriented view over input headers.
     pub fn headers_in(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
-        checked_header_list(unsafe { &self.raw.as_ref().headers_in.headers })
+        checked_header_list(
+            unsafe { &self.raw.as_ref().headers_in.headers },
+            HttpHeaderSource::Input,
+        )
     }
 
     /// Returns a checked byte-oriented view over output headers.
     pub fn headers_out(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
-        checked_header_list(unsafe { &self.raw.as_ref().headers_out.headers })
+        checked_header_list(
+            unsafe { &self.raw.as_ref().headers_out.headers },
+            HttpHeaderSource::Output,
+        )
     }
 
     /// Starts constructing a raw replacement input-header list in the request pool.
@@ -3452,7 +3515,10 @@ impl<'callback> RequestRefMut<'callback> {
 
     /// Returns a checked byte-oriented view over output trailers.
     pub fn trailers_out(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
-        checked_header_list(unsafe { &self.raw.as_ref().headers_out.trailers })
+        checked_header_list(
+            unsafe { &self.raw.as_ref().headers_out.trailers },
+            HttpHeaderSource::Output,
+        )
     }
 
     /// Returns the active upstream pointer for an explicit nginx FFI operation.
@@ -4061,29 +4127,35 @@ where
     .unwrap_or(NGX_ERROR as _)
 }
 
-/// Iterator for [`ngx_list_t`] types.
-///
-/// Implementes the core::iter::Iterator trait.
-pub struct NgxListIterator<'a>(NgxListIter<'a, ngx_table_elt_t>);
+/// Iterator over enabled HTTP headers in an [`ngx_list_t`].
+pub struct NgxListIterator<'a>(NgxListRawIter<'a, ngx_table_elt_t>);
 
-/// Creates new HTTP header iterator
+/// Creates a new HTTP header iterator.
 ///
 /// # Safety
 ///
-/// The list parts must be valid and contain initialized [`ngx_table_elt_t`] values whose key and
-/// value strings remain valid for the returned borrow.
+/// The list parts and element slots must be valid. Every entry's `hash` must be initialized, and
+/// enabled entries must have initialized key and value strings that remain valid for the returned
+/// borrow. Disabled entries may leave all other fields uninitialized.
 pub unsafe fn list_iterator(list: &ngx_list_t) -> NgxListIterator<'_> {
-    let list = unsafe { NgxList::from_ngx_list(list) }.expect("HTTP header list type");
-    NgxListIterator(list.iter())
+    let headers = unsafe { NgxList::raw_iter(list) }.expect("HTTP header list type");
+    NgxListIterator(headers)
 }
 
-// iterator for ngx_list_t
 impl<'a> Iterator for NgxListIterator<'a> {
     type Item = (&'a NgxStr, &'a NgxStr);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let header = self.0.next()?;
-        unsafe { Some((NgxStr::from_ngx_str(header.key), NgxStr::from_ngx_str(header.value))) }
+        for header in self.0.by_ref() {
+            let hash = unsafe { ptr::addr_of!((*header.as_ptr()).hash).read() };
+            if hash == 0 {
+                continue;
+            }
+            let key = unsafe { ptr::addr_of!((*header.as_ptr()).key).read() };
+            let value = unsafe { ptr::addr_of!((*header.as_ptr()).value).read() };
+            return unsafe { Some((NgxStr::from_ngx_str(key), NgxStr::from_ngx_str(value))) };
+        }
+        None
     }
 }
 
@@ -5245,8 +5317,10 @@ mod tests {
     #[test]
     fn header_iterator_returns_keys_and_values() {
         let mut headers: [ngx_table_elt_t; 2] = unsafe { MaybeUninit::zeroed().assume_init() };
+        headers[0].hash = 1;
         headers[0].key = crate::ngx_string!("X-First");
         headers[0].value = crate::ngx_string!("one");
+        headers[1].hash = 1;
         headers[1].key = crate::ngx_string!("X-Second");
         headers[1].value = crate::ngx_string!("two");
 
@@ -5271,32 +5345,24 @@ mod tests {
     }
 
     #[test]
-    fn checked_header_views_keep_raw_bytes_parts_and_disabled_entries() {
+    fn checked_header_views_keep_raw_bytes_and_skip_disabled_entries() {
         let input_key = [b'X', b'-', 0xff];
         let input_value = [0, 0xff];
         let input_lowcase = [b'x', b'-', 0xff];
-        let mut input_headers: [ngx_table_elt_t; 1] =
-            unsafe { MaybeUninit::zeroed().assume_init() };
-        input_headers[0].hash = 17;
-        input_headers[0].key =
-            ngx_str_t { len: input_key.len(), data: input_key.as_ptr().cast_mut() };
-        input_headers[0].value =
-            ngx_str_t { len: input_value.len(), data: input_value.as_ptr().cast_mut() };
-        input_headers[0].lowcase_key = input_lowcase.as_ptr().cast_mut();
+        let mut input_headers = [MaybeUninit::<ngx_table_elt_t>::uninit()];
+        let input_header = input_headers[0].as_mut_ptr();
+        unsafe {
+            ptr::addr_of_mut!((*input_header).hash).write(17);
+            ptr::addr_of_mut!((*input_header).key)
+                .write(ngx_str_t { len: input_key.len(), data: input_key.as_ptr().cast_mut() });
+            ptr::addr_of_mut!((*input_header).value)
+                .write(ngx_str_t { len: input_value.len(), data: input_value.as_ptr().cast_mut() });
+            ptr::addr_of_mut!((*input_header).lowcase_key).write(input_lowcase.as_ptr().cast_mut());
+        }
 
-        let mut empty_headers: [ngx_table_elt_t; 1] =
-            unsafe { MaybeUninit::zeroed().assume_init() };
-        let disabled_key = *b"X-Disabled";
-        let disabled_value = [0xff, b'!'];
-        let disabled_lowcase = *b"x-disabled";
-        let mut disabled_headers: [ngx_table_elt_t; 1] =
-            unsafe { MaybeUninit::zeroed().assume_init() };
-        disabled_headers[0].hash = 0;
-        disabled_headers[0].key =
-            ngx_str_t { len: disabled_key.len(), data: disabled_key.as_ptr().cast_mut() };
-        disabled_headers[0].value =
-            ngx_str_t { len: disabled_value.len(), data: disabled_value.as_ptr().cast_mut() };
-        disabled_headers[0].lowcase_key = disabled_lowcase.as_ptr().cast_mut();
+        let mut empty_headers = [MaybeUninit::<ngx_table_elt_t>::uninit()];
+        let mut disabled_headers = [MaybeUninit::<ngx_table_elt_t>::uninit()];
+        unsafe { ptr::addr_of_mut!((*disabled_headers[0].as_mut_ptr()).hash).write(0) };
 
         let mut disabled_part = ngx_list_part_t {
             elts: disabled_headers.as_mut_ptr().cast(),
@@ -5324,28 +5390,26 @@ mod tests {
         let request = request_from(&mut raw);
         let input = request.headers_in().unwrap();
         let headers: Vec<_> = input.iter().collect();
-        assert_eq!(headers.len(), 2);
+        assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].key(), input_key);
         assert_eq!(headers[0].value(), input_value);
         assert_eq!(headers[0].lowercase_key(), Some(input_lowcase.as_slice()));
         assert_eq!(headers[0].hash(), 17);
         assert!(headers[0].is_enabled());
-        assert_eq!(headers[1].key(), disabled_key);
-        assert_eq!(headers[1].value(), disabled_value);
-        assert_eq!(headers[1].lowercase_key(), Some(disabled_lowcase.as_slice()));
-        assert!(!headers[1].is_enabled());
 
         let output_key = [b'Y', 0xfe];
         let output_value = [0xff, b'!'];
-        let output_lowcase = [b'y', 0xfe];
-        let mut output_headers: [ngx_table_elt_t; 1] =
-            unsafe { MaybeUninit::zeroed().assume_init() };
-        output_headers[0].hash = 23;
-        output_headers[0].key =
-            ngx_str_t { len: output_key.len(), data: output_key.as_ptr().cast_mut() };
-        output_headers[0].value =
-            ngx_str_t { len: output_value.len(), data: output_value.as_ptr().cast_mut() };
-        output_headers[0].lowcase_key = output_lowcase.as_ptr().cast_mut();
+        let mut output_headers = [MaybeUninit::<ngx_table_elt_t>::uninit()];
+        let output_header = output_headers[0].as_mut_ptr();
+        unsafe {
+            ptr::addr_of_mut!((*output_header).hash).write(23);
+            ptr::addr_of_mut!((*output_header).key)
+                .write(ngx_str_t { len: output_key.len(), data: output_key.as_ptr().cast_mut() });
+            ptr::addr_of_mut!((*output_header).value).write(ngx_str_t {
+                len: output_value.len(),
+                data: output_value.as_ptr().cast_mut(),
+            });
+        }
         raw.headers_out.headers = ngx_list_t {
             last: &raw mut raw.headers_out.headers.part,
             part: ngx_list_part_t {
@@ -5363,8 +5427,32 @@ mod tests {
         let header = output.iter().next().unwrap();
         assert_eq!(header.key(), output_key);
         assert_eq!(header.value(), output_value);
-        assert_eq!(header.lowercase_key(), Some(output_lowcase.as_slice()));
+        assert_eq!(header.lowercase_key(), None);
         assert_eq!(header.hash(), 23);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn native_post_push_failure_is_skipped_before_partial_header_fields() {
+        let mut fixture = TerminalRequestFixture::new();
+        fixture._core.etag = 1;
+        fixture.request.headers_out.last_modified_time = 1;
+        fixture.request.headers_out.content_length_n = 1;
+        fixture.request.headers_out.headers = poisoned_header_list(fixture.request_pool.raw);
+
+        unsafe {
+            (*fixture.request_pool.raw).d.last = (*fixture.request_pool.raw).d.end;
+            (*fixture.request_pool.raw).max = 0;
+            ngx_rs_test_fail_allocations_after(0);
+        }
+        let status = unsafe { ngx_http_set_etag(&raw mut *fixture.request) };
+        unsafe { ngx_rs_test_reset_allocation_failures() };
+
+        assert_eq!(status, NGX_ERROR as ngx_int_t);
+        assert_eq!(fixture.request.headers_out.headers.part.nelts, 1);
+        let request = request_from(&mut fixture.request);
+        assert!(request.headers_out().unwrap().is_empty());
+        assert_eq!(request.headers_out_iterator().count(), 0);
     }
 
     #[test]
@@ -5414,6 +5502,7 @@ mod tests {
         assert!(matches!(request_from(&mut raw).headers_in(), Err(HeaderListError::InvalidList)));
 
         let mut header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        header.hash = 1;
         header.key.len = 1;
         let mut raw = zeroed_request();
         raw.headers_in.headers = ngx_list_t {
@@ -5434,6 +5523,7 @@ mod tests {
 
         let key = *b"X";
         let mut header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        header.hash = 1;
         header.key = ngx_str_t { len: key.len(), data: key.as_ptr().cast_mut() };
         header.value.len = 1;
         let mut raw = zeroed_request();
@@ -5454,6 +5544,7 @@ mod tests {
         ));
 
         let mut header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        header.hash = 1;
         header.key.len = isize::MAX as usize + 1;
         let mut raw = zeroed_request();
         raw.headers_in.headers = ngx_list_t {
@@ -5470,6 +5561,7 @@ mod tests {
         assert!(matches!(request_from(&mut raw).headers_in(), Err(HeaderListError::KeyTooLong)));
 
         let mut header: ngx_table_elt_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        header.hash = 1;
         header.key = ngx_str_t { len: key.len(), data: key.as_ptr().cast_mut() };
         header.value.len = isize::MAX as usize + 1;
         let mut raw = zeroed_request();
@@ -6311,35 +6403,21 @@ mod tests {
             Ok(Some(b"new".as_slice()))
         );
         let headers = request.headers_in().unwrap();
-        let mut content_length_count = 0;
-        let mut disabled_content_length_count = 0;
-        let mut disabled_transfer_encoding_count = 0;
-        for header in headers.iter() {
-            if header.is_enabled() && header.key().eq_ignore_ascii_case(b"Content-Length") {
-                content_length_count += 1;
-                assert_eq!(header.value(), b"3");
-            }
-            if !header.is_enabled() && header.key().eq_ignore_ascii_case(b"Content-Length") {
-                disabled_content_length_count += 1;
-            }
-            if !header.is_enabled() && header.key().eq_ignore_ascii_case(b"Transfer-Encoding") {
-                disabled_transfer_encoding_count += 1;
-            }
-        }
-        assert_eq!(content_length_count, 1);
-        assert_eq!(disabled_content_length_count, 1);
-        assert_eq!(disabled_transfer_encoding_count, 1);
+        let fields = headers
+            .iter()
+            .map(|header| (header.key().to_vec(), header.value().to_vec()))
+            .collect::<Vec<_>>();
+        assert_eq!(fields, vec![(b"Content-Length".to_vec(), b"3".to_vec())]);
     }
 
     #[cfg(feature = "test-link")]
     #[test]
     fn request_body_framing_keeps_builtin_slots_in_the_live_header_list() {
         fn assert_slots_are_live(raw: &ngx_http_request_t, expect_multiple_parts: bool) {
-            let headers = checked_header_list(&raw.headers_in.headers).unwrap();
-            let entries = headers
-                .headers
-                .iter()
-                .map(|header| ptr::from_ref(header).cast_mut())
+            let headers =
+                checked_header_list(&raw.headers_in.headers, HttpHeaderSource::Input).unwrap();
+            let entries = unsafe { NgxList::<ngx_table_elt_t>::raw_iter(headers.headers).unwrap() }
+                .map(NonNull::as_ptr)
                 .collect::<Vec<_>>();
             let second_cookie = unsafe { (*raw.headers_in.cookie).next };
 
@@ -6439,8 +6517,6 @@ mod tests {
             vec![
                 (b"Host".to_vec(), b"example.test".to_vec(), true),
                 (b"X-Keep".to_vec(), b"kept".to_vec(), true),
-                (b"Content-Length".to_vec(), b"99".to_vec(), false),
-                (b"Transfer-Encoding".to_vec(), b"chunked".to_vec(), false),
                 (b"Content-Length".to_vec(), b"11".to_vec(), true),
             ]
         );
@@ -6501,8 +6577,6 @@ mod tests {
             vec![
                 (b"Host".to_vec(), b"example.test".to_vec(), true),
                 (b"X-Keep".to_vec(), b"kept".to_vec(), true),
-                (b"Content-Length".to_vec(), b"99".to_vec(), false),
-                (b"Transfer-Encoding".to_vec(), b"chunked".to_vec(), false),
                 (b"Content-Length".to_vec(), b"0".to_vec(), true),
             ]
         );
