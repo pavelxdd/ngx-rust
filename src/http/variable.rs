@@ -1174,20 +1174,6 @@ where
     }
 }
 
-/// Invokes a typed HTTP variable handler through its native adapter in cross-crate tests.
-#[cfg(feature = "test-link")]
-#[doc(hidden)]
-pub unsafe fn test_invoke_variable_handler<H>(
-    request: *mut ngx_http_request_t,
-    value: *mut ngx_variable_value_t,
-    data: usize,
-) -> ngx_int_t
-where
-    H: HttpVariableHandler,
-{
-    unsafe { raw_get_handler::<H>(request, value, data) }
-}
-
 unsafe fn prefix_name_from_data<'callback>(data: usize) -> Option<&'callback NgxStr> {
     let name = NonNull::new(ptr::with_exposed_provenance_mut::<ngx_str_t>(data))?;
     if !name.as_ptr().is_aligned() {
