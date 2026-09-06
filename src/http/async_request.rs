@@ -68,6 +68,7 @@ where
     output: Option<H::Output>,
     hold: Option<RequestHold>,
     posted_request: NonNull<ngx_http_posted_request_t>,
+    context: Option<NonNull<AsyncHandlerContext<H>>>,
     active: bool,
     phase_posted: bool,
 }
@@ -82,6 +83,7 @@ where
             output: None,
             hold: None,
             posted_request,
+            context: None,
             active: true,
             phase_posted: false,
         }
@@ -220,23 +222,24 @@ where
             };
             (pool_raw, continuation)
         };
-        if request
-            .get_or_insert_pinned_module_context_with::<H::Module>(|| {
-                AsyncHandlerContext::new(continuation)
-            })
-            .is_err()
-        {
-            let pool = unsafe { crate::core::Pool::from_raw(pool_raw) }
-                .expect("request pool remained valid while its context was created");
-            let _ = unsafe { pool.remove_cleanup(continuation) };
-            ngx_log_error!(
-                crate::ffi::NGX_LOG_ERR,
-                log,
-                "async handler {} context allocation failed",
-                H::name()
-            );
-            return NGX_ERROR as ngx_int_t;
-        }
+        let context = match request.get_or_insert_pinned_module_context_with::<H::Module>(|| {
+            AsyncHandlerContext::new(continuation)
+        }) {
+            Ok(context) => NonNull::from(context.as_ref().get_ref()),
+            Err(_) => {
+                let pool = unsafe { crate::core::Pool::from_raw(pool_raw) }
+                    .expect("request pool remained valid while its context was created");
+                let _ = unsafe { pool.remove_cleanup(continuation) };
+                ngx_log_error!(
+                    crate::ffi::NGX_LOG_ERR,
+                    log,
+                    "async handler {} context allocation failed",
+                    H::name()
+                );
+                return NGX_ERROR as ngx_int_t;
+            }
+        };
+        unsafe { continuation.as_ref() }.state().borrow_mut().context = Some(context);
         let started = match spawn(handler_future(future, continuation)) {
             Ok(task) => {
                 let mut state = unsafe { continuation.as_ref() }.state().borrow_mut();
@@ -304,11 +307,32 @@ fn async_phase_continuation<H>(event: PostedEventCallback<'_, RefCell<AsyncConti
 where
     H: AsyncHttpRequestHandler,
 {
+    let (request, expected_context) = {
+        let state = event.state().borrow();
+        if !state.active || state.phase_posted || state.output.is_none() {
+            return;
+        }
+        let Some(request) = RequestHold::request_ptr(&state.hold) else {
+            return;
+        };
+        let Some(context) = state.context else {
+            return;
+        };
+        (request, context)
+    };
+
+    let current = unsafe {
+        RequestRefMut::is_current_module_context::<H::Module>(request.as_ptr(), expected_context)
+    }
+    .unwrap_or(false);
+    if !current {
+        return;
+    }
+
     let mut state = event.state().borrow_mut();
     if !state.active || state.phase_posted || state.output.is_none() {
         return;
     }
-
     let resumed = {
         let state = &mut *state;
         RequestHold::resume_phase(&mut state.hold, unsafe { state.posted_request.as_mut() }).is_ok()
@@ -363,9 +387,11 @@ mod tests {
         ngx_array_t, ngx_conf_t, ngx_connection_t, ngx_create_pool, ngx_cycle, ngx_cycle_t,
         ngx_delete_posted_event, ngx_destroy_pool, ngx_event_actions, ngx_event_actions_t,
         ngx_event_flags, ngx_event_move_posted_next, ngx_event_process_posted, ngx_event_t,
-        ngx_http_conf_ctx_t, ngx_http_core_main_conf_t, ngx_http_handler_pt, ngx_http_log_ctx_t,
-        ngx_http_request_t, ngx_http_run_posted_requests, ngx_int_t, ngx_log_t, ngx_module_t,
-        ngx_pool_t, ngx_posted_events, ngx_posted_next_events, ngx_queue_init, ngx_uint_t,
+        ngx_http_conf_ctx_t, ngx_http_core_loc_conf_t, ngx_http_core_main_conf_t,
+        ngx_http_core_srv_conf_t, ngx_http_handler_pt, ngx_http_log_ctx_t,
+        ngx_http_phase_handler_t, ngx_http_request_t, ngx_http_run_posted_requests, ngx_int_t,
+        ngx_log_t, ngx_module_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events,
+        ngx_queue_init, ngx_uint_t,
     };
     use crate::http::{HttpModule, HttpModuleRequestContext};
 
@@ -917,6 +943,13 @@ mod tests {
                 let _ = lease.release();
             }
         }
+    }
+
+    unsafe extern "C" fn stop_phase_engine(
+        _request: *mut ngx_http_request_t,
+        _phase: *mut ngx_http_phase_handler_t,
+    ) -> ngx_int_t {
+        NGX_OK as _
     }
 
     struct TestRequest {
@@ -1499,6 +1532,75 @@ mod tests {
         complete_handler::<ErrorHandler>(&mut worker, &mut error);
         let mut request_ref = error.borrow();
         assert_eq!(AsyncPhaseHandler::<ErrorHandler>::handler(&mut request_ref), NGX_ERROR as _);
+    }
+
+    #[test]
+    fn internal_redirect_cancels_pending_generation_before_replacement() {
+        let mut worker = TestWorker::new();
+        worker.init();
+        PENDING_FINISHES.store(0, Ordering::Relaxed);
+        let old = install_local_state();
+        let mut request = TestRequest::new();
+
+        start_handler::<PendingHandler>(&mut request);
+        worker.process_posted();
+        assert_eq!(old.polls.get(), 1);
+        let old_waker = old.waker.borrow_mut().take().unwrap();
+        assert_eq!(request.main_count(), 2);
+
+        let mut phase_handlers =
+            Box::new([unsafe { MaybeUninit::<ngx_http_phase_handler_t>::zeroed().assume_init() }]);
+        phase_handlers[0].checker = Some(stop_phase_engine);
+        let mut main_conf =
+            Box::new(unsafe { MaybeUninit::<ngx_http_core_main_conf_t>::zeroed().assume_init() });
+        main_conf.phase_engine.handlers = phase_handlers.as_mut_ptr();
+        main_conf.phase_engine.server_rewrite_index = 0;
+        let mut core_loc =
+            Box::new(unsafe { MaybeUninit::<ngx_http_core_loc_conf_t>::zeroed().assume_init() });
+        let mut loc_conf = Box::new([(&raw mut *core_loc).cast::<c_void>()]);
+        let mut main_conf_slots = Box::new([(&raw mut *main_conf).cast::<c_void>()]);
+        let mut http_context = Box::new(ngx_http_conf_ctx_t {
+            main_conf: main_conf_slots.as_mut_ptr(),
+            srv_conf: ptr::null_mut(),
+            loc_conf: loc_conf.as_mut_ptr(),
+        });
+        let mut server =
+            Box::new(unsafe { MaybeUninit::<ngx_http_core_srv_conf_t>::zeroed().assume_init() });
+        server.ctx = &raw mut *http_context;
+        let mut server_slots = Box::new([(&raw mut *server).cast::<c_void>()]);
+        http_context.srv_conf = server_slots.as_mut_ptr();
+        request.request.main_conf = main_conf_slots.as_mut_ptr();
+        request.request.srv_conf = server_slots.as_mut_ptr();
+        request.request.loc_conf = loc_conf.as_mut_ptr();
+        request.request.set_uri_changes(2);
+
+        {
+            let mut request_ref = request.borrow();
+            assert_eq!(
+                request_ref.internal_redirect("/replacement"),
+                Ok(crate::core::Status::NGX_DONE)
+            );
+            request_ref.finalize(crate::core::Status::NGX_DONE).unwrap();
+        }
+        assert_ne!(request.request.internal(), 0);
+        assert_eq!(old.drops.get(), 1);
+        assert_eq!(request.main_count(), 1);
+        assert!(request._contexts[0].is_null());
+
+        let replacement = install_local_state();
+        start_handler::<PendingHandler>(&mut request);
+        assert_eq!(request.main_count(), 2);
+
+        old_waker.wake();
+        worker.process_posted();
+        assert_eq!(PENDING_FINISHES.load(Ordering::Relaxed), 0);
+        assert_eq!(request.write_is_posted(), 0);
+
+        worker.process_posted();
+        assert_eq!(replacement.polls.get(), 1);
+        remove_handler_context::<PendingHandler>(&mut request);
+        assert_eq!(replacement.drops.get(), 1);
+        assert_eq!(request.main_count(), 1);
     }
 
     #[test]

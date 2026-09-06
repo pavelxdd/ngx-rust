@@ -517,12 +517,20 @@ pub unsafe trait HttpModule {
 /// Associates one request-context type with an HTTP module.
 ///
 /// # Safety
-/// The module's request context slot must be null or point to a valid initialized value allocated
-/// with a cleanup handler from the request pool. The value must remain registered with that pool
-/// until it is removed.
+/// The module's request context slot must be null or contain the pointer published by
+/// [`RequestRefMut`](crate::http::RequestRefMut). The request slot array and pool must remain live;
+/// native nginx may clear the slot during a redirect or filter finalization.
 pub unsafe trait HttpModuleRequestContext: HttpModule {
     /// Value stored in the module's per-request context slot.
     type RequestContext: 'static;
+
+    /// Cancels context-owned work before an ordinary context removal or native slot reset.
+    ///
+    /// The request context slot is already empty when this hook runs. Unlike pool cleanup, this
+    /// path must release any request reference held by the context.
+    fn cancel(context: Pin<&mut Self::RequestContext>) {
+        Self::cleanup(context);
+    }
 
     /// Cancels context-owned work before the request pool drops the context.
     ///

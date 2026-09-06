@@ -3,6 +3,7 @@ use core::error;
 use core::ffi::c_void;
 use core::fmt;
 use core::marker::PhantomData;
+use core::mem::{self, ManuallyDrop};
 use core::pin::Pin;
 use core::ptr::{self, NonNull};
 use core::slice;
@@ -1841,26 +1842,185 @@ fn decimal_bytes(mut value: usize, buffer: &mut [u8]) -> &[u8] {
 }
 
 #[repr(C)]
-struct RequestContextOwner<T> {
-    context: T,
+struct RequestContextRegistry {
+    first: *mut RequestContextRegistration,
+}
+
+#[repr(C)]
+struct RequestContextRegistration {
+    registry: NonNull<RequestContextRegistry>,
+    next: *mut Self,
     slot: NonNull<*mut c_void>,
+    context: NonNull<c_void>,
+    cancel: unsafe fn(*mut c_void),
+    active: bool,
+}
+
+impl RequestContextRegistry {
+    fn insert(&mut self, registration: &mut RequestContextRegistration) {
+        registration.next = self.first;
+        self.first = registration;
+    }
+
+    fn cancel_stale(&mut self) {
+        let mut current = self.first;
+        while let Some(registration) = NonNull::new(current) {
+            let registration = unsafe { &mut *registration.as_ptr() };
+            let next = registration.next;
+            if registration.active
+                && !ptr::eq(unsafe { *registration.slot.as_ptr() }, registration.context.as_ptr())
+            {
+                registration.cancel();
+            }
+            current = next;
+        }
+    }
+}
+
+impl RequestContextRegistration {
+    fn cancel(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        unsafe {
+            if ptr::eq(*self.slot.as_ptr(), self.context.as_ptr()) {
+                *self.slot.as_ptr() = ptr::null_mut();
+            }
+            (self.cancel)(self.context.as_ptr());
+        }
+    }
+
+    fn unlink(&mut self) {
+        let target = ptr::from_mut(self);
+        let mut link = unsafe { &raw mut self.registry.as_mut().first };
+        loop {
+            let current = unsafe { *link };
+            if current.is_null() {
+                return;
+            }
+            if ptr::eq(current, target) {
+                unsafe { *link = (*current).next };
+                self.next = ptr::null_mut();
+                return;
+            }
+            link = unsafe { &raw mut (*current).next };
+        }
+    }
+}
+
+unsafe extern "C" fn cleanup_request_context_registry(data: *mut c_void) {
+    let registry = data.cast::<RequestContextRegistry>();
+    debug_assert!(unsafe { (*registry).first.is_null() });
+}
+
+fn find_request_context_registry(
+    pool: NonNull<ngx_pool_t>,
+) -> Option<NonNull<RequestContextRegistry>> {
+    let expected = cleanup_request_context_registry as unsafe extern "C" fn(*mut c_void);
+    let mut cleanup = unsafe { pool.as_ref().cleanup };
+    while let Some(current) = NonNull::new(cleanup) {
+        let entry = unsafe { current.as_ref() };
+        if entry.handler.is_some_and(|handler| ptr::fn_addr_eq(handler, expected)) {
+            let registry = NonNull::new(entry.data.cast::<RequestContextRegistry>())?;
+            if registry.as_ptr().is_aligned() {
+                return Some(registry);
+            }
+            return None;
+        }
+        cleanup = entry.next;
+    }
+    None
+}
+
+fn get_or_create_request_context_registry(
+    pool: &Pool<'_>,
+) -> Result<(NonNull<RequestContextRegistry>, bool), RequestContextError> {
+    let raw = NonNull::new(pool.as_ptr()).expect("checked request pool must have a pointer");
+    if let Some(registry) = find_request_context_registry(raw) {
+        return Ok((registry, false));
+    }
+
+    let cleanup = NonNull::new(unsafe {
+        ngx_pool_cleanup_add(raw.as_ptr(), mem::size_of::<RequestContextRegistry>())
+    })
+    .ok_or(RequestContextError::Allocation)?;
+    let registry: NonNull<RequestContextRegistry> =
+        NonNull::new(unsafe { cleanup.as_ref().data.cast() })
+            .ok_or(RequestContextError::Allocation)?;
+    unsafe {
+        registry.as_ptr().write(RequestContextRegistry { first: ptr::null_mut() });
+        (*cleanup.as_ptr()).handler = Some(cleanup_request_context_registry);
+    }
+    Ok((registry, true))
+}
+
+fn cancel_stale_request_contexts(raw: NonNull<ngx_http_request_t>) {
+    let Some(pool) = NonNull::new(unsafe { raw.as_ref().pool }) else {
+        return;
+    };
+    let Some(mut registry) = find_request_context_registry(pool) else {
+        return;
+    };
+    unsafe { registry.as_mut().cancel_stale() };
+}
+
+fn request_context_generation(raw: NonNull<ngx_http_request_t>) -> *mut RequestContextRegistration {
+    let Some(pool) = NonNull::new(unsafe { raw.as_ref().pool }) else {
+        return ptr::null_mut();
+    };
+    find_request_context_registry(pool)
+        .map(|registry| unsafe { registry.as_ref().first })
+        .unwrap_or(ptr::null_mut())
+}
+
+fn cancel_request_context_generation(mut current: *mut RequestContextRegistration) {
+    while let Some(registration) = NonNull::new(current) {
+        let registration = unsafe { &mut *registration.as_ptr() };
+        let next = registration.next;
+        registration.cancel();
+        current = next;
+    }
+}
+
+#[repr(C)]
+struct RequestContextOwner<T> {
+    context: ManuallyDrop<T>,
+    registration: RequestContextRegistration,
     cleanup: fn(Pin<&mut T>),
 }
 
 impl<T> RequestContextOwner<T> {
     fn context_ptr(owner: NonNull<Self>) -> NonNull<T> {
-        unsafe { NonNull::from(&mut (*owner.as_ptr()).context) }
+        unsafe { NonNull::new_unchecked(ptr::addr_of_mut!((*owner.as_ptr()).context).cast()) }
+    }
+}
+
+unsafe fn cancel_request_context<M>(context: *mut c_void)
+where
+    M: HttpModuleRequestContext,
+{
+    let context = context.cast::<M::RequestContext>();
+    unsafe {
+        M::cancel(Pin::new_unchecked(&mut *context));
+        ptr::drop_in_place(context);
     }
 }
 
 impl<T> Drop for RequestContextOwner<T> {
     fn drop(&mut self) {
-        let context = ptr::addr_of_mut!(self.context).cast::<c_void>();
+        self.registration.unlink();
+        if !self.registration.active {
+            return;
+        }
+        self.registration.active = false;
         unsafe {
-            if ptr::eq(*self.slot.as_ptr(), context) {
-                *self.slot.as_ptr() = ptr::null_mut();
+            if ptr::eq(*self.registration.slot.as_ptr(), self.registration.context.as_ptr()) {
+                *self.registration.slot.as_ptr() = ptr::null_mut();
             }
-            (self.cleanup)(Pin::new_unchecked(&mut self.context));
+            let mut context = NonNull::new_unchecked(ptr::addr_of_mut!(self.context).cast::<T>());
+            (self.cleanup)(Pin::new_unchecked(context.as_mut()));
+            ManuallyDrop::drop(&mut self.context);
         }
     }
 }
@@ -2408,6 +2568,34 @@ impl<'callback> RequestRefMut<'callback> {
         Ok(Self { raw, _callback: PhantomData, _not_thread_safe: PhantomData })
     }
 
+    /// Verifies that `context` is still published in module `M`'s request slot.
+    ///
+    /// A mismatch cancels every stale registered context before returning `false`.
+    ///
+    /// # Safety
+    ///
+    /// `request` and `context` must identify a live request and one of its registered module
+    /// contexts on entry. No reference to `context` may be live. A `false` result means context
+    /// cancellation may also have released the request's final retained reference, so neither
+    /// pointer may be used afterward.
+    pub unsafe fn is_current_module_context<M>(
+        request: *mut ngx_http_request_t,
+        context: NonNull<M::RequestContext>,
+    ) -> Result<bool, RequestContextError>
+    where
+        M: HttpModuleRequestContext,
+    {
+        let raw = checked_request_ptr(request)?;
+        let slot = RequestRef { raw, _callback: PhantomData, _not_thread_safe: PhantomData }
+            .module_context_slot(M::module())?;
+        if ptr::eq(unsafe { *slot.as_ptr() }, context.as_ptr().cast()) {
+            return Ok(true);
+        }
+
+        cancel_stale_request_contexts(raw);
+        Ok(false)
+    }
+
     /// Invokes a closure with a request view that cannot escape the nginx callback through a safe
     /// value.
     ///
@@ -2606,6 +2794,7 @@ impl<'callback> RequestRefMut<'callback> {
     where
         M: HttpModuleRequestContext,
     {
+        cancel_stale_request_contexts(self.raw);
         let slot =
             RequestRef { raw: self.raw, _callback: PhantomData, _not_thread_safe: PhantomData }
                 .module_context_slot(M::module())?;
@@ -2621,6 +2810,7 @@ impl<'callback> RequestRefMut<'callback> {
         M: HttpModuleRequestContext,
         M::RequestContext: Unpin,
     {
+        cancel_stale_request_contexts(self.raw);
         let slot = self.view().module_context_slot(M::module())?;
         Ok(RequestRef::context_from_slot::<M::RequestContext>(slot)?
             .map(|mut context| unsafe { context.as_mut() }))
@@ -2633,6 +2823,7 @@ impl<'callback> RequestRefMut<'callback> {
     where
         M: HttpModuleRequestContext,
     {
+        cancel_stale_request_contexts(self.raw);
         let slot = self.view().module_context_slot(M::module())?;
         Ok(RequestRef::context_from_slot::<M::RequestContext>(slot)?
             .map(|mut context| unsafe { Pin::new_unchecked(context.as_mut()) }))
@@ -2652,9 +2843,10 @@ impl<'callback> RequestRefMut<'callback> {
 
     /// Returns a pinned module context, inserting a pool-owned value when absent.
     ///
-    /// The request context slot is published only after the context and its pool cleanup are
-    /// initialized. Pool cleanup clears the slot, calls [`HttpModuleRequestContext::cleanup`],
-    /// and then drops the value.
+    /// The request context slot is published only after the context, its request registry entry,
+    /// and its pool cleanup are initialized. An ordinary removal or native slot reset calls
+    /// [`HttpModuleRequestContext::cancel`] before dropping the value; pool teardown calls
+    /// [`HttpModuleRequestContext::cleanup`] instead.
     ///
     /// ```compile_fail
     /// use core::marker::PhantomPinned;
@@ -2726,23 +2918,42 @@ impl<'callback> RequestRefMut<'callback> {
     where
         M: HttpModuleRequestContext,
     {
+        cancel_stale_request_contexts(self.raw);
         let slot = self.view().module_context_slot(M::module())?;
         if let Some(mut context) = RequestRef::context_from_slot::<M::RequestContext>(slot)? {
             return Ok(unsafe { Pin::new_unchecked(context.as_mut()) });
         }
 
-        let owner = self
-            .pool()?
-            .try_allocate_with_cleanup(|| {
-                constructor().map(|context| RequestContextOwner {
-                    context,
+        let pool = self.pool()?;
+        let (mut registry, registry_created) = get_or_create_request_context_registry(&pool)?;
+        let owner = match pool.try_allocate_with_cleanup(|| {
+            constructor().map(|context| RequestContextOwner {
+                context: ManuallyDrop::new(context),
+                registration: RequestContextRegistration {
+                    registry,
+                    next: ptr::null_mut(),
                     slot,
-                    cleanup: M::cleanup,
-                })
-            })?
-            .into_non_null();
+                    context: NonNull::dangling(),
+                    cancel: cancel_request_context::<M>,
+                    active: true,
+                },
+                cleanup: M::cleanup,
+            })
+        }) {
+            Ok(owner) => owner.into_non_null(),
+            Err(error) => {
+                if registry_created {
+                    unsafe { pool.remove_cleanup(registry) };
+                }
+                return Err(error.into());
+            }
+        };
         let mut context = RequestContextOwner::context_ptr(owner);
-        unsafe { *slot.as_ptr() = context.as_ptr().cast() };
+        unsafe {
+            (*owner.as_ptr()).registration.context = context.cast();
+            registry.as_mut().insert(&mut (*owner.as_ptr()).registration);
+            *slot.as_ptr() = context.as_ptr().cast();
+        }
         Ok(unsafe { Pin::new_unchecked(context.as_mut()) })
     }
 
@@ -2754,18 +2965,17 @@ impl<'callback> RequestRefMut<'callback> {
     where
         M: HttpModuleRequestContext,
     {
+        cancel_stale_request_contexts(self.raw);
         let pool = self.pool()?;
         let slot = self.view().module_context_slot(M::module())?;
         let Some(context) = RequestRef::context_from_slot::<M::RequestContext>(slot)? else {
             return Ok(false);
         };
 
-        unsafe { *slot.as_ptr() = ptr::null_mut() };
-        if unsafe { pool.remove_cleanup(context.cast::<RequestContextOwner<M::RequestContext>>()) }
-        {
+        let owner = context.cast::<RequestContextOwner<M::RequestContext>>();
+        if unsafe { pool.remove_cleanup_with(owner, |owner| owner.registration.cancel()) } {
             Ok(true)
         } else {
-            unsafe { *slot.as_ptr() = context.as_ptr().cast() };
             Err(RequestContextError::MissingCleanup)
         }
     }
@@ -3110,11 +3320,13 @@ impl<'callback> RequestRefMut<'callback> {
             return Err(RequestError::Allocation);
         };
 
+        let generation = request_context_generation(self.raw);
         let status = if location.starts_with('@') {
             unsafe { ngx_http_named_location(self.raw.as_ptr(), &raw mut uri) }
         } else {
             unsafe { ngx_http_internal_redirect(self.raw.as_ptr(), &raw mut uri, ptr::null_mut()) }
         };
+        cancel_request_context_generation(generation);
         Ok(Status(status))
     }
 
@@ -3195,6 +3407,11 @@ impl RequestHold {
     /// Cancels a delayed operation and releases its retained request reference.
     pub fn cancel(hold: &mut Option<Self>) -> bool {
         hold.take().is_some()
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) fn request_ptr(hold: &Option<Self>) -> Option<NonNull<ngx_http_request_t>> {
+        hold.as_ref().map(|hold| hold.request)
     }
 
     /// Disarms a hold while nginx is already tearing down its request pool.
@@ -3481,8 +3698,11 @@ where
 {
     unsafe {
         RequestRefMut::with_raw(request, |mut request| {
+            cancel_stale_request_contexts(request.raw);
             let result = callback(&mut request);
-            result.into_handler_status(&request.view())
+            let status = result.into_handler_status(&request.view());
+            cancel_stale_request_contexts(request.raw);
+            status
         })
     }
     .unwrap_or(NGX_ERROR as _)
@@ -3828,8 +4048,9 @@ mod tests {
     use crate::ffi::{
         ngx_create_pool, ngx_current_msec, ngx_cycle_t, ngx_destroy_pool, ngx_event_expire_timers,
         ngx_event_move_posted_next, ngx_event_process_posted, ngx_event_timer_init,
-        ngx_http_conf_ctx_t, ngx_http_core_srv_conf_t, ngx_http_phase_handler_t, ngx_log_t,
-        ngx_pool_t, ngx_posted_events, ngx_posted_next_events, ngx_queue_init, ngx_uint_t,
+        ngx_http_conf_ctx_t, ngx_http_core_srv_conf_t, ngx_http_output_header_filter_pt,
+        ngx_http_phase_handler_t, ngx_log_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events,
+        ngx_queue_init, ngx_uint_t,
     };
 
     #[cfg(feature = "test-link")]
@@ -4047,6 +4268,38 @@ mod tests {
             ngx_current_msec = 0;
             ngx_queue_init(&raw mut ngx_posted_events);
             ngx_queue_init(&raw mut ngx_posted_next_events);
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    unsafe extern "C" fn stop_phase_engine(
+        _request: *mut ngx_http_request_t,
+        _phase: *mut ngx_http_phase_handler_t,
+    ) -> ngx_int_t {
+        NGX_OK as _
+    }
+
+    #[cfg(feature = "test-link")]
+    unsafe extern "C" fn accept_header(_request: *mut ngx_http_request_t) -> ngx_int_t {
+        NGX_OK as _
+    }
+
+    #[cfg(feature = "test-link")]
+    struct HeaderFilterGuard(ngx_http_output_header_filter_pt);
+
+    #[cfg(feature = "test-link")]
+    impl HeaderFilterGuard {
+        fn install() -> Self {
+            let previous = unsafe { nginx_sys::ngx_http_top_header_filter };
+            unsafe { nginx_sys::ngx_http_top_header_filter = Some(accept_header) };
+            Self(previous)
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    impl Drop for HeaderFilterGuard {
+        fn drop(&mut self) {
+            unsafe { nginx_sys::ngx_http_top_header_filter = self.0 };
         }
     }
 
@@ -6540,6 +6793,7 @@ mod tests {
 
         let mut phase_handlers =
             Box::new([unsafe { MaybeUninit::<ngx_http_phase_handler_t>::zeroed().assume_init() }]);
+        phase_handlers[0].checker = Some(stop_phase_engine);
         fixture._main_conf.phase_engine.handlers = phase_handlers.as_mut_ptr();
         fixture._main_conf.phase_engine.server_rewrite_index = 0;
         let mut http_context = Box::new(ngx_http_conf_ctx_t {
@@ -6553,7 +6807,7 @@ mod tests {
         let mut server_slots = Box::new([(&raw mut *server).cast::<c_void>()]);
         http_context.srv_conf = server_slots.as_mut_ptr();
         fixture.request.srv_conf = server_slots.as_mut_ptr();
-        fixture.request.uri_changes = 2;
+        fixture.request.set_uri_changes(2);
 
         let mut request = request_from(&mut fixture.request);
         assert_eq!(request.internal_redirect("/redirect"), Ok(Status::NGX_DONE));
@@ -6561,6 +6815,221 @@ mod tests {
         request.finalize(Status::NGX_DONE).unwrap();
         assert_eq!(fixture.request.count(), native_limit);
         assert!(hold.is_none());
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn internal_redirect_cancels_registered_context_before_native_slot_reset() {
+        let mut fixture = TerminalRequestFixture::new();
+        reset_pinned_context_state();
+        let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
+        fixture.request.ctx = slots.as_mut_ptr();
+
+        {
+            let mut request = request_from(&mut fixture.request);
+            request
+                .get_or_insert_pinned_module_context_with::<PinnedContextModule>(|| {
+                    PINNED_CONTEXT_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+                    pinned_context(slots.as_mut_ptr())
+                })
+                .unwrap();
+        }
+
+        let mut phase_handlers =
+            Box::new([unsafe { MaybeUninit::<ngx_http_phase_handler_t>::zeroed().assume_init() }]);
+        phase_handlers[0].checker = Some(stop_phase_engine);
+        fixture._main_conf.phase_engine.handlers = phase_handlers.as_mut_ptr();
+        fixture._main_conf.phase_engine.server_rewrite_index = 0;
+        let mut http_context = Box::new(ngx_http_conf_ctx_t {
+            main_conf: fixture._main_conf_slots.as_mut_ptr(),
+            srv_conf: ptr::null_mut(),
+            loc_conf: fixture._loc_conf.as_mut_ptr(),
+        });
+        let mut server =
+            Box::new(unsafe { MaybeUninit::<ngx_http_core_srv_conf_t>::zeroed().assume_init() });
+        server.ctx = &raw mut *http_context;
+        let mut server_slots = Box::new([(&raw mut *server).cast::<c_void>()]);
+        http_context.srv_conf = server_slots.as_mut_ptr();
+        fixture.request.srv_conf = server_slots.as_mut_ptr();
+        fixture.request.set_uri_changes(2);
+
+        let mut request = request_from(&mut fixture.request);
+        assert_eq!(request.internal_redirect("/redirect"), Ok(Status::NGX_DONE));
+        assert_ne!(unsafe { request.raw.as_ref().internal() }, 0);
+        assert!(slots[0].is_null());
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
+        assert!(PINNED_CONTEXT_DROP_SAW_INVALIDATED_SLOT.load(Ordering::Relaxed));
+        request.finalize(Status::NGX_DONE).unwrap();
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn redirect_uri_allocation_failure_preserves_registered_context() {
+        let mut fixture = TerminalRequestFixture::new();
+        reset_pinned_context_state();
+        let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
+        fixture.request.ctx = slots.as_mut_ptr();
+
+        {
+            let mut request = request_from(&mut fixture.request);
+            request
+                .get_or_insert_pinned_module_context_with::<PinnedContextModule>(|| {
+                    PINNED_CONTEXT_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+                    pinned_context(slots.as_mut_ptr())
+                })
+                .unwrap();
+        }
+        unsafe {
+            (*fixture.request_pool.raw).d.last = (*fixture.request_pool.raw).d.end;
+            (*fixture.request_pool.raw).max = 0;
+            ngx_rs_test_fail_allocations_after(0);
+        }
+        let result = request_from(&mut fixture.request).internal_redirect("/redirect");
+        unsafe { ngx_rs_test_reset_allocation_failures() };
+
+        assert_eq!(result, Err(RequestError::Allocation));
+        assert!(!slots[0].is_null());
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 0);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 0);
+        let mut request = request_from(&mut fixture.request);
+        assert_eq!(request.remove_module_context::<PinnedContextModule>(), Ok(true));
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn named_redirect_cancels_registered_context_before_location_reentry() {
+        let mut fixture = TerminalRequestFixture::new();
+        reset_pinned_context_state();
+        let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
+        fixture.request.ctx = slots.as_mut_ptr();
+
+        {
+            let mut request = request_from(&mut fixture.request);
+            request
+                .get_or_insert_pinned_module_context_with::<PinnedContextModule>(|| {
+                    PINNED_CONTEXT_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+                    pinned_context(slots.as_mut_ptr())
+                })
+                .unwrap();
+        }
+
+        let mut phase_handlers =
+            Box::new([unsafe { MaybeUninit::<ngx_http_phase_handler_t>::zeroed().assume_init() }]);
+        phase_handlers[0].checker = Some(stop_phase_engine);
+        fixture._main_conf.phase_engine.handlers = phase_handlers.as_mut_ptr();
+        fixture._main_conf.phase_engine.location_rewrite_index = 0;
+        let mut named =
+            Box::new(unsafe { MaybeUninit::<ngx_http_core_loc_conf_t>::zeroed().assume_init() });
+        named.name =
+            ngx_str_t { len: b"@replacement".len(), data: b"@replacement".as_ptr().cast_mut() };
+        named.loc_conf = fixture._loc_conf.as_mut_ptr();
+        let mut named_locations = Box::new([&raw mut *named, ptr::null_mut()]);
+        let mut http_context = Box::new(ngx_http_conf_ctx_t {
+            main_conf: fixture._main_conf_slots.as_mut_ptr(),
+            srv_conf: ptr::null_mut(),
+            loc_conf: fixture._loc_conf.as_mut_ptr(),
+        });
+        let mut server =
+            Box::new(unsafe { MaybeUninit::<ngx_http_core_srv_conf_t>::zeroed().assume_init() });
+        server.ctx = &raw mut *http_context;
+        server.named_locations = named_locations.as_mut_ptr();
+        let mut server_slots = Box::new([(&raw mut *server).cast::<c_void>()]);
+        http_context.srv_conf = server_slots.as_mut_ptr();
+        fixture.request.srv_conf = server_slots.as_mut_ptr();
+        fixture.request.main_conf = fixture._main_conf_slots.as_mut_ptr();
+        fixture.request.uri =
+            ngx_str_t { len: b"/source".len(), data: b"/source".as_ptr().cast_mut() };
+        fixture.request.set_uri_changes(2);
+
+        let mut request = request_from(&mut fixture.request);
+        assert_eq!(request.internal_redirect("@replacement"), Ok(Status::NGX_DONE));
+        assert_ne!(unsafe { request.raw.as_ref().internal() }, 0);
+        assert!(slots[0].is_null());
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
+        request.finalize(Status::NGX_DONE).unwrap();
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn missing_named_location_cancels_registered_context_before_terminal_response() {
+        let mut fixture = TerminalRequestFixture::new();
+        let _header_filter = HeaderFilterGuard::install();
+        reset_pinned_context_state();
+        let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
+        fixture.request.ctx = slots.as_mut_ptr();
+        fixture.request.method = NGX_HTTP_HEAD as _;
+        fixture.request.set_header_only(1);
+
+        {
+            let mut request = request_from(&mut fixture.request);
+            request
+                .get_or_insert_pinned_module_context_with::<PinnedContextModule>(|| {
+                    PINNED_CONTEXT_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+                    pinned_context(slots.as_mut_ptr())
+                })
+                .unwrap();
+        }
+
+        let mut http_context = Box::new(ngx_http_conf_ctx_t {
+            main_conf: fixture._main_conf_slots.as_mut_ptr(),
+            srv_conf: ptr::null_mut(),
+            loc_conf: fixture._loc_conf.as_mut_ptr(),
+        });
+        let mut server =
+            Box::new(unsafe { MaybeUninit::<ngx_http_core_srv_conf_t>::zeroed().assume_init() });
+        server.ctx = &raw mut *http_context;
+        let mut server_slots = Box::new([(&raw mut *server).cast::<c_void>()]);
+        http_context.srv_conf = server_slots.as_mut_ptr();
+        fixture.request.srv_conf = server_slots.as_mut_ptr();
+        fixture.request.uri =
+            ngx_str_t { len: b"/source".len(), data: b"/source".as_ptr().cast_mut() };
+        fixture.request.set_uri_changes(2);
+
+        let mut request = request_from(&mut fixture.request);
+        assert_eq!(request.internal_redirect("@missing"), Ok(Status::NGX_DONE));
+        assert!(slots[0].is_null());
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn conditional_filter_finalization_cancels_the_cleared_context() {
+        let mut fixture = TerminalRequestFixture::new();
+        let _header_filter = HeaderFilterGuard::install();
+        reset_pinned_context_state();
+        let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
+        fixture.request.ctx = slots.as_mut_ptr();
+        fixture.request.method = NGX_HTTP_HEAD as _;
+        fixture.request.set_header_only(1);
+
+        {
+            let mut request = request_from(&mut fixture.request);
+            request
+                .get_or_insert_pinned_module_context_with::<PinnedContextModule>(|| {
+                    PINNED_CONTEXT_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+                    pinned_context(slots.as_mut_ptr())
+                })
+                .unwrap();
+        }
+
+        let status = unsafe {
+            request_callback_status(&raw mut *fixture.request, |request| {
+                let request = request.as_ptr();
+                Status(ngx_http_filter_finalize_request(
+                    request,
+                    ptr::null_mut(),
+                    NGX_HTTP_PRECONDITION_FAILED as _,
+                ))
+            })
+        };
+
+        assert_eq!(status, NGX_ERROR as _);
+        assert!(slots[0].is_null());
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -7704,6 +8173,52 @@ mod tests {
 
     #[cfg(feature = "test-link")]
     #[test]
+    fn native_slot_reset_cancels_old_context_before_replacement() {
+        let _globals = RequestGlobals::new(1, 1);
+        reset_pinned_context_state();
+        let owner = TestPool::new();
+        let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        raw.ctx = slots.as_mut_ptr();
+
+        let old = {
+            let mut request = request_from(&mut raw);
+            let context = request
+                .get_or_insert_pinned_module_context_with::<PinnedContextModule>(|| {
+                    PINNED_CONTEXT_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+                    pinned_context(slots.as_mut_ptr())
+                })
+                .unwrap();
+            NonNull::from(context.as_ref().get_ref()).as_ptr()
+        };
+
+        slots[0] = ptr::null_mut();
+        let status = unsafe { request_callback_status(&raw mut raw, |_request| Status::NGX_OK) };
+        assert_eq!(status, NGX_OK as _);
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
+
+        let new = {
+            let mut request = request_from(&mut raw);
+            let context = request
+                .get_or_insert_pinned_module_context_with::<PinnedContextModule>(|| {
+                    PINNED_CONTEXT_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+                    pinned_context(slots.as_mut_ptr())
+                })
+                .unwrap();
+            NonNull::from(context.as_ref().get_ref()).as_ptr()
+        };
+
+        assert_ne!(new, old);
+        assert_eq!(slots[0], new.cast());
+        drop(owner);
+        assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 2);
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
     fn failed_request_context_constructor_leaves_the_slot_unpublished_and_retries() {
         let _globals = RequestGlobals::new(1, 1);
         reset_pinned_context_state();
@@ -7758,7 +8273,7 @@ mod tests {
         raw.pool = owner.raw;
         raw.ctx = slots.as_mut_ptr();
 
-        for successes in 0..=1 {
+        for successes in 0..=3 {
             unsafe { ngx_rs_test_fail_allocations_after(successes) };
             let result = {
                 let mut request = request_from(&mut raw);
