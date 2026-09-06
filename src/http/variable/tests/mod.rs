@@ -444,24 +444,31 @@ struct VariableConfiguration {
 #[cfg(feature = "test-link")]
 impl VariableConfiguration {
     fn new(pool: &mut TestPool) -> Self {
-        let mut main =
+        let main =
             Box::new(unsafe { MaybeUninit::<ngx_http_core_main_conf_t>::zeroed().assume_init() });
-        main.variables_hash_max_size = 1024;
-        main.variables_hash_bucket_size = 64;
-        let mut main_conf: Box<[*mut c_void; 1]> = Box::new([(&raw mut *main).cast()]);
-        let mut context = Box::new(ngx_http_conf_ctx_t {
-            main_conf: main_conf.as_mut_ptr(),
-            srv_conf: ptr::null_mut(),
-            loc_conf: ptr::null_mut(),
-        });
-        let mut cf = Box::new(unsafe { MaybeUninit::<ngx_conf_t>::zeroed().assume_init() });
-        cf.pool = pool.raw;
-        cf.temp_pool = pool.raw;
-        cf.log = &raw mut *pool.log;
-        cf.ctx = (&raw mut *context).cast();
-        assert_eq!(unsafe { ngx_http_variables_add_core_vars(&raw mut *cf) }, NGX_OK as _);
+        let main_conf = Box::new([ptr::null_mut()]);
+        let context =
+            Box::new(unsafe { MaybeUninit::<ngx_http_conf_ctx_t>::zeroed().assume_init() });
+        let cf = Box::new(unsafe { MaybeUninit::<ngx_conf_t>::zeroed().assume_init() });
+        let mut configuration = Self { main, main_conf, _context: context, cf };
+        configuration.reset(pool);
+        configuration
+    }
 
-        Self { main, main_conf, _context: context, cf }
+    fn reset(&mut self, pool: &mut TestPool) {
+        *self.main = unsafe { MaybeUninit::zeroed().assume_init() };
+        self.main.variables_hash_max_size = 1024;
+        self.main.variables_hash_bucket_size = 64;
+        self.main_conf[0] = (&raw mut *self.main).cast();
+        self._context.main_conf = self.main_conf.as_mut_ptr();
+        self._context.srv_conf = ptr::null_mut();
+        self._context.loc_conf = ptr::null_mut();
+        *self.cf = unsafe { MaybeUninit::zeroed().assume_init() };
+        self.cf.pool = pool.raw;
+        self.cf.temp_pool = pool.raw;
+        self.cf.log = &raw mut *pool.log;
+        self.cf.ctx = (&raw mut *self._context).cast();
+        assert_eq!(unsafe { ngx_http_variables_add_core_vars(&raw mut *self.cf) }, NGX_OK as _);
     }
 
     fn configuration(&mut self) -> HttpConfigurationParser<'_> {
