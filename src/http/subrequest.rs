@@ -16,7 +16,7 @@ use core::task::{Context, Poll, Waker};
 
 use nginx_sys::{
     NGX_HTTP_SUBREQUEST_BACKGROUND, NGX_HTTP_SUBREQUEST_CLONE, NGX_HTTP_SUBREQUEST_IN_MEMORY,
-    NGX_HTTP_SUBREQUEST_WAITED, NGX_OK, ngx_http_post_subrequest_t, ngx_http_request_body_t,
+    NGX_HTTP_SUBREQUEST_WAITED, ngx_http_post_subrequest_t, ngx_http_request_body_t,
     ngx_http_request_t, ngx_int_t, ngx_list_init, ngx_list_t, ngx_str_t, ngx_table_elt_t,
     ngx_uint_t,
 };
@@ -292,7 +292,7 @@ impl<'request> SubRequestBuilder<'request, '_> {
         let subrequest = self
             .handler(move |request, status| {
                 if !guard.accepts_completion() {
-                    return NGX_OK as ngx_int_t;
+                    return nginx_sys::NGX_OK as ngx_int_t;
                 }
                 let (output, handler_status) = handler(request, status);
                 let handler_status = handler_status.into_handler_status(&request.view());
