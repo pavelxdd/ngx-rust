@@ -67,8 +67,14 @@ pub enum UpstreamCallbackError {
     MissingOriginalInitPeer,
     /// The saved original peer getter is absent.
     MissingOriginalGetPeer,
-    /// The saved original peer releaser is absent.
-    MissingOriginalFreePeer,
+    /// A selected peer has not yet been released.
+    PeerSelectionPendingRelease,
+    /// nginx tried to release a peer without a matching successful selection.
+    PeerReleaseWithoutSelection,
+    /// A handler discarded a peer selected by the original getter.
+    DiscardedOriginalPeerSelection,
+    /// A handler returned a selected-peer proof from another selection generation.
+    ForeignSelectedPeer,
     /// A successful upstream initializer left the request peer initializer absent.
     MissingPeerInitializer,
     /// A successful original request peer initializer left the peer getter absent.
@@ -150,8 +156,17 @@ impl fmt::Display for UpstreamCallbackError {
             Self::MissingOriginalGetPeer => {
                 formatter.write_str("upstream has no original peer getter")
             }
-            Self::MissingOriginalFreePeer => {
-                formatter.write_str("upstream has no original peer releaser")
+            Self::PeerSelectionPendingRelease => {
+                formatter.write_str("selected upstream peer has not been released")
+            }
+            Self::PeerReleaseWithoutSelection => {
+                formatter.write_str("upstream peer release has no matching selection")
+            }
+            Self::DiscardedOriginalPeerSelection => {
+                formatter.write_str("handler discarded the original selected peer")
+            }
+            Self::ForeignSelectedPeer => {
+                formatter.write_str("selected upstream peer belongs to another generation")
             }
             Self::MissingPeerInitializer => {
                 formatter.write_str("upstream initialization installed no peer initializer")
@@ -806,12 +821,14 @@ pub trait HttpUpstreamPeerHandler: Sized + 'static {
         original: OriginalPeerGet<'callback>,
     ) -> Result<UpstreamPeerSelection<'callback>, UpstreamCallbackError>;
 
-    /// Releases a peer or delegates release to the saved original callback.
-    fn free<'callback>(
-        peer: &'callback mut UpstreamPeerConnection<'_>,
+    /// Observes a peer release after the framework has released the saved original peer.
+    ///
+    /// Original release accounting is complete before this hook runs, including when the hook
+    /// returns an error or terminates the worker by panicking.
+    fn free(
+        peer: &mut UpstreamPeerConnection<'_>,
         data: &mut Self::Data,
         state: UpstreamPeerState,
-        original: OriginalPeerFree<'callback>,
     ) -> Result<(), UpstreamCallbackError>;
 }
 
@@ -827,6 +844,7 @@ pub trait HttpUpstreamPeerHandler: Sized + 'static {
 /// ```
 pub struct SelectedUpstreamPeer<'callback> {
     status: ngx_int_t,
+    generation: u64,
     _callback: PhantomData<&'callback mut ngx_peer_connection_t>,
 }
 
@@ -851,7 +869,20 @@ pub enum UpstreamPeerSelection<'callback> {
 }
 
 impl UpstreamPeerSelection<'_> {
-    fn status(self) -> ngx_int_t {
+    fn into_returned(self) -> ReturnedPeerSelection {
+        match self {
+            Self::Error => ReturnedPeerSelection::Unselected(Status::NGX_ERROR.0),
+            Self::Busy => ReturnedPeerSelection::Unselected(Status::NGX_BUSY.0),
+            Self::Declined => ReturnedPeerSelection::Unselected(Status::NGX_DECLINED.0),
+            Self::Selected(selected) => ReturnedPeerSelection::Selected {
+                status: selected.status,
+                generation: selected.generation,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn status(&self) -> ngx_int_t {
         match self {
             Self::Error => Status::NGX_ERROR.0,
             Self::Busy => Status::NGX_BUSY.0,
@@ -859,6 +890,12 @@ impl UpstreamPeerSelection<'_> {
             Self::Selected(selected) => selected.status,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ReturnedPeerSelection {
+    Unselected(ngx_int_t),
+    Selected { status: ngx_int_t, generation: u64 },
 }
 
 /// Checked peer-connection callback view.
@@ -886,6 +923,7 @@ impl UpstreamPeerConnection<'_> {
     fn selected(
         &mut self,
         status: ngx_int_t,
+        generation: u64,
     ) -> Result<SelectedUpstreamPeer<'_>, UpstreamCallbackError> {
         let peer = unsafe { self.raw.as_ref() };
         if peer.name.is_null() {
@@ -911,7 +949,7 @@ impl UpstreamPeerConnection<'_> {
             }
         }
 
-        Ok(SelectedUpstreamPeer { status, _callback: PhantomData })
+        Ok(SelectedUpstreamPeer { status, generation, _callback: PhantomData })
     }
 
     fn log_failure(&self, action: &str, error: &UpstreamCallbackError) {
@@ -958,6 +996,8 @@ struct OriginalPeerCallbacks {
 /// ```
 pub struct OriginalPeerGet<'callback> {
     original: OriginalPeerCallbacks,
+    generation: u64,
+    outcome: &'callback Cell<OriginalPeerGetOutcome>,
     _callback: PhantomData<&'callback mut ngx_peer_connection_t>,
 }
 
@@ -971,48 +1011,68 @@ impl<'callback> OriginalPeerGet<'callback> {
         let status =
             call_original(self.original, peer, |peer, data| unsafe { callback(peer, data) });
         match status {
-            status if status == Status::NGX_ERROR.0 => Ok(UpstreamPeerSelection::Error),
-            status if status == Status::NGX_BUSY.0 => Ok(UpstreamPeerSelection::Busy),
-            status if status == Status::NGX_DECLINED.0 => Ok(UpstreamPeerSelection::Declined),
+            status if status == Status::NGX_ERROR.0 => {
+                self.outcome.set(OriginalPeerGetOutcome::Unselected);
+                Ok(UpstreamPeerSelection::Error)
+            }
+            status if status == Status::NGX_BUSY.0 => {
+                self.outcome.set(OriginalPeerGetOutcome::Unselected);
+                Ok(UpstreamPeerSelection::Busy)
+            }
+            status if status == Status::NGX_DECLINED.0 => {
+                self.outcome.set(OriginalPeerGetOutcome::Unselected);
+                Ok(UpstreamPeerSelection::Declined)
+            }
             status
                 if status == Status::NGX_OK.0
                     || status == Status::NGX_AGAIN.0
                     || status == Status::NGX_DONE.0 =>
             {
-                Ok(UpstreamPeerSelection::Selected(peer.selected(status)?))
+                self.outcome.set(OriginalPeerGetOutcome::Selected);
+                Ok(UpstreamPeerSelection::Selected(peer.selected(status, self.generation)?))
             }
-            status => Err(UpstreamCallbackError::InvalidOriginalGetStatus(status)),
+            status => {
+                self.outcome.set(OriginalPeerGetOutcome::Unselected);
+                Err(UpstreamCallbackError::InvalidOriginalGetStatus(status))
+            }
         }
     }
 }
 
-/// One callback-local capability to invoke the saved original peer releaser.
-///
-/// ```compile_fail
-/// use ngx::http::{OriginalPeerFree, UpstreamPeerConnection};
-///
-/// fn duplicate(original: OriginalPeerFree<'_>, peer: &mut UpstreamPeerConnection<'_>) {
-///     original.call(peer).unwrap();
-///     original.call(peer).unwrap();
-/// }
-/// ```
-pub struct OriginalPeerFree<'callback> {
-    original: OriginalPeerCallbacks,
-    state: UpstreamPeerState,
-    _callback: PhantomData<&'callback mut ngx_peer_connection_t>,
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OriginalPeerGetOutcome {
+    NotCalled,
+    Unselected,
+    Selected,
 }
 
-impl<'callback> OriginalPeerFree<'callback> {
-    /// Consumes this capability and invokes the original peer releaser once.
-    pub fn call(
-        self,
-        peer: &'callback mut UpstreamPeerConnection<'_>,
-    ) -> Result<(), UpstreamCallbackError> {
-        let callback = self.original.free.ok_or(UpstreamCallbackError::MissingOriginalFreePeer)?;
-        call_original(self.original, peer, |peer, data| unsafe {
-            callback(peer, data, self.state.bits())
-        });
-        Ok(())
+#[derive(Default)]
+struct PeerSelectionState {
+    generation: u64,
+    active_generation: Option<u64>,
+}
+
+impl PeerSelectionState {
+    fn begin(&mut self) -> Result<u64, UpstreamCallbackError> {
+        if self.active_generation.is_some() {
+            return Err(UpstreamCallbackError::PeerSelectionPendingRelease);
+        }
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generation = 1;
+        }
+        Ok(self.generation)
+    }
+
+    fn select(&mut self, generation: u64) {
+        self.active_generation = Some(generation);
+    }
+
+    fn release(&mut self) -> Result<(), UpstreamCallbackError> {
+        self.active_generation
+            .take()
+            .map(|_| ())
+            .ok_or(UpstreamCallbackError::PeerReleaseWithoutSelection)
     }
 }
 
@@ -1021,6 +1081,7 @@ struct HttpUpstreamPeerData<T> {
     handler: TypeId,
     value: T,
     original: OriginalPeerCallbacks,
+    selection: PeerSelectionState,
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
@@ -1034,6 +1095,7 @@ impl<T> HttpUpstreamPeerData<T> {
             handler: TypeId::of::<H>(),
             value,
             original,
+            selection: PeerSelectionState::default(),
             _not_thread_safe: PhantomData,
         }
     }
@@ -1045,6 +1107,16 @@ fn call_original<R>(
     callback: impl FnOnce(*mut ngx_peer_connection_t, *mut c_void) -> R,
 ) -> R {
     callback(peer.raw.as_ptr(), original.data)
+}
+
+fn release_original_peer(
+    original: OriginalPeerCallbacks,
+    peer: &mut UpstreamPeerConnection<'_>,
+    state: UpstreamPeerState,
+) {
+    if let Some(callback) = original.free {
+        call_original(original, peer, |peer, data| unsafe { callback(peer, data, state.bits()) });
+    }
 }
 
 struct RequestUpstream {
@@ -1230,12 +1302,46 @@ where
     match (|| {
         let mut data = peer_data::<H>(data)?;
         let data = unsafe { data.as_mut() };
-        let selection = H::get(
+        let generation = data.selection.begin()?;
+        let outcome = Cell::new(OriginalPeerGetOutcome::NotCalled);
+        let returned = H::get(
             &mut peer,
             &mut data.value,
-            OriginalPeerGet { original: data.original, _callback: PhantomData },
-        )?;
-        Ok(selection.status())
+            OriginalPeerGet {
+                original: data.original,
+                generation,
+                outcome: &outcome,
+                _callback: PhantomData,
+            },
+        )
+        .map(UpstreamPeerSelection::into_returned);
+
+        match (outcome.get(), returned) {
+            (
+                OriginalPeerGetOutcome::Selected,
+                Ok(ReturnedPeerSelection::Selected { status, generation: selected_generation }),
+            ) if selected_generation == generation => {
+                data.selection.select(generation);
+                Ok(status)
+            }
+            (OriginalPeerGetOutcome::Selected, Ok(ReturnedPeerSelection::Selected { .. })) => {
+                release_original_peer(data.original, &mut peer, UpstreamPeerState(0));
+                Err(UpstreamCallbackError::ForeignSelectedPeer)
+            }
+            (OriginalPeerGetOutcome::Selected, Ok(ReturnedPeerSelection::Unselected(_))) => {
+                release_original_peer(data.original, &mut peer, UpstreamPeerState(0));
+                Err(UpstreamCallbackError::DiscardedOriginalPeerSelection)
+            }
+            (OriginalPeerGetOutcome::Selected, Err(error)) => {
+                release_original_peer(data.original, &mut peer, UpstreamPeerState(0));
+                Err(error)
+            }
+            (_, Ok(ReturnedPeerSelection::Selected { .. })) => {
+                Err(UpstreamCallbackError::ForeignSelectedPeer)
+            }
+            (_, Ok(ReturnedPeerSelection::Unselected(status))) => Ok(status),
+            (_, Err(error)) => Err(error),
+        }
     })() {
         Ok(status) => status,
         Err(error) => {
@@ -1258,13 +1364,10 @@ unsafe extern "C" fn raw_free_peer<H>(
     let result = (|| {
         let mut data = peer_data::<H>(data)?;
         let data = unsafe { data.as_mut() };
+        data.selection.release()?;
         let state = UpstreamPeerState(state);
-        H::free(
-            &mut peer,
-            &mut data.value,
-            state,
-            OriginalPeerFree { original: data.original, state, _callback: PhantomData },
-        )
+        release_original_peer(data.original, &mut peer, state);
+        H::free(&mut peer, &mut data.value, state)
     })();
     if let Err(error) = result {
         peer.log_failure("peer release", &error);

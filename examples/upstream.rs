@@ -18,12 +18,12 @@ use ngx::ffi::{
 };
 use ngx::http::{
     HttpConfigurationParser, HttpModule, HttpModuleServerConf, HttpUpstreamInitializer,
-    HttpUpstreamPeerHandler, Merge, MergeConfigError, NgxHttpUpstreamModule, OriginalPeerFree,
-    OriginalPeerGet, OriginalPeerInit, OriginalUpstreamInit, UpstreamCallbackError,
-    UpstreamCallbackSlot, UpstreamConfiguration, UpstreamInitStatus, UpstreamInitialization,
-    UpstreamPeerConnection, UpstreamPeerInit, UpstreamPeerInitRequest, UpstreamPeerInitStatus,
-    UpstreamPeerSelection, UpstreamPeerState, UpstreamServerConf, install_upstream_initializer,
-    postconfiguration, preconfiguration,
+    HttpUpstreamPeerHandler, Merge, MergeConfigError, NgxHttpUpstreamModule, OriginalPeerGet,
+    OriginalPeerInit, OriginalUpstreamInit, UpstreamCallbackError, UpstreamCallbackSlot,
+    UpstreamConfiguration, UpstreamInitStatus, UpstreamInitialization, UpstreamPeerConnection,
+    UpstreamPeerInit, UpstreamPeerInitRequest, UpstreamPeerInitStatus, UpstreamPeerSelection,
+    UpstreamPeerState, UpstreamServerConf, install_upstream_initializer, postconfiguration,
+    preconfiguration,
 };
 use ngx::{ngx_conf_log_error, ngx_log_debug_http, ngx_string};
 
@@ -144,13 +144,12 @@ impl HttpUpstreamPeerHandler for CustomPeer {
         original.call(peer)
     }
 
-    fn free<'callback>(
-        peer: &'callback mut UpstreamPeerConnection<'_>,
+    fn free(
+        _peer: &mut UpstreamPeerConnection<'_>,
         _data: &mut Self::Data,
         _state: UpstreamPeerState,
-        original: OriginalPeerFree<'callback>,
     ) -> Result<(), UpstreamCallbackError> {
-        original.call(peer)
+        Ok(())
     }
 }
 
