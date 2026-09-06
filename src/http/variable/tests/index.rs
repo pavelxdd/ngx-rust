@@ -398,6 +398,61 @@ fn variable_index_rejects_a_foreign_definition_at_a_reused_configuration_address
 
 #[cfg(feature = "test-link")]
 #[test]
+fn stale_variable_index_is_rejected_after_configuration_storage_reuse() {
+    let _globals = VariableGlobals::new();
+    let mut failed_pool = TestPool::new();
+    let mut retry_pool = TestPool::new();
+    let mut configuration = VariableConfiguration::new(&mut failed_pool);
+    let main_address = ptr::from_ref(&*configuration.main);
+    let parser_address = ptr::from_ref(&*configuration.cf);
+
+    add_variable::<TestVariable>(
+        &mut configuration.configuration(),
+        NgxStr::from_bytes(b"ngx_rs_failed_generation"),
+        HttpVariableFlags::empty(),
+        41,
+    )
+    .unwrap();
+    let stale_index = get_variable_index(
+        &mut configuration.configuration(),
+        NgxStr::from_bytes(b"ngx_rs_failed_generation"),
+    )
+    .unwrap();
+
+    configuration.reset(&mut retry_pool);
+    drop(failed_pool);
+    assert_eq!(ptr::from_ref(&*configuration.main), main_address);
+    assert_eq!(ptr::from_ref(&*configuration.cf), parser_address);
+
+    add_variable::<TestVariable>(
+        &mut configuration.configuration(),
+        NgxStr::from_bytes(b"ngx_rs_retry_generation"),
+        HttpVariableFlags::empty(),
+        42,
+    )
+    .unwrap();
+    let current_index = get_variable_index(
+        &mut configuration.configuration(),
+        NgxStr::from_bytes(b"ngx_rs_retry_generation"),
+    )
+    .unwrap();
+    assert_eq!(current_index.index, stale_index.index);
+    configuration.finalize_variables();
+
+    configuration.with_request(|request| {
+        assert_eq!(unsafe { (*request.as_ptr()).headers_out.status }, 0);
+        assert!(matches!(
+            stale_index.get_cached(request),
+            Err(HttpVariableLookupError::ForeignConfiguration)
+        ));
+        assert_eq!(unsafe { (*request.as_ptr()).headers_out.status }, 0);
+        assert_eq!(current_index.get_cached(request).unwrap().bytes(), Some(&b"detected"[..]));
+        assert_eq!(unsafe { (*request.as_ptr()).headers_out.status }, 42);
+    });
+}
+
+#[cfg(feature = "test-link")]
+#[test]
 fn variable_indexes_follow_the_same_definition_across_reload_configurations() {
     let mut fixture = VariableFixture::new();
     add_variable::<IndexedVariable>(
@@ -412,6 +467,7 @@ fn variable_indexes_follow_the_same_definition_across_reload_configurations() {
         NgxStr::from_bytes(b"ngx_rs_reloaded_index"),
     )
     .unwrap();
+    fixture.configuration.finalize_variables();
 
     let mut reloaded = VariableConfiguration::new(&mut fixture.pool);
     add_variable::<IndexedVariable>(
@@ -429,15 +485,14 @@ fn variable_indexes_follow_the_same_definition_across_reload_configurations() {
     reloaded.finalize_variables();
     INDEXED_VARIABLE_CALLS.store(0, Ordering::Relaxed);
 
-    reloaded.with_request(|request| {
-        {
-            let value = old_index.get_cached(request).unwrap();
-            assert_eq!(value.bytes(), Some(&b"indexed"[..]));
-        }
-        {
-            let value = new_index.get_cached(request).unwrap();
-            assert_eq!(value.bytes(), Some(&b"indexed"[..]));
-        }
-        assert_eq!(INDEXED_VARIABLE_CALLS.load(Ordering::Relaxed), 1);
+    fixture.configuration.with_request(|old_request| {
+        assert_eq!(old_index.get_cached(old_request).unwrap().bytes(), Some(&b"indexed"[..]));
+        assert_eq!(new_index.get_cached(old_request).unwrap().bytes(), Some(&b"indexed"[..]));
+
+        reloaded.with_request(|new_request| {
+            assert_eq!(old_index.get_cached(new_request).unwrap().bytes(), Some(&b"indexed"[..]));
+            assert_eq!(new_index.get_cached(new_request).unwrap().bytes(), Some(&b"indexed"[..]));
+        });
     });
+    assert_eq!(INDEXED_VARIABLE_CALLS.load(Ordering::Relaxed), 2);
 }
