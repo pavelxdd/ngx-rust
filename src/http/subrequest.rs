@@ -162,7 +162,7 @@ impl<'request, 'callback, H> SubRequestBuilder<'request, 'callback, H> {
 
     /// Set the initial input-header capacity.
     ///
-    /// A capacity of zero preserves the parent's shallow-copied headers.
+    /// A capacity of zero preserves the parent's shallow-copied headers for read-only access.
     pub fn init_headers_in(mut self, capacity: ngx_uint_t) -> Self {
         self.headers_in_capacity = capacity;
         self
@@ -264,6 +264,9 @@ impl<'request, 'callback, H> SubRequestBuilder<'request, 'callback, H> {
         }
         if let Some(headers) = headers_in {
             subrequest.reset_headers_in(headers);
+        } else {
+            // Native shallow copy leaves a one-part list's tail pointing at the parent's inline part.
+            subrequest.repair_headers_in_last();
         }
         Ok(subrequest)
     }
@@ -437,18 +440,137 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "test-link")]
-    use alloc::rc::Rc;
+    use alloc::{boxed::Box, rc::Rc};
     #[cfg(feature = "test-link")]
     use core::cell::Cell;
     #[cfg(feature = "test-link")]
     use nginx_sys::{
-        NGX_HTTP_MODULE, ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_log_t, ngx_uint_t,
+        NGX_HTTP_MODULE, ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_http_conf_ctx_t,
+        ngx_http_core_loc_conf_t, ngx_http_core_main_conf_t, ngx_http_core_srv_conf_t, ngx_log_t,
+        ngx_uint_t,
     };
+    #[cfg(feature = "test-link")]
+    use std::sync::MutexGuard;
 
     #[cfg(feature = "test-link")]
     unsafe extern "C" {
         fn ngx_rs_test_fail_allocations_after(successes: ngx_uint_t);
         fn ngx_rs_test_reset_allocation_failures();
+    }
+
+    #[cfg(feature = "test-link")]
+    struct TestGlobals {
+        _guard: MutexGuard<'static, ()>,
+        http_max_module: ngx_uint_t,
+        core_context_index: ngx_uint_t,
+    }
+
+    #[cfg(feature = "test-link")]
+    impl TestGlobals {
+        fn new() -> Self {
+            let guard = crate::TEST_NGINX_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
+            let (http_max_module, core_context_index) = unsafe {
+                let core = &raw const nginx_sys::ngx_http_core_module;
+                (nginx_sys::ngx_http_max_module, (*core).ctx_index)
+            };
+            unsafe {
+                nginx_sys::ngx_http_max_module = 1;
+                let core = &raw mut nginx_sys::ngx_http_core_module;
+                (*core).ctx_index = 0;
+            }
+            Self { _guard: guard, http_max_module, core_context_index }
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    impl Drop for TestGlobals {
+        fn drop(&mut self) {
+            unsafe {
+                nginx_sys::ngx_http_max_module = self.http_max_module;
+                let core = &raw mut nginx_sys::ngx_http_core_module;
+                (*core).ctx_index = self.core_context_index;
+            }
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    struct NativeSubRequestFixture {
+        _globals: TestGlobals,
+        pool: *mut nginx_sys::ngx_pool_t,
+        _log: Box<ngx_log_t>,
+        _connection: Box<ngx_connection_t>,
+        _core_loc: Box<ngx_http_core_loc_conf_t>,
+        _loc_conf: Box<[*mut c_void; 1]>,
+        _main_conf: Box<ngx_http_core_main_conf_t>,
+        _main_conf_slots: Box<[*mut c_void; 1]>,
+        _http_context: Box<ngx_http_conf_ctx_t>,
+        _server: Box<ngx_http_core_srv_conf_t>,
+        _server_slots: Box<[*mut c_void; 1]>,
+        request: Box<ngx_http_request_t>,
+    }
+
+    #[cfg(feature = "test-link")]
+    impl NativeSubRequestFixture {
+        fn new() -> Self {
+            let globals = TestGlobals::new();
+            let mut log = Box::new(unsafe { mem::zeroed::<ngx_log_t>() });
+            let pool = unsafe { ngx_create_pool(4096, &raw mut *log) };
+            assert!(!pool.is_null());
+            let mut connection = Box::new(unsafe { mem::zeroed::<ngx_connection_t>() });
+            connection.log = &raw mut *log;
+            connection.fd = -1;
+            let mut core_loc = Box::new(unsafe { mem::zeroed::<ngx_http_core_loc_conf_t>() });
+            let mut loc_conf = Box::new([(&raw mut *core_loc).cast::<c_void>()]);
+            let mut main_conf = Box::new(unsafe { mem::zeroed::<ngx_http_core_main_conf_t>() });
+            let mut main_conf_slots = Box::new([(&raw mut *main_conf).cast::<c_void>()]);
+            let mut http_context = Box::new(ngx_http_conf_ctx_t {
+                main_conf: main_conf_slots.as_mut_ptr(),
+                srv_conf: ptr::null_mut(),
+                loc_conf: loc_conf.as_mut_ptr(),
+            });
+            let mut server = Box::new(unsafe { mem::zeroed::<ngx_http_core_srv_conf_t>() });
+            server.ctx = &raw mut *http_context;
+            let mut server_slots = Box::new([(&raw mut *server).cast::<c_void>()]);
+            http_context.srv_conf = server_slots.as_mut_ptr();
+            let mut request = Box::new(unsafe { mem::zeroed::<ngx_http_request_t>() });
+            request.signature = NGX_HTTP_MODULE as _;
+            request.main = &raw mut *request;
+            request.parent = &raw mut *request;
+            request.pool = pool;
+            request.connection = &raw mut *connection;
+            request.main_conf = main_conf_slots.as_mut_ptr();
+            request.srv_conf = server_slots.as_mut_ptr();
+            request.loc_conf = loc_conf.as_mut_ptr();
+            request.set_count(1);
+            request.set_subrequests(2);
+            connection.data = (&raw mut *request).cast();
+
+            Self {
+                _globals: globals,
+                pool,
+                _log: log,
+                _connection: connection,
+                _core_loc: core_loc,
+                _loc_conf: loc_conf,
+                _main_conf: main_conf,
+                _main_conf_slots: main_conf_slots,
+                _http_context: http_context,
+                _server: server,
+                _server_slots: server_slots,
+                request,
+            }
+        }
+
+        fn borrow(&mut self) -> RequestRefMut<'_> {
+            unsafe { RequestRefMut::from_raw(&raw mut *self.request).unwrap() }
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    impl Drop for NativeSubRequestFixture {
+        fn drop(&mut self) {
+            unsafe { ngx_destroy_pool(self.pool) };
+        }
     }
 
     #[cfg(feature = "test-link")]
@@ -543,6 +665,157 @@ mod tests {
         assert_eq!(drops.get(), 1);
         unsafe { ngx_destroy_pool(pool) };
         assert_eq!(drops.get(), 1);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn inherited_headers_are_readable_for_one_and_multiple_parts() {
+        for capacity in [2, 1] {
+            let mut fixture = NativeSubRequestFixture::new();
+            {
+                let mut request = fixture.borrow();
+                let mut headers = unsafe { request.headers_in_builder(capacity) }.unwrap();
+                headers.add(b"Host", b"parent.test").unwrap();
+                headers.add(b"X-Second", b"two").unwrap();
+                headers.commit();
+            }
+            let parent = &raw mut *fixture.request;
+            let original = unsafe {
+                (
+                    (*parent).headers_in.headers.part.elts,
+                    (*parent).headers_in.headers.part.nelts,
+                    (*parent).headers_in.headers.part.next,
+                    (*parent).headers_in.headers.last,
+                    (*parent).headers_in.count,
+                    (*parent).headers_in.host,
+                )
+            };
+            assert_eq!(original.2.is_null(), capacity == 2);
+
+            let mut request = fixture.borrow();
+            let child = SubRequestBuilder::new(&mut request, "/child")
+                .unwrap()
+                .keep_body()
+                .init_headers_in(0)
+                .background()
+                .build()
+                .unwrap();
+            let child_raw = unsafe { child.as_ptr() };
+            assert_eq!(unsafe { (*child_raw).headers_in.count }, original.4);
+            assert_eq!(unsafe { (*child_raw).headers_in.host }, original.5);
+            if capacity == 2 {
+                assert_eq!(unsafe { (*child_raw).headers_in.headers.last }, unsafe {
+                    &raw mut (*child_raw).headers_in.headers.part
+                });
+            } else {
+                assert_eq!(unsafe { (*child_raw).headers_in.headers.last }, original.3);
+            }
+            {
+                let headers = child.headers_in().unwrap();
+                let mut headers = headers.iter();
+                let host = headers.next().unwrap();
+                assert_eq!(host.key(), b"Host");
+                assert_eq!(host.value(), b"parent.test");
+                let second = headers.next().unwrap();
+                assert_eq!(second.key(), b"X-Second");
+                assert_eq!(second.value(), b"two");
+                assert!(headers.next().is_none());
+            }
+            child.finalize(crate::core::Status::NGX_OK).unwrap();
+
+            assert_eq!(fixture.request.count(), 1);
+            assert_eq!(
+                (
+                    fixture.request.headers_in.headers.part.elts,
+                    fixture.request.headers_in.headers.part.nelts,
+                    fixture.request.headers_in.headers.part.next,
+                    fixture.request.headers_in.headers.last,
+                    fixture.request.headers_in.count,
+                    fixture.request.headers_in.host,
+                ),
+                original
+            );
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn inherited_header_creation_failures_do_not_change_the_parent() {
+        let mut reached_success = false;
+
+        for successes in 0..8 {
+            let mut fixture = NativeSubRequestFixture::new();
+            {
+                let mut request = fixture.borrow();
+                let mut headers = unsafe { request.headers_in_builder(1) }.unwrap();
+                headers.add(b"Host", b"parent.test").unwrap();
+                headers.add(b"X-Second", b"two").unwrap();
+                headers.commit();
+            }
+            let original = (
+                fixture.request.headers_in.headers.part.elts,
+                fixture.request.headers_in.headers.part.nelts,
+                fixture.request.headers_in.headers.part.next,
+                fixture.request.headers_in.headers.last,
+                fixture.request.headers_in.count,
+                fixture.request.headers_in.host,
+            );
+            let original_native_owners = (
+                fixture.request.posted_requests,
+                fixture.request.postponed,
+                fixture._connection.data,
+            );
+            let pool = fixture.pool;
+            let mut request = fixture.borrow();
+            let builder = SubRequestBuilder::new(&mut request, "/child").unwrap();
+            unsafe {
+                (*pool).d.last = (*pool).d.end;
+                (*pool).max = 0;
+                ngx_rs_test_fail_allocations_after(successes);
+            }
+            let result = builder.keep_body().init_headers_in(0).background().build();
+            unsafe { ngx_rs_test_reset_allocation_failures() };
+
+            match result {
+                Ok(child) => {
+                    assert_eq!(child.headers_in().unwrap().len(), 2);
+                    child.finalize(crate::core::Status::NGX_OK).unwrap();
+                    reached_success = true;
+                }
+                Err(error) => {
+                    assert!(matches!(
+                        error,
+                        SubRequestError::Create(status)
+                            if status == nginx_sys::NGX_ERROR as ngx_int_t
+                    ));
+                    assert_eq!(
+                        (
+                            fixture.request.posted_requests,
+                            fixture.request.postponed,
+                            fixture._connection.data,
+                        ),
+                        original_native_owners
+                    );
+                }
+            }
+            assert_eq!(fixture.request.count(), 1);
+            assert_eq!(
+                (
+                    fixture.request.headers_in.headers.part.elts,
+                    fixture.request.headers_in.headers.part.nelts,
+                    fixture.request.headers_in.headers.part.next,
+                    fixture.request.headers_in.headers.last,
+                    fixture.request.headers_in.count,
+                    fixture.request.headers_in.host,
+                ),
+                original
+            );
+            if reached_success {
+                break;
+            }
+        }
+
+        assert!(reached_success);
     }
 
     #[cfg(feature = "async")]
