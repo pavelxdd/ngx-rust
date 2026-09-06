@@ -12,12 +12,20 @@ use super::*;
 use crate::core::{ModuleDescriptor, Status};
 use crate::ffi::{
     NGX_BUSY, NGX_DECLINED, NGX_ERROR, NGX_HTTP_MODULE, NGX_LOG_ERR, ngx_conf_t, ngx_connection_t,
-    ngx_http_request_t, ngx_http_upstream_srv_conf_t, ngx_http_upstream_t, ngx_int_t, ngx_log_t,
-    ngx_module_t, ngx_peer_connection_t, ngx_str_t, ngx_uint_t, sockaddr,
+    ngx_destroy_pool, ngx_http_request_t, ngx_http_upstream_srv_conf_t, ngx_http_upstream_t,
+    ngx_int_t, ngx_log_t, ngx_module_t, ngx_peer_connection_t, ngx_str_t, ngx_uint_t, sockaddr,
 };
 use crate::http::{HttpModule, HttpModuleServerConf};
 
+unsafe extern "C" {
+    fn ngx_rs_test_fail_allocations_after(successes: ngx_uint_t);
+    fn ngx_rs_test_reset_allocation_failures();
+}
+
 static ORIGINAL_INIT_PEER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static COUNTING_INIT_PEER_CALLS: AtomicUsize = AtomicUsize::new(0);
+static REPLACEMENT_REQUEST_UPSTREAM: AtomicPtr<ngx_http_upstream_t> =
+    AtomicPtr::new(ptr::null_mut());
 static ORIGINAL_INIT_UPSTREAM_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DELEGATED_INIT_UPSTREAM_CALLS: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_GET_STATUS: AtomicIsize = AtomicIsize::new(0);
@@ -394,6 +402,24 @@ impl HttpUpstreamPeerHandler for DelegatePeerInit {
     }
 }
 
+unsafe extern "C" fn replace_request_upstream(
+    request: *mut ngx_http_request_t,
+    _upstream: *mut ngx_http_upstream_srv_conf_t,
+) -> ngx_int_t {
+    unsafe { (*request).upstream = REPLACEMENT_REQUEST_UPSTREAM.load(Ordering::Relaxed) };
+    Status::NGX_OK.0
+}
+
+unsafe extern "C" fn destroy_request_during_peer_init(
+    request: *mut ngx_http_request_t,
+    _upstream: *mut ngx_http_upstream_srv_conf_t,
+) -> ngx_int_t {
+    let request = unsafe { &mut *request };
+    unsafe { (*request.upstream).peer.get = Some(incomplete_selected_get_peer) };
+    unsafe { ngx_destroy_pool(request.pool) };
+    Status::NGX_OK.0
+}
+
 unsafe extern "C" fn ordered_init_peer(
     request: *mut ngx_http_request_t,
     _upstream: *mut ngx_http_upstream_srv_conf_t,
@@ -526,6 +552,40 @@ impl HttpUpstreamPeerHandler for OrderedPeer {
         original: OriginalPeerFree<'callback>,
     ) -> Result<(), UpstreamCallbackError> {
         original.call(peer)
+    }
+}
+
+struct CountingPeerInit;
+
+impl HttpUpstreamPeerHandler for CountingPeerInit {
+    test_callback_owner!();
+
+    type Data = ();
+
+    fn init(
+        _request: &mut UpstreamPeerInitRequest<'_>,
+        _upstream: &mut UpstreamServerConf<'_>,
+        _original: OriginalPeerInit<Self>,
+    ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
+        COUNTING_INIT_PEER_CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(UpstreamPeerInit::Install(()))
+    }
+
+    fn get<'callback>(
+        _peer: &'callback mut UpstreamPeerConnection<'_>,
+        _data: &mut Self::Data,
+        _original: OriginalPeerGet<'callback>,
+    ) -> Result<UpstreamPeerSelection<'callback>, UpstreamCallbackError> {
+        Ok(UpstreamPeerSelection::Error)
+    }
+
+    fn free<'callback>(
+        _peer: &'callback mut UpstreamPeerConnection<'_>,
+        _data: &mut Self::Data,
+        _state: UpstreamPeerState,
+        _original: OriginalPeerFree<'callback>,
+    ) -> Result<(), UpstreamCallbackError> {
+        Ok(())
     }
 }
 
@@ -885,6 +945,87 @@ fn peer_initializer_preserves_an_original_non_success_outcome() {
     assert_eq!(ORIGINAL_INIT_PEER_CALLS.load(Ordering::Relaxed), 1);
     assert!(request_upstream.peer.data.is_null());
     assert!(request_upstream.peer.get.is_none());
+    assert!(request_upstream.peer.free.is_none());
+}
+
+#[test]
+fn peer_initializer_allocation_failure_does_not_publish_callbacks() {
+    for successful_allocations in 0..=1 {
+        COUNTING_INIT_PEER_CALLS.store(0, Ordering::Relaxed);
+        let pool = TestPool::new();
+        let mut request_upstream =
+            unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
+        let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+        initialized_request(&pool, &mut request, &mut request_upstream);
+        let mut server = ConfiguredServer::new(0);
+        assert_eq!(server.install_peer::<CountingPeerInit>(), Ok(()));
+
+        unsafe {
+            (*pool.raw).d.last = (*pool.raw).d.end;
+            (*pool.raw).max = 0;
+            ngx_rs_test_fail_allocations_after(successful_allocations);
+        }
+        let status =
+            unsafe { raw_init_peer::<CountingPeerInit>(&raw mut request, &raw mut *server.raw) };
+        unsafe { ngx_rs_test_reset_allocation_failures() };
+
+        assert_eq!(status, Status::NGX_ERROR.0);
+        assert_eq!(
+            COUNTING_INIT_PEER_CALLS.load(Ordering::Relaxed),
+            successful_allocations as usize
+        );
+        assert!(request_upstream.peer.data.is_null());
+        assert!(request_upstream.peer.get.is_none());
+        assert!(request_upstream.peer.free.is_none());
+    }
+}
+
+#[test]
+fn peer_initializer_rejects_replaced_request_upstream_before_publication() {
+    let pool = TestPool::new();
+    let mut original = unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
+    let mut replacement = unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
+    replacement.peer.get = Some(incomplete_selected_get_peer);
+    REPLACEMENT_REQUEST_UPSTREAM.store(&raw mut replacement, Ordering::Relaxed);
+    let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+    initialized_request(&pool, &mut request, &mut original);
+    let mut server = ConfiguredServer::new(0);
+    server.raw.peer.init = Some(replace_request_upstream);
+    assert_eq!(server.install_peer::<DelegatePeerInit>(), Ok(()));
+
+    assert_eq!(
+        unsafe { raw_init_peer::<DelegatePeerInit>(&raw mut request, &raw mut *server.raw) },
+        Status::NGX_ERROR.0
+    );
+    assert!(original.peer.data.is_null());
+    assert!(original.peer.get.is_none());
+    assert!(original.peer.free.is_none());
+    assert_eq!(request.upstream, &raw mut replacement);
+}
+
+#[test]
+fn peer_initializer_stops_after_synchronous_request_pool_destruction() {
+    let mut pool = TestPool::new();
+    let mut request_upstream =
+        unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
+    let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+    initialized_request(&pool, &mut request, &mut request_upstream);
+    let mut server = ConfiguredServer::new(0);
+    server.raw.peer.init = Some(destroy_request_during_peer_init);
+    assert_eq!(server.install_peer::<DelegatePeerInit>(), Ok(()));
+
+    assert_eq!(
+        unsafe { raw_init_peer::<DelegatePeerInit>(&raw mut request, &raw mut *server.raw) },
+        Status::NGX_ERROR.0
+    );
+    pool.disarm();
+    assert!(request_upstream.peer.data.is_null());
+    assert_eq!(
+        unsafe {
+            request_upstream.peer.get.unwrap()(&raw mut request_upstream.peer, ptr::null_mut())
+        },
+        Status::NGX_OK.0
+    );
     assert!(request_upstream.peer.free.is_none());
 }
 
