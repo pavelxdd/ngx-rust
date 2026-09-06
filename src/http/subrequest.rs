@@ -16,7 +16,7 @@ use core::task::{Context, Poll, Waker};
 
 use nginx_sys::{
     NGX_HTTP_SUBREQUEST_BACKGROUND, NGX_HTTP_SUBREQUEST_CLONE, NGX_HTTP_SUBREQUEST_IN_MEMORY,
-    NGX_HTTP_SUBREQUEST_WAITED, ngx_http_post_subrequest_t, ngx_http_request_body_t,
+    NGX_HTTP_SUBREQUEST_WAITED, NGX_OK, ngx_http_post_subrequest_t, ngx_http_request_body_t,
     ngx_http_request_t, ngx_int_t, ngx_list_init, ngx_list_t, ngx_str_t, ngx_table_elt_t,
     ngx_uint_t,
 };
@@ -291,7 +291,11 @@ impl<'request> SubRequestBuilder<'request, '_> {
         let guard = AsyncSubRequestGuard { state, active: true };
         let subrequest = self
             .handler(move |request, status| {
+                if !guard.accepts_completion() {
+                    return NGX_OK as ngx_int_t;
+                }
                 let (output, handler_status) = handler(request, status);
+                let handler_status = handler_status.into_handler_status(&request.view());
                 guard.finish(output);
                 handler_status
             })
@@ -302,6 +306,9 @@ impl<'request> SubRequestBuilder<'request, '_> {
 }
 
 /// Future returned by [`SubRequestBuilder::build_async`].
+///
+/// Dropping the future cancels delivery and suppresses its completion handler if nginx invokes the
+/// native post-subrequest callback later.
 #[cfg(feature = "async")]
 pub struct SubRequestFuture<T> {
     state: Rc<RefCell<AsyncSubRequestState<T>>>,
@@ -330,20 +337,34 @@ impl<T> Future for SubRequestFuture<T> {
 }
 
 #[cfg(feature = "async")]
+impl<T> Drop for SubRequestFuture<T> {
+    fn drop(&mut self) {
+        let mut state = self.state.borrow_mut();
+        if state.consumed {
+            return;
+        }
+        state.canceled = true;
+        state.output.take();
+        state.waker.take();
+    }
+}
+
+#[cfg(feature = "async")]
 struct AsyncSubRequestState<T> {
     output: Option<Result<T, SubRequestError>>,
     waker: Option<Waker>,
     consumed: bool,
+    canceled: bool,
 }
 
 #[cfg(feature = "async")]
 impl<T> AsyncSubRequestState<T> {
     fn new() -> Self {
-        Self { output: None, waker: None, consumed: false }
+        Self { output: None, waker: None, consumed: false, canceled: false }
     }
 
     fn complete(&mut self, output: Result<T, SubRequestError>) -> Option<Waker> {
-        if self.consumed || self.output.is_some() {
+        if self.canceled || self.consumed || self.output.is_some() {
             return None;
         }
         self.output = Some(output);
@@ -359,6 +380,10 @@ struct AsyncSubRequestGuard<T> {
 
 #[cfg(feature = "async")]
 impl<T> AsyncSubRequestGuard<T> {
+    fn accepts_completion(&self) -> bool {
+        !self.state.borrow().canceled
+    }
+
     fn finish(mut self, output: T) {
         self.active = false;
         let waker = self.state.borrow_mut().complete(Ok(output));
@@ -417,8 +442,14 @@ mod tests {
     use core::cell::Cell;
     #[cfg(feature = "test-link")]
     use nginx_sys::{
-        NGX_HTTP_MODULE, ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_log_t,
+        NGX_HTTP_MODULE, ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_log_t, ngx_uint_t,
     };
+
+    #[cfg(feature = "test-link")]
+    unsafe extern "C" {
+        fn ngx_rs_test_fail_allocations_after(successes: ngx_uint_t);
+        fn ngx_rs_test_reset_allocation_failures();
+    }
 
     #[cfg(feature = "test-link")]
     struct DropCounter(Rc<Cell<usize>>);
@@ -463,6 +494,53 @@ mod tests {
             );
             assert_eq!(drops.get(), 1);
         }
+        unsafe { ngx_destroy_pool(pool) };
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn post_handler_allocation_failure_drops_transferred_handler_once() {
+        let mut log = unsafe { mem::zeroed::<ngx_log_t>() };
+        let pool = unsafe { ngx_create_pool(4096, &raw mut log) };
+        assert!(!pool.is_null());
+        let mut connection = unsafe { mem::zeroed::<ngx_connection_t>() };
+        connection.log = &raw mut log;
+        let mut raw = unsafe { mem::zeroed::<ngx_http_request_t>() };
+        raw.signature = NGX_HTTP_MODULE as _;
+        raw.main = &raw mut raw;
+        raw.pool = pool;
+        raw.connection = &raw mut connection;
+        raw.set_count(1);
+        raw.set_subrequests(1);
+
+        let drops = Rc::new(Cell::new(0));
+        let mut request = unsafe { RequestRefMut::from_raw(&raw mut raw).unwrap() };
+        let builder =
+            SubRequestBuilder::new(&mut request, "/child").unwrap().keep_body().init_headers_in(0);
+        let captured = DropCounter(Rc::clone(&drops));
+        let handler = move |_: &mut RequestRefMut<'_>, _| {
+            drop(captured);
+            crate::core::Status::NGX_OK
+        };
+        fn option_size<T>(_: &T) -> usize {
+            mem::size_of::<Option<T>>()
+        }
+
+        let align = mem::align_of::<usize>();
+        let aligned = |size: usize| (size + align - 1) & !(align - 1);
+        let required = aligned(mem::size_of::<nginx_sys::ngx_pool_cleanup_t>())
+            + aligned(option_size(&handler));
+        unsafe {
+            assert!(((*pool).d.end as usize - (*pool).d.last as usize) >= required);
+            (*pool).d.last = (*pool).d.end.sub(required);
+            ngx_rs_test_fail_allocations_after(0);
+        }
+        let result = builder.handler(handler).build();
+        unsafe { ngx_rs_test_reset_allocation_failures() };
+
+        assert!(matches!(result, Err(SubRequestError::Alloc)));
+        assert_eq!(drops.get(), 1);
         unsafe { ngx_destroy_pool(pool) };
         assert_eq!(drops.get(), 1);
     }
