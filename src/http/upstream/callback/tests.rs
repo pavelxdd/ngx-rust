@@ -37,6 +37,9 @@ static REPLACEMENT_REQUEST_UPSTREAM: AtomicPtr<ngx_http_upstream_t> =
     AtomicPtr::new(ptr::null_mut());
 static ORIGINAL_INIT_UPSTREAM_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DELEGATED_INIT_UPSTREAM_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SELF_UPSTREAM_INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SELF_PEER_INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static INITIALIZER_CHAIN_ORDER: AtomicU64 = AtomicU64::new(0);
 static ORIGINAL_GET_STATUS: AtomicIsize = AtomicIsize::new(0);
 static ACCOUNTING_GET_STATUS: AtomicIsize = AtomicIsize::new(0);
 static ACCOUNTING_GET_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -176,11 +179,16 @@ unsafe impl HttpModule for TestServerModule {
 struct TestServerConfig {
     value: u32,
     callbacks: UpstreamCallbackSlot,
+    outer_callbacks: UpstreamCallbackSlot,
 }
 
 impl TestServerConfig {
     fn new(value: u32) -> Self {
-        Self { value, callbacks: UpstreamCallbackSlot::new() }
+        Self {
+            value,
+            callbacks: UpstreamCallbackSlot::new(),
+            outer_callbacks: UpstreamCallbackSlot::new(),
+        }
     }
 }
 
@@ -196,6 +204,21 @@ macro_rules! test_callback_owner {
             &mut configuration.callbacks
         }
     };
+}
+
+fn record_initializer_step(step: u64) {
+    let mut current = INITIALIZER_CHAIN_ORDER.load(Ordering::Relaxed);
+    loop {
+        match INITIALIZER_CHAIN_ORDER.compare_exchange_weak(
+            current,
+            current * 10 + step,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(value) => current = value,
+        }
+    }
 }
 
 unsafe extern "C" fn incomplete_init_peer(
@@ -395,6 +418,189 @@ impl HttpUpstreamPeerHandler for DelegatePeerInit {
         original: OriginalPeerInit<Self>,
     ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
         match original.call(request, upstream)? {
+            UpstreamPeerInitStatus::Initialized => Ok(UpstreamPeerInit::Install(())),
+            UpstreamPeerInitStatus::Unavailable => Ok(UpstreamPeerInit::Unavailable),
+        }
+    }
+
+    fn get<'callback>(
+        _peer: &'callback mut UpstreamPeerConnection<'_>,
+        _data: &mut Self::Data,
+        _original: OriginalPeerGet<'callback>,
+    ) -> Result<UpstreamPeerSelection<'callback>, UpstreamCallbackError> {
+        Ok(UpstreamPeerSelection::Error)
+    }
+
+    fn free(
+        _peer: &mut UpstreamPeerConnection<'_>,
+        _data: &mut Self::Data,
+        _state: UpstreamPeerState,
+    ) -> Result<(), UpstreamCallbackError> {
+        Ok(())
+    }
+}
+
+unsafe extern "C" fn successful_init_upstream(
+    _configuration: *mut ngx_conf_t,
+    upstream: *mut ngx_http_upstream_srv_conf_t,
+) -> ngx_int_t {
+    SELF_UPSTREAM_INIT_CALLS.fetch_add(1, Ordering::Relaxed);
+    unsafe { (*upstream).peer.init = Some(successful_init_peer) };
+    Status::NGX_OK.0
+}
+
+unsafe extern "C" fn successful_init_peer(
+    request: *mut ngx_http_request_t,
+    _upstream: *mut ngx_http_upstream_srv_conf_t,
+) -> ngx_int_t {
+    SELF_PEER_INIT_CALLS.fetch_add(1, Ordering::Relaxed);
+    unsafe { (*(*request).upstream).peer.get = Some(error_get_peer) };
+    Status::NGX_OK.0
+}
+
+unsafe extern "C" fn error_get_peer(
+    _peer: *mut ngx_peer_connection_t,
+    _data: *mut c_void,
+) -> ngx_int_t {
+    Status::NGX_ERROR.0
+}
+
+unsafe extern "C" fn chained_init_upstream(
+    _configuration: *mut ngx_conf_t,
+    upstream: *mut ngx_http_upstream_srv_conf_t,
+) -> ngx_int_t {
+    record_initializer_step(3);
+    unsafe { (*upstream).peer.init = Some(chained_init_peer) };
+    Status::NGX_OK.0
+}
+
+unsafe extern "C" fn chained_init_peer(
+    request: *mut ngx_http_request_t,
+    _upstream: *mut ngx_http_upstream_srv_conf_t,
+) -> ngx_int_t {
+    record_initializer_step(3);
+    unsafe { (*(*request).upstream).peer.get = Some(error_get_peer) };
+    Status::NGX_OK.0
+}
+
+struct SelfDelegatingInitializer;
+
+impl HttpUpstreamInitializer for SelfDelegatingInitializer {
+    test_callback_owner!();
+
+    fn init<'upstream>(
+        configuration: &mut UpstreamConfiguration<'_>,
+        upstream: &'upstream mut UpstreamServerConf<'_>,
+        original: OriginalUpstreamInit<Self>,
+    ) -> Result<UpstreamInitialization<'upstream>, UpstreamCallbackError> {
+        let callback =
+            unsafe { upstream.raw.as_ref().peer.init_upstream.map(|value| value as usize) };
+        if upstream.install_upstream::<Self>()
+            != Err(UpstreamCallbackError::DuplicateUpstreamInitializer)
+            || unsafe { upstream.raw.as_ref().peer.init_upstream.map(|value| value as usize) }
+                != callback
+        {
+            return Err(UpstreamCallbackError::ForeignUpstreamInitializer);
+        }
+        match original.call(configuration, upstream)? {
+            UpstreamInitStatus::Initialized => {
+                Ok(UpstreamInitialization::Initialized(upstream.initialized()?))
+            }
+            UpstreamInitStatus::Unavailable => Ok(UpstreamInitialization::Unavailable),
+        }
+    }
+}
+
+impl HttpUpstreamPeerHandler for SelfDelegatingInitializer {
+    test_callback_owner!();
+
+    type Data = ();
+
+    fn init(
+        request: &mut UpstreamPeerInitRequest<'_>,
+        upstream: &mut UpstreamServerConf<'_>,
+        original: OriginalPeerInit<Self>,
+    ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
+        let callback = unsafe { upstream.raw.as_ref().peer.init.map(|value| value as usize) };
+        if upstream.install_peer_initializer::<Self>()
+            != Err(UpstreamCallbackError::DuplicatePeerInitializer)
+            || unsafe { upstream.raw.as_ref().peer.init.map(|value| value as usize) } != callback
+        {
+            return Err(UpstreamCallbackError::ForeignPeerInitializer);
+        }
+        match original.call(request, upstream)? {
+            UpstreamPeerInitStatus::Initialized => Ok(UpstreamPeerInit::Install(())),
+            UpstreamPeerInitStatus::Unavailable => Ok(UpstreamPeerInit::Unavailable),
+        }
+    }
+
+    fn get<'callback>(
+        _peer: &'callback mut UpstreamPeerConnection<'_>,
+        _data: &mut Self::Data,
+        _original: OriginalPeerGet<'callback>,
+    ) -> Result<UpstreamPeerSelection<'callback>, UpstreamCallbackError> {
+        Ok(UpstreamPeerSelection::Error)
+    }
+
+    fn free(
+        _peer: &mut UpstreamPeerConnection<'_>,
+        _data: &mut Self::Data,
+        _state: UpstreamPeerState,
+    ) -> Result<(), UpstreamCallbackError> {
+        Ok(())
+    }
+}
+
+struct ChainedInitializer<const OUTER: bool, const ENTER: u64, const EXIT: u64>;
+
+type InnerInitializer = ChainedInitializer<false, 2, 4>;
+type OuterInitializer = ChainedInitializer<true, 1, 5>;
+
+impl<const OUTER: bool, const ENTER: u64, const EXIT: u64> HttpUpstreamInitializer
+    for ChainedInitializer<OUTER, ENTER, EXIT>
+{
+    type Module = TestServerModule;
+
+    fn callback_slot(configuration: &mut TestServerConfig) -> &mut UpstreamCallbackSlot {
+        if OUTER { &mut configuration.outer_callbacks } else { &mut configuration.callbacks }
+    }
+
+    fn init<'upstream>(
+        configuration: &mut UpstreamConfiguration<'_>,
+        upstream: &'upstream mut UpstreamServerConf<'_>,
+        original: OriginalUpstreamInit<Self>,
+    ) -> Result<UpstreamInitialization<'upstream>, UpstreamCallbackError> {
+        record_initializer_step(ENTER);
+        let status = original.call(configuration, upstream)?;
+        record_initializer_step(EXIT);
+        match status {
+            UpstreamInitStatus::Initialized => {
+                Ok(UpstreamInitialization::Initialized(upstream.initialized()?))
+            }
+            UpstreamInitStatus::Unavailable => Ok(UpstreamInitialization::Unavailable),
+        }
+    }
+}
+
+impl<const OUTER: bool, const ENTER: u64, const EXIT: u64> HttpUpstreamPeerHandler
+    for ChainedInitializer<OUTER, ENTER, EXIT>
+{
+    type Module = TestServerModule;
+    type Data = ();
+
+    fn callback_slot(configuration: &mut TestServerConfig) -> &mut UpstreamCallbackSlot {
+        if OUTER { &mut configuration.outer_callbacks } else { &mut configuration.callbacks }
+    }
+
+    fn init(
+        request: &mut UpstreamPeerInitRequest<'_>,
+        upstream: &mut UpstreamServerConf<'_>,
+        original: OriginalPeerInit<Self>,
+    ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
+        record_initializer_step(ENTER);
+        let status = original.call(request, upstream)?;
+        record_initializer_step(EXIT);
+        match status {
             UpstreamPeerInitStatus::Initialized => Ok(UpstreamPeerInit::Install(())),
             UpstreamPeerInitStatus::Unavailable => Ok(UpstreamPeerInit::Unavailable),
         }
@@ -805,6 +1011,74 @@ fn repeated_peer_initializer_installation_is_rejected_before_publication() {
         unsafe { server.raw.peer.init.unwrap()(ptr::null_mut(), ptr::null_mut()) },
         Status::NGX_OK.0
     );
+}
+
+#[test]
+fn self_delegating_upstream_initializer_is_rejected_without_callback_changes() {
+    let pool = TestPool::new();
+    let mut configuration = unsafe { MaybeUninit::<ngx_conf_t>::zeroed().assume_init() };
+    configuration.pool = pool.raw;
+    let mut server = ConfiguredServer::new(0);
+    SELF_UPSTREAM_INIT_CALLS.store(0, Ordering::Relaxed);
+    server.raw.peer.init_upstream = Some(successful_init_upstream);
+
+    assert_eq!(install_upstream_initializer::<SelfDelegatingInitializer>(&mut server.raw), Ok(()));
+    let callback = server.raw.peer.init_upstream.unwrap();
+    assert_eq!(unsafe { callback(&raw mut configuration, &raw mut *server.raw) }, Status::NGX_OK.0);
+    assert_eq!(server.raw.peer.init_upstream.map(|value| value as usize), Some(callback as usize));
+    assert_eq!(SELF_UPSTREAM_INIT_CALLS.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn self_delegating_peer_initializer_is_rejected_without_callback_changes() {
+    let pool = TestPool::new();
+    let mut request_upstream =
+        unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
+    let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+    initialized_request(&pool, &mut request, &mut request_upstream);
+    let mut server = ConfiguredServer::new(0);
+    SELF_PEER_INIT_CALLS.store(0, Ordering::Relaxed);
+    server.raw.peer.init = Some(successful_init_peer);
+
+    assert_eq!(server.install_peer::<SelfDelegatingInitializer>(), Ok(()));
+    let callback = server.raw.peer.init.unwrap();
+    assert_eq!(unsafe { callback(&raw mut request, &raw mut *server.raw) }, Status::NGX_OK.0);
+    assert_eq!(server.raw.peer.init.map(|value| value as usize), Some(callback as usize));
+    assert_eq!(SELF_PEER_INIT_CALLS.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn distinct_upstream_initializers_delegate_in_installation_order() {
+    let pool = TestPool::new();
+    let mut configuration = unsafe { MaybeUninit::<ngx_conf_t>::zeroed().assume_init() };
+    configuration.pool = pool.raw;
+    let mut server = ConfiguredServer::new(0);
+    INITIALIZER_CHAIN_ORDER.store(0, Ordering::Relaxed);
+    server.raw.peer.init_upstream = Some(chained_init_upstream);
+
+    assert_eq!(install_upstream_initializer::<InnerInitializer>(&mut server.raw), Ok(()));
+    assert_eq!(install_upstream_initializer::<OuterInitializer>(&mut server.raw), Ok(()));
+    let callback = server.raw.peer.init_upstream.unwrap();
+    assert_eq!(unsafe { callback(&raw mut configuration, &raw mut *server.raw) }, Status::NGX_OK.0);
+    assert_eq!(INITIALIZER_CHAIN_ORDER.load(Ordering::Relaxed), 12_345);
+}
+
+#[test]
+fn distinct_peer_initializers_delegate_in_installation_order() {
+    let pool = TestPool::new();
+    let mut request_upstream =
+        unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
+    let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+    initialized_request(&pool, &mut request, &mut request_upstream);
+    let mut server = ConfiguredServer::new(0);
+    INITIALIZER_CHAIN_ORDER.store(0, Ordering::Relaxed);
+    server.raw.peer.init = Some(chained_init_peer);
+
+    assert_eq!(server.install_peer::<InnerInitializer>(), Ok(()));
+    assert_eq!(server.install_peer::<OuterInitializer>(), Ok(()));
+    let callback = server.raw.peer.init.unwrap();
+    assert_eq!(unsafe { callback(&raw mut request, &raw mut *server.raw) }, Status::NGX_OK.0);
+    assert_eq!(INITIALIZER_CHAIN_ORDER.load(Ordering::Relaxed), 12_345);
 }
 
 #[test]
