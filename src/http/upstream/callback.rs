@@ -1079,6 +1079,7 @@ impl PeerSelectionState {
 struct HttpUpstreamPeerData<T> {
     magic: u64,
     handler: TypeId,
+    peer: NonNull<ngx_peer_connection_t>,
     value: T,
     original: OriginalPeerCallbacks,
     selection: PeerSelectionState,
@@ -1086,13 +1087,18 @@ struct HttpUpstreamPeerData<T> {
 }
 
 impl<T> HttpUpstreamPeerData<T> {
-    fn new<H>(value: T, original: OriginalPeerCallbacks) -> Self
+    fn new<H>(
+        peer: NonNull<ngx_peer_connection_t>,
+        value: T,
+        original: OriginalPeerCallbacks,
+    ) -> Self
     where
         H: HttpUpstreamPeerHandler,
     {
         Self {
             magic: PEER_DATA_MAGIC,
             handler: TypeId::of::<H>(),
+            peer,
             value,
             original,
             selection: PeerSelectionState::default(),
@@ -1151,8 +1157,9 @@ impl RequestUpstream {
             save_session: peer.save_session,
             data: peer.data,
         };
+        let owner = NonNull::from(&mut *peer);
         let data = pool
-            .allocate_with_cleanup(|| HttpUpstreamPeerData::new::<H>(value, original))
+            .allocate_with_cleanup(|| HttpUpstreamPeerData::new::<H>(owner, value, original))
             .map_err(|_| UpstreamCallbackError::Allocation)?
             .into_non_null();
 
@@ -1176,6 +1183,7 @@ impl RequestUpstream {
 }
 
 fn peer_data<H>(
+    peer: &UpstreamPeerConnection<'_>,
     data: *mut c_void,
 ) -> Result<NonNull<HttpUpstreamPeerData<H::Data>>, UpstreamCallbackError>
 where
@@ -1187,7 +1195,10 @@ where
         return Err(UpstreamCallbackError::MisalignedPeerData);
     }
     let value = unsafe { data.as_ref() };
-    if value.magic != PEER_DATA_MAGIC || value.handler != TypeId::of::<H>() {
+    if value.magic != PEER_DATA_MAGIC
+        || value.handler != TypeId::of::<H>()
+        || value.peer != peer.raw
+    {
         return Err(UpstreamCallbackError::ForeignPeerData);
     }
 
@@ -1300,7 +1311,7 @@ where
         return Status::NGX_ERROR.0;
     };
     match (|| {
-        let mut data = peer_data::<H>(data)?;
+        let mut data = peer_data::<H>(&peer, data)?;
         let data = unsafe { data.as_mut() };
         let generation = data.selection.begin()?;
         let outcome = Cell::new(OriginalPeerGetOutcome::NotCalled);
@@ -1362,7 +1373,7 @@ unsafe extern "C" fn raw_free_peer<H>(
         return;
     };
     let result = (|| {
-        let mut data = peer_data::<H>(data)?;
+        let mut data = peer_data::<H>(&peer, data)?;
         let data = unsafe { data.as_mut() };
         data.selection.release()?;
         let state = UpstreamPeerState(state);
@@ -1384,7 +1395,7 @@ unsafe extern "C" fn raw_notify_peer<H>(
     let Ok(mut peer) = (unsafe { UpstreamPeerConnection::from_raw(peer) }) else {
         return;
     };
-    let data = match peer_data::<H>(data) {
+    let data = match peer_data::<H>(&peer, data) {
         Ok(data) => unsafe { data.as_ref() },
         Err(error) => {
             peer.log_failure("peer notification", &error);
@@ -1408,7 +1419,7 @@ where
     let Ok(mut peer) = (unsafe { UpstreamPeerConnection::from_raw(peer) }) else {
         return Status::NGX_ERROR.0;
     };
-    let data = match peer_data::<H>(data) {
+    let data = match peer_data::<H>(&peer, data) {
         Ok(data) => unsafe { data.as_ref() },
         Err(error) => {
             peer.log_failure("peer session lookup", &error);
@@ -1429,7 +1440,7 @@ where
     let Ok(mut peer) = (unsafe { UpstreamPeerConnection::from_raw(peer) }) else {
         return;
     };
-    let data = match peer_data::<H>(data) {
+    let data = match peer_data::<H>(&peer, data) {
         Ok(data) => unsafe { data.as_ref() },
         Err(error) => {
             peer.log_failure("peer session save", &error);

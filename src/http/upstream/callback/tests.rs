@@ -1306,6 +1306,97 @@ fn peer_callback_family_composes_with_distinct_outer_and_original_data() {
 }
 
 #[test]
+fn peer_callbacks_reject_data_owned_by_another_connection() {
+    CALLBACK_ORDER.store(0, Ordering::Relaxed);
+    let first_pool = TestPool::new();
+    let second_pool = TestPool::new();
+    let mut first_upstream = unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
+    let mut second_upstream = unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
+    let mut first_request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+    let mut second_request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+    initialized_request(&first_pool, &mut first_request, &mut first_upstream);
+    initialized_request(&second_pool, &mut second_request, &mut second_upstream);
+    let mut server = ConfiguredServer::new(0);
+    server.raw.peer.init = Some(ordered_init_peer);
+    assert_eq!(server.install_peer::<OrderedPeer>(), Ok(()));
+
+    let mut first_original_data = 1_u8;
+    let first_original_data = ptr::from_mut(&mut first_original_data).cast::<c_void>();
+    ORIGINAL_DATA.store(first_original_data, Ordering::Relaxed);
+    assert_eq!(
+        unsafe { raw_init_peer::<OrderedPeer>(&raw mut first_request, &raw mut *server.raw) },
+        Status::NGX_OK.0
+    );
+    let first_typed_data = first_upstream.peer.data;
+
+    let mut second_original_data = 2_u8;
+    let second_original_data = ptr::from_mut(&mut second_original_data).cast::<c_void>();
+    ORIGINAL_DATA.store(second_original_data, Ordering::Relaxed);
+    assert_eq!(
+        unsafe { raw_init_peer::<OrderedPeer>(&raw mut second_request, &raw mut *server.raw) },
+        Status::NGX_OK.0
+    );
+    let second_typed_data = second_upstream.peer.data;
+
+    let mut first_outer_data = 3_u8;
+    let first_outer_data = ptr::from_mut(&mut first_outer_data).cast::<c_void>();
+    let mut second_outer_data = 4_u8;
+    let second_outer_data = ptr::from_mut(&mut second_outer_data).cast::<c_void>();
+    let mut first_name = ngx_str_t::default();
+    let mut second_name = ngx_str_t::default();
+    let mut first_address = unsafe { MaybeUninit::<sockaddr>::zeroed().assume_init() };
+    let mut second_address = unsafe { MaybeUninit::<sockaddr>::zeroed().assume_init() };
+    first_upstream.peer.data = first_outer_data;
+    first_upstream.peer.name = &raw mut first_name;
+    first_upstream.peer.sockaddr = &raw mut first_address;
+    second_upstream.peer.data = second_outer_data;
+    second_upstream.peer.name = &raw mut second_name;
+    second_upstream.peer.sockaddr = &raw mut second_address;
+    assert_eq!(CALLBACK_ORDER.load(Ordering::Relaxed), 2);
+
+    assert_eq!(
+        unsafe { raw_get_peer::<OrderedPeer>(&raw mut first_upstream.peer, second_typed_data) },
+        Status::NGX_ERROR.0
+    );
+    assert_eq!(CALLBACK_ORDER.load(Ordering::Relaxed), 2);
+    assert_eq!(first_upstream.peer.data, first_outer_data);
+
+    assert_eq!(
+        unsafe { raw_get_peer::<OrderedPeer>(&raw mut first_upstream.peer, first_typed_data) },
+        Status::NGX_OK.0
+    );
+    assert_eq!(OBSERVED_GET_CALLBACK_DATA.load(Ordering::Relaxed), first_original_data);
+    assert_eq!(
+        unsafe { raw_get_peer::<OrderedPeer>(&raw mut second_upstream.peer, second_typed_data) },
+        Status::NGX_OK.0
+    );
+    assert_eq!(OBSERVED_GET_CALLBACK_DATA.load(Ordering::Relaxed), second_original_data);
+    assert_eq!(CALLBACK_ORDER.load(Ordering::Relaxed), 4);
+
+    unsafe { raw_free_peer::<OrderedPeer>(&raw mut first_upstream.peer, second_typed_data, 0x41) };
+    unsafe {
+        raw_notify_peer::<OrderedPeer>(&raw mut first_upstream.peer, second_typed_data, 0x42)
+    };
+    #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+    unsafe {
+        assert_eq!(
+            raw_set_session::<OrderedPeer>(&raw mut first_upstream.peer, second_typed_data),
+            Status::NGX_ERROR.0
+        );
+        raw_save_session::<OrderedPeer>(&raw mut first_upstream.peer, second_typed_data);
+    }
+    assert_eq!(CALLBACK_ORDER.load(Ordering::Relaxed), 4);
+    assert_eq!(first_upstream.peer.data, first_outer_data);
+    assert_eq!(second_upstream.peer.data, second_outer_data);
+
+    unsafe { raw_free_peer::<OrderedPeer>(&raw mut first_upstream.peer, first_typed_data, 0x43) };
+    unsafe { raw_free_peer::<OrderedPeer>(&raw mut second_upstream.peer, second_typed_data, 0x44) };
+    assert_eq!(CALLBACK_ORDER.load(Ordering::Relaxed), 6);
+    assert_eq!(first_upstream.peer.data, first_outer_data);
+    assert_eq!(second_upstream.peer.data, second_outer_data);
+}
+
+#[test]
 fn discarded_original_selection_is_released_before_get_error() {
     reset_accounting(Status::NGX_OK.0, 1, 0);
     let pool = TestPool::new();
