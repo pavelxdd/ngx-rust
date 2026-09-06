@@ -1,10 +1,12 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+#[cfg(unix)]
+use core::ffi::c_int;
 use core::ffi::c_void;
 use core::mem::MaybeUninit;
 use core::ptr;
 use core::slice;
-use core::sync::atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::MutexGuard;
 
 use super::super::test_support::TestPool;
@@ -22,6 +24,13 @@ unsafe extern "C" {
     fn ngx_rs_test_reset_allocation_failures();
 }
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn fork() -> c_int;
+    fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+    fn _exit(status: c_int) -> !;
+}
+
 static ORIGINAL_INIT_PEER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static COUNTING_INIT_PEER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static REPLACEMENT_REQUEST_UPSTREAM: AtomicPtr<ngx_http_upstream_t> =
@@ -29,6 +38,15 @@ static REPLACEMENT_REQUEST_UPSTREAM: AtomicPtr<ngx_http_upstream_t> =
 static ORIGINAL_INIT_UPSTREAM_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DELEGATED_INIT_UPSTREAM_CALLS: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_GET_STATUS: AtomicIsize = AtomicIsize::new(0);
+static ACCOUNTING_GET_STATUS: AtomicIsize = AtomicIsize::new(0);
+static ACCOUNTING_GET_CALLS: AtomicUsize = AtomicUsize::new(0);
+static ACCOUNTING_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
+static ACCOUNTING_CONNS: AtomicIsize = AtomicIsize::new(0);
+static ACCOUNTING_REFS: AtomicIsize = AtomicIsize::new(0);
+static ACCOUNTING_LAST_FREE_STATE: AtomicUsize = AtomicUsize::new(0);
+static ACCOUNTING_GET_BEHAVIOR: AtomicUsize = AtomicUsize::new(0);
+static ACCOUNTING_FREE_BEHAVIOR: AtomicUsize = AtomicUsize::new(0);
+static ACCOUNTING_LAST_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CALLBACK_ORDER: AtomicUsize = AtomicUsize::new(0);
 static ORIGINAL_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static OBSERVED_GET_PEER_DATA: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
@@ -304,11 +322,10 @@ impl HttpUpstreamPeerHandler for IncompleteOriginalPeerInitializer {
         Ok(UpstreamPeerSelection::Error)
     }
 
-    fn free<'callback>(
-        _peer: &'callback mut UpstreamPeerConnection<'_>,
+    fn free(
+        _peer: &mut UpstreamPeerConnection<'_>,
         _data: &mut Self::Data,
         _state: UpstreamPeerState,
-        _original: OriginalPeerFree<'callback>,
     ) -> Result<(), UpstreamCallbackError> {
         Ok(())
     }
@@ -337,11 +354,10 @@ impl HttpUpstreamPeerHandler for IncompleteOriginalPeerSelection {
         original.call(peer)
     }
 
-    fn free<'callback>(
-        _peer: &'callback mut UpstreamPeerConnection<'_>,
+    fn free(
+        _peer: &mut UpstreamPeerConnection<'_>,
         _data: &mut Self::Data,
         _state: UpstreamPeerState,
-        _original: OriginalPeerFree<'callback>,
     ) -> Result<(), UpstreamCallbackError> {
         Ok(())
     }
@@ -392,11 +408,10 @@ impl HttpUpstreamPeerHandler for DelegatePeerInit {
         Ok(UpstreamPeerSelection::Error)
     }
 
-    fn free<'callback>(
-        _peer: &'callback mut UpstreamPeerConnection<'_>,
+    fn free(
+        _peer: &mut UpstreamPeerConnection<'_>,
         _data: &mut Self::Data,
         _state: UpstreamPeerState,
-        _original: OriginalPeerFree<'callback>,
     ) -> Result<(), UpstreamCallbackError> {
         Ok(())
     }
@@ -446,7 +461,9 @@ unsafe extern "C" fn selected_status_get_peer(
     ORIGINAL_GET_STATUS.load(Ordering::Relaxed)
 }
 
-fn original_peer_get<'callback>() -> OriginalPeerGet<'callback> {
+fn original_peer_get<'callback>(
+    outcome: &'callback Cell<OriginalPeerGetOutcome>,
+) -> OriginalPeerGet<'callback> {
     OriginalPeerGet {
         original: OriginalPeerCallbacks {
             get: Some(selected_status_get_peer),
@@ -458,6 +475,8 @@ fn original_peer_get<'callback>() -> OriginalPeerGet<'callback> {
             save_session: None,
             data: ptr::null_mut(),
         },
+        generation: 1,
+        outcome,
         _callback: PhantomData,
     }
 }
@@ -469,6 +488,44 @@ unsafe extern "C" fn incomplete_selected_get_peer(
     Status::NGX_OK.0
 }
 
+unsafe extern "C" fn accounting_get_peer(
+    _peer: *mut ngx_peer_connection_t,
+    _data: *mut c_void,
+) -> ngx_int_t {
+    ACCOUNTING_GET_CALLS.fetch_add(1, Ordering::Relaxed);
+    let status = ACCOUNTING_GET_STATUS.load(Ordering::Relaxed);
+    if status == Status::NGX_OK.0 {
+        ACCOUNTING_CONNS.fetch_add(1, Ordering::Relaxed);
+        ACCOUNTING_REFS.fetch_add(1, Ordering::Relaxed);
+    }
+    status
+}
+
+unsafe extern "C" fn accounting_free_peer(
+    peer: *mut ngx_peer_connection_t,
+    _data: *mut c_void,
+    state: ngx_uint_t,
+) {
+    ACCOUNTING_FREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    ACCOUNTING_CONNS.fetch_sub(1, Ordering::Relaxed);
+    ACCOUNTING_REFS.fetch_sub(1, Ordering::Relaxed);
+    ACCOUNTING_LAST_FREE_STATE.store(state, Ordering::Relaxed);
+    let tries = unsafe { &mut (*peer).tries };
+    if *tries != 0 {
+        *tries -= 1;
+    }
+}
+
+unsafe extern "C" fn accounting_init_peer(
+    request: *mut ngx_http_request_t,
+    _upstream: *mut ngx_http_upstream_srv_conf_t,
+) -> ngx_int_t {
+    let peer = unsafe { &mut (*(*request).upstream).peer };
+    peer.get = Some(accounting_get_peer);
+    peer.free = Some(accounting_free_peer);
+    Status::NGX_OK.0
+}
+
 unsafe extern "C" fn ordered_get_peer(
     peer: *mut ngx_peer_connection_t,
     data: *mut c_void,
@@ -476,7 +533,7 @@ unsafe extern "C" fn ordered_get_peer(
     OBSERVED_GET_PEER_DATA.store(unsafe { (*peer).data }, Ordering::Relaxed);
     OBSERVED_GET_CALLBACK_DATA.store(data, Ordering::Relaxed);
     CALLBACK_ORDER.fetch_add(1, Ordering::Relaxed);
-    NGX_BUSY as _
+    Status::NGX_OK.0
 }
 
 unsafe extern "C" fn ordered_free_peer(
@@ -545,13 +602,68 @@ impl HttpUpstreamPeerHandler for OrderedPeer {
         original.call(peer)
     }
 
-    fn free<'callback>(
-        peer: &'callback mut UpstreamPeerConnection<'_>,
+    fn free(
+        _peer: &mut UpstreamPeerConnection<'_>,
         _data: &mut Self::Data,
         _state: UpstreamPeerState,
-        original: OriginalPeerFree<'callback>,
     ) -> Result<(), UpstreamCallbackError> {
-        original.call(peer)
+        Ok(())
+    }
+}
+
+struct AccountingPeer;
+
+impl HttpUpstreamPeerHandler for AccountingPeer {
+    test_callback_owner!();
+
+    type Data = ();
+
+    fn init(
+        request: &mut UpstreamPeerInitRequest<'_>,
+        upstream: &mut UpstreamServerConf<'_>,
+        original: OriginalPeerInit<Self>,
+    ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
+        match original.call(request, upstream)? {
+            UpstreamPeerInitStatus::Initialized => Ok(UpstreamPeerInit::Install(())),
+            UpstreamPeerInitStatus::Unavailable => Ok(UpstreamPeerInit::Unavailable),
+        }
+    }
+
+    fn get<'callback>(
+        peer: &'callback mut UpstreamPeerConnection<'_>,
+        _data: &mut Self::Data,
+        original: OriginalPeerGet<'callback>,
+    ) -> Result<UpstreamPeerSelection<'callback>, UpstreamCallbackError> {
+        let selection = original.call(peer)?;
+        if let UpstreamPeerSelection::Selected(selected) = &selection {
+            ACCOUNTING_LAST_GENERATION.store(selected.generation, Ordering::Relaxed);
+        }
+        match ACCOUNTING_GET_BEHAVIOR.load(Ordering::Relaxed) {
+            1 => Ok(UpstreamPeerSelection::Error),
+            _ => Ok(selection),
+        }
+    }
+
+    fn free(
+        _peer: &mut UpstreamPeerConnection<'_>,
+        _data: &mut Self::Data,
+        state: UpstreamPeerState,
+    ) -> Result<(), UpstreamCallbackError> {
+        match ACCOUNTING_FREE_BEHAVIOR.load(Ordering::Relaxed) {
+            1 => Err(UpstreamCallbackError::Allocation),
+            #[cfg(unix)]
+            2 => {
+                if ACCOUNTING_CONNS.load(Ordering::Relaxed) != 0
+                    || ACCOUNTING_REFS.load(Ordering::Relaxed) != 0
+                    || ACCOUNTING_FREE_CALLS.load(Ordering::Relaxed) != 1
+                    || ACCOUNTING_LAST_FREE_STATE.load(Ordering::Relaxed) != state.bits()
+                {
+                    unsafe { _exit(42) };
+                }
+                panic!("peer free callback panic");
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -560,7 +672,7 @@ struct CountingPeerInit;
 impl HttpUpstreamPeerHandler for CountingPeerInit {
     test_callback_owner!();
 
-    type Data = ();
+    type Data = [u8; 8192];
 
     fn init(
         _request: &mut UpstreamPeerInitRequest<'_>,
@@ -568,7 +680,7 @@ impl HttpUpstreamPeerHandler for CountingPeerInit {
         _original: OriginalPeerInit<Self>,
     ) -> Result<UpstreamPeerInit<Self::Data>, UpstreamCallbackError> {
         COUNTING_INIT_PEER_CALLS.fetch_add(1, Ordering::Relaxed);
-        Ok(UpstreamPeerInit::Install(()))
+        Ok(UpstreamPeerInit::Install([0; 8192]))
     }
 
     fn get<'callback>(
@@ -579,11 +691,10 @@ impl HttpUpstreamPeerHandler for CountingPeerInit {
         Ok(UpstreamPeerSelection::Error)
     }
 
-    fn free<'callback>(
-        _peer: &'callback mut UpstreamPeerConnection<'_>,
+    fn free(
+        _peer: &mut UpstreamPeerConnection<'_>,
         _data: &mut Self::Data,
         _state: UpstreamPeerState,
-        _original: OriginalPeerFree<'callback>,
     ) -> Result<(), UpstreamCallbackError> {
         Ok(())
     }
@@ -612,13 +723,12 @@ impl HttpUpstreamPeerHandler for MissingOriginalPeer {
         original.call(peer)
     }
 
-    fn free<'callback>(
-        peer: &'callback mut UpstreamPeerConnection<'_>,
+    fn free(
+        _peer: &mut UpstreamPeerConnection<'_>,
         _data: &mut Self::Data,
         _state: UpstreamPeerState,
-        original: OriginalPeerFree<'callback>,
     ) -> Result<(), UpstreamCallbackError> {
-        original.call(peer)
+        Ok(())
     }
 }
 
@@ -631,6 +741,34 @@ fn initialized_request(
     request.main = request;
     request.pool = pool.raw;
     request.upstream = upstream;
+}
+
+fn reset_accounting(get_status: ngx_int_t, get_behavior: usize, free_behavior: usize) {
+    ACCOUNTING_GET_STATUS.store(get_status, Ordering::Relaxed);
+    ACCOUNTING_GET_CALLS.store(0, Ordering::Relaxed);
+    ACCOUNTING_FREE_CALLS.store(0, Ordering::Relaxed);
+    ACCOUNTING_CONNS.store(0, Ordering::Relaxed);
+    ACCOUNTING_REFS.store(0, Ordering::Relaxed);
+    ACCOUNTING_LAST_FREE_STATE.store(0, Ordering::Relaxed);
+    ACCOUNTING_GET_BEHAVIOR.store(get_behavior, Ordering::Relaxed);
+    ACCOUNTING_FREE_BEHAVIOR.store(free_behavior, Ordering::Relaxed);
+    ACCOUNTING_LAST_GENERATION.store(0, Ordering::Relaxed);
+}
+
+fn initialize_accounting_peer(
+    pool: &TestPool,
+    request: &mut ngx_http_request_t,
+    request_upstream: &mut ngx_http_upstream_t,
+    server: &mut ConfiguredServer,
+) -> *mut c_void {
+    initialized_request(pool, request, request_upstream);
+    server.raw.peer.init = Some(accounting_init_peer);
+    assert_eq!(server.install_peer::<AccountingPeer>(), Ok(()));
+    assert_eq!(
+        unsafe { raw_init_peer::<AccountingPeer>(request, &raw mut *server.raw) },
+        Status::NGX_OK.0
+    );
+    request_upstream.peer.data
 }
 
 #[test]
@@ -800,6 +938,7 @@ fn selected_status_without_native_peer_state_is_rejected() {
 fn original_peer_selection_accepts_only_native_statuses_with_required_state() {
     let mut raw_peer = unsafe { MaybeUninit::<ngx_peer_connection_t>::zeroed().assume_init() };
     let mut peer = unsafe { UpstreamPeerConnection::from_raw(&raw mut raw_peer) }.unwrap();
+    let outcome = Cell::new(OriginalPeerGetOutcome::NotCalled);
 
     for (status, expected) in [
         (Status::NGX_ERROR.0, Status::NGX_ERROR.0),
@@ -807,42 +946,42 @@ fn original_peer_selection_accepts_only_native_statuses_with_required_state() {
         (Status::NGX_DECLINED.0, Status::NGX_DECLINED.0),
     ] {
         ORIGINAL_GET_STATUS.store(status, Ordering::Relaxed);
-        assert_eq!(original_peer_get().call(&mut peer).unwrap().status(), expected);
+        assert_eq!(original_peer_get(&outcome).call(&mut peer).unwrap().status(), expected);
     }
 
     ORIGINAL_GET_STATUS.store(Status::NGX_ABORT.0, Ordering::Relaxed);
     assert_eq!(
-        original_peer_get().call(&mut peer).err(),
+        original_peer_get(&outcome).call(&mut peer).err(),
         Some(UpstreamCallbackError::InvalidOriginalGetStatus(Status::NGX_ABORT.0))
     );
 
     ORIGINAL_GET_STATUS.store(Status::NGX_OK.0, Ordering::Relaxed);
     assert_eq!(
-        original_peer_get().call(&mut peer).err(),
+        original_peer_get(&outcome).call(&mut peer).err(),
         Some(UpstreamCallbackError::MissingSelectedPeerName)
     );
     let mut name = ngx_str_t::default();
     unsafe { peer.raw.as_mut().name = &raw mut name };
     assert_eq!(
-        original_peer_get().call(&mut peer).err(),
+        original_peer_get(&outcome).call(&mut peer).err(),
         Some(UpstreamCallbackError::MissingSelectedPeerAddress)
     );
     let mut address = unsafe { MaybeUninit::<sockaddr>::zeroed().assume_init() };
     unsafe { peer.raw.as_mut().sockaddr = &raw mut address };
-    assert_eq!(original_peer_get().call(&mut peer).unwrap().status(), Status::NGX_OK.0);
+    assert_eq!(original_peer_get(&outcome).call(&mut peer).unwrap().status(), Status::NGX_OK.0);
 
     unsafe { peer.raw.as_mut().sockaddr = ptr::null_mut() };
     ORIGINAL_GET_STATUS.store(Status::NGX_AGAIN.0, Ordering::Relaxed);
     assert_eq!(
-        original_peer_get().call(&mut peer).err(),
+        original_peer_get(&outcome).call(&mut peer).err(),
         Some(UpstreamCallbackError::MissingSelectedPeerConnection)
     );
     let mut connection = unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() };
     unsafe { peer.raw.as_mut().connection = &raw mut connection };
-    assert_eq!(original_peer_get().call(&mut peer).unwrap().status(), Status::NGX_AGAIN.0);
+    assert_eq!(original_peer_get(&outcome).call(&mut peer).unwrap().status(), Status::NGX_AGAIN.0);
 
     ORIGINAL_GET_STATUS.store(Status::NGX_DONE.0, Ordering::Relaxed);
-    assert_eq!(original_peer_get().call(&mut peer).unwrap().status(), Status::NGX_DONE.0);
+    assert_eq!(original_peer_get(&outcome).call(&mut peer).unwrap().status(), Status::NGX_DONE.0);
 }
 
 #[test]
@@ -962,7 +1101,6 @@ fn peer_initializer_allocation_failure_does_not_publish_callbacks() {
 
         unsafe {
             (*pool.raw).d.last = (*pool.raw).d.end;
-            (*pool.raw).max = 0;
             ngx_rs_test_fail_allocations_after(successful_allocations);
         }
         let status =
@@ -970,10 +1108,7 @@ fn peer_initializer_allocation_failure_does_not_publish_callbacks() {
         unsafe { ngx_rs_test_reset_allocation_failures() };
 
         assert_eq!(status, Status::NGX_ERROR.0);
-        assert_eq!(
-            COUNTING_INIT_PEER_CALLS.load(Ordering::Relaxed),
-            successful_allocations as usize
-        );
+        assert_eq!(COUNTING_INIT_PEER_CALLS.load(Ordering::Relaxed), successful_allocations);
         assert!(request_upstream.peer.data.is_null());
         assert!(request_upstream.peer.get.is_none());
         assert!(request_upstream.peer.free.is_none());
@@ -1114,11 +1249,15 @@ fn peer_callback_family_composes_with_distinct_outer_and_original_data() {
     let mut outer_data = 8_u8;
     let outer_data = ptr::from_mut(&mut outer_data).cast::<c_void>();
     request_upstream.peer.data = outer_data;
+    let mut name = ngx_str_t::default();
+    let mut address = unsafe { MaybeUninit::<sockaddr>::zeroed().assume_init() };
+    request_upstream.peer.name = &raw mut name;
+    request_upstream.peer.sockaddr = &raw mut address;
     assert_eq!(CALLBACK_ORDER.load(Ordering::Relaxed), 1);
 
     assert_eq!(
         unsafe { raw_get_peer::<OrderedPeer>(&raw mut request_upstream.peer, typed_data) },
-        NGX_BUSY as _
+        Status::NGX_OK.0
     );
     assert_eq!(OBSERVED_GET_PEER_DATA.load(Ordering::Relaxed), outer_data);
     assert_eq!(OBSERVED_GET_CALLBACK_DATA.load(Ordering::Relaxed), original_data);
@@ -1164,6 +1303,159 @@ fn peer_callback_family_composes_with_distinct_outer_and_original_data() {
     assert_eq!(CALLBACK_ORDER.load(Ordering::Relaxed), 6);
     #[cfg(not(any(ngx_feature = "ssl", ngx_feature = "compat")))]
     assert_eq!(CALLBACK_ORDER.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn discarded_original_selection_is_released_before_get_error() {
+    reset_accounting(Status::NGX_OK.0, 1, 0);
+    let pool = TestPool::new();
+    let mut request_upstream =
+        unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
+    let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+    let mut server = ConfiguredServer::new(0);
+    let typed_data =
+        initialize_accounting_peer(&pool, &mut request, &mut request_upstream, &mut server);
+    let mut name = ngx_str_t::default();
+    let mut address = unsafe { MaybeUninit::<sockaddr>::zeroed().assume_init() };
+    request_upstream.peer.name = &raw mut name;
+    request_upstream.peer.sockaddr = &raw mut address;
+    request_upstream.peer.tries = 2;
+
+    assert_eq!(
+        unsafe { raw_get_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data) },
+        Status::NGX_ERROR.0
+    );
+    assert_eq!(ACCOUNTING_GET_CALLS.load(Ordering::Relaxed), 1);
+    assert_eq!(ACCOUNTING_FREE_CALLS.load(Ordering::Relaxed), 1);
+    assert_eq!(ACCOUNTING_LAST_FREE_STATE.load(Ordering::Relaxed), 0);
+    assert_eq!(ACCOUNTING_CONNS.load(Ordering::Relaxed), 0);
+    assert_eq!(ACCOUNTING_REFS.load(Ordering::Relaxed), 0);
+    assert_eq!(request_upstream.peer.tries, 1);
+}
+
+#[test]
+fn duplicate_get_and_free_are_rejected_before_native_accounting() {
+    reset_accounting(Status::NGX_OK.0, 0, 0);
+    let pool = TestPool::new();
+    let mut request_upstream =
+        unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
+    let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+    let mut server = ConfiguredServer::new(0);
+    let typed_data =
+        initialize_accounting_peer(&pool, &mut request, &mut request_upstream, &mut server);
+    let mut name = ngx_str_t::default();
+    let mut address = unsafe { MaybeUninit::<sockaddr>::zeroed().assume_init() };
+    request_upstream.peer.name = &raw mut name;
+    request_upstream.peer.sockaddr = &raw mut address;
+    request_upstream.peer.tries = 2;
+
+    assert_eq!(
+        unsafe { raw_get_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data) },
+        Status::NGX_OK.0
+    );
+    assert_eq!(
+        unsafe { raw_get_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data) },
+        Status::NGX_ERROR.0
+    );
+    assert_eq!(ACCOUNTING_GET_CALLS.load(Ordering::Relaxed), 1);
+
+    let state = 0x5a_u32 as ngx_uint_t;
+    unsafe { raw_free_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data, state) };
+    unsafe { raw_free_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data, state) };
+    assert_eq!(ACCOUNTING_FREE_CALLS.load(Ordering::Relaxed), 1);
+    assert_eq!(ACCOUNTING_LAST_FREE_STATE.load(Ordering::Relaxed), state as usize);
+    assert_eq!(ACCOUNTING_CONNS.load(Ordering::Relaxed), 0);
+    assert_eq!(ACCOUNTING_REFS.load(Ordering::Relaxed), 0);
+    assert_eq!(request_upstream.peer.tries, 1);
+}
+
+#[test]
+fn get_error_has_no_release_debt_and_retry_gets_a_new_attempt() {
+    reset_accounting(Status::NGX_ERROR.0, 0, 0);
+    let pool = TestPool::new();
+    let mut request_upstream =
+        unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
+    let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+    let mut server = ConfiguredServer::new(0);
+    let typed_data =
+        initialize_accounting_peer(&pool, &mut request, &mut request_upstream, &mut server);
+    let mut name = ngx_str_t::default();
+    let mut address = unsafe { MaybeUninit::<sockaddr>::zeroed().assume_init() };
+    request_upstream.peer.name = &raw mut name;
+    request_upstream.peer.sockaddr = &raw mut address;
+    request_upstream.peer.tries = 2;
+
+    assert_eq!(
+        unsafe { raw_get_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data) },
+        Status::NGX_ERROR.0
+    );
+    assert_eq!(ACCOUNTING_CONNS.load(Ordering::Relaxed), 0);
+    assert_eq!(ACCOUNTING_REFS.load(Ordering::Relaxed), 0);
+
+    ACCOUNTING_GET_STATUS.store(Status::NGX_OK.0, Ordering::Relaxed);
+    assert_eq!(
+        unsafe { raw_get_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data) },
+        Status::NGX_OK.0
+    );
+    let first_generation = ACCOUNTING_LAST_GENERATION.load(Ordering::Relaxed);
+    unsafe { raw_free_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data, 0x6b) };
+    assert_eq!(
+        unsafe { raw_get_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data) },
+        Status::NGX_OK.0
+    );
+    assert_ne!(ACCOUNTING_LAST_GENERATION.load(Ordering::Relaxed), first_generation);
+    unsafe { raw_free_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data, 0x6c) };
+    assert_eq!(ACCOUNTING_GET_CALLS.load(Ordering::Relaxed), 3);
+    assert_eq!(ACCOUNTING_FREE_CALLS.load(Ordering::Relaxed), 2);
+    assert_eq!(ACCOUNTING_LAST_FREE_STATE.load(Ordering::Relaxed), 0x6c);
+    assert_eq!(ACCOUNTING_CONNS.load(Ordering::Relaxed), 0);
+    assert_eq!(ACCOUNTING_REFS.load(Ordering::Relaxed), 0);
+    assert_eq!(request_upstream.peer.tries, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn original_free_runs_before_handler_error_or_abort() {
+    reset_accounting(Status::NGX_OK.0, 0, 1);
+    let pool = TestPool::new();
+    let mut request_upstream =
+        unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
+    let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
+    let mut server = ConfiguredServer::new(0);
+    let typed_data =
+        initialize_accounting_peer(&pool, &mut request, &mut request_upstream, &mut server);
+    let mut name = ngx_str_t::default();
+    let mut address = unsafe { MaybeUninit::<sockaddr>::zeroed().assume_init() };
+    request_upstream.peer.name = &raw mut name;
+    request_upstream.peer.sockaddr = &raw mut address;
+
+    assert_eq!(
+        unsafe { raw_get_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data) },
+        Status::NGX_OK.0
+    );
+    unsafe { raw_free_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data, 0x7c) };
+    assert_eq!(ACCOUNTING_FREE_CALLS.load(Ordering::Relaxed), 1);
+    assert_eq!(ACCOUNTING_LAST_FREE_STATE.load(Ordering::Relaxed), 0x7c);
+    assert_eq!(ACCOUNTING_CONNS.load(Ordering::Relaxed), 0);
+    assert_eq!(ACCOUNTING_REFS.load(Ordering::Relaxed), 0);
+
+    let child = unsafe { fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        reset_accounting(Status::NGX_OK.0, 0, 2);
+        assert_eq!(
+            unsafe { raw_get_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data) },
+            Status::NGX_OK.0
+        );
+        unsafe {
+            raw_free_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data, 0x7d)
+        };
+        unsafe { _exit(0) };
+    }
+
+    let mut status = 0;
+    assert_eq!(unsafe { waitpid(child, &raw mut status, 0) }, child);
+    assert_ne!(status & 0x7f, 0, "free panic did not terminate the child");
 }
 
 #[test]
