@@ -98,6 +98,48 @@ impl<T> NgxList<T> {
         }
     }
 
+    /// Creates an iterator over element pointers without requiring initialized `T` values.
+    ///
+    /// # Safety
+    ///
+    /// Every part pointer and the first `nelts` element slots in each part must be valid and remain
+    /// immutable for the returned borrow. Individual fields may be read only when their native
+    /// producer initialized them.
+    pub(crate) unsafe fn raw_iter(list: &ngx_list_t) -> Option<NgxListRawIter<'_, T>> {
+        if !unsafe { Self::is_compatible(list) } {
+            return None;
+        }
+
+        Some(NgxListRawIter {
+            part: &raw const list.part,
+            index: 0,
+            remaining: unsafe { Self::count(list) }?,
+            _lifetime: PhantomData,
+        })
+    }
+
+    /// Creates an exclusive iterator over element pointers without requiring initialized `T`
+    /// values.
+    ///
+    /// # Safety
+    ///
+    /// Every part pointer and the first `nelts` element slots in each part must be valid and remain
+    /// exclusively accessible for the returned borrow. Individual fields may be read or written
+    /// only when their native initialization contract permits it.
+    pub(crate) unsafe fn raw_iter_mut(list: &mut ngx_list_t) -> Option<NgxListRawIterMut<'_, T>> {
+        if !unsafe { Self::is_compatible(list) } {
+            return None;
+        }
+        let remaining = unsafe { Self::count(list) }?;
+
+        Some(NgxListRawIterMut {
+            part: &raw mut list.part,
+            index: 0,
+            remaining,
+            _lifetime: PhantomData,
+        })
+    }
+
     /// Appends an element to the last part, allocating a new part when necessary.
     pub fn push(&mut self, value: T) -> Result<&mut T, AllocError> {
         if self.inner.pool.is_null() || self.inner.nalloc == 0 || self.len() == usize::MAX {
@@ -219,6 +261,84 @@ impl<'a, T> Iterator for NgxListIter<'a, T> {
 
 impl<T> ExactSizeIterator for NgxListIter<'_, T> {}
 impl<T> FusedIterator for NgxListIter<'_, T> {}
+
+/// An iterator over nginx list element pointers whose values may be partially initialized.
+#[derive(Clone)]
+pub(crate) struct NgxListRawIter<'a, T> {
+    part: *const ngx_list_part_t,
+    index: usize,
+    remaining: usize,
+    _lifetime: PhantomData<&'a T>,
+}
+
+impl<T> Iterator for NgxListRawIter<'_, T> {
+    type Item = NonNull<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        loop {
+            let part = unsafe { self.part.as_ref() }?;
+            if self.index < part.nelts {
+                let element =
+                    unsafe { NonNull::new_unchecked(part.elts.cast::<T>().add(self.index)) };
+                self.index += 1;
+                self.remaining -= 1;
+                return Some(element);
+            }
+            self.part = part.next;
+            self.index = 0;
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<T> ExactSizeIterator for NgxListRawIter<'_, T> {}
+impl<T> FusedIterator for NgxListRawIter<'_, T> {}
+
+/// An exclusive iterator over nginx list element pointers whose values may be partially
+/// initialized.
+pub(crate) struct NgxListRawIterMut<'a, T> {
+    part: *mut ngx_list_part_t,
+    index: usize,
+    remaining: usize,
+    _lifetime: PhantomData<&'a mut T>,
+}
+
+impl<T> Iterator for NgxListRawIterMut<'_, T> {
+    type Item = NonNull<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        loop {
+            let part = unsafe { self.part.as_mut() }?;
+            if self.index < part.nelts {
+                let element =
+                    unsafe { NonNull::new_unchecked(part.elts.cast::<T>().add(self.index)) };
+                self.index += 1;
+                self.remaining -= 1;
+                return Some(element);
+            }
+            self.part = part.next;
+            self.index = 0;
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<T> ExactSizeIterator for NgxListRawIterMut<'_, T> {}
+impl<T> FusedIterator for NgxListRawIterMut<'_, T> {}
 
 /// A mutable iterator over a typed nginx list.
 pub struct NgxListIterMut<'a, T> {
