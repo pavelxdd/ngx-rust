@@ -809,6 +809,31 @@ impl HttpVariableIndex {
 ///     request.finalize(HTTPStatus::BAD_REQUEST).unwrap();
 /// }
 /// ```
+///
+/// ```compile_fail
+/// use ngx::http::HttpVariableRequest;
+///
+/// fn cannot_redirect(request: &mut HttpVariableRequest<'_, '_>) {
+///     request.internal_redirect("/next").unwrap();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::core::PoolChain;
+/// use ngx::http::HttpVariableRequest;
+///
+/// fn cannot_output(request: &mut HttpVariableRequest<'_, '_>, body: PoolChain<'_>) {
+///     request.output_filter(body).unwrap();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::http::HttpVariableRequest;
+///
+/// fn cannot_access_raw_upstream(request: &HttpVariableRequest<'_, '_>) {
+///     let _ = request.upstream();
+/// }
+/// ```
 pub struct HttpVariableRequest<'request, 'callback> {
     request: &'request mut RequestRefMut<'callback>,
 }
@@ -929,21 +954,39 @@ pub trait HttpPrefixVariableHandler {
 /// Typed setter for a registered HTTP variable.
 ///
 /// A setter must not panic; panics terminate the worker process.
-/// Setters receive only shared request access, so they cannot safely flush or re-evaluate a
-/// variable while retaining the assigned value:
+/// Setters receive only shared request access, so they cannot terminate, redirect, or emit output
+/// while nginx retains the assigned value:
 ///
 /// ```compile_fail
-/// use ngx::http::{HttpVariableSetter, HttpVariableValueRef, RequestRefMut};
+/// use ngx::http::{HTTPStatus, RequestRef};
 ///
-/// struct MutableSetter;
+/// fn cannot_finalize(request: &RequestRef<'_>) {
+///     request.finalize(HTTPStatus::BAD_REQUEST).unwrap();
+/// }
+/// ```
 ///
-/// impl HttpVariableSetter for MutableSetter {
-///     fn set(
-///         _request: &mut RequestRefMut<'_>,
-///         _value: HttpVariableValueRef<'_>,
-///         _data: usize,
-///     ) {
-///     }
+/// ```compile_fail
+/// use ngx::http::RequestRef;
+///
+/// fn cannot_redirect(request: &RequestRef<'_>) {
+///     request.internal_redirect("/next").unwrap();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::core::PoolChain;
+/// use ngx::http::RequestRef;
+///
+/// fn cannot_output(request: &RequestRef<'_>, body: PoolChain<'_>) {
+///     request.output_filter(body).unwrap();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ngx::http::RequestRef;
+///
+/// fn cannot_access_raw_upstream(request: &RequestRef<'_>) {
+///     let _ = request.upstream();
 /// }
 /// ```
 pub trait HttpVariableSetter {
