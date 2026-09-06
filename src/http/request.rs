@@ -3459,6 +3459,10 @@ impl<'callback> RequestRefMut<'callback> {
         request.headers_in.keep_alive_n = -1;
     }
 
+    pub(crate) fn repair_headers_in_last(&mut self) {
+        repair_header_list_last(unsafe { &mut self.raw.as_mut().headers_in.headers });
+    }
+
     /// Adds an output header allocated from the request pool.
     pub fn add_header_out(&mut self, key: &str, value: &str) -> Result<(), RequestError> {
         let pool = self.pool()?.as_ptr();
