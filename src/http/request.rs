@@ -261,6 +261,10 @@ pub enum RequestError {
     NegativeCounter,
     /// A response content length cannot be represented by nginx's `off_t`.
     ContentLengthTooLarge,
+    /// Content-Length and Transfer-Encoding are owned by nginx's output framing filters.
+    ManagedOutputFraming,
+    /// The output-header list is not safe to update.
+    InvalidHeaderList(HeaderListError),
     /// Nginx could not allocate request-pool storage.
     Allocation,
 }
@@ -472,6 +476,10 @@ pub enum HeaderBuildError {
     InvalidCapacity,
     /// Nginx could not allocate request-pool storage.
     Allocation,
+    /// A response content length cannot be represented by nginx's `off_t`.
+    ContentLengthTooLarge,
+    /// Content-Length and Transfer-Encoding require the typed output framing API.
+    ManagedOutputFraming,
     /// The input header count cannot be represented by nginx.
     CountOverflow,
 }
@@ -1011,6 +1019,7 @@ pub struct HttpHeadersOutBuilder<'request, 'callback> {
     trailer_capacity: usize,
     trailers_owned: bool,
     expect_trailers: Option<bool>,
+    content_length_set: bool,
 }
 
 impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
@@ -1030,19 +1039,36 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
             trailer_capacity: capacity,
             trailers_owned: false,
             expect_trailers: None,
+            content_length_set: false,
         })
     }
 
     /// Adds a copied raw output header to the candidate list.
     ///
     /// `Content-Type` is represented by nginx's dedicated output field rather than a list entry.
+    /// Content-Length and Transfer-Encoding are rejected because nginx's output filters own
+    /// response framing; use [`set_content_length`](Self::set_content_length) for a known length.
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<(), HeaderBuildError> {
+        if key.eq_ignore_ascii_case(b"Content-Length")
+            || key.eq_ignore_ascii_case(b"Transfer-Encoding")
+        {
+            return Err(HeaderBuildError::ManagedOutputFraming);
+        }
         if key.eq_ignore_ascii_case(b"Content-Type") {
             return self.set_content_type(value);
         }
 
         let header = append_pool_header(&mut self.headers.headers, self.pool, key, value)?;
         unsafe { bind_headers_out(&mut self.headers, header.as_ptr()) };
+        Ok(())
+    }
+
+    /// Sets the response Content-Length for nginx's output framing filters.
+    pub fn set_content_length(&mut self, length: usize) -> Result<(), HeaderBuildError> {
+        self.headers.content_length_n =
+            off_t::try_from(length).map_err(|_| HeaderBuildError::ContentLengthTooLarge)?;
+        self.headers.content_length = ptr::null_mut();
+        self.content_length_set = true;
         Ok(())
     }
 
@@ -1072,11 +1098,14 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
 
     /// Publishes the complete output-header candidate to the request.
     pub fn commit(self) {
-        let Self { request, headers, expect_trailers, .. } = self;
+        let Self { request, headers, expect_trailers, content_length_set, .. } = self;
         let request = unsafe { request.raw.as_mut() };
         request.headers_out = headers;
         if let Some(expect_trailers) = expect_trailers {
             request.set_expect_trailers(expect_trailers.into());
+        }
+        if content_length_set {
+            request.set_chunked(0);
         }
         repair_header_list_last(&mut request.headers_out.headers);
         repair_header_list_last(&mut request.headers_out.trailers);
@@ -1776,6 +1805,24 @@ fn clear_headers_out_metadata(headers: &mut ngx_http_headers_out_t) {
     headers.trailers.part.nelts = 0;
     headers.trailers.part.next = ptr::null_mut();
     headers.trailers.last = &raw mut headers.trailers.part;
+}
+
+fn disable_output_framing_headers(
+    headers: &mut ngx_http_headers_out_t,
+) -> Result<(), HeaderListError> {
+    checked_header_list(&headers.headers)?;
+    let list = unsafe { NgxList::<ngx_table_elt_t>::from_ngx_list_mut(&mut headers.headers) }
+        .ok_or(HeaderListError::InvalidList)?;
+    for header in list.iter_mut() {
+        let key = unsafe { header_bytes_unchecked(header.key) };
+        if key.eq_ignore_ascii_case(b"Content-Length")
+            || key.eq_ignore_ascii_case(b"Transfer-Encoding")
+        {
+            header.hash = 0;
+        }
+    }
+    headers.content_length = ptr::null_mut();
+    Ok(())
 }
 
 struct RequestBodyFramingCandidate {
@@ -3369,6 +3416,9 @@ impl<'callback> RequestRefMut<'callback> {
     }
 
     /// Starts constructing a complete replacement output-header list in the request pool.
+    ///
+    /// Response framing must be configured through
+    /// [`HttpHeadersOutBuilder::set_content_length`], not raw framing headers.
     pub fn headers_out_builder(
         &mut self,
         capacity: usize,
@@ -3379,7 +3429,9 @@ impl<'callback> RequestRefMut<'callback> {
     /// Starts constructing a complete output-header candidate with fresh response metadata.
     ///
     /// Unlike [`headers_out_builder`](Self::headers_out_builder), this clears the status,
-    /// trailers, and scalar output metadata inherited from the current response.
+    /// trailers, and scalar output metadata inherited from the current response. Response framing
+    /// must be configured through [`HttpHeadersOutBuilder::set_content_length`], not raw framing
+    /// headers.
     pub fn clean_headers_out_builder(
         &mut self,
         capacity: usize,
@@ -3530,7 +3582,15 @@ impl<'callback> RequestRefMut<'callback> {
     }
 
     /// Adds an output header allocated from the request pool.
+    ///
+    /// Content-Length and Transfer-Encoding are managed through
+    /// [`set_content_length_n`](Self::set_content_length_n) and nginx's output filters.
     pub fn add_header_out(&mut self, key: &str, value: &str) -> Result<(), RequestError> {
+        if key.eq_ignore_ascii_case("Content-Length")
+            || key.eq_ignore_ascii_case("Transfer-Encoding")
+        {
+            return Err(RequestError::ManagedOutputFraming);
+        }
         let pool = self.pool()?.as_ptr();
         append_pool_header(
             unsafe { &mut self.raw.as_mut().headers_out.headers },
@@ -3542,10 +3602,14 @@ impl<'callback> RequestRefMut<'callback> {
         .map_err(|_| RequestError::Allocation)
     }
 
-    /// Sets the response Content-Length.
+    /// Sets the response Content-Length and removes conflicting list framing.
     pub fn set_content_length_n(&mut self, length: usize) -> Result<(), RequestError> {
         let length = off_t::try_from(length).map_err(|_| RequestError::ContentLengthTooLarge)?;
-        unsafe { self.raw.as_mut().headers_out.content_length_n = length };
+        let request = unsafe { self.raw.as_mut() };
+        disable_output_framing_headers(&mut request.headers_out)
+            .map_err(RequestError::InvalidHeaderList)?;
+        request.headers_out.content_length_n = length;
+        request.set_chunked(0);
         Ok(())
     }
 
@@ -5905,6 +5969,116 @@ mod tests {
             0
         );
         assert_eq!(headers.iter().filter(|header| header.key() == b"X-Duplicate").count(), 2);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn output_header_builders_require_typed_framing_without_partial_publication() {
+        for clean in [false, true] {
+            let owner = TestPool::new();
+            let mut raw = zeroed_request();
+            raw.pool = owner.raw;
+            raw.headers_out.headers = create_header_list(owner.raw, 1).unwrap();
+            append_pool_header(&mut raw.headers_out.headers, owner.raw, b"X-Original", b"kept")
+                .unwrap();
+            raw.headers_out.content_length_n = 91;
+
+            {
+                let mut request = request_from(&mut raw);
+                let mut headers = if clean {
+                    request.clean_headers_out_builder(1).unwrap()
+                } else {
+                    request.headers_out_builder(1).unwrap()
+                };
+                assert_eq!(
+                    headers.add(b"Content-Length", b"7"),
+                    Err(HeaderBuildError::ManagedOutputFraming)
+                );
+                assert_eq!(
+                    headers.add(b"Transfer-Encoding", b"chunked"),
+                    Err(HeaderBuildError::ManagedOutputFraming)
+                );
+            }
+
+            assert_eq!(raw.headers_out.content_length_n, 91);
+            let request = request_from(&mut raw);
+            let headers = request.headers_out().unwrap().iter().collect::<Vec<_>>();
+            assert_eq!(headers.len(), 1);
+            assert_eq!((headers[0].key(), headers[0].value()), (b"X-Original", b"kept"));
+        }
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn typed_output_content_length_synchronizes_builder_and_direct_state() {
+        for clean in [false, true] {
+            let owner = TestPool::new();
+            let mut raw = zeroed_request();
+            raw.pool = owner.raw;
+            raw.headers_out.content_length_n = 91;
+
+            {
+                let mut request = request_from(&mut raw);
+                let mut headers = if clean {
+                    request.clean_headers_out_builder(1).unwrap()
+                } else {
+                    request.headers_out_builder(1).unwrap()
+                };
+                headers.set_content_length(7).unwrap();
+                headers.commit();
+            }
+
+            assert_eq!(raw.headers_out.content_length_n, 7);
+            assert!(raw.headers_out.content_length.is_null());
+            assert!(request_from(&mut raw).headers_out().unwrap().is_empty());
+        }
+
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        raw.headers_out.headers = create_header_list(owner.raw, 2).unwrap();
+        let content_length =
+            append_pool_header(&mut raw.headers_out.headers, owner.raw, b"Content-Length", b"91")
+                .unwrap();
+        let transfer_encoding = append_pool_header(
+            &mut raw.headers_out.headers,
+            owner.raw,
+            b"Transfer-Encoding",
+            b"chunked",
+        )
+        .unwrap();
+        raw.headers_out.content_length = content_length.as_ptr();
+        raw.headers_out.content_length_n = 91;
+        raw.set_chunked(1);
+
+        let mut request = request_from(&mut raw);
+        request.set_content_length_n(7).unwrap();
+
+        assert_eq!(raw.headers_out.content_length_n, 7);
+        assert!(raw.headers_out.content_length.is_null());
+        assert_eq!(raw.chunked(), 0);
+        assert_eq!(unsafe { (*content_length.as_ptr()).hash }, 0);
+        assert_eq!(unsafe { (*transfer_encoding.as_ptr()).hash }, 0);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn direct_output_header_add_rejects_native_framing_ownership() {
+        let owner = TestPool::new();
+        let mut raw = zeroed_request();
+        raw.pool = owner.raw;
+        raw.headers_out.headers = create_header_list(owner.raw, 1).unwrap();
+
+        let mut request = request_from(&mut raw);
+        assert_eq!(
+            request.add_header_out("Content-Length", "invalid"),
+            Err(RequestError::ManagedOutputFraming)
+        );
+        assert_eq!(
+            request.add_header_out("Transfer-Encoding", "chunked"),
+            Err(RequestError::ManagedOutputFraming)
+        );
+        assert!(request.headers_out().unwrap().is_empty());
     }
 
     #[cfg(feature = "test-link")]
