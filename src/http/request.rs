@@ -5875,7 +5875,6 @@ mod tests {
         let standard_headers = [
             (b"Server".as_slice(), b"ngx".as_slice()),
             (b"Date".as_slice(), b"Wed, 21 Oct 2015 07:28:00 GMT".as_slice()),
-            (b"Content-Length".as_slice(), b"91".as_slice()),
             (b"Content-Encoding".as_slice(), b"identity".as_slice()),
             (b"Location".as_slice(), b"/next".as_slice()),
             (b"Refresh".as_slice(), b"1".as_slice()),
@@ -5894,6 +5893,7 @@ mod tests {
             let mut request = request_from(&mut raw);
             let mut headers = request.headers_out_builder(1).unwrap();
             headers.add(b"Content-Type", content_type).unwrap();
+            headers.set_content_length(91).unwrap();
             for (key, value) in standard_headers {
                 headers.add(key, value).unwrap();
             }
@@ -5925,10 +5925,7 @@ mod tests {
             unsafe { checked_ngx_str((*raw.headers_out.date).value) }.unwrap().as_bytes(),
             b"Wed, 21 Oct 2015 07:28:00 GMT"
         );
-        assert_eq!(
-            unsafe { checked_ngx_str((*raw.headers_out.content_length).value) }.unwrap().as_bytes(),
-            b"91"
-        );
+        assert!(raw.headers_out.content_length.is_null());
         assert_eq!(
             unsafe { checked_ngx_str((*raw.headers_out.content_encoding).value) }
                 .unwrap()
@@ -5989,7 +5986,11 @@ mod tests {
         assert_eq!(
             headers
                 .iter()
-                .filter(|header| header.key().eq_ignore_ascii_case(b"Content-Type"))
+                .filter(|header| {
+                    header.key().eq_ignore_ascii_case(b"Content-Type")
+                        || header.key().eq_ignore_ascii_case(b"Content-Length")
+                        || header.key().eq_ignore_ascii_case(b"Transfer-Encoding")
+                })
                 .count(),
             0
         );
