@@ -432,19 +432,23 @@ impl<'pool> Pool<'pool> {
     /// [`PoolValue::into_non_null`] for this pool. No references to the value may be live, and the
     /// pointer must not be used after this call.
     pub unsafe fn remove_cleanup<T>(&self, value: NonNull<T>) -> bool {
-        let Some(cleanup) = self
-            .unlink_cleanup_if(|cleanup| unsafe { ptr::addr_eq((*cleanup).data, value.as_ptr()) })
-        else {
-            return false;
-        };
-        let Some(handler) = (unsafe { (*cleanup.as_ptr()).handler }) else {
-            return false;
-        };
+        unsafe { self.remove_cleanup_with(value, |_| {}) }
+    }
 
-        unsafe {
-            (*cleanup.as_ptr()).handler = None;
-            handler((*cleanup.as_ptr()).data);
-        }
+    pub(crate) unsafe fn remove_cleanup_with<T>(
+        &self,
+        mut value: NonNull<T>,
+        before_drop: impl FnOnce(&mut T),
+    ) -> bool {
+        let Some(cleanup) = self.unlink_cleanup_if(|cleanup| unsafe {
+            ptr::addr_eq((*cleanup).data, value.as_ptr()) && (*cleanup).handler.is_some()
+        }) else {
+            return false;
+        };
+        let handler = unsafe { (*cleanup.as_ptr()).handler.take().unwrap_unchecked() };
+
+        before_drop(unsafe { value.as_mut() });
+        unsafe { handler((*cleanup.as_ptr()).data) };
         true
     }
 
