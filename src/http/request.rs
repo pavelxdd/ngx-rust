@@ -3975,7 +3975,7 @@ impl RequestContinuation<'_> {
     /// Calls the saved header filter once for this delayed terminal path.
     ///
     /// This keeps the continuation active so the caller can pass the terminal status to
-    /// [`finalize`](Self::finalize) after the complete filter sequence.
+    /// [`finalize_after_output`](Self::finalize_after_output) after the complete filter sequence.
     pub fn call_next_header<M: HttpFilter>(
         &mut self,
         filters: &HttpFilterSlot<M>,
@@ -3994,7 +3994,7 @@ impl RequestContinuation<'_> {
     /// Calls the saved body filter once for this delayed terminal path.
     ///
     /// This keeps the continuation active so the caller can pass the terminal status to
-    /// [`finalize`](Self::finalize) after the complete filter sequence.
+    /// [`finalize_after_output`](Self::finalize_after_output) after the complete filter sequence.
     pub fn call_next_body<M: HttpFilter>(
         &mut self,
         filters: &HttpFilterSlot<M>,
@@ -4023,6 +4023,28 @@ impl RequestContinuation<'_> {
             return Err(RequestContinuationError::NonConsumingStatus);
         }
         self.transfer_to_nginx();
+        unsafe { ngx_http_finalize_request(self.request.raw.as_ptr(), status.0) };
+        Ok(())
+    }
+
+    /// Finalizes after an output or saved-filter call has transferred buffered work to nginx.
+    ///
+    /// The retained request reference is released before finalization because nginx's writer owns
+    /// any `NGX_AGAIN` continuation and consumes only the request's ordinary processing reference
+    /// when the buffered output finishes. Validation errors leave this continuation active for
+    /// retry or explicit cancellation. `NGX_DECLINED` is rejected because it resumes phases.
+    pub fn finalize_after_output(
+        &mut self,
+        status: impl Into<Status>,
+    ) -> Result<(), RequestContinuationError> {
+        self.ensure_active()?;
+        self.ensure_releasable_hold()?;
+        self.request.validate_terminal_operation()?;
+        let status = status.into();
+        if status.0 == NGX_DECLINED as _ {
+            return Err(RequestContinuationError::NonConsumingStatus);
+        }
+        self.release_for_resume();
         unsafe { ngx_http_finalize_request(self.request.raw.as_ptr(), status.0) };
         Ok(())
     }
@@ -7886,6 +7908,22 @@ mod tests {
         continuation
             .finalize(Status::NGX_DONE)
             .expect("terminal finalization accepts the held reference");
+        fixture.disarm_nginx_pools();
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn finalization_after_output_releases_the_hold_before_entering_nginx() {
+        let mut fixture = TerminalRequestFixture::new();
+        let mut hold = None;
+        fixture.hold(&mut hold);
+        assert_eq!(fixture.request.count(), 2);
+
+        let mut continuation =
+            RequestHold::take(&mut hold, request_from(&mut fixture.request)).unwrap();
+        continuation
+            .finalize_after_output(Status::NGX_DONE)
+            .expect("output finalization releases the held reference");
         fixture.disarm_nginx_pools();
     }
 
