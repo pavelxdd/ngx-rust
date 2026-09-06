@@ -1,8 +1,9 @@
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
+use core::ptr::NonNull;
 
-use crate::core::{ChainMut, Status};
-use crate::ffi::{NGX_LOG_EMERG, ngx_conf_t, ngx_http_request_t, ngx_int_t};
+use crate::core::{ChainMut, Pool, Status};
+use crate::ffi::{NGX_LOG_EMERG, ngx_conf_t, ngx_http_request_t, ngx_int_t, ngx_pool_t};
 use crate::http::{HttpModule, IntoHandlerStatus, RequestRefMut};
 
 type HeaderFilter = unsafe extern "C" fn(*mut ngx_http_request_t) -> ngx_int_t;
@@ -16,6 +17,8 @@ pub enum HttpFilterError {
     AlreadyPrepared,
     /// This slot was not prepared for the current postconfiguration callback.
     NotPrepared,
+    /// Nginx could not register cleanup for an incomplete configuration attempt.
+    PreparationCleanup,
     /// Nginx has no header filter to continue.
     MissingHeaderFilter,
     /// Nginx has no body filter to continue.
@@ -46,6 +49,7 @@ fn log_installation_error(cf: &mut ngx_conf_t, module: &str, error: HttpFilterEr
     let message = match error {
         HttpFilterError::AlreadyPrepared => "preconfiguration was repeated",
         HttpFilterError::NotPrepared => "paired preconfiguration was not completed",
+        HttpFilterError::PreparationCleanup => "configuration cleanup could not be registered",
         HttpFilterError::MissingHeaderFilter => "header filter chain is empty",
         HttpFilterError::MissingBodyFilter => "body filter chain is empty",
         HttpFilterError::MissingHeaderNext | HttpFilterError::MissingBodyNext => {
@@ -63,12 +67,26 @@ fn log_installation_error(cf: &mut ngx_conf_t, module: &str, error: HttpFilterEr
 struct FilterState {
     header: Option<HeaderFilter>,
     body: Option<BodyFilter>,
-    prepared: bool,
+    preparation: Option<NonNull<()>>,
 }
 
 impl FilterState {
     const fn empty() -> Self {
-        Self { header: None, body: None, prepared: false }
+        Self { header: None, body: None, preparation: None }
+    }
+}
+
+struct FilterPreparation<M: HttpFilter> {
+    slot: &'static HttpFilterSlot<M>,
+}
+
+impl<M: HttpFilter> Drop for FilterPreparation<M> {
+    fn drop(&mut self) {
+        let marker = NonNull::from(&mut *self).cast();
+        let state = unsafe { &mut *self.slot.state.get() };
+        if state.preparation == Some(marker) {
+            state.preparation = None;
+        }
     }
 }
 
@@ -130,25 +148,30 @@ where
         Ok(unsafe { next(request, chain.as_ptr()) })
     }
 
-    fn prepare(&self) -> Result<(), HttpFilterError> {
+    fn prepare(&'static self, pool: *mut ngx_pool_t) -> Result<(), HttpFilterError> {
         let state = unsafe { &mut *self.state.get() };
-        if state.prepared {
+        if state.preparation.is_some() {
             return Err(HttpFilterError::AlreadyPrepared);
         }
-        state.prepared = true;
+
+        let pool = unsafe { Pool::from_raw(pool) }.ok_or(HttpFilterError::PreparationCleanup)?;
+        let preparation = pool
+            .allocate_with_cleanup(|| FilterPreparation { slot: self })
+            .map_err(|_| HttpFilterError::PreparationCleanup)?;
+        state.preparation = Some(preparation.into_non_null().cast());
         Ok(())
     }
 
     fn cancel_preparation(&self) {
-        unsafe { (*self.state.get()).prepared = false };
+        unsafe { (*self.state.get()).preparation = None };
     }
 
     fn begin_installation(&self) -> Result<(), HttpFilterError> {
         let state = unsafe { &mut *self.state.get() };
-        if !state.prepared {
+        if state.preparation.is_none() {
             return Err(HttpFilterError::NotPrepared);
         }
-        state.prepared = false;
+        state.preparation = None;
         Ok(())
     }
 
@@ -158,7 +181,7 @@ where
         let body = unsafe { nginx_sys::ngx_http_top_body_filter }
             .ok_or(HttpFilterError::MissingBodyFilter)?;
 
-        Ok(FilterState { header: Some(header), body: Some(body), prepared: false })
+        Ok(FilterState { header: Some(header), body: Some(body), preparation: None })
     }
 
     fn install(&self) -> Result<(), HttpFilterError> {
@@ -272,7 +295,7 @@ where
 {
     crate::http::module::configuration_callback_status(cf, |parser| {
         let module = core::any::type_name::<M>();
-        if let Err(error) = M::filter_slot().prepare() {
+        if let Err(error) = M::filter_slot().prepare(unsafe { (*parser.as_raw()).pool }) {
             log_installation_error(unsafe { &mut *parser.as_raw() }, module, error);
             return Status::NGX_ERROR.0;
         }
@@ -331,6 +354,7 @@ mod tests {
     use alloc::vec::Vec;
     use core::ffi::c_int;
     use core::mem::MaybeUninit;
+    use core::ops::{Deref, DerefMut};
     use core::ptr;
     use core::slice;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -344,8 +368,9 @@ mod tests {
     use crate::core::{ChainMut, ConnectionError, ModuleDescriptor, Pool, Status};
     use crate::ffi::{
         NGX_HTTP_MODULE, NGX_LOG_EMERG, ngx_buf_t, ngx_chain_t, ngx_conf_t, ngx_connection_t,
-        ngx_cycle_t, ngx_http_output_body_filter_pt, ngx_http_output_header_filter_pt,
-        ngx_http_request_t, ngx_int_t, ngx_log_t, ngx_module_t, ngx_pool_t, ngx_uint_t,
+        ngx_create_pool, ngx_cycle_t, ngx_destroy_pool, ngx_http_output_body_filter_pt,
+        ngx_http_output_header_filter_pt, ngx_http_request_t, ngx_int_t, ngx_log_t, ngx_module_t,
+        ngx_pool_t, ngx_uint_t,
     };
     use crate::http::{
         HttpModule, RequestContinuationError, RequestError, RequestHold, RequestRefMut,
@@ -360,6 +385,7 @@ mod tests {
 
     const RELOAD_TEST_CHILD: &str = "NGX_HTTP_FILTER_RELOAD_TEST_CHILD";
     const FAILED_RELOAD_REUSE_TEST_CHILD: &str = "NGX_HTTP_FILTER_FAILED_RELOAD_REUSE_TEST_CHILD";
+    const FAILED_PARSE_REUSE_TEST_CHILD: &str = "NGX_HTTP_FILTER_FAILED_PARSE_REUSE_TEST_CHILD";
 
     #[derive(Default)]
     struct ConfigLogCapture {
@@ -479,10 +505,52 @@ mod tests {
         request
     }
 
-    fn configuration(cycle: &mut ngx_cycle_t) -> ngx_conf_t {
-        let mut configuration = unsafe { MaybeUninit::<ngx_conf_t>::zeroed().assume_init() };
-        configuration.cycle = cycle;
-        configuration
+    struct TestConfiguration {
+        raw: ngx_conf_t,
+    }
+
+    impl TestConfiguration {
+        fn recycle_pool(&mut self) {
+            unsafe { ngx_destroy_pool(self.raw.pool) };
+            self.raw.pool = test_pool();
+        }
+
+        fn as_mut_ptr(&mut self) -> *mut ngx_conf_t {
+            &raw mut self.raw
+        }
+    }
+
+    impl Deref for TestConfiguration {
+        type Target = ngx_conf_t;
+
+        fn deref(&self) -> &Self::Target {
+            &self.raw
+        }
+    }
+
+    impl DerefMut for TestConfiguration {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.raw
+        }
+    }
+
+    impl Drop for TestConfiguration {
+        fn drop(&mut self) {
+            unsafe { ngx_destroy_pool(self.raw.pool) };
+        }
+    }
+
+    fn test_pool() -> *mut ngx_pool_t {
+        let pool = unsafe { ngx_create_pool(4096, ptr::null_mut()) };
+        assert!(!pool.is_null());
+        pool
+    }
+
+    fn configuration(cycle: &mut ngx_cycle_t) -> TestConfiguration {
+        let mut raw = unsafe { MaybeUninit::<ngx_conf_t>::zeroed().assume_init() };
+        raw.cycle = cycle;
+        raw.pool = test_pool();
+        TestConfiguration { raw }
     }
 
     fn configure_filter<M: HttpFilter>(configuration: &mut ngx_conf_t) -> ngx_int_t {
@@ -1563,23 +1631,23 @@ mod tests {
         let mut configuration = configuration(&mut cycle);
 
         assert_eq!(
-            unsafe { filter_postconfiguration::<LifecycleFilter>(&raw mut configuration) },
+            unsafe { filter_postconfiguration::<LifecycleFilter>(configuration.as_mut_ptr()) },
             Status::NGX_ERROR.0
         );
         assert_eq!(
-            unsafe { filter_preconfiguration::<LifecycleFilter>(&raw mut configuration) },
+            unsafe { filter_preconfiguration::<LifecycleFilter>(configuration.as_mut_ptr()) },
             Status::NGX_OK.0
         );
         assert_eq!(
-            unsafe { filter_preconfiguration::<LifecycleFilter>(&raw mut configuration) },
+            unsafe { filter_preconfiguration::<LifecycleFilter>(configuration.as_mut_ptr()) },
             Status::NGX_ERROR.0
         );
         assert_eq!(
-            unsafe { filter_postconfiguration::<LifecycleFilter>(&raw mut configuration) },
+            unsafe { filter_postconfiguration::<LifecycleFilter>(configuration.as_mut_ptr()) },
             Status::NGX_OK.0
         );
         assert_eq!(
-            unsafe { filter_postconfiguration::<LifecycleFilter>(&raw mut configuration) },
+            unsafe { filter_postconfiguration::<LifecycleFilter>(configuration.as_mut_ptr()) },
             Status::NGX_ERROR.0
         );
 
@@ -1599,7 +1667,7 @@ mod tests {
         NEXT_BODY_CALLS.store(0, Ordering::Relaxed);
         assert_eq!(configure_filter::<RepeatedFilter>(&mut configuration), Status::NGX_OK.0);
         assert_eq!(
-            unsafe { filter_postconfiguration::<RepeatedFilter>(&raw mut configuration) },
+            unsafe { filter_postconfiguration::<RepeatedFilter>(configuration.as_mut_ptr()) },
             Status::NGX_ERROR.0
         );
         assert_single_emergency(&capture, b"failed to install");
@@ -1747,6 +1815,45 @@ mod tests {
         let mut chain = ngx_chain_t { buf: ptr::null_mut(), next: ptr::null_mut() };
         assert_eq!(top_header(&mut request), Status::NGX_AGAIN.0);
         assert_eq!(top_body(&mut request, &raw mut chain), Status::NGX_BUSY.0);
+    }
+
+    #[test]
+    fn failed_parse_cleanup_allows_reused_cycle_storage() {
+        if std::env::var_os(FAILED_PARSE_REUSE_TEST_CHILD).is_some() {
+            failed_parse_reuse_in_isolated_test_process();
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("test executable");
+        let status = Command::new(executable)
+            .arg("--exact")
+            .arg("http::filter::tests::failed_parse_cleanup_allows_reused_cycle_storage")
+            .env(FAILED_PARSE_REUSE_TEST_CHILD, "1")
+            .env("RUST_TEST_THREADS", "1")
+            .status()
+            .expect("spawn isolated failed-parse test");
+        assert!(status.success(), "isolated failed-parse test failed: {status}");
+    }
+
+    fn failed_parse_reuse_in_isolated_test_process() {
+        let globals = FilterGlobals::new();
+        let mut recycled_cycle = unsafe { MaybeUninit::<ngx_cycle_t>::zeroed().assume_init() };
+        let mut configuration = configuration(&mut recycled_cycle);
+
+        globals.set(Some(old_header), Some(old_body));
+        assert_eq!(configure_filter::<ReloadFilter>(&mut configuration), Status::NGX_OK.0);
+        configuration.recycle_pool();
+
+        assert_eq!(
+            unsafe { filter_preconfiguration::<ReloadFilter>(configuration.as_mut_ptr()) },
+            Status::NGX_OK.0
+        );
+        configuration.recycle_pool();
+        assert_eq!(reload_next_statuses(), (Status::NGX_DONE.0, Status::NGX_ABORT.0));
+
+        globals.set(Some(new_header), Some(new_body));
+        assert_eq!(configure_filter::<ReloadFilter>(&mut configuration), Status::NGX_OK.0);
+        assert_eq!(reload_next_statuses(), (Status::NGX_AGAIN.0, Status::NGX_BUSY.0));
     }
 
     #[test]
