@@ -4340,6 +4340,24 @@ mod tests {
     unsafe extern "C" fn blocked_request_handler(_request: *mut ngx_http_request_t) {}
 
     #[cfg(feature = "test-link")]
+    unsafe extern "C" fn pending_body_recv(
+        connection: *mut ngx_connection_t,
+        _buffer: *mut u8,
+        _size: usize,
+    ) -> isize {
+        unsafe { (*(*connection).read).set_ready(0) };
+        NGX_AGAIN as _
+    }
+
+    #[cfg(feature = "test-link")]
+    unsafe extern "C" fn test_request_body_filter(
+        _request: *mut ngx_http_request_t,
+        _chain: *mut ngx_chain_t,
+    ) -> ngx_int_t {
+        NGX_OK as _
+    }
+
+    #[cfg(feature = "test-link")]
     struct PinnedContext {
         value: u32,
         slot: *mut *mut c_void,
@@ -4543,6 +4561,7 @@ mod tests {
         core_module_type: ngx_uint_t,
         core_module_index: ngx_uint_t,
         core_module_context_index: ngx_uint_t,
+        request_body_filter: nginx_sys::ngx_http_request_body_filter_pt,
     }
 
     #[cfg(feature = "test-link")]
@@ -4555,6 +4574,7 @@ mod tests {
                 core_module_type,
                 core_module_index,
                 core_module_context_index,
+                request_body_filter,
             ) = unsafe {
                 let module = &raw const nginx_sys::ngx_http_core_module;
                 (
@@ -4563,6 +4583,7 @@ mod tests {
                     (*module).type_,
                     (*module).index,
                     (*module).ctx_index,
+                    nginx_sys::ngx_http_top_request_body_filter,
                 )
             };
             unsafe {
@@ -4576,6 +4597,7 @@ mod tests {
                 core_module_type,
                 core_module_index,
                 core_module_context_index,
+                request_body_filter,
             }
         }
     }
@@ -4590,6 +4612,7 @@ mod tests {
                 (*module).type_ = self.core_module_type;
                 (*module).index = self.core_module_index;
                 (*module).ctx_index = self.core_module_context_index;
+                nginx_sys::ngx_http_top_request_body_filter = self.request_body_filter;
             }
         }
     }
@@ -7591,16 +7614,34 @@ mod tests {
         let mut fixture = TerminalRequestFixture::new();
         let mut contexts: [*mut c_void; 1] = [ptr::null_mut()];
         fixture.request.ctx = contexts.as_mut_ptr();
-        let mut body: ngx_http_request_body_t = unsafe { MaybeUninit::zeroed().assume_init() };
-        body.rest = 1;
-        body.post_handler = Some(raw_client_body_handler::<BodyCallback>);
-        fixture.request.request_body = &raw mut body;
+        let mut header_storage = [0_u8; 16];
+        let mut header: ngx_buf_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        header.start = header_storage.as_mut_ptr();
+        header.pos = header_storage.as_mut_ptr();
+        header.last = header_storage.as_mut_ptr();
+        header.end = unsafe { header_storage.as_mut_ptr().add(header_storage.len()) };
+        fixture.request.header_in = &raw mut header;
+        fixture.request.headers_in.content_length_n = 4;
+        fixture._core.client_body_buffer_size = 8;
+        fixture._core.client_body_timeout = 0;
+        fixture.connection.recv = Some(pending_body_recv);
+        fixture._read.set_active(1);
+        fixture._read.set_ready(1);
+        fixture._read.set_timer_set(1);
+        fixture._read.timer.key = unsafe { ngx_current_msec };
+        unsafe { nginx_sys::ngx_http_top_request_body_filter = Some(test_request_body_filter) };
         BODY_CALLBACKS.store(0, Ordering::Relaxed);
         BODY_CALLBACK_ACTIVE.store(true, Ordering::Relaxed);
-        assert!(matches!(
-            register_client_body_read::<BodyCallback>(NonNull::from(&mut *fixture.request)),
-            Ok(Some(_))
-        ));
+
+        let mut request = request_from(&mut fixture.request);
+        let start = request.read_client_body::<BodyCallback>();
+        assert_eq!(start.status(), &ClientBodyReadStatus::Again);
+        assert_eq!(unsafe { start.request.raw.as_ref().count() }, 2);
+        assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 0);
+        start.release();
+        assert_eq!(fixture.request.count(), 1);
+        let body = NonNull::new(fixture.request.request_body).expect("pending native body");
+        assert_eq!(unsafe { body.as_ref().rest }, 4);
 
         let mut phase_handlers =
             Box::new([unsafe { MaybeUninit::<ngx_http_phase_handler_t>::zeroed().assume_init() }]);
@@ -7631,13 +7672,17 @@ mod tests {
         assert!(!start.release_required);
         start.release();
         assert_eq!(fixture.request.count(), 1);
-        assert_eq!(fixture.request.request_body, &raw mut body);
-        assert_eq!(body.rest, 1);
+        assert_eq!(fixture.request.request_body, body.as_ptr());
+        assert_eq!(unsafe { body.as_ref().rest }, 4);
 
         fixture.request.set_blocked(1);
         fixture.request.write_event_handler = Some(blocked_request_handler);
-        body.rest = 0;
-        let late_callback = body.post_handler.expect("native body callback");
+        fixture._read.set_timer_set(0);
+        unsafe {
+            (*body.as_ptr()).rest = 0;
+            (*body.as_ptr()).set_last_saved(1);
+        }
+        let late_callback = unsafe { body.as_ref().post_handler }.expect("native body callback");
         unsafe { late_callback(&raw mut *fixture.request) };
         assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 0);
         assert_ne!(fixture.request.terminated(), 0);
