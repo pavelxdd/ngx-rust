@@ -196,14 +196,14 @@ macro_rules! ngx_modules {
     ($( $mod:ident ),+) => {
         #[unsafe(no_mangle)]
         #[allow(non_upper_case_globals)]
-        pub static mut ngx_modules: [*const $crate::ffi::ngx_module_t; $crate::count!($( $mod, )+) + 1] = [
+        pub static mut ngx_modules: [*const $crate::ffi::ngx_module_t; $crate::count!($( $mod ),+) + 1] = [
             $( unsafe { &$mod } as *const $crate::ffi::ngx_module_t, )+
             ::core::ptr::null()
         ];
 
         #[unsafe(no_mangle)]
         #[allow(non_upper_case_globals)]
-        pub static mut ngx_module_names: [*const ::core::ffi::c_char; $crate::count!($( $mod, )+) + 1] = [
+        pub static mut ngx_module_names: [*const ::core::ffi::c_char; $crate::count!($( $mod ),+) + 1] = [
             $( concat!(stringify!($mod), "\0").as_ptr() as *const ::core::ffi::c_char, )+
             ::core::ptr::null()
         ];
@@ -219,6 +219,8 @@ macro_rules! ngx_modules {
 /// Count number of arguments
 #[macro_export]
 macro_rules! count {
-    () => { 0usize };
-    ($x:tt, $( $xs:tt ),*) => { 1usize + $crate::count!($( $xs, )*) };
+    ($( $item:tt ),* $(,)?) => {
+        <[()]>::len(&[$($crate::count!(@item $item)),*])
+    };
+    (@item $item:tt) => { () };
 }

@@ -20,9 +20,12 @@ use ngx::http::{
 use ngx::{async_ as ngx_async, ngx_conf_log_error, ngx_log_debug_http, ngx_string};
 
 struct Module;
+struct CompanionModule;
 
 std::thread_local! {
     static WORKER_SCHEDULER_LEASE: RefCell<Option<ngx_async::WorkerSchedulerLease>> =
+        const { RefCell::new(None) };
+    static COMPANION_SCHEDULER_LEASE: RefCell<Option<ngx_async::WorkerSchedulerLease>> =
         const { RefCell::new(None) };
 }
 
@@ -61,7 +64,45 @@ unsafe impl http::HttpModule for Module {
     fn exit_process(_cycle: http::ProcessCycle<'_>) {
         WORKER_SCHEDULER_LEASE.with(|current| {
             if let Some(mut lease) = current.borrow_mut().take() {
-                let _ = lease.release();
+                let stopped = lease.release().unwrap_or(false);
+                log::info!("async primary scheduler lease released, stopped={stopped}");
+            }
+        });
+    }
+}
+
+unsafe impl HttpModule for CompanionModule {
+    fn module() -> ModuleDescriptor {
+        unsafe { ModuleDescriptor::from_raw(&raw mut ngx_http_async_companion_module) }
+            .expect("ngx_http_async_companion_module descriptor")
+    }
+
+    fn init_process(cycle: http::ProcessCycle<'_>) -> ngx_int_t {
+        let Some(log) = (unsafe { ngx::log::LogRef::from_raw((*cycle.as_ptr()).log) }) else {
+            return Status::NGX_ERROR.0;
+        };
+        // SAFETY: nginx retains the process-cycle logger until the matching exit hook.
+        let Ok(mut lease) = (unsafe { ngx_async::acquire_worker(log) }) else {
+            return Status::NGX_ERROR.0;
+        };
+        let Ok(task) = ngx_async::spawn(async {
+            log::info!("async companion task executed");
+        }) else {
+            let _ = lease.release();
+            return Status::NGX_ERROR.0;
+        };
+        let _cancellation = task.detach();
+        COMPANION_SCHEDULER_LEASE.with(|current| {
+            *current.borrow_mut() = Some(lease);
+        });
+        Status::NGX_OK.0
+    }
+
+    fn exit_process(_cycle: http::ProcessCycle<'_>) {
+        COMPANION_SCHEDULER_LEASE.with(|current| {
+            if let Some(mut lease) = current.borrow_mut().take() {
+                let stopped = lease.release().unwrap_or(false);
+                log::info!("async companion scheduler lease released, stopped={stopped}");
             }
         });
     }
@@ -102,7 +143,7 @@ static NGX_HTTP_ASYNC_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
 // Generate the `ngx_modules` table with exported modules.
 // This feature is required to build a 'cdylib' dynamic module outside of the NGINX buildsystem.
 #[cfg(feature = "export-modules")]
-ngx::ngx_modules!(ngx_http_async_module);
+ngx::ngx_modules!(ngx_http_async_module, ngx_http_async_companion_module);
 
 #[used]
 #[allow(non_upper_case_globals)]
@@ -114,6 +155,29 @@ pub static mut ngx_http_async_module: ngx_module_t = ngx_module_t {
     init_process: Some(http::init_process::<Module>),
     exit_process: Some(http::exit_process::<Module>),
     ..ngx_module_t::default()
+};
+
+#[used]
+#[allow(non_upper_case_globals)]
+#[cfg_attr(not(feature = "export-modules"), unsafe(no_mangle))]
+pub static mut ngx_http_async_companion_module: ngx_module_t = ngx_module_t {
+    ctx: &raw const NGX_HTTP_ASYNC_COMPANION_MODULE_CTX as _,
+    commands: ptr::null_mut(),
+    type_: NGX_HTTP_MODULE as _,
+    init_process: Some(http::init_process::<CompanionModule>),
+    exit_process: Some(http::exit_process::<CompanionModule>),
+    ..ngx_module_t::default()
+};
+
+static NGX_HTTP_ASYNC_COMPANION_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
+    preconfiguration: None,
+    postconfiguration: None,
+    create_main_conf: None,
+    init_main_conf: None,
+    create_srv_conf: None,
+    merge_srv_conf: None,
+    create_loc_conf: None,
+    merge_loc_conf: None,
 };
 
 impl http::Merge for ModuleConfig {
