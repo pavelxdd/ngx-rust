@@ -568,6 +568,11 @@ mod tests {
         assert!(write_download(&cached, &mut reader).is_err());
         assert!(!cached.exists());
         assert_eq!(fs::read_dir(temp_dir.path())?.count(), 0);
+
+        let mut complete = &b"complete"[..];
+        let pending = write_download(&cached, &mut complete)?;
+        assert_eq!(pending.publish()?, cached);
+        assert_eq!(fs::read(&cached)?, b"complete");
         Ok(())
     }
 
