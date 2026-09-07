@@ -22,7 +22,7 @@ select STDERR; $| = 1;
 select STDOUT; $| = 1;
 
 my $thread_wake = $^O ne 'MSWin32';
-my $t = Test::Nginx->new()->has(qw/http/)->plan(4 + $thread_wake)
+my $t = Test::Nginx->new()->has(qw/http/)->plan(9 + $thread_wake)
 	->write_file_expand('nginx.conf', <<'EOF');
 
 %%TEST_GLOBALS%%
@@ -68,5 +68,14 @@ like($response, qr/X-Async-Subrequest-Status: 204/, 'async subrequest');
 like($response, qr/X-Async-Thread-Wake: 1/, 'async thread wake') if $thread_wake;
 unlike(http_get('/disabled'), qr/X-Async-Time:/, 'disabled async handler');
 like($t->read_file('error.log'), qr/async log facade initialized/, 'log facade');
+
+$t->stop();
+my $log = $t->read_file('error.log');
+like($log, qr/async companion task executed/, 'second module task');
+like($log, qr/async primary scheduler lease released/, 'primary module released scheduler');
+like($log, qr/async companion scheduler lease released/, 'companion module released scheduler');
+my @final_releases = $log =~ /async (?:primary|companion) scheduler lease released, stopped=true/g;
+is(scalar @final_releases, 1, 'scheduler stopped by final module only');
+unlike($log, qr/(?:open socket #[0-9]+ left|aborting)/, 'process exit quiesced async resources');
 
 ###############################################################################
