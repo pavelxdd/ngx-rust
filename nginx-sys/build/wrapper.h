@@ -14,8 +14,10 @@
 ngx_uint_t ngx_rs_http_request_is_internal(const ngx_http_request_t *request);
 ngx_uint_t ngx_rs_http_request_header_only(const ngx_http_request_t *request);
 ngx_uint_t ngx_rs_http_request_keepalive(const ngx_http_request_t *request);
+ngx_uint_t ngx_rs_http_request_expect_trailers(const ngx_http_request_t *request);
 void ngx_rs_http_request_set_keepalive(ngx_http_request_t *request, ngx_uint_t keepalive);
 void ngx_rs_http_request_set_header_only(ngx_http_request_t *request, ngx_uint_t header_only);
+void ngx_rs_http_request_set_expect_trailers(ngx_http_request_t *request, ngx_uint_t expect_trailers);
 void ngx_rs_http_request_set_header_sent(ngx_http_request_t *request, ngx_uint_t header_sent);
 #endif
 
