@@ -4073,10 +4073,12 @@ impl RequestContinuation<'_> {
     /// Finalizes after an output or saved-filter call has transferred buffered work to nginx.
     ///
     /// When an ordinary processing reference remains, the retained reference is released before
-    /// finalization so nginx's writer can consume that ordinary reference after `NGX_AGAIN`. If
-    /// the hold is the request's only live reference, ownership is transferred instead so the
-    /// writer still has a reference to consume. Validation errors leave this continuation active
-    /// for retry or explicit cancellation. `NGX_DECLINED` is rejected because it resumes phases.
+    /// finalization so nginx's writer can consume that ordinary reference after `NGX_AGAIN`. For
+    /// the final subrequest, nginx consumes one reference while waking its parent, so a count of
+    /// two still requires transferring the hold to keep the parent writer live. If the hold is the
+    /// request's only live reference, ownership is transferred for the same reason. Validation
+    /// errors leave this continuation active for retry or explicit cancellation. `NGX_DECLINED`
+    /// is rejected because it resumes phases.
     pub fn finalize_after_output(
         &mut self,
         status: impl Into<Status>,
@@ -4088,7 +4090,9 @@ impl RequestContinuation<'_> {
             return Err(RequestContinuationError::NonConsumingStatus);
         }
         let hold = self.hold.as_ref().expect("active continuation owns its request hold");
-        if unsafe { hold.main.as_ref().count() } > 1 {
+        let count = unsafe { hold.main.as_ref().count() };
+        let final_subrequest = hold.request != hold.main && count == 2;
+        if count > 1 && !final_subrequest {
             self.release_for_resume();
         } else {
             self.transfer_to_nginx();
@@ -7973,6 +7977,35 @@ mod tests {
             .finalize_after_output(Status::NGX_DONE)
             .expect("output finalization releases the held reference");
         fixture.disarm_nginx_pools();
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn finalization_after_output_preserves_parent_reference_for_last_subrequest() {
+        let mut fixture = TerminalRequestFixture::new();
+        let mut main = Box::new(zeroed_request());
+        main.main = &raw mut *main;
+        main.parent = &raw mut *main;
+        main.pool = fixture.request.pool;
+        main.connection = fixture.request.connection;
+        main.loc_conf = fixture.request.loc_conf;
+        main.main_conf = fixture.request.main_conf;
+        main.set_count(1);
+        main.blocked = 1;
+        fixture.request.main = &raw mut *main;
+        fixture.request.parent = &raw mut *main;
+
+        let mut hold = None;
+        fixture.hold(&mut hold);
+        assert_eq!(main.count(), 2);
+
+        let mut continuation =
+            RequestHold::take(&mut hold, request_from(&mut fixture.request)).unwrap();
+        continuation
+            .finalize_after_output(Status::NGX_DONE)
+            .expect("last subrequest finalization keeps the parent writer live");
+
+        assert_eq!(main.count(), 1);
     }
 
     #[cfg(feature = "test-link")]
