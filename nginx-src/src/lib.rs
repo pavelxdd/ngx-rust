@@ -294,13 +294,20 @@ mod tests {
     #[test]
     fn configure_arguments_preserve_shell_quoted_boundaries() {
         let arguments = parse_configure_args(
-            "--with-debug --with-openssl-opt='no-asm no-tests' '--prefix=/tmp/nginx build'",
+            "--with-debug --with-openssl-opt='no-asm no-tests' --with-cc-opt=pipe\\ tune \
+             --with-path=C:\\\\nginx '--prefix=/tmp/nginx build'",
         )
         .unwrap();
 
         assert_eq!(
             arguments,
-            ["--with-debug", "--with-openssl-opt=no-asm no-tests", "--prefix=/tmp/nginx build"]
+            [
+                "--with-debug",
+                "--with-openssl-opt=no-asm no-tests",
+                "--with-cc-opt=pipe tune",
+                "--with-path=C:\\nginx",
+                "--prefix=/tmp/nginx build",
+            ]
         );
     }
 
