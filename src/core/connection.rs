@@ -338,7 +338,11 @@ impl<'input> ProxyProtocolBuilder<'input> {
 
     /// Sets opaque PROXY protocol TLV bytes after enforcing the carrier-specific bound.
     pub fn tlvs(mut self, tlvs: &'input [u8]) -> Result<Self, ProxyProtocolError> {
-        if tlvs.len() > proxy_protocol_tlv_limit(self.source, self.transport) {
+        #[cfg(nginx1_23_2)]
+        let limit = proxy_protocol_tlv_limit(self.source, self.transport);
+        #[cfg(not(nginx1_23_2))]
+        let limit = 0;
+        if tlvs.len() > limit {
             return Err(ProxyProtocolError::TlvsTooLong);
         }
 
@@ -1000,6 +1004,7 @@ impl ProxyProtocolBuilder<'_> {
             ngx_str_t::from_bytes(pool.as_ptr(), &destination_text[..destination_text_len])
         }
         .ok_or(ProxyProtocolError::Allocation)?;
+        #[cfg(nginx1_23_2)]
         let tlvs = if self.tlvs.is_empty() {
             ngx_str_t::empty()
         } else {
@@ -1013,7 +1018,10 @@ impl ProxyProtocolBuilder<'_> {
             (*metadata).dst_addr = destination;
             (*metadata).src_port = self.source.port().host_order();
             (*metadata).dst_port = self.destination.port().host_order();
-            (*metadata).tlvs = tlvs;
+            #[cfg(nginx1_23_2)]
+            {
+                (*metadata).tlvs = tlvs;
+            }
             connection.raw.as_mut().proxy_protocol = metadata;
         }
 
@@ -1187,7 +1195,10 @@ fn connection_proxy_protocol<'callback>(
     let source = proxy_protocol_address(source_text, metadata.src_port)?;
     let destination = proxy_protocol_address(destination_text, metadata.dst_port)?;
     let transport = connection_socket_type(connection).map_err(ProxyProtocolError::Connection)?;
+    #[cfg(nginx1_23_2)]
     let tlvs = checked_proxy_protocol_bytes(metadata.tlvs)?;
+    #[cfg(not(nginx1_23_2))]
+    let tlvs = &[];
     if tlvs.len() > proxy_protocol_tlv_limit(source, transport) {
         return Err(ProxyProtocolError::TlvsTooLong);
     }

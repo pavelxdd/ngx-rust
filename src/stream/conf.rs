@@ -507,7 +507,11 @@ pub use core_module::{NgxStreamCoreModule, add_phase_handler, try_add_phase_hand
 
 #[cfg(ngx_feature = "stream_ssl")]
 mod ssl {
-    use crate::ffi::{ngx_stream_ssl_module, ngx_stream_ssl_srv_conf_t};
+    #[cfg(not(nginx1_25_5))]
+    use crate::ffi::ngx_stream_ssl_conf_t as ngx_stream_ssl_srv_conf_t;
+    use crate::ffi::ngx_stream_ssl_module;
+    #[cfg(nginx1_25_5)]
+    use crate::ffi::ngx_stream_ssl_srv_conf_t;
     use crate::stream::{StreamModule, StreamModuleServerConf};
 
     /// Typed access to `ngx_stream_ssl_module` configuration.

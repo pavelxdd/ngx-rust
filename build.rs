@@ -40,7 +40,12 @@ fn main() {
     let versions: &[(u64, &str, bool)] = &[
         //
         (1_021_001, "nginx1_21_1", true),
+        (1_023_002, "nginx1_23_2", true),
         (1_025_001, "nginx1_25_1", true),
+        (1_025_004, "nginx1_25_4", true),
+        (1_025_005, "nginx1_25_5", true),
+        (1_029_006, "nginx1_29_6", true),
+        (1_029_008, "nginx1_29_8", true),
         (1_031_002, "angie1_12_0", nginx_name == "Angie"),
     ];
     versions.iter().for_each(|check| println!("cargo::rustc-check-cfg=cfg({})", check.1));

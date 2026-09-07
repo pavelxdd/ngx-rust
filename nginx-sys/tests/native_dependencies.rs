@@ -5,10 +5,10 @@ use core::mem::MaybeUninit;
 use core::ptr;
 
 use nginx_sys::{
-    NGX_HTTP_MODULE, NGX_OK, NGX_SSL_DEFAULT_PROTOCOLS, ngx_create_pool, ngx_cycle, ngx_cycle_t,
-    ngx_destroy_pool, ngx_log_t, ngx_module_t, ngx_pagesize, ngx_pagesize_shift, ngx_regex_compile,
-    ngx_regex_compile_t, ngx_regex_exec, ngx_regex_init, ngx_ssl_cleanup_ctx, ngx_ssl_create,
-    ngx_ssl_init, ngx_ssl_t, ngx_str_t,
+    NGX_HTTP_MODULE, NGX_OK, ngx_create_pool, ngx_cycle, ngx_cycle_t, ngx_destroy_pool, ngx_log_t,
+    ngx_module_t, ngx_pagesize, ngx_pagesize_shift, ngx_regex_compile, ngx_regex_compile_t,
+    ngx_regex_exec, ngx_regex_init, ngx_ssl_cleanup_ctx, ngx_ssl_create, ngx_ssl_init, ngx_ssl_t,
+    ngx_str_t,
 };
 
 const Z_OK: c_int = 0;
@@ -50,10 +50,7 @@ fn source_built_native_dependencies_execute_through_test_link() {
     assert_eq!(unsafe { ngx_ssl_init(&raw mut log) }, NGX_OK as _);
     let mut ssl = unsafe { MaybeUninit::<ngx_ssl_t>::zeroed().assume_init() };
     ssl.log = &raw mut log;
-    assert_eq!(
-        unsafe { ngx_ssl_create(&raw mut ssl, NGX_SSL_DEFAULT_PROTOCOLS as _, ptr::null_mut()) },
-        NGX_OK as _
-    );
+    assert_eq!(unsafe { ngx_ssl_create(&raw mut ssl, 0, ptr::null_mut()) }, NGX_OK as _);
     assert!(!ssl.ctx.is_null());
     unsafe { ngx_ssl_cleanup_ctx((&raw mut ssl).cast::<c_void>()) };
 
