@@ -330,6 +330,12 @@ ngx_rs_http_request_keepalive(const ngx_http_request_t *request)
     return request->keepalive;
 }
 
+ngx_uint_t
+ngx_rs_http_request_expect_trailers(const ngx_http_request_t *request)
+{
+    return request->expect_trailers;
+}
+
 void
 ngx_rs_http_request_set_keepalive(ngx_http_request_t *request, ngx_uint_t keepalive)
 {
@@ -340,6 +346,12 @@ void
 ngx_rs_http_request_set_header_only(ngx_http_request_t *request, ngx_uint_t header_only)
 {
     request->header_only = header_only != 0;
+}
+
+void
+ngx_rs_http_request_set_expect_trailers(ngx_http_request_t *request, ngx_uint_t expect_trailers)
+{
+    request->expect_trailers = expect_trailers != 0;
 }
 
 void
@@ -482,6 +494,7 @@ ngx_rs_test_http_request_flags(const ngx_http_request_t *request)
     flags |= request->keepalive << 1;
     flags |= request->header_sent << 2;
     flags |= request->internal << 3;
+    flags |= request->expect_trailers << 4;
 
     return flags;
 }
