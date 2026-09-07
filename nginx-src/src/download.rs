@@ -722,6 +722,11 @@ mod tests {
     #[test]
     fn escaping_symlink_is_rejected() -> io::Result<()> {
         let temp_dir = tempfile::tempdir()?;
+        let output = temp_dir.path().join("output");
+        let outside = output.join("outside");
+        fs::create_dir_all(&outside)?;
+        let sentinel = outside.join("sentinel");
+        fs::write(&sentinel, b"unchanged")?;
         let archive = create_archive(
             &temp_dir,
             &[
@@ -732,11 +737,12 @@ mod tests {
                     link_name: Some("../../outside"),
                     contents: &[],
                 },
+                file("source/link/sentinel", b"changed"),
             ],
         )?;
-        let output = temp_dir.path().join("output");
 
         assert!(extract_archive(&archive, &output).is_err());
+        assert_eq!(fs::read(sentinel)?, b"unchanged");
         assert!(!output.join("source").exists());
         Ok(())
     }
