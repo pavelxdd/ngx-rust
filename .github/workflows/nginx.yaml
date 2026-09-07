@@ -69,16 +69,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Exact stable releases keep both module-linking paths executable at the compatibility
+        # floor and at the current supported version.
         nginx-ref:
           - master
-          - stable-1.30
+          - release-1.22.1
+          - release-1.30.4
         module:
           - static
           - dynamic
-        include:
-          # minimal supported nginx version (Debian bookworm: 1.22.1)
-          - nginx-ref: stable-1.22
-            module: dynamic
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -108,11 +107,13 @@ jobs:
             nginx/objs/**/CACHEDIR.TAG
             nginx/objs/**/ngx-debug
             nginx/objs/**/ngx-release
-          key: ${{ runner.os }}-nginx-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-nginx-
+          key: ${{ runner.os }}-nginx-${{ matrix.nginx-ref }}-${{ matrix.module }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-nginx-${{ matrix.nginx-ref }}-${{ matrix.module }}-
+            ${{ runner.os }}-nginx-${{ matrix.nginx-ref }}-
 
       - name: Update configure arguments
-        if: matrix.nginx-ref != 'stable-1.22'
+        if: matrix.nginx-ref != 'release-1.22.1'
         run: |
             echo NGX_CONFIGURE_UNIX="${NGX_CONFIGURE_UNIX} --with-http_v3_module" \
                 >> "$GITHUB_ENV"
@@ -191,8 +192,10 @@ jobs:
             nginx/objs/**/CACHEDIR.TAG
             nginx/objs/**/ngx-debug
             nginx/objs/**/ngx-release
-          key: ${{ runner.os }}-nginx-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-nginx-
+          key: ${{ runner.os }}-nginx-${{ matrix.nginx-ref }}-${{ matrix.module }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-nginx-${{ matrix.nginx-ref }}-${{ matrix.module }}-
+            ${{ runner.os }}-nginx-${{ matrix.nginx-ref }}-
 
       - name: Prepare build environment
         shell: bash

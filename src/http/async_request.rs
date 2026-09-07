@@ -382,18 +382,23 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::core::{ModuleDescriptor, Status};
+    use crate::core::ModuleDescriptor;
+    #[cfg(nginx1_25_4)]
+    use crate::core::Status;
+    #[cfg(nginx1_25_4)]
+    use crate::ffi::ngx_http_finalize_request;
     use crate::ffi::{
         NGX_DECLINED, NGX_DONE, NGX_ERROR, NGX_HTTP_MODULE, NGX_OK, NGX_USE_CLEAR_EVENT,
         ngx_array_t, ngx_conf_t, ngx_connection_t, ngx_create_pool, ngx_cycle, ngx_cycle_t,
         ngx_delete_posted_event, ngx_destroy_pool, ngx_event_actions, ngx_event_actions_t,
         ngx_event_flags, ngx_event_move_posted_next, ngx_event_process_posted, ngx_event_t,
         ngx_http_conf_ctx_t, ngx_http_core_loc_conf_t, ngx_http_core_main_conf_t,
-        ngx_http_core_srv_conf_t, ngx_http_finalize_request, ngx_http_handler_pt,
-        ngx_http_log_ctx_t, ngx_http_phase_handler_t, ngx_http_request_t,
-        ngx_http_run_posted_requests, ngx_int_t, ngx_log_t, ngx_module_t, ngx_pool_t,
-        ngx_posted_events, ngx_posted_next_events, ngx_queue_init, ngx_uint_t,
+        ngx_http_core_srv_conf_t, ngx_http_handler_pt, ngx_http_log_ctx_t,
+        ngx_http_phase_handler_t, ngx_http_request_t, ngx_http_run_posted_requests, ngx_int_t,
+        ngx_log_t, ngx_module_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events,
+        ngx_queue_init, ngx_uint_t,
     };
+    #[cfg(nginx1_25_4)]
     use crate::http::subrequest::{SubRequestBuilder, SubRequestError};
     use crate::http::{HttpModule, HttpModuleRequestContext};
 
@@ -651,18 +656,22 @@ mod tests {
         }
     }
 
+    #[cfg(nginx1_25_4)]
     struct AsyncSubrequestModule;
 
+    #[cfg(nginx1_25_4)]
     unsafe impl HttpModule for AsyncSubrequestModule {
         fn module() -> ModuleDescriptor {
             test_module()
         }
     }
 
+    #[cfg(nginx1_25_4)]
     unsafe impl HttpModuleRequestContext for AsyncSubrequestModule {
         type RequestContext = AsyncHandlerContext<AsyncSubrequestHandler>;
     }
 
+    #[cfg(nginx1_25_4)]
     struct AsyncSubrequestState {
         subrequest: Cell<*mut ngx_http_request_t>,
         callbacks: Cell<usize>,
@@ -670,6 +679,7 @@ mod tests {
         task_drops: Cell<usize>,
     }
 
+    #[cfg(nginx1_25_4)]
     impl AsyncSubrequestState {
         fn new() -> Self {
             Self {
@@ -681,26 +691,32 @@ mod tests {
         }
     }
 
+    #[cfg(nginx1_25_4)]
     struct CompletionCapture(Rc<AsyncSubrequestState>);
 
+    #[cfg(nginx1_25_4)]
     impl Drop for CompletionCapture {
         fn drop(&mut self) {
             self.0.completion_drops.set(self.0.completion_drops.get() + 1);
         }
     }
 
+    #[cfg(nginx1_25_4)]
     struct TaskCapture(Rc<AsyncSubrequestState>);
 
+    #[cfg(nginx1_25_4)]
     impl Drop for TaskCapture {
         fn drop(&mut self) {
             self.0.task_drops.set(self.0.task_drops.get() + 1);
         }
     }
 
+    #[cfg(nginx1_25_4)]
     std::thread_local! {
         static ASYNC_SUBREQUEST_STATE: RefCell<Option<Rc<AsyncSubrequestState>>> = const { RefCell::new(None) };
     }
 
+    #[cfg(nginx1_25_4)]
     fn install_async_subrequest_state() -> Rc<AsyncSubrequestState> {
         let state = Rc::new(AsyncSubrequestState::new());
         ASYNC_SUBREQUEST_STATE.with(|slot| {
@@ -711,11 +727,15 @@ mod tests {
         state
     }
 
+    #[cfg(nginx1_25_4)]
     static ASYNC_SUBREQUEST_SAW_CONTEXT: AtomicBool = AtomicBool::new(false);
+    #[cfg(nginx1_25_4)]
     static ASYNC_SUBREQUEST_FINISHES: AtomicUsize = AtomicUsize::new(0);
 
+    #[cfg(nginx1_25_4)]
     struct AsyncSubrequestHandler;
 
+    #[cfg(nginx1_25_4)]
     impl AsyncHttpRequestHandler for AsyncSubrequestHandler {
         const PHASE: HttpPhase = HttpPhase::Access;
         type Module = AsyncSubrequestModule;
@@ -1061,6 +1081,7 @@ mod tests {
         NGX_OK as _
     }
 
+    #[cfg(nginx1_25_4)]
     unsafe extern "C" fn blocked_write_handler(_request: *mut ngx_http_request_t) {}
 
     struct TestRequest {
@@ -1069,6 +1090,7 @@ mod tests {
         write_event: Box<ngx_event_t>,
         _connection: Box<ngx_connection_t>,
         _core_loc: Box<ngx_http_core_loc_conf_t>,
+        #[cfg_attr(not(nginx1_25_4), allow(dead_code))]
         loc_conf: Box<[*mut c_void; 1]>,
         request: Box<ngx_http_request_t>,
     }
@@ -1729,6 +1751,7 @@ mod tests {
         assert_eq!(request.main_count(), 1);
     }
 
+    #[cfg(nginx1_25_4)]
     #[test]
     fn native_termination_cancels_pending_main_before_late_wake() {
         let mut worker = TestWorker::new();
@@ -1768,6 +1791,7 @@ mod tests {
         assert_eq!(state.drops.get(), 1);
     }
 
+    #[cfg(nginx1_25_4)]
     #[test]
     fn native_termination_cancels_done_noncurrent_subrequest_before_late_wake() {
         let mut worker = TestWorker::new();
@@ -1822,6 +1846,7 @@ mod tests {
         assert_eq!(state.drops.get(), 1);
     }
 
+    #[cfg(nginx1_25_4)]
     #[test]
     fn native_termination_cancels_waited_subrequest_before_late_completion() {
         let mut worker = TestWorker::new();

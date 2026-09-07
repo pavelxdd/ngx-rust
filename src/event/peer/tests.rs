@@ -545,7 +545,7 @@ fn builder_initializes_every_configured_peer_field() {
     assert_eq!(raw.type_, libc::SOCK_DGRAM);
     assert_eq!(raw.rcvbuf, 1024);
     assert_eq!(raw.log, (&raw const log).cast_mut());
-    #[cfg(any(ngx_feature = "http_upstream_sid", ngx_feature = "compat"))]
+    #[cfg(all(nginx1_29_6, any(ngx_feature = "http_upstream_sid", ngx_feature = "compat")))]
     {
         assert!(raw.hint.is_null());
         assert!(raw.sid.is_null());
@@ -662,7 +662,7 @@ fn builder_defaults_to_a_fresh_stream_peer() {
     assert_eq!(raw.so_keepalive(), 0);
     assert_eq!(raw.down(), 0);
     assert_eq!(raw.log_error(), EventPeerLogError::Alert.raw());
-    #[cfg(any(ngx_feature = "http_upstream_sid", ngx_feature = "compat"))]
+    #[cfg(all(nginx1_29_6, any(ngx_feature = "http_upstream_sid", ngx_feature = "compat")))]
     {
         assert!(raw.hint.is_null());
         assert!(raw.sid.is_null());

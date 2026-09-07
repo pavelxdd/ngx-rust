@@ -928,12 +928,14 @@ impl<'header> Iterator for HttpHeaderIter<'header> {
 impl ExactSizeIterator for HttpHeaderIter<'_> {}
 
 /// Request-pool builder for atomically replacing HTTP input headers.
+#[cfg(nginx1_29_8)]
 pub struct HttpHeadersInBuilder<'request, 'callback> {
     request: &'request mut RequestRefMut<'callback>,
     pool: *mut ngx_pool_t,
     headers: ngx_http_headers_in_t,
 }
 
+#[cfg(nginx1_29_8)]
 impl<'request, 'callback> HttpHeadersInBuilder<'request, 'callback> {
     fn new(
         request: &'request mut RequestRefMut<'callback>,
@@ -1035,6 +1037,7 @@ impl<'request, 'callback> HttpTrailersOutBuilder<'request, 'callback> {
 }
 
 /// Request-pool builder for atomically replacing HTTP output headers.
+#[cfg(nginx1_29_8)]
 pub struct HttpHeadersOutBuilder<'request, 'callback> {
     request: &'request mut RequestRefMut<'callback>,
     pool: *mut ngx_pool_t,
@@ -1045,6 +1048,7 @@ pub struct HttpHeadersOutBuilder<'request, 'callback> {
     content_length_set: bool,
 }
 
+#[cfg(nginx1_29_8)]
 impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
     fn new(
         request: &'request mut RequestRefMut<'callback>,
@@ -1647,6 +1651,7 @@ fn create_header_list(
     Ok(headers)
 }
 
+#[cfg(nginx1_29_8)]
 fn clone_header_list(
     pool: *mut ngx_pool_t,
     source: &ngx_list_t,
@@ -1704,7 +1709,12 @@ fn build_pool_header(
         unsafe { ngx_hash_strlow(lowcase_key, key.data, key.len) }
     };
 
-    Ok(ngx_table_elt_t { hash, key, value, lowcase_key, next: ptr::null_mut() })
+    let mut header: ngx_table_elt_t = unsafe { core::mem::zeroed() };
+    header.hash = hash;
+    header.key = key;
+    header.value = value;
+    header.lowcase_key = lowcase_key;
+    Ok(header)
 }
 
 fn append_header(
@@ -1736,6 +1746,7 @@ fn repair_header_list_last(headers: &mut ngx_list_t) {
     headers.last = last;
 }
 
+#[cfg(nginx1_29_8)]
 unsafe fn append_header_slot(slot: &mut *mut ngx_table_elt_t, header: *mut ngx_table_elt_t) {
     let mut tail = slot;
     while !(*tail).is_null() {
@@ -1747,6 +1758,7 @@ unsafe fn append_header_slot(slot: &mut *mut ngx_table_elt_t, header: *mut ngx_t
     }
 }
 
+#[cfg(nginx1_29_8)]
 unsafe fn bind_headers_in(headers: &mut ngx_http_headers_in_t, header: *mut ngx_table_elt_t) {
     if unsafe { (*header).hash } == 0 {
         return;
@@ -1791,6 +1803,7 @@ unsafe fn bind_headers_in(headers: &mut ngx_http_headers_in_t, header: *mut ngx_
     }
 }
 
+#[cfg(nginx1_29_8)]
 unsafe fn bind_headers_out(headers: &mut ngx_http_headers_out_t, header: *mut ngx_table_elt_t) {
     if unsafe { (*header).hash } == 0 {
         return;
@@ -1830,6 +1843,7 @@ unsafe fn bind_headers_out(headers: &mut ngx_http_headers_out_t, header: *mut ng
     }
 }
 
+#[cfg(nginx1_29_8)]
 fn clear_headers_out_slots(headers: &mut ngx_http_headers_out_t) {
     headers.server = ptr::null_mut();
     headers.date = ptr::null_mut();
@@ -1853,6 +1867,7 @@ fn clear_headers_out_slots(headers: &mut ngx_http_headers_out_t) {
     headers.content_type_hash = 0;
 }
 
+#[cfg(nginx1_29_8)]
 fn clear_headers_out_metadata(headers: &mut ngx_http_headers_out_t) {
     headers.status = 0;
     headers.status_line = ngx_str_t::empty();
@@ -1901,6 +1916,7 @@ fn disable_output_framing_headers(
 struct RequestBodyFramingCandidate {
     content_length: ngx_table_elt_t,
     content_length_n: off_t,
+    #[cfg(nginx1_29_8)]
     count: ngx_uint_t,
 }
 
@@ -1910,7 +1926,9 @@ fn request_body_framing_candidate(
     length: usize,
 ) -> Result<RequestBodyFramingCandidate, RequestBodyBuildError> {
     request.headers_in()?;
+    #[cfg(nginx1_29_8)]
     let headers = unsafe { &request.raw.as_ref().headers_in };
+    #[cfg(nginx1_29_8)]
     let count = headers.count.checked_add(1).ok_or(HeaderBuildError::CountOverflow)?;
     let content_length_n =
         off_t::try_from(length).map_err(|_| RequestBodyBuildError::ContentLengthTooLarge)?;
@@ -1918,7 +1936,12 @@ fn request_body_framing_candidate(
     let value = decimal_bytes(length, &mut decimal);
     let content_length = build_pool_header(pool, b"Content-Length", value)?;
 
-    Ok(RequestBodyFramingCandidate { content_length, content_length_n, count })
+    Ok(RequestBodyFramingCandidate {
+        content_length,
+        content_length_n,
+        #[cfg(nginx1_29_8)]
+        count,
+    })
 }
 
 fn publish_request_body_framing(
@@ -1934,12 +1957,16 @@ fn publish_request_body_framing(
     headers.content_length = content_length.as_ptr();
     headers.transfer_encoding = ptr::null_mut();
     headers.content_length_n = candidate.content_length_n;
-    headers.count = candidate.count;
+    #[cfg(nginx1_29_8)]
+    {
+        headers.count = candidate.count;
+    }
     headers.set_chunked(0);
     request.request_body = body;
     Ok(())
 }
 
+#[cfg(nginx1_29_8)]
 fn replace_request_body_framing(
     headers: &mut ngx_http_headers_in_t,
     pool: *mut ngx_pool_t,
@@ -1964,6 +1991,7 @@ fn replace_request_body_framing(
     Ok(())
 }
 
+#[cfg(nginx1_29_8)]
 fn publish_request_body(
     request: &mut RequestRefMut<'_>,
     headers: ngx_http_headers_in_t,
@@ -2114,10 +2142,22 @@ impl RequestContextRegistration {
     }
 }
 
+fn request_is_terminated(request: *const ngx_http_request_t) -> bool {
+    #[cfg(nginx1_25_4)]
+    {
+        unsafe { (*request).terminated() != 0 }
+    }
+    #[cfg(not(nginx1_25_4))]
+    {
+        let _ = request;
+        false
+    }
+}
+
 unsafe extern "C" fn terminate_request_context_registry(data: *mut c_void) {
     let registry = data.cast::<RequestContextRegistry>();
     // Normal completion reaches pool cleanup; early termination must cancel delayed owners first.
-    if unsafe { (*registry).main.as_ref().terminated() } != 0 {
+    if request_is_terminated(unsafe { (*registry).main.as_ptr() }) {
         unsafe {
             (*registry).client_body_read = None;
             (*registry).cancel_all();
@@ -3386,6 +3426,7 @@ impl<'callback> RequestRefMut<'callback> {
     ///     let _ = request.headers_in_builder(1);
     /// }
     /// ```
+    #[cfg(nginx1_29_8)]
     pub unsafe fn headers_in_builder(
         &mut self,
         capacity: usize,
@@ -3482,6 +3523,7 @@ impl<'callback> RequestRefMut<'callback> {
     ///
     /// Response framing must be configured through
     /// [`HttpHeadersOutBuilder::set_content_length`], not raw framing headers.
+    #[cfg(nginx1_29_8)]
     pub fn headers_out_builder(
         &mut self,
         capacity: usize,
@@ -3495,6 +3537,7 @@ impl<'callback> RequestRefMut<'callback> {
     /// trailers, and scalar output metadata inherited from the current response. Response framing
     /// must be configured through [`HttpHeadersOutBuilder::set_content_length`], not raw framing
     /// headers.
+    #[cfg(nginx1_29_8)]
     pub fn clean_headers_out_builder(
         &mut self,
         capacity: usize,
@@ -3858,7 +3901,7 @@ impl RequestHold {
         if count > 1 {
             let mut main = self.main;
             unsafe { main.as_mut().set_count(count - 1) };
-        } else if count == 1 && main.terminated() == 0 {
+        } else if count == 1 && !request_is_terminated(main) {
             unsafe { ngx_http_finalize_request(self.request.as_ptr(), NGX_DONE as _) };
         }
     }
@@ -4456,7 +4499,7 @@ enum MethodInner {
     Connect,
 }
 
-#[cfg(test)]
+#[cfg(all(test, nginx1_29_8))]
 mod tests {
     extern crate alloc;
 

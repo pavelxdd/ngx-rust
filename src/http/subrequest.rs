@@ -439,17 +439,22 @@ where
 mod tests {
     use super::*;
 
+    #[cfg(all(feature = "test-link", nginx1_29_8))]
+    use alloc::boxed::Box;
     #[cfg(feature = "test-link")]
-    use alloc::{boxed::Box, rc::Rc};
+    use alloc::rc::Rc;
     #[cfg(feature = "test-link")]
     use core::cell::Cell;
     #[cfg(feature = "test-link")]
     use nginx_sys::{
-        NGX_HTTP_MODULE, ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_http_conf_ctx_t,
-        ngx_http_core_loc_conf_t, ngx_http_core_main_conf_t, ngx_http_core_srv_conf_t, ngx_log_t,
-        ngx_uint_t,
+        NGX_HTTP_MODULE, ngx_connection_t, ngx_create_pool, ngx_destroy_pool, ngx_log_t, ngx_uint_t,
     };
-    #[cfg(feature = "test-link")]
+    #[cfg(all(feature = "test-link", nginx1_29_8))]
+    use nginx_sys::{
+        ngx_http_conf_ctx_t, ngx_http_core_loc_conf_t, ngx_http_core_main_conf_t,
+        ngx_http_core_srv_conf_t,
+    };
+    #[cfg(all(feature = "test-link", nginx1_29_8))]
     use std::sync::MutexGuard;
 
     #[cfg(feature = "test-link")]
@@ -458,14 +463,14 @@ mod tests {
         fn ngx_rs_test_reset_allocation_failures();
     }
 
-    #[cfg(feature = "test-link")]
+    #[cfg(all(feature = "test-link", nginx1_29_8))]
     struct TestGlobals {
         _guard: MutexGuard<'static, ()>,
         http_max_module: ngx_uint_t,
         core_context_index: ngx_uint_t,
     }
 
-    #[cfg(feature = "test-link")]
+    #[cfg(all(feature = "test-link", nginx1_29_8))]
     impl TestGlobals {
         fn new() -> Self {
             let guard = crate::TEST_NGINX_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
@@ -482,7 +487,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test-link")]
+    #[cfg(all(feature = "test-link", nginx1_29_8))]
     impl Drop for TestGlobals {
         fn drop(&mut self) {
             unsafe {
@@ -493,7 +498,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test-link")]
+    #[cfg(all(feature = "test-link", nginx1_29_8))]
     struct NativeSubRequestFixture {
         _globals: TestGlobals,
         pool: *mut nginx_sys::ngx_pool_t,
@@ -509,7 +514,7 @@ mod tests {
         request: Box<ngx_http_request_t>,
     }
 
-    #[cfg(feature = "test-link")]
+    #[cfg(all(feature = "test-link", nginx1_29_8))]
     impl NativeSubRequestFixture {
         fn new() -> Self {
             let globals = TestGlobals::new();
@@ -566,7 +571,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test-link")]
+    #[cfg(all(feature = "test-link", nginx1_29_8))]
     impl Drop for NativeSubRequestFixture {
         fn drop(&mut self) {
             unsafe { ngx_destroy_pool(self.pool) };
@@ -667,7 +672,7 @@ mod tests {
         assert_eq!(drops.get(), 1);
     }
 
-    #[cfg(feature = "test-link")]
+    #[cfg(all(feature = "test-link", nginx1_29_8))]
     #[test]
     fn inherited_headers_are_readable_for_one_and_multiple_parts() {
         for capacity in [2, 1] {
@@ -738,7 +743,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "test-link")]
+    #[cfg(all(feature = "test-link", nginx1_29_8))]
     #[test]
     fn inherited_header_creation_failures_do_not_change_the_parent() {
         let mut reached_success = false;
