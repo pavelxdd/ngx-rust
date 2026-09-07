@@ -11,10 +11,9 @@ pub use crate::http::{AsyncHandlerContext, AsyncHttpRequestHandler};
 pub use crate::http::{
     ClientBodyReadStart, ClientBodyReadStatus, ConfiguredUpstreamUrl, HTTPStatus, HeaderBuildError,
     HeaderListError, HttpClientBodyHandler, HttpConfigError, HttpConfigurationParser, HttpFilter,
-    HttpFilterError, HttpFilterSlot, HttpHeaderIter, HttpHeaderList, HttpHeaderRef,
-    HttpHeadersInBuilder, HttpHeadersOutBuilder, HttpModule, HttpModuleLocationConf,
-    HttpModuleMainConf, HttpModuleRequestContext, HttpModuleServerConf, HttpPhase,
-    HttpRequestHandler, HttpUpstreamInitializer, HttpUpstreamPeerHandler,
+    HttpFilterError, HttpFilterSlot, HttpHeaderIter, HttpHeaderList, HttpHeaderRef, HttpModule,
+    HttpModuleLocationConf, HttpModuleMainConf, HttpModuleRequestContext, HttpModuleServerConf,
+    HttpPhase, HttpRequestHandler, HttpUpstreamInitializer, HttpUpstreamPeerHandler,
     HttpVariableCacheInvalidation, HttpVariableCacheInvalidationError, HttpVariableFlags,
     HttpVariableHandler, HttpVariableIndex, HttpVariableIndexError, HttpVariableLookupError,
     HttpVariableOutput, HttpVariableOutputError, HttpVariablePoolBytes,
@@ -35,4 +34,6 @@ pub use crate::http::{
     get_variable_index, init_process, install_upstream_initializer,
     phase_handler_postconfiguration, postconfiguration, preconfiguration,
 };
+#[cfg(nginx1_29_8)]
+pub use crate::http::{HttpHeadersInBuilder, HttpHeadersOutBuilder};
 pub use crate::ngx_log_debug_http;

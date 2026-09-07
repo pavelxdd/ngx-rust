@@ -636,7 +636,7 @@ impl<'address, 'log> EventPeerBuilder<'address, 'log> {
         raw.type_ = socket_type_raw(self.socket_type);
         raw.rcvbuf = self.receive_buffer;
         raw.log = log.as_ptr();
-        #[cfg(any(ngx_feature = "http_upstream_sid", ngx_feature = "compat"))]
+        #[cfg(all(nginx1_29_6, any(ngx_feature = "http_upstream_sid", ngx_feature = "compat")))]
         {
             raw.hint = ptr::null_mut();
             raw.sid = ptr::null_mut();

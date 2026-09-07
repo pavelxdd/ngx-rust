@@ -1183,7 +1183,7 @@ mod tests {
             unsafe { MaybeUninit::<libc::sockaddr_in>::zeroed().assume_init() };
         first_sockaddr.sin_family = libc::AF_INET as _;
         first_sockaddr.sin_port = 8443_u16.to_be();
-        first_sockaddr.sin_addr = libc::in_addr { s_addr: u32::from_be_bytes([192, 0, 2, 1]) };
+        first_sockaddr.sin_addr = libc::in_addr { s_addr: u32::from_ne_bytes([192, 0, 2, 1]) };
         let mut second_sockaddr =
             unsafe { MaybeUninit::<libc::sockaddr_in6>::zeroed().assume_init() };
         second_sockaddr.sin6_family = libc::AF_INET6 as _;

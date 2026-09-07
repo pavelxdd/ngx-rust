@@ -37,7 +37,12 @@ fn main() {
     const VERSION_CHECKS: &[(u64, &str)] = &[
         //
         (1_021_001, "nginx1_21_1"),
+        (1_023_002, "nginx1_23_2"),
         (1_025_001, "nginx1_25_1"),
+        (1_025_004, "nginx1_25_4"),
+        (1_025_005, "nginx1_25_5"),
+        (1_029_006, "nginx1_29_6"),
+        (1_029_008, "nginx1_29_8"),
     ];
     VERSION_CHECKS.iter().for_each(|check| println!("cargo::rustc-check-cfg=cfg({})", check.1));
 

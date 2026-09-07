@@ -27,15 +27,19 @@ jobs:
           | tee -a "$GITHUB_OUTPUT"
 
   test-linux:
-    name: Test (Linux)
+    name: Test (Linux, Rust ${{ matrix.rust-version }}, nginx ${{ matrix.nginx-version }})
     needs: rust-version
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        rust-version:
-          - ${{ needs.rust-version.outputs.version }}
-          - stable
+        include:
+          - rust-version: ${{ needs.rust-version.outputs.version }}
+            nginx-version: 1.22.1
+          - rust-version: stable
+            nginx-version: 1.30.4
+    env:
+      NGX_VERSION: ${{ matrix.nginx-version }}
     steps:
       - name: checkout source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,8 +55,8 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ matrix.rust-version}}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-${{ matrix.rust-version }}-
+          key: ${{ runner.os }}-cargo-${{ matrix.rust-version }}-nginx-${{ matrix.nginx-version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.rust-version }}-nginx-${{ matrix.nginx-version }}-
       - name: set up nginx deps cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         continue-on-error: false
@@ -63,8 +67,8 @@ jobs:
             .cache/*.tar.gz
             .cache/*.tar.asc
             .cache/*.tar.sig
-          key:  ${{ runner.os }}-deps-${{ hashFiles('**/nginx-sys/build.rs') }}
-          restore-keys: ${{ runner.os }}-deps-
+          key: ${{ runner.os }}-deps-nginx-${{ matrix.nginx-version }}-${{ hashFiles('**/nginx-sys/build.rs') }}
+          restore-keys: ${{ runner.os }}-deps-nginx-${{ matrix.nginx-version }}-
 
       - name: set up Rust toolchain
         env:
@@ -97,10 +101,14 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: cargo clippy --workspace --all-targets --all-features -- -Dwarnings
 
-      - name: test
-        # always run if build succeeds
+      - name: test version-neutral compatibility surface
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cargo test --workspace --all-features
+        run: |
+          cargo test -p ngx --all-features --lib -- core:: --test-threads=1
+          cargo test -p ngx --all-features --lib -- event:: --test-threads=1
+          cargo test -p ngx --all-features --lib -- async_::spawn --test-threads=1
+          cargo test -p nginx-src --lib
+          cargo test -p nginx-sys --lib --all-features
 
       - name: rustdoc
         # always run if build succeeds

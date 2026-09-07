@@ -5,6 +5,7 @@ extern crate std;
 use alloc::alloc::{alloc_zeroed, dealloc};
 use alloc::boxed::Box;
 #[cfg(feature = "test-link")]
+#[cfg(nginx1_23_2)]
 use alloc::vec;
 #[cfg(unix)]
 use core::alloc::Layout;
@@ -21,21 +22,26 @@ use super::parse_socket_address;
 use super::{
     ConnectionChainWriteError, ConnectionChainWriteResult, ConnectionError, ConnectionIoError,
     ConnectionReadResult, ConnectionRef, ConnectionRefMut, ConnectionWriteResult,
-    ProxyProtocolAddress, ProxyProtocolBuilder, ProxyProtocolError, ProxyProtocolTlvLookup,
-    SocketAddressError, SocketPort, SocketType,
+    ProxyProtocolAddress, ProxyProtocolBuilder, ProxyProtocolError, SocketAddressError, SocketPort,
+    SocketType,
 };
+#[cfg(nginx1_23_2)]
+use crate::core::ProxyProtocolTlvLookup;
 use crate::core::{BufferError, BufferFlags, ChainMut, Pool};
 #[cfg(feature = "test-link")]
 use crate::ffi::ngx_proxy_protocol_read;
+#[cfg(nginx1_23_2)]
+use crate::ffi::ngx_uint_t;
 use crate::ffi::{
     NGX_AGAIN, NGX_ERROR, in6_addr__bindgen_ty_1, ngx_buf_t, ngx_chain_t, ngx_connection_t,
     ngx_create_pool, ngx_destroy_pool, ngx_event_t, ngx_listening_t, ngx_log_t, ngx_pool_t,
-    ngx_proxy_protocol_t, ngx_str_t, ngx_uint_t, off_t, sockaddr, sockaddr_in, sockaddr_in6,
+    ngx_proxy_protocol_t, ngx_str_t, off_t, sockaddr, sockaddr_in, sockaddr_in6,
 };
 #[cfg(unix)]
 use crate::ffi::{sa_family_t, sockaddr_un};
 
 #[cfg(feature = "test-link")]
+#[cfg(nginx1_23_2)]
 unsafe extern "C" {
     fn ngx_rs_test_fail_allocations_after(successes: ngx_uint_t);
     fn ngx_rs_test_reset_allocation_failures();
@@ -981,6 +987,7 @@ fn proxy_protocol_builder_rejects_datagram_metadata_on_a_unix_stream_carrier() {
 }
 
 #[cfg(feature = "test-link")]
+#[cfg(nginx1_23_2)]
 #[test]
 fn proxy_protocol_tlv_lookup_preserves_parser_results() {
     let source = ProxyProtocolAddress::Ipv4 {
@@ -1032,6 +1039,7 @@ fn proxy_protocol_tlv_lookup_preserves_parser_results() {
 }
 
 #[cfg(feature = "test-link")]
+#[cfg(nginx1_23_2)]
 #[test]
 fn proxy_protocol_tlv_lookup_does_not_require_a_connection_log() {
     let source = ProxyProtocolAddress::Ipv4 {
@@ -1070,6 +1078,7 @@ fn proxy_protocol_tlv_lookup_does_not_require_a_connection_log() {
 }
 
 #[cfg(feature = "test-link")]
+#[cfg(nginx1_23_2)]
 #[test]
 fn proxy_protocol_builder_keeps_tcp_and_datagram_tlv_limits_separate() {
     let source = ProxyProtocolAddress::Ipv6 {
@@ -1122,6 +1131,7 @@ fn proxy_protocol_builder_keeps_tcp_and_datagram_tlv_limits_separate() {
 }
 
 #[cfg(feature = "test-link")]
+#[cfg(nginx1_23_2)]
 #[test]
 fn proxy_protocol_builder_keeps_existing_metadata_when_each_copy_fails() {
     let source = ProxyProtocolAddress::Ipv4 {
