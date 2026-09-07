@@ -619,6 +619,57 @@ mod tests {
     }
 
     #[test]
+    fn truncated_extraction_is_not_published_and_can_be_retried() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive = create_archive(
+            &temp_dir,
+            &[
+                directory("source/"),
+                file("source/first", b"first"),
+                file("source/second", b"second"),
+            ],
+        )?;
+        let output = temp_dir.path().join("output");
+        let truncated_len = fs::metadata(&archive)?.len() / 2;
+        File::options().write(true).open(&archive)?.set_len(truncated_len)?;
+
+        assert!(extract_archive(&archive, &output).is_err());
+        assert!(!output.join("source").exists());
+        assert_eq!(fs::read_dir(&output)?.count(), 0);
+
+        create_archive(&temp_dir, &[directory("source/"), file("source/README", b"complete")])?;
+        let extracted = extract_archive(&archive, &output)?;
+        assert_eq!(fs::read(extracted.join("README"))?, b"complete");
+
+        fs::remove_file(&archive)?;
+        assert_eq!(extract_archive(&archive, &output)?, extracted);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_entry_unpack_is_not_published_and_can_be_retried() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive = create_archive(
+            &temp_dir,
+            &[
+                directory("source/"),
+                file("source/node", b"file"),
+                file("source/node/child", b"unreachable"),
+            ],
+        )?;
+        let output = temp_dir.path().join("output");
+
+        assert!(extract_archive(&archive, &output).is_err());
+        assert!(!output.join("source").exists());
+        assert_eq!(fs::read_dir(&output)?.count(), 0);
+
+        create_archive(&temp_dir, &[directory("source/"), file("source/README", b"complete")])?;
+        let extracted = extract_archive(&archive, &output)?;
+        assert_eq!(fs::read(extracted.join("README"))?, b"complete");
+        Ok(())
+    }
+
+    #[test]
     fn unexpected_top_level_root_is_rejected() -> io::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let archive =
