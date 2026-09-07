@@ -1031,7 +1031,9 @@ impl<'request, 'callback> HttpTrailersOutBuilder<'request, 'callback> {
         let Self { request, trailers, has_trailers, .. } = self;
         let request = unsafe { request.raw.as_mut() };
         request.headers_out.trailers = trailers;
-        request.set_expect_trailers(has_trailers.into());
+        unsafe {
+            ngx_rs_http_request_set_expect_trailers(request, has_trailers.into());
+        }
         repair_header_list_last(&mut request.headers_out.trailers);
     }
 }
@@ -1129,7 +1131,9 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
         let request = unsafe { request.raw.as_mut() };
         request.headers_out = headers;
         if let Some(expect_trailers) = expect_trailers {
-            request.set_expect_trailers(expect_trailers.into());
+            unsafe {
+                ngx_rs_http_request_set_expect_trailers(request, expect_trailers.into());
+            }
         }
         if content_length_set {
             request.set_chunked(0);
@@ -2732,6 +2736,11 @@ impl<'callback> RequestRef<'callback> {
         unsafe { ngx_rs_http_request_keepalive(self.raw.as_ptr()) != 0 }
     }
 
+    /// Whether nginx expects output trailers for this response.
+    pub fn expect_trailers(&self) -> bool {
+        unsafe { ngx_rs_http_request_expect_trailers(self.raw.as_ptr()) != 0 }
+    }
+
     /// Returns a checked byte-oriented view over input headers.
     pub fn headers_in(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
         checked_header_list(
@@ -3393,6 +3402,11 @@ impl<'callback> RequestRefMut<'callback> {
         self.view().keepalive()
     }
 
+    /// Whether nginx expects output trailers for this response.
+    pub fn expect_trailers(&self) -> bool {
+        self.view().expect_trailers()
+    }
+
     /// Returns a checked byte-oriented view over input headers.
     pub fn headers_in(&self) -> Result<HttpHeaderList<'_>, HeaderListError> {
         checked_header_list(
@@ -3636,6 +3650,13 @@ impl<'callback> RequestRefMut<'callback> {
     /// Sets whether nginx must suppress the response body.
     pub fn set_header_only(&mut self, header_only: bool) {
         unsafe { ngx_rs_http_request_set_header_only(self.raw.as_ptr(), header_only.into()) };
+    }
+
+    /// Sets whether nginx expects output trailers for this response.
+    pub fn set_expect_trailers(&mut self, expect_trailers: bool) {
+        unsafe {
+            ngx_rs_http_request_set_expect_trailers(self.raw.as_ptr(), expect_trailers.into())
+        };
     }
 
     /// Marks whether nginx has sent the response headers.
@@ -6268,7 +6289,7 @@ mod tests {
             headers.commit();
         }
 
-        assert_ne!(raw.expect_trailers(), 0);
+        assert!(request_from(&mut raw).expect_trailers());
         let request = request_from(&mut raw);
         let trailers = request.trailers_out().unwrap();
         let mut trailers = trailers.iter();
@@ -6305,7 +6326,7 @@ mod tests {
         }
 
         assert_eq!(raw.headers_out.status, 201);
-        assert_ne!(raw.expect_trailers(), 0);
+        assert!(request_from(&mut raw).expect_trailers());
         let request = request_from(&mut raw);
         let trailers = request.trailers_out().unwrap();
         let fields = trailers
@@ -6325,7 +6346,7 @@ mod tests {
             request.trailers_out_builder(1).unwrap().commit();
         }
         assert_eq!(raw.headers_out.status, 201);
-        assert_eq!(raw.expect_trailers(), 0);
+        assert!(!request_from(&mut raw).expect_trailers());
         assert!(request_from(&mut raw).trailers_out().unwrap().iter().next().is_none());
     }
 
@@ -6370,7 +6391,7 @@ mod tests {
         raw.headers_out.content_offset = 7;
         raw.headers_out.date_time = 11;
         raw.headers_out.last_modified_time = 13;
-        raw.set_expect_trailers(1);
+        request_from(&mut raw).set_expect_trailers(true);
 
         {
             let mut request = request_from(&mut raw);
@@ -6388,7 +6409,7 @@ mod tests {
         assert_eq!(raw.headers_out.content_offset, 0);
         assert_eq!(raw.headers_out.date_time, 0);
         assert_eq!(raw.headers_out.last_modified_time, -1);
-        assert_eq!(raw.expect_trailers(), 0);
+        assert!(!request_from(&mut raw).expect_trailers());
         assert_eq!(raw.headers_out.trailers.part.nelts, 0);
         assert!(raw.headers_out.trailers.part.next.is_null());
         assert_eq!(raw.headers_out.trailers.last, &raw mut raw.headers_out.trailers.part);
@@ -9023,12 +9044,14 @@ mod tests {
         request.set_header_only(true);
         request.set_keepalive(true);
         request.set_header_sent(true);
+        request.set_expect_trailers(true);
         unsafe { ngx_rs_test_http_request_set_internal(request.as_ptr(), 1) };
 
         assert!(request.is_internal());
         assert!(request.header_only());
         assert!(request.keepalive());
-        assert_eq!(unsafe { ngx_rs_test_http_request_flags(request.as_ptr()) }, 15);
+        assert!(request.expect_trailers());
+        assert_eq!(unsafe { ngx_rs_test_http_request_flags(request.as_ptr()) }, 31);
     }
 
     #[test]
