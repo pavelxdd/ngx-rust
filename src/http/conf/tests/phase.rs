@@ -506,6 +506,7 @@ fn phase_registration_keeps_nginx_reverse_dispatch_order() {
         return;
     };
     let mut request = callback_request();
+    request.main = &raw mut request;
     for handler in handlers.iter().rev().flatten() {
         assert_eq!(unsafe { (*handler)(&raw mut request) }, Status::NGX_DECLINED.0);
     }
@@ -527,6 +528,7 @@ fn phase_handlers_convert_statuses_and_create_fresh_request_borrows() {
     assert_eq!(fixture.register::<CountingHandler>(), Status::NGX_OK.0);
 
     let mut request = callback_request();
+    request.main = &raw mut request;
     for (index, expected) in [
         (0, Status::NGX_AGAIN.0),
         (1, Status::NGX_DECLINED.0),

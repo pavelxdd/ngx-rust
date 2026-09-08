@@ -13,6 +13,8 @@
 
 ngx_uint_t ngx_rs_http_request_is_internal(const ngx_http_request_t *request);
 ngx_uint_t ngx_rs_http_request_header_only(const ngx_http_request_t *request);
+ngx_uint_t ngx_rs_http_request_done(const ngx_http_request_t *request);
+void ngx_rs_http_request_set_done(ngx_http_request_t *request, ngx_uint_t done);
 ngx_uint_t ngx_rs_http_request_terminated(const ngx_http_request_t *request);
 void ngx_rs_http_request_set_terminated(ngx_http_request_t *request, ngx_uint_t terminated);
 ngx_uint_t ngx_rs_http_request_keepalive(const ngx_http_request_t *request);

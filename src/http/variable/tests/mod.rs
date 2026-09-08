@@ -310,12 +310,17 @@ fn misaligned_ptr<T>(storage: &mut [u8]) -> *mut T {
     unsafe { storage.as_mut_ptr().add(offset + 1).cast() }
 }
 
+fn initialize_callback_request(request: &mut ngx_http_request_t) {
+    request.signature = NGX_HTTP_MODULE as _;
+    request.main = request;
+}
+
 fn raw_handler_status<H>() -> ngx_int_t
 where
     H: HttpVariableHandler,
 {
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
-    request.signature = NGX_HTTP_MODULE as _;
+    initialize_callback_request(&mut request);
     let mut value = unsafe { MaybeUninit::<ngx_variable_value_t>::zeroed().assume_init() };
 
     unsafe { raw_get_handler::<H>(&raw mut request, &raw mut value, 0) }

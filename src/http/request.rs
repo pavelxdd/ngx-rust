@@ -950,7 +950,7 @@ impl<'request, 'callback> HttpHeadersInBuilder<'request, 'callback> {
     ) -> Result<Self, HeaderBuildError> {
         let pool = request.pool()?.as_ptr();
         let mut headers: ngx_http_headers_in_t = unsafe { core::mem::zeroed() };
-        headers.headers = create_header_list(pool, capacity)?;
+        create_header_list(&mut headers.headers, pool, capacity)?;
         headers.content_length_n = -1;
         headers.keep_alive_n = -1;
 
@@ -1022,7 +1022,8 @@ impl<'request, 'callback> HttpTrailersOutBuilder<'request, 'callback> {
         capacity: usize,
     ) -> Result<Self, HeaderBuildError> {
         let pool = request.pool()?.as_ptr();
-        let trailers = create_header_list(pool, capacity)?;
+        let mut trailers: ngx_list_t = unsafe { core::mem::zeroed() };
+        create_header_list(&mut trailers, pool, capacity)?;
         Ok(Self { request, pool, trailers, has_trailers: false })
     }
 
@@ -1065,7 +1066,7 @@ impl<'request, 'callback> HttpHeadersOutBuilder<'request, 'callback> {
     ) -> Result<Self, HeaderBuildError> {
         let pool = request.pool()?.as_ptr();
         let mut headers = unsafe { request.raw.as_ref().headers_out };
-        headers.headers = create_header_list(pool, capacity)?;
+        create_header_list(&mut headers.headers, pool, capacity)?;
         clear_headers_out_slots(&mut headers);
 
         Ok(Self {
@@ -1640,9 +1641,10 @@ unsafe fn header_bytes_unchecked<'header>(value: ngx_str_t) -> &'header [u8] {
 }
 
 fn create_header_list(
+    headers: &mut ngx_list_t,
     pool: *mut ngx_pool_t,
     capacity: usize,
-) -> Result<ngx_list_t, HeaderBuildError> {
+) -> Result<(), HeaderBuildError> {
     if capacity == 0
         || capacity
             .checked_mul(core::mem::size_of::<ngx_table_elt_t>())
@@ -1651,15 +1653,14 @@ fn create_header_list(
         return Err(HeaderBuildError::InvalidCapacity);
     }
 
-    let mut headers: ngx_list_t = unsafe { core::mem::zeroed() };
-    if unsafe {
-        ngx_list_init(&raw mut headers, pool, capacity, core::mem::size_of::<ngx_table_elt_t>())
-    } != NGX_OK as ngx_int_t
+    *headers = unsafe { core::mem::zeroed() };
+    if unsafe { ngx_list_init(headers, pool, capacity, core::mem::size_of::<ngx_table_elt_t>()) }
+        != NGX_OK as ngx_int_t
     {
         return Err(HeaderBuildError::Allocation);
     }
 
-    Ok(headers)
+    Ok(())
 }
 
 #[cfg(nginx1_29_8)]
@@ -1672,7 +1673,8 @@ fn clone_header_list(
         .map_err(HeaderBuildError::InvalidSource)?;
     let capacity =
         source.len().checked_add(additional_capacity).ok_or(HeaderBuildError::CountOverflow)?;
-    let mut candidate = create_header_list(pool, capacity)?;
+    let mut candidate: ngx_list_t = unsafe { core::mem::zeroed() };
+    create_header_list(&mut candidate, pool, capacity)?;
     for header in source.iter() {
         let value = ngx_table_elt_t {
             hash: header.hash(),
@@ -1898,6 +1900,7 @@ fn disable_framing_headers(
     headers: &mut ngx_list_t,
     source: HttpHeaderSource,
 ) -> Result<(), HeaderListError> {
+    repair_header_list_last(headers);
     checked_header_list(headers, source)?;
     let entries = unsafe { NgxList::<ngx_table_elt_t>::raw_iter_mut(headers) }
         .ok_or(HeaderListError::InvalidList)?;
@@ -4184,6 +4187,9 @@ impl RequestContinuation<'_> {
             let request = &mut self.request;
             let hold = self.hold.as_mut().expect("active continuation owns its request hold");
             request.validate_terminal_operation()?;
+            if unsafe { request.raw.as_ref().phase_handler } < 0 {
+                return Err(RequestPhaseResumeError::NegativePhaseHandler.into());
+            }
             let original_handler = unsafe { request.raw.as_ref().write_event_handler };
             unsafe { request.raw.as_mut().write_event_handler = Some(ngx_http_core_run_phases) };
             let request_raw = request.raw.as_ptr();
@@ -4993,7 +4999,7 @@ mod tests {
     }
 
     #[cfg(feature = "test-link")]
-    fn poisoned_header_list(pool: *mut ngx_pool_t) -> ngx_list_t {
+    fn poisoned_header_list(headers: &mut ngx_list_t, pool: *mut ngx_pool_t) {
         let size = mem::size_of::<ngx_table_elt_t>();
         let storage = unsafe { ngx_palloc(pool, size) };
         assert!(!storage.is_null());
@@ -5001,9 +5007,8 @@ mod tests {
             ptr::write_bytes(storage, 0xa5, size);
             ngx_reset_pool(pool);
         }
-        let headers = create_header_list(pool, 1).unwrap();
+        create_header_list(headers, pool, 1).unwrap();
         assert_eq!(headers.part.elts, storage);
-        headers
     }
 
     #[cfg(feature = "test-link")]
@@ -5062,7 +5067,7 @@ mod tests {
             });
             let mut main_conf_slots = Box::new([(&raw mut *main_conf).cast::<c_void>()]);
             let mut request = Box::new(zeroed_request());
-            request.main = &raw mut *request;
+            initialize_request(&mut request);
             request.parent = &raw mut *request;
             request.pool = request_pool.raw;
             request.connection = &raw mut *connection;
@@ -5145,6 +5150,7 @@ mod tests {
 
             let mut request = zeroed_request();
             request.pool = pool.raw;
+            request.parent = &raw mut request;
             request.connection = &raw mut *connection;
             request.loc_conf = slots.as_mut_ptr();
             initialize_request(&mut request);
@@ -5570,7 +5576,7 @@ mod tests {
         fixture._core.etag = 1;
         fixture.request.headers_out.last_modified_time = 1;
         fixture.request.headers_out.content_length_n = 1;
-        fixture.request.headers_out.headers = poisoned_header_list(fixture.request_pool.raw);
+        poisoned_header_list(&mut fixture.request.headers_out.headers, fixture.request_pool.raw);
 
         unsafe {
             (*fixture.request_pool.raw).d.last = (*fixture.request_pool.raw).d.end;
@@ -5734,9 +5740,9 @@ mod tests {
             let mut raw = zeroed_request();
             raw.pool = owner.raw;
             if input {
-                raw.headers_in.headers = poisoned_header_list(owner.raw);
+                poisoned_header_list(&mut raw.headers_in.headers, owner.raw);
             } else {
-                raw.headers_out.headers = poisoned_header_list(owner.raw);
+                poisoned_header_list(&mut raw.headers_out.headers, owner.raw);
             }
 
             let mut request = request_from(&mut raw);
@@ -5785,14 +5791,14 @@ mod tests {
         for input in [true, false] {
             let mut reached_success = false;
 
-            for successes in 0..6 {
+            for successes in 0..7 {
                 let owner = TestPool::new();
                 let mut raw = zeroed_request();
                 raw.pool = owner.raw;
                 if input {
-                    raw.headers_in.headers = poisoned_header_list(owner.raw);
+                    poisoned_header_list(&mut raw.headers_in.headers, owner.raw);
                 } else {
-                    raw.headers_out.headers = poisoned_header_list(owner.raw);
+                    poisoned_header_list(&mut raw.headers_out.headers, owner.raw);
                 }
                 {
                     let mut request = request_from(&mut raw);
@@ -6203,7 +6209,7 @@ mod tests {
             let owner = TestPool::new();
             let mut raw = zeroed_request();
             raw.pool = owner.raw;
-            raw.headers_out.headers = create_header_list(owner.raw, 1).unwrap();
+            create_header_list(&mut raw.headers_out.headers, owner.raw, 1).unwrap();
             append_pool_header(&mut raw.headers_out.headers, owner.raw, b"X-Original", b"kept")
                 .unwrap();
             raw.headers_out.content_length_n = 91;
@@ -6265,7 +6271,7 @@ mod tests {
         let owner = TestPool::new();
         let mut raw = zeroed_request();
         raw.pool = owner.raw;
-        raw.headers_out.headers = create_header_list(owner.raw, 2).unwrap();
+        create_header_list(&mut raw.headers_out.headers, owner.raw, 2).unwrap();
         let content_length =
             append_pool_header(&mut raw.headers_out.headers, owner.raw, b"Content-Length", b"91")
                 .unwrap();
@@ -6296,7 +6302,7 @@ mod tests {
         let owner = TestPool::new();
         let mut raw = zeroed_request();
         raw.pool = owner.raw;
-        raw.headers_out.headers = create_header_list(owner.raw, 1).unwrap();
+        create_header_list(&mut raw.headers_out.headers, owner.raw, 1).unwrap();
 
         let mut request = request_from(&mut raw);
         assert_eq!(
@@ -6316,7 +6322,7 @@ mod tests {
         let owner = TestPool::new();
         let mut raw = zeroed_request();
         raw.pool = owner.raw;
-        raw.headers_out.trailers = create_header_list(owner.raw, 1).unwrap();
+        create_header_list(&mut raw.headers_out.trailers, owner.raw, 1).unwrap();
 
         {
             let mut request = request_from(&mut raw);
@@ -6539,7 +6545,13 @@ mod tests {
             .iter()
             .map(|header| (header.key().to_vec(), header.value().to_vec()))
             .collect::<Vec<_>>();
-        assert_eq!(fields, vec![(b"Content-Length".to_vec(), b"3".to_vec())]);
+        assert_eq!(
+            fields,
+            vec![
+                (b"Host".to_vec(), b"example.test".to_vec()),
+                (b"Content-Length".to_vec(), b"3".to_vec()),
+            ]
+        );
     }
 
     #[cfg(feature = "test-link")]
@@ -7663,8 +7675,10 @@ mod tests {
 
     #[test]
     fn request_hold_rejects_reentry_and_is_removed_before_continuation() {
+        let mut pool = zeroed_pool();
         let mut main = zeroed_request();
         initialize_request(&mut main);
+        main.pool = &raw mut pool;
         main.set_count(1);
 
         let mut raw = zeroed_request();
@@ -7690,8 +7704,10 @@ mod tests {
 
     #[test]
     fn request_hold_preserves_nginx_reference_reserve() {
+        let mut pool = zeroed_pool();
         let mut main = zeroed_request();
         initialize_request(&mut main);
+        main.pool = &raw mut pool;
 
         let mut raw = zeroed_request();
         raw.main = &raw mut main;
@@ -8044,7 +8060,7 @@ mod tests {
     fn finalization_after_output_preserves_parent_reference_for_last_subrequest() {
         let mut fixture = TerminalRequestFixture::new();
         let mut main = Box::new(zeroed_request());
-        main.main = &raw mut *main;
+        initialize_request(&mut main);
         main.parent = &raw mut *main;
         main.pool = fixture.request.pool;
         main.connection = fixture.request.connection;
@@ -8086,8 +8102,10 @@ mod tests {
 
     #[test]
     fn phase_resume_rejects_the_only_live_hold() {
+        let mut pool = zeroed_pool();
         let mut main = zeroed_request();
         initialize_request(&mut main);
+        main.pool = &raw mut pool;
         main.set_count(1);
 
         let mut raw = zeroed_request();
@@ -8159,8 +8177,10 @@ mod tests {
 
     #[test]
     fn request_continuation_cancellation_prevents_reentry() {
+        let mut pool = zeroed_pool();
         let mut main = zeroed_request();
         initialize_request(&mut main);
+        main.pool = &raw mut pool;
         main.set_count(1);
 
         let mut raw = zeroed_request();
@@ -8268,8 +8288,10 @@ mod tests {
 
     #[test]
     fn invalidated_continuations_reject_terminal_operations() {
+        let mut pool = zeroed_pool();
         let mut main = zeroed_request();
         initialize_request(&mut main);
+        main.pool = &raw mut pool;
         main.set_count(1);
 
         let mut raw = zeroed_request();
@@ -8291,8 +8313,10 @@ mod tests {
         assert!(RequestHold::cancel(&mut hold));
         assert_eq!(main.count(), 1);
 
+        let mut resume_pool = zeroed_pool();
         let mut resume_main = zeroed_request();
         initialize_request(&mut resume_main);
+        resume_main.pool = &raw mut resume_pool;
         resume_main.set_count(1);
         let mut resume_raw = zeroed_request();
         resume_raw.main = &raw mut resume_main;
@@ -8313,8 +8337,10 @@ mod tests {
 
     #[test]
     fn continuation_rejects_nonconsuming_finalization_without_losing_ownership() {
+        let mut pool = zeroed_pool();
         let mut main = zeroed_request();
         initialize_request(&mut main);
+        main.pool = &raw mut pool;
         main.set_count(1);
         let mut connection = unsafe { MaybeUninit::<ngx_connection_t>::zeroed().assume_init() };
         let mut raw = zeroed_request();
@@ -9426,7 +9452,7 @@ mod tests {
         fixture.request.set_count(1);
         unsafe { *fixture.request.ctx = ptr::null_mut() };
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let result = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| unsafe {
             RequestRefMut::is_current_module_context::<HeldContextModule>(raw.as_ptr(), context)
         }));
         if fixture.request.pool.is_null() {

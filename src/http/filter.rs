@@ -562,10 +562,16 @@ mod tests {
     }
 
     fn top_header(request: &mut ngx_http_request_t) -> ngx_int_t {
+        if request.main.is_null() {
+            request.main = request;
+        }
         unsafe { nginx_sys::ngx_http_top_header_filter.unwrap()(request) }
     }
 
     fn top_body(request: &mut ngx_http_request_t, chain: *mut ngx_chain_t) -> ngx_int_t {
+        if request.main.is_null() {
+            request.main = request;
+        }
         unsafe { nginx_sys::ngx_http_top_body_filter.unwrap()(request, chain) }
     }
 
@@ -1709,6 +1715,7 @@ mod tests {
         assert_eq!(configure_filter::<IdenticalSecondFilter>(&mut configuration), Status::NGX_OK.0);
 
         let mut raw = request();
+        raw.main = &raw mut raw;
         let mut chain = ngx_chain_t { buf: ptr::null_mut(), next: ptr::null_mut() };
         let (header, body) = unsafe {
             RequestRefMut::with_raw(&raw mut raw, |mut request| {

@@ -314,6 +314,18 @@ ngx_rs_http_request_header_only(const ngx_http_request_t *request)
 }
 
 ngx_uint_t
+ngx_rs_http_request_done(const ngx_http_request_t *request)
+{
+    return request->done;
+}
+
+void
+ngx_rs_http_request_set_done(ngx_http_request_t *request, ngx_uint_t done)
+{
+    request->done = done;
+}
+
+ngx_uint_t
 ngx_rs_http_request_terminated(const ngx_http_request_t *request)
 {
 #if (nginx_version >= 1025004)
