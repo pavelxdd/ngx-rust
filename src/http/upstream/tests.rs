@@ -1,16 +1,19 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::cell::Cell;
 #[cfg(unix)]
 use core::ffi::c_int;
 use core::ffi::c_void;
+use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ptr;
 use core::slice;
 use core::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::MutexGuard;
 
-use super::super::test_support::TestPool;
+use super::test_support::TestPool;
 use super::*;
+use super::{callback::*, init::*, peer::*, peer_init::*};
 use crate::core::{ModuleDescriptor, Status};
 use crate::ffi::{
     NGX_BUSY, NGX_DECLINED, NGX_ERROR, NGX_HTTP_MODULE, NGX_LOG_ERR, ngx_conf_t, ngx_connection_t,
