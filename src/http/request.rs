@@ -209,7 +209,12 @@ where
     let Ok(raw) = checked_request_ptr(request) else {
         return;
     };
-    cancel_stale_request_contexts(raw);
+    let Ok(_hold) = retain_request_for_context_cancellation(raw) else {
+        return;
+    };
+    if cancel_stale_request_contexts(raw).is_err() {
+        return;
+    }
     match take_client_body_read::<H>(raw) {
         ClientBodyCallbackState::Current => {
             let _ = unsafe {
@@ -247,6 +252,8 @@ pub enum RequestError {
     ForeignMain,
     /// The request has no pool.
     MissingPool,
+    /// The native main-request reference count cannot retain another lifecycle owner.
+    ReferenceCountOverflow,
     /// The request pool pointer does not satisfy `ngx_pool_t` alignment.
     MisalignedPool,
     /// An output chain belongs to a different nginx pool.
@@ -2147,15 +2154,7 @@ impl RequestContextRegistration {
 }
 
 fn request_is_terminated(request: *const ngx_http_request_t) -> bool {
-    #[cfg(nginx1_25_4)]
-    {
-        unsafe { (*request).terminated() != 0 }
-    }
-    #[cfg(not(nginx1_25_4))]
-    {
-        let _ = request;
-        false
-    }
+    unsafe { ngx_rs_http_request_terminated(request) != 0 }
 }
 
 unsafe extern "C" fn terminate_request_context_registry(data: *mut c_void) {
@@ -2260,17 +2259,41 @@ fn remove_request_context_registry(
     debug_assert!(unsafe { pool.remove_cleanup(registry) });
 }
 
-fn cancel_stale_request_contexts(raw: NonNull<ngx_http_request_t>) {
+fn retain_request_for_context_cancellation(
+    raw: NonNull<ngx_http_request_t>,
+) -> Result<Option<RequestHold>, RequestError> {
+    let request = RequestRef { raw, _callback: PhantomData, _not_thread_safe: PhantomData };
+    let mut main = request.main_raw()?;
+    let count = unsafe { main.as_ref().count() };
+    if count == 0 {
+        return Ok(None);
+    }
+    if count == u16::MAX as _ {
+        return Err(RequestError::ReferenceCountOverflow);
+    }
+
+    // Cancellation and context destructors may release every other request reference. This
+    // synchronous owner uses the native lifecycle reserve, not the delayed-operation budget.
+    unsafe { main.as_mut().set_count(count + 1) };
+    Ok(Some(RequestHold { request: raw, main, active: true, _not_thread_safe: PhantomData }))
+}
+
+fn cancel_stale_request_contexts(raw: NonNull<ngx_http_request_t>) -> Result<(), RequestError> {
     let Some(pool) = NonNull::new(unsafe { raw.as_ref().pool }) else {
-        return;
+        return Ok(());
     };
     let Some(mut registry) = find_request_context_registry(pool) else {
-        return;
+        return Ok(());
     };
+    let hold = retain_request_for_context_cancellation(raw)?;
     let registry = unsafe { registry.as_mut() };
     if registry.cancel_stale() {
         registry.advance_generation();
     }
+    if hold.as_ref().is_some_and(|hold| unsafe { hold.main.as_ref().count() } == 1) {
+        return Err(RequestError::MissingPool);
+    }
+    Ok(())
 }
 
 fn advance_request_generation(raw: NonNull<ngx_http_request_t>) {
@@ -2993,8 +3016,10 @@ impl<'callback> RequestRefMut<'callback> {
             return Ok(true);
         }
 
-        cancel_stale_request_contexts(raw);
-        Ok(false)
+        match cancel_stale_request_contexts(raw) {
+            Ok(()) | Err(RequestError::MissingPool) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Invokes a closure with a request view that cannot escape the nginx callback through a safe
@@ -3195,7 +3220,7 @@ impl<'callback> RequestRefMut<'callback> {
     where
         M: HttpModuleRequestContext,
     {
-        cancel_stale_request_contexts(self.raw);
+        cancel_stale_request_contexts(self.raw)?;
         let slot =
             RequestRef { raw: self.raw, _callback: PhantomData, _not_thread_safe: PhantomData }
                 .module_context_slot(M::module())?;
@@ -3211,7 +3236,7 @@ impl<'callback> RequestRefMut<'callback> {
         M: HttpModuleRequestContext,
         M::RequestContext: Unpin,
     {
-        cancel_stale_request_contexts(self.raw);
+        cancel_stale_request_contexts(self.raw)?;
         let slot = self.view().module_context_slot(M::module())?;
         Ok(RequestRef::context_from_slot::<M::RequestContext>(slot)?
             .map(|mut context| unsafe { context.as_mut() }))
@@ -3224,7 +3249,7 @@ impl<'callback> RequestRefMut<'callback> {
     where
         M: HttpModuleRequestContext,
     {
-        cancel_stale_request_contexts(self.raw);
+        cancel_stale_request_contexts(self.raw)?;
         let slot = self.view().module_context_slot(M::module())?;
         Ok(RequestRef::context_from_slot::<M::RequestContext>(slot)?
             .map(|mut context| unsafe { Pin::new_unchecked(context.as_mut()) }))
@@ -3319,7 +3344,7 @@ impl<'callback> RequestRefMut<'callback> {
     where
         M: HttpModuleRequestContext,
     {
-        cancel_stale_request_contexts(self.raw);
+        cancel_stale_request_contexts(self.raw)?;
         let slot = self.view().module_context_slot(M::module())?;
         if let Some(mut context) = RequestRef::context_from_slot::<M::RequestContext>(slot)? {
             return Ok(unsafe { Pin::new_unchecked(context.as_mut()) });
@@ -3367,13 +3392,14 @@ impl<'callback> RequestRefMut<'callback> {
     where
         M: HttpModuleRequestContext,
     {
-        cancel_stale_request_contexts(self.raw);
+        cancel_stale_request_contexts(self.raw)?;
         let pool = self.pool()?;
         let slot = self.view().module_context_slot(M::module())?;
         let Some(context) = RequestRef::context_from_slot::<M::RequestContext>(slot)? else {
             return Ok(false);
         };
 
+        let _hold = retain_request_for_context_cancellation(self.raw)?;
         let owner = context.cast::<RequestContextOwner<M::RequestContext>>();
         if unsafe { pool.remove_cleanup_with(owner, |owner| owner.registration.cancel()) } {
             Ok(true)
@@ -3797,6 +3823,7 @@ impl<'callback> RequestRefMut<'callback> {
             return Err(RequestError::Allocation);
         };
 
+        let _hold = retain_request_for_context_cancellation(self.raw)?;
         let generation = request_context_generation(self.raw);
         advance_request_generation(self.raw);
         let status = if location.starts_with('@') {
@@ -4212,10 +4239,17 @@ where
 {
     unsafe {
         RequestRefMut::with_raw(request, |mut request| {
-            cancel_stale_request_contexts(request.raw);
+            let Ok(_hold) = retain_request_for_context_cancellation(request.raw) else {
+                return NGX_ERROR as _;
+            };
+            if cancel_stale_request_contexts(request.raw).is_err() {
+                return NGX_ERROR as _;
+            }
             let result = callback(&mut request);
             let status = result.into_handler_status(&request.view());
-            cancel_stale_request_contexts(request.raw);
+            if cancel_stale_request_contexts(request.raw).is_err() {
+                return NGX_ERROR as _;
+            }
             status
         })
     }
@@ -4570,7 +4604,8 @@ mod tests {
         ngx_event_move_posted_next, ngx_event_process_posted, ngx_event_timer_init,
         ngx_http_conf_ctx_t, ngx_http_core_srv_conf_t, ngx_http_output_header_filter_pt,
         ngx_http_phase_handler_t, ngx_log_t, ngx_palloc, ngx_pool_t, ngx_posted_events,
-        ngx_posted_next_events, ngx_queue_init, ngx_reset_pool, ngx_uint_t,
+        ngx_posted_next_events, ngx_queue_init, ngx_reset_pool,
+        ngx_rs_http_request_set_header_only, ngx_rs_http_request_set_terminated, ngx_uint_t,
     };
 
     #[cfg(feature = "test-link")]
@@ -5020,6 +5055,7 @@ mod tests {
             });
             core.keepalive_timeout = 0;
             core.lingering_close = 0;
+            core.error_log = &raw mut *log;
             let mut loc_conf = Box::new([(&raw mut *core).cast::<c_void>()]);
             let mut main_conf = Box::new(unsafe {
                 MaybeUninit::<ngx_http_core_main_conf_t>::zeroed().assume_init()
@@ -5030,6 +5066,7 @@ mod tests {
             request.parent = &raw mut *request;
             request.pool = request_pool.raw;
             request.connection = &raw mut *connection;
+            connection.data = (&raw mut *request).cast();
             request.loc_conf = loc_conf.as_mut_ptr();
             request.main_conf = main_conf_slots.as_mut_ptr();
             request.set_logged(1);
@@ -7682,6 +7719,8 @@ mod tests {
     #[test]
     fn request_hold_reserve_survives_native_body_read_and_redirect_increments() {
         let mut fixture = TerminalRequestFixture::new();
+        let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
+        fixture.request.ctx = slots.as_mut_ptr();
         let native_limit = u32::from(u16::MAX) - 1000;
         fixture.request.set_count(native_limit);
         fixture.request.headers_in.content_length_n = -1;
@@ -7766,7 +7805,7 @@ mod tests {
 
         let mut request = request_from(&mut fixture.request);
         assert_eq!(request.internal_redirect("/redirect"), Ok(Status::NGX_DONE));
-        assert_ne!(unsafe { request.raw.as_ref().internal() }, 0);
+        assert!(request.is_internal());
         assert!(slots[0].is_null());
         assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
         assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
@@ -7855,7 +7894,7 @@ mod tests {
 
         let mut request = request_from(&mut fixture.request);
         assert_eq!(request.internal_redirect("@replacement"), Ok(Status::NGX_DONE));
-        assert_ne!(unsafe { request.raw.as_ref().internal() }, 0);
+        assert!(request.is_internal());
         assert!(slots[0].is_null());
         assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 1);
         assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
@@ -7871,7 +7910,7 @@ mod tests {
         let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
         fixture.request.ctx = slots.as_mut_ptr();
         fixture.request.method = NGX_HTTP_HEAD as _;
-        fixture.request.set_header_only(1);
+        unsafe { ngx_rs_http_request_set_header_only(&raw mut *fixture.request, 1) };
 
         {
             let mut request = request_from(&mut fixture.request);
@@ -7914,7 +7953,7 @@ mod tests {
         let mut slots: [*mut c_void; 1] = [ptr::null_mut()];
         fixture.request.ctx = slots.as_mut_ptr();
         fixture.request.method = NGX_HTTP_HEAD as _;
-        fixture.request.set_header_only(1);
+        unsafe { ngx_rs_http_request_set_header_only(&raw mut *fixture.request, 1) };
 
         {
             let mut request = request_from(&mut fixture.request);
@@ -8012,7 +8051,7 @@ mod tests {
         main.loc_conf = fixture.request.loc_conf;
         main.main_conf = fixture.request.main_conf;
         main.set_count(1);
-        main.blocked = 1;
+        main.set_blocked(1);
         fixture.request.main = &raw mut *main;
         fixture.request.parent = &raw mut *main;
 
@@ -8078,7 +8117,7 @@ mod tests {
         initialize_request(&mut main);
         main.pool = &raw mut pool;
         main.set_count(1);
-        main.set_terminated(1);
+        unsafe { ngx_rs_http_request_set_terminated(&raw mut main, 1) };
 
         let mut raw = zeroed_request();
         raw.main = &raw mut main;
@@ -8158,8 +8197,10 @@ mod tests {
 
     #[test]
     fn cancelled_continuation_rejects_nonterminal_and_terminal_operations() {
+        let mut pool = zeroed_pool();
         let mut main = zeroed_request();
         initialize_request(&mut main);
+        main.pool = &raw mut pool;
         main.set_count(1);
 
         let mut raw = zeroed_request();
@@ -8187,6 +8228,7 @@ mod tests {
 
         let mut resume_main = zeroed_request();
         initialize_request(&mut resume_main);
+        resume_main.pool = &raw mut pool;
         resume_main.set_count(1);
         let mut resume_raw = zeroed_request();
         resume_raw.main = &raw mut resume_main;
@@ -8418,7 +8460,7 @@ mod tests {
         let late_callback = unsafe { body.as_ref().post_handler }.expect("native body callback");
         unsafe { late_callback(&raw mut *fixture.request) };
         assert_eq!(BODY_CALLBACKS.load(Ordering::Relaxed), 0);
-        assert_ne!(fixture.request.terminated(), 0);
+        assert_ne!(unsafe { ngx_rs_http_request_terminated(&raw mut *fixture.request) }, 0);
         assert_eq!(fixture.request.count(), 1);
         fixture.request.set_blocked(0);
         fixture.request.write_event_handler = None;
@@ -9324,6 +9366,75 @@ mod tests {
         drop(owner);
         assert_eq!(PINNED_CONTEXT_CLEANUPS.load(Ordering::Relaxed), 2);
         assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 2);
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn stale_context_cancellation_keeps_the_pool_live_until_context_drop() {
+        struct HeldContext {
+            request: NonNull<ngx_http_request_t>,
+            hold: Option<RequestHold>,
+        }
+
+        impl Drop for HeldContext {
+            fn drop(&mut self) {
+                assert!(!unsafe { self.request.as_ref() }.pool.is_null());
+                PINNED_CONTEXT_DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        struct HeldContextModule;
+
+        unsafe impl HttpModule for HeldContextModule {
+            fn module() -> ModuleDescriptor {
+                PinnedContextModule::module()
+            }
+        }
+
+        unsafe impl HttpModuleRequestContext for HeldContextModule {
+            type RequestContext = HeldContext;
+
+            fn cancel(context: Pin<&mut HeldContext>) {
+                let context = context.get_mut();
+                let request = context.request;
+                RequestHold::cancel(&mut context.hold);
+                assert!(!unsafe { request.as_ref() }.pool.is_null());
+            }
+
+            fn cleanup(context: Pin<&mut HeldContext>) {
+                unsafe { RequestHold::disarm_for_cleanup(&mut context.get_mut().hold) };
+            }
+        }
+
+        let mut fixture = TerminalRequestFixture::new();
+        reset_pinned_context_state();
+        let mut slots = [ptr::null_mut(); 1];
+        fixture.request.ctx = slots.as_mut_ptr();
+        let mut hold = None;
+        fixture.hold(&mut hold);
+        let raw = NonNull::from(&mut *fixture.request);
+        let context = {
+            let mut request = request_from(&mut fixture.request);
+            let context = request
+                .get_or_insert_pinned_module_context_with::<HeldContextModule>(|| HeldContext {
+                    request: raw,
+                    hold,
+                })
+                .unwrap();
+            NonNull::from(context.as_ref().get_ref())
+        };
+        fixture.request.set_count(1);
+        unsafe { *fixture.request.ctx = ptr::null_mut() };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            RequestRefMut::is_current_module_context::<HeldContextModule>(raw.as_ptr(), context)
+        }));
+        if fixture.request.pool.is_null() {
+            fixture.disarm_nginx_pools();
+        }
+        assert_eq!(result.unwrap(), Ok(false));
+        assert_eq!(PINNED_CONTEXT_DROPS.load(Ordering::Relaxed), 1);
+        assert!(fixture.request.pool.is_null());
     }
 
     #[cfg(feature = "test-link")]
