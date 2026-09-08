@@ -14,11 +14,9 @@ pub use crate::http::{
     HttpFilterError, HttpFilterSlot, HttpHeaderIter, HttpHeaderList, HttpHeaderRef, HttpModule,
     HttpModuleLocationConf, HttpModuleMainConf, HttpModuleRequestContext, HttpModuleServerConf,
     HttpPhase, HttpRequestHandler, HttpUpstreamInitializer, HttpUpstreamPeerHandler,
-    HttpVariableCacheInvalidation, HttpVariableCacheInvalidationError, HttpVariableFlags,
-    HttpVariableHandler, HttpVariableIndex, HttpVariableIndexError, HttpVariableLookupError,
-    HttpVariableOutput, HttpVariableOutputError, HttpVariablePoolBytes,
-    HttpVariableRegistrationError, HttpVariableSetter, HttpVariableValueRef, InitMainConf,
-    IntoHandlerStatus, Merge, MergeConfigError, OriginalPeerGet, OriginalPeerInit,
+    HttpVariableFlags, HttpVariableHandler, HttpVariableOutput, HttpVariableOutputError,
+    HttpVariablePoolBytes, HttpVariableRegistrationError, HttpVariableSetter, HttpVariableValueRef,
+    InitMainConf, IntoHandlerStatus, Merge, MergeConfigError, OriginalPeerGet, OriginalPeerInit,
     OriginalUpstreamInit, ProcessCycle, ProcessCycleError, RequestBodyBuildError,
     RequestBodyBuilder, RequestBodyError, RequestBodyRef, RequestBodySize,
     RequestContextCreateError, RequestContextError, RequestContinuation, RequestContinuationError,
@@ -31,9 +29,14 @@ pub use crate::http::{
     UpstreamServerConf, UpstreamState, UpstreamStateError, UpstreamStates, UpstreamUrlMessage,
     UpstreamUrlParseError, UpstreamUrlViewError, add_phase_handler, add_variable,
     add_variable_with_setter, exit_process, filter_postconfiguration, filter_preconfiguration,
-    get_variable_index, init_process, install_upstream_initializer,
-    phase_handler_postconfiguration, postconfiguration, preconfiguration,
+    init_process, install_upstream_initializer, phase_handler_postconfiguration, postconfiguration,
+    preconfiguration,
 };
 #[cfg(nginx1_29_8)]
 pub use crate::http::{HttpHeadersInBuilder, HttpHeadersOutBuilder};
+#[cfg(feature = "alloc")]
+pub use crate::http::{
+    HttpVariableCacheInvalidation, HttpVariableCacheInvalidationError, HttpVariableIndex,
+    HttpVariableIndexError, HttpVariableLookupError, get_variable_index,
+};
 pub use crate::ngx_log_debug_http;

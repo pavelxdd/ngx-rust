@@ -53,7 +53,7 @@ fn raw_variable_value_construction_rejects_null_and_misaligned_pointers() {
 #[test]
 fn successful_getter_without_a_value_publishes_not_found() {
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
-    request.signature = NGX_HTTP_MODULE as _;
+    initialize_callback_request(&mut request);
     let mut value = poisoned_value();
 
     let status = unsafe {
@@ -72,7 +72,7 @@ fn successful_getter_without_a_value_publishes_not_found() {
 #[test]
 fn failed_getter_preserves_the_native_output() {
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
-    request.signature = NGX_HTTP_MODULE as _;
+    initialize_callback_request(&mut request);
     let mut value = poisoned_value();
 
     let status = unsafe { raw_get_handler::<DataVariable>(&raw mut request, &raw mut value, 0) };

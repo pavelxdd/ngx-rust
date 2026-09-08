@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn allocation_allows_the_native_debug_writer_to_mutate_the_logger() {
+    fn allocation_invokes_the_native_writer_only_in_debug_builds() {
         let mut logger = TestLogger::new();
         logger.raw.log_level = NGX_LOG_DEBUG_ALLOC as _;
         logger.raw.writer = Some(mutate_logger);
@@ -311,7 +311,7 @@ mod tests {
             unsafe { allocator.deallocate(allocation, layout) };
         }
 
-        assert_eq!(logger.raw.connection, 1);
+        assert_eq!(logger.raw.connection != 0, crate::log::DEBUG);
     }
 
     #[test]
