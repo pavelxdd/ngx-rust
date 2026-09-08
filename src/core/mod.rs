@@ -1,4 +1,5 @@
 mod buffer;
+mod chain;
 mod command;
 mod conf;
 mod connection;
@@ -12,6 +13,7 @@ mod status;
 mod string;
 
 pub use buffer::*;
+pub use chain::*;
 pub use command::*;
 pub use conf::*;
 pub use connection::*;
