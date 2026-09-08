@@ -1,16 +1,13 @@
-#[cfg(test)]
-mod tests {
-    extern crate std;
+extern crate std;
 
-    use super::super::*;
+use super::*;
 
-    #[test]
-    fn spawn_rejects_before_worker_initialization() {
-        let _scheduler = SCHEDULER_TESTS.lock().unwrap_or_else(|error| error.into_inner());
-        let result = spawn(async { 7 });
+#[test]
+fn spawn_rejects_before_worker_initialization() {
+    let _scheduler = SCHEDULER_TESTS.lock().unwrap_or_else(|error| error.into_inner());
+    let result = spawn(async { 7 });
 
-        assert!(matches!(result, Err(SpawnError::Uninitialized)));
-    }
+    assert!(matches!(result, Err(SpawnError::Uninitialized)));
 }
 
 #[cfg(all(test, feature = "test-link"))]
