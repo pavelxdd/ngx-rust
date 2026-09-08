@@ -1,8 +1,10 @@
+#[cfg(feature = "alloc")]
 use alloc::boxed::Box;
 use core::alloc::Layout;
 use core::error;
 use core::fmt;
 use core::marker::PhantomData;
+#[cfg(feature = "alloc")]
 use core::mem;
 use core::ops::Deref;
 use core::pin::Pin;
@@ -12,15 +14,19 @@ use crate::allocator::Allocator;
 use crate::core::{NgxStr, Pool};
 use crate::ffi::{
     NGX_ERROR, NGX_HTTP_VAR_CHANGEABLE, NGX_HTTP_VAR_NOCACHEABLE, NGX_HTTP_VAR_NOHASH,
-    NGX_HTTP_VAR_PREFIX, NGX_HTTP_VAR_WEAK, NGX_OK, ngx_http_add_variable,
-    ngx_http_get_flushed_variable, ngx_http_get_indexed_variable, ngx_http_get_variable_index,
-    ngx_http_request_t, ngx_http_variable_t, ngx_int_t, ngx_str_t, ngx_uint_t,
-    ngx_variable_value_t,
+    NGX_HTTP_VAR_PREFIX, NGX_HTTP_VAR_WEAK, NGX_OK, ngx_http_add_variable, ngx_http_request_t,
+    ngx_http_variable_t, ngx_int_t, ngx_str_t, ngx_uint_t, ngx_variable_value_t,
 };
+#[cfg(feature = "alloc")]
+use crate::ffi::{
+    ngx_http_get_flushed_variable, ngx_http_get_indexed_variable, ngx_http_get_variable_index,
+};
+#[cfg(feature = "alloc")]
+use crate::http::HttpConfigError;
 use crate::http::{
-    HttpConfigError, HttpConfigurationParser, HttpModuleMainConf, HttpModuleRequestContext,
-    IntoHandlerStatus, NgxHttpCoreModule, RequestContextError, RequestError, RequestRef,
-    RequestRefMut, request_callback_status,
+    HttpConfigurationParser, HttpModuleMainConf, HttpModuleRequestContext, IntoHandlerStatus,
+    NgxHttpCoreModule, RequestContextError, RequestError, RequestRef, RequestRefMut,
+    request_callback_status,
 };
 
 bitflags::bitflags! {
@@ -53,6 +59,7 @@ impl fmt::Display for HttpVariableRegistrationError {
 impl error::Error for HttpVariableRegistrationError {}
 
 /// Error returned when nginx cannot create an indexed HTTP variable reference.
+#[cfg(feature = "alloc")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpVariableIndexError {
     /// The configuration cannot resolve the HTTP core main configuration.
@@ -63,6 +70,7 @@ pub enum HttpVariableIndexError {
     Registration,
 }
 
+#[cfg(feature = "alloc")]
 impl fmt::Display for HttpVariableIndexError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -77,8 +85,10 @@ impl fmt::Display for HttpVariableIndexError {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl error::Error for HttpVariableIndexError {}
 
+#[cfg(feature = "alloc")]
 impl From<HttpConfigError> for HttpVariableIndexError {
     fn from(error: HttpConfigError) -> Self {
         Self::Configuration(error)
@@ -101,6 +111,7 @@ impl From<HttpConfigError> for HttpVariableIndexError {
 ///     let _ = (moved, index);
 /// }
 /// ```
+#[cfg(feature = "alloc")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpVariableIndex {
     index: ngx_uint_t,
@@ -109,6 +120,7 @@ pub struct HttpVariableIndex {
 }
 
 /// Error returned when nginx's indexed HTTP variable cache cannot be invalidated safely.
+#[cfg(feature = "alloc")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpVariableCacheInvalidationError {
     /// The request cannot resolve the HTTP core main configuration.
@@ -129,6 +141,7 @@ pub enum HttpVariableCacheInvalidationError {
     ForeignRequest,
 }
 
+#[cfg(feature = "alloc")]
 impl fmt::Display for HttpVariableCacheInvalidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -160,8 +173,10 @@ impl fmt::Display for HttpVariableCacheInvalidationError {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl error::Error for HttpVariableCacheInvalidationError {}
 
+#[cfg(feature = "alloc")]
 impl From<HttpConfigError> for HttpVariableCacheInvalidationError {
     fn from(error: HttpConfigError) -> Self {
         Self::Configuration(error)
@@ -173,6 +188,7 @@ impl From<HttpConfigError> for HttpVariableCacheInvalidationError {
 /// Preparation validates every pointer and preserved index before request state changes. Commit
 /// clears getter-backed cached values, including changeable computed variables such as maps, while
 /// preserving explicitly listed indexes and native weak slots assigned directly by rewrite code.
+#[cfg(feature = "alloc")]
 pub struct HttpVariableCacheInvalidation<'preserved, 'callback> {
     request: NonNull<ngx_http_request_t>,
     definitions: NonNull<ngx_http_variable_t>,
@@ -183,6 +199,7 @@ pub struct HttpVariableCacheInvalidation<'preserved, 'callback> {
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
+#[cfg(feature = "alloc")]
 impl<'preserved, 'callback> HttpVariableCacheInvalidation<'preserved, 'callback> {
     /// Validates the request cache and indexes that must survive invalidation.
     pub fn prepare(
@@ -263,6 +280,7 @@ impl<'preserved, 'callback> HttpVariableCacheInvalidation<'preserved, 'callback>
 }
 
 /// Error returned when an indexed HTTP variable cannot be looked up safely.
+#[cfg(feature = "alloc")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpVariableLookupError {
     /// The request cannot resolve the HTTP core main configuration.
@@ -287,6 +305,7 @@ pub enum HttpVariableLookupError {
     InvalidResult,
 }
 
+#[cfg(feature = "alloc")]
 impl fmt::Display for HttpVariableLookupError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -318,8 +337,10 @@ impl fmt::Display for HttpVariableLookupError {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl error::Error for HttpVariableLookupError {}
 
+#[cfg(feature = "alloc")]
 impl From<HttpConfigError> for HttpVariableLookupError {
     fn from(error: HttpConfigError) -> Self {
         Self::Configuration(error)
@@ -725,6 +746,7 @@ impl HttpVariableValueRef<'_> {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl HttpVariableIndex {
     /// Looks up the value currently cached for this request.
     pub fn get_cached<'request>(
@@ -877,6 +899,7 @@ impl<'request, 'callback> HttpVariableRequest<'request, 'callback> {
     }
 
     /// Looks up the value currently cached for this request.
+    #[cfg(feature = "alloc")]
     pub fn get_cached<'value>(
         &'value mut self,
         index: &HttpVariableIndex,
@@ -885,6 +908,7 @@ impl<'request, 'callback> HttpVariableRequest<'request, 'callback> {
     }
 
     /// Clears a noncacheable value before looking it up for this request.
+    #[cfg(feature = "alloc")]
     pub fn get_flushed<'value>(
         &'value mut self,
         index: &HttpVariableIndex,
@@ -1122,6 +1146,7 @@ fn register_variable(
 ///     let _ = get_variable_index(parser, name);
 /// }
 /// ```
+#[cfg(feature = "alloc")]
 pub fn get_variable_index(
     parser: &mut HttpConfigurationParser<'_>,
     name: &NgxStr,

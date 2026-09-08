@@ -39,7 +39,7 @@ fn raw_variable_handler_rejects_invalid_callback_pointers_without_calling_the_ge
 fn raw_variable_handler_forwards_zero_and_maximum_data() {
     RAW_VARIABLE_DATA.store(1, Ordering::Relaxed);
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
-    request.signature = NGX_HTTP_MODULE as _;
+    initialize_callback_request(&mut request);
     let mut value = unsafe { MaybeUninit::<ngx_variable_value_t>::zeroed().assume_init() };
 
     assert_eq!(
@@ -60,7 +60,7 @@ fn raw_variable_setter_reads_a_checked_input_value() {
     RAW_SET_VARIABLE_CALLS.store(0, Ordering::Relaxed);
     RAW_SET_VARIABLE_DATA.store(0, Ordering::Relaxed);
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
-    request.signature = NGX_HTTP_MODULE as _;
+    initialize_callback_request(&mut request);
     request.headers_out.status = 418;
     let mut value = unsafe { MaybeUninit::<ngx_variable_value_t>::zeroed().assume_init() };
     value.data = b"set value".as_ptr().cast_mut();
@@ -113,7 +113,7 @@ fn raw_variable_handler_converts_every_supported_status_output() {
 #[test]
 fn raw_variable_handler_wraps_the_request_and_value() {
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
-    request.signature = NGX_HTTP_MODULE as _;
+    initialize_callback_request(&mut request);
     let mut raw_value = unsafe { MaybeUninit::<ngx_variable_value_t>::zeroed().assume_init() };
 
     let status = unsafe {

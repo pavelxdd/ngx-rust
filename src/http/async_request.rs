@@ -396,7 +396,8 @@ mod tests {
         ngx_http_core_srv_conf_t, ngx_http_handler_pt, ngx_http_log_ctx_t,
         ngx_http_phase_handler_t, ngx_http_request_t, ngx_http_run_posted_requests, ngx_int_t,
         ngx_log_t, ngx_module_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events,
-        ngx_queue_init, ngx_uint_t,
+        ngx_queue_init, ngx_rs_http_request_done, ngx_rs_http_request_set_done,
+        ngx_rs_http_request_terminated, ngx_time_init, ngx_uint_t,
     };
     #[cfg(nginx1_25_4)]
     use crate::http::subrequest::{SubRequestBuilder, SubRequestError};
@@ -954,6 +955,7 @@ mod tests {
                 }
             };
             unsafe {
+                ngx_time_init();
                 nginx_sys::ngx_max_module = 1;
                 nginx_sys::ngx_http_max_module = 1;
                 let core = &raw mut nginx_sys::ngx_http_core_module;
@@ -1736,9 +1738,11 @@ mod tests {
             unsafe { crate::ffi::ngx_rs_http_request_is_internal(&raw mut *request.request) },
             0
         );
-        assert_eq!(old.drops.get(), 1);
         assert_eq!(request.main_count(), 1);
         assert!(request._contexts[0].is_null());
+        worker.process_posted();
+        worker.process_posted();
+        assert_eq!(old.drops.get(), 1);
 
         let replacement = install_local_state();
         start_handler::<PendingHandler>(&mut request);
@@ -1752,8 +1756,10 @@ mod tests {
         worker.process_posted();
         assert_eq!(replacement.polls.get(), 1);
         remove_handler_context::<PendingHandler>(&mut request);
-        assert_eq!(replacement.drops.get(), 1);
         assert_eq!(request.main_count(), 1);
+        worker.process_posted();
+        worker.process_posted();
+        assert_eq!(replacement.drops.get(), 1);
     }
 
     #[cfg(nginx1_25_4)]
@@ -1775,7 +1781,7 @@ mod tests {
 
         unsafe { ngx_http_finalize_request(&raw mut *request.request, NGX_ERROR as _) };
 
-        assert_ne!(request.request.terminated(), 0);
+        assert_ne!(unsafe { ngx_rs_http_request_terminated(&raw mut *request.request) }, 0);
         assert!(request._contexts[0].is_null());
         assert_eq!(request.main_count(), 1);
         waker.wake();
@@ -1814,7 +1820,7 @@ mod tests {
         subrequest.connection = &raw mut *main._connection;
         subrequest.ctx = contexts.as_mut_ptr();
         subrequest.loc_conf = main.loc_conf.as_mut_ptr();
-        subrequest.set_done(1);
+        unsafe { ngx_rs_http_request_set_done(&raw mut *subrequest, 1) };
 
         {
             let mut request = unsafe { RequestRefMut::from_raw(&raw mut *subrequest).unwrap() };
@@ -1829,8 +1835,8 @@ mod tests {
 
         unsafe { ngx_http_finalize_request(&raw mut *subrequest, NGX_ERROR as _) };
 
-        assert_ne!(main.request.terminated(), 0);
-        assert_ne!(subrequest.done(), 0);
+        assert_ne!(unsafe { ngx_rs_http_request_terminated(&raw mut *main.request) }, 0);
+        assert_ne!(unsafe { ngx_rs_http_request_done(&raw mut *subrequest) }, 0);
         assert!(contexts[0].is_null());
         assert_eq!(main.main_count(), 1);
         waker.wake();
@@ -1888,9 +1894,11 @@ mod tests {
         request.request.write_event_handler = Some(blocked_write_handler);
         unsafe { ngx_http_finalize_request(&raw mut *request.request, NGX_ERROR as _) };
 
-        assert_ne!(request.request.terminated(), 0);
+        assert_ne!(unsafe { ngx_rs_http_request_terminated(&raw mut *request.request) }, 0);
         assert!(request._contexts[0].is_null());
         assert_eq!(request.main_count(), 2);
+        worker.process_posted();
+        worker.process_posted();
         assert_eq!(state.task_drops.get(), 1);
         assert_eq!(state.callbacks.get(), 0);
         assert_eq!(state.completion_drops.get(), 0);
@@ -1899,7 +1907,7 @@ mod tests {
         assert!(!subrequest.is_null());
         request._connection.set_error(0);
         unsafe { ngx_http_finalize_request(subrequest, NGX_OK as _) };
-        assert_ne!(unsafe { (*subrequest).done() }, 0);
+        assert_ne!(unsafe { ngx_rs_http_request_done(subrequest) }, 0);
         assert_eq!(request.main_count(), 1);
         assert_eq!(state.callbacks.get(), 0);
         assert_eq!(state.completion_drops.get(), 1);
