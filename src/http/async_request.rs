@@ -1108,6 +1108,7 @@ mod tests {
             let mut core_loc = Box::new(unsafe {
                 MaybeUninit::<ngx_http_core_loc_conf_t>::zeroed().assume_init()
             });
+            core_loc.error_log = (&raw const *pool.log).cast_mut();
             let mut loc_conf = Box::new([(&raw mut *core_loc).cast::<c_void>()]);
             let mut request =
                 Box::new(unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() });
@@ -1705,6 +1706,7 @@ mod tests {
         main_conf.phase_engine.server_rewrite_index = 0;
         let mut core_loc =
             Box::new(unsafe { MaybeUninit::<ngx_http_core_loc_conf_t>::zeroed().assume_init() });
+        core_loc.error_log = (&raw const *request._pool.log).cast_mut();
         let mut loc_conf = Box::new([(&raw mut *core_loc).cast::<c_void>()]);
         let mut main_conf_slots = Box::new([(&raw mut *main_conf).cast::<c_void>()]);
         let mut http_context = Box::new(ngx_http_conf_ctx_t {
@@ -1730,7 +1732,10 @@ mod tests {
             );
             request_ref.finalize(crate::core::Status::NGX_DONE).unwrap();
         }
-        assert_ne!(request.request.internal(), 0);
+        assert_ne!(
+            unsafe { crate::ffi::ngx_rs_http_request_is_internal(&raw mut *request.request) },
+            0
+        );
         assert_eq!(old.drops.get(), 1);
         assert_eq!(request.main_count(), 1);
         assert!(request._contexts[0].is_null());

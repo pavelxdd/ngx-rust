@@ -314,6 +314,27 @@ ngx_rs_http_request_header_only(const ngx_http_request_t *request)
 }
 
 ngx_uint_t
+ngx_rs_http_request_terminated(const ngx_http_request_t *request)
+{
+#if (nginx_version >= 1025004)
+    return request->terminated;
+#else
+    return 0;
+#endif
+}
+
+void
+ngx_rs_http_request_set_terminated(ngx_http_request_t *request, ngx_uint_t terminated)
+{
+#if (nginx_version >= 1025004)
+    request->terminated = terminated;
+#else
+    (void) request;
+    (void) terminated;
+#endif
+}
+
+ngx_uint_t
 ngx_rs_http_request_keepalive(const ngx_http_request_t *request)
 {
     return request->keepalive;
