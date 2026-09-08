@@ -163,7 +163,7 @@ where
     /// Posts this event to the selected nginx queue.
     ///
     /// Returns `Ok(false)` when nginx has already queued the event. Foreign threads must use
-    /// [`notify`] instead.
+    /// [`crate::event::notify`] instead.
     ///
     /// # Safety
     ///
