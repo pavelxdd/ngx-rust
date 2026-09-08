@@ -6,6 +6,7 @@ pub use builder::{
     EventPeerCallbacks, EventPeerLogError,
 };
 mod connection;
+#[cfg(all(test, feature = "test-link"))]
 use connection::{EVENT_PEER_MIN_POOL_SIZE, inert_event_handler};
 pub use connection::{
     EventPeer, EventPeerConnectError, EventPeerConnectReady, EventPeerConnectReadyError,
