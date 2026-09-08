@@ -611,7 +611,7 @@ impl<'address, 'log> EventPeerBuilder<'address, 'log> {
         self
     }
 
-    /// Creates the fully initialized peer. Patched device and socket-mark fields are always zero.
+    /// Creates the fully initialized peer.
     pub fn build(self) -> Result<EventPeer<'address, 'log>, EventPeerBuildError> {
         let log = self.log.ok_or(EventPeerBuildError::MissingLog)?;
         let get = self.callbacks.get.ok_or(EventPeerBuildError::MissingGetCallback)?;
@@ -640,14 +640,6 @@ impl<'address, 'log> EventPeerBuilder<'address, 'log> {
         {
             raw.hint = ptr::null_mut();
             raw.sid = ptr::null_mut();
-        }
-        #[cfg(ngx_feature = "have_bindtodevice")]
-        {
-            raw.device = ptr::null();
-        }
-        #[cfg(ngx_feature = "have_so_mark")]
-        {
-            raw.so_mark = 0;
         }
         raw.set_cached(self.cached.into());
         raw.set_transparent(self.transparent.into());

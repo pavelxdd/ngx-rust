@@ -550,10 +550,6 @@ fn builder_initializes_every_configured_peer_field() {
         assert!(raw.hint.is_null());
         assert!(raw.sid.is_null());
     }
-    #[cfg(ngx_feature = "have_bindtodevice")]
-    assert!(raw.device.is_null());
-    #[cfg(ngx_feature = "have_so_mark")]
-    assert_eq!(raw.so_mark, 0);
     assert_eq!(raw.cached(), 1);
     assert_eq!(raw.transparent(), 1);
     assert_eq!(raw.so_keepalive(), 1);
@@ -667,10 +663,6 @@ fn builder_defaults_to_a_fresh_stream_peer() {
         assert!(raw.hint.is_null());
         assert!(raw.sid.is_null());
     }
-    #[cfg(ngx_feature = "have_bindtodevice")]
-    assert!(raw.device.is_null());
-    #[cfg(ngx_feature = "have_so_mark")]
-    assert_eq!(raw.so_mark, 0);
 }
 
 #[test]
