@@ -50,20 +50,24 @@ pub(crate) fn nginx_binary_dependencies(lines: &[String]) -> Result<Vec<String>,
 }
 
 #[cfg(any(feature = "test-link", test))]
-pub(crate) fn nginx_build_archives(
-    lines: &[String],
-    source_dir: &Path,
-    build_dir: &Path,
-) -> Result<Vec<String>, String> {
+pub(crate) fn nginx_rust_archives(lines: &[String]) -> Result<Vec<String>, String> {
+    // auto/rust marks Rust archive targets with an always-rebuilt prerequisite.
+    let rust_targets: HashSet<_> = lines
+        .iter()
+        .filter_map(|line| {
+            let (target, dependencies) = line.split_once(':')?;
+            let dependencies = shlex::split(dependencies)?;
+            dependencies
+                .iter()
+                .any(|dependency| dependency == ".NGX_RUST_PHONY")
+                .then_some(target.trim())
+        })
+        .collect();
+
     Ok(nginx_binary_dependencies(lines)?
         .into_iter()
         .filter(|dependency| {
-            let path = Path::new(dependency);
-            if path.extension().and_then(|extension| extension.to_str()) != Some("a") {
-                return false;
-            }
-            let path = if path.is_absolute() { path.to_owned() } else { source_dir.join(path) };
-            path.starts_with(build_dir)
+            dependency.ends_with(".a") && rust_targets.contains(dependency.as_str())
         })
         .collect())
 }
