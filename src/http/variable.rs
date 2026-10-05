@@ -915,7 +915,7 @@ impl<'request, 'callback> HttpVariableRequest<'request, 'callback> {
     }
 }
 
-impl<'request, 'callback> Deref for HttpVariableRequest<'request, 'callback> {
+impl<'callback> Deref for HttpVariableRequest<'_, 'callback> {
     type Target = RequestRefMut<'callback>;
 
     fn deref(&self) -> &Self::Target {

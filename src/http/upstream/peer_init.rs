@@ -307,7 +307,7 @@ impl UpstreamCallbackSlot {
     }
 }
 
-impl<'callback> UpstreamServerConf<'callback> {
+impl UpstreamServerConf<'_> {
     fn peer_slot<H>(&mut self) -> Result<NonNull<UpstreamCallbackSlot>, UpstreamCallbackError>
     where
         H: HttpUpstreamPeerHandler,

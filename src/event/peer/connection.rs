@@ -250,7 +250,7 @@ impl<'address, 'log> EventPeer<'address, 'log> {
     ///
     /// `NGX_ERROR` is returned as [`EventPeerConnectResult::Error`]. `Err` is reserved for an
     /// invalid native status or connection descriptor.
-    #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
+    #[allow(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub fn connect(
         mut self,
     ) -> Result<EventPeerConnectResult<'address, 'log>, EventPeerConnectError<'address, 'log>> {
@@ -272,7 +272,7 @@ impl<'address, 'log> EventPeer<'address, 'log> {
         self.classify_connect(status)
     }
 
-    #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
+    #[allow(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub(super) fn classify_connect(
         mut self,
         status: ngx_int_t,
@@ -688,7 +688,7 @@ impl<'address, 'log> EventPeerPendingConnection<'address, 'log> {
     }
 
     /// Consumes this owner after nginx reports connect readiness or terminal state.
-    #[expect(
+    #[allow(
         clippy::result_large_err,
         reason = "the error returns the allocation-free pending owner"
     )]
@@ -745,7 +745,7 @@ impl<'address, 'log> EventPeerPendingConnection<'address, 'log> {
     }
 }
 
-impl<'address, 'log> EventPeerConnection<'address, 'log> {
+impl<'log> EventPeerConnection<'_, 'log> {
     #[cfg(feature = "async")]
     pub(crate) fn readiness_parts(
         &self,
@@ -844,7 +844,7 @@ pub enum EventPeerConnectResult<'address, 'log> {
     Error(EventPeer<'address, 'log>),
 }
 
-impl<'address, 'log> EventPeerConnectResult<'address, 'log> {
+impl EventPeerConnectResult<'_, '_> {
     /// Returns the exact native result category.
     pub fn status(&self) -> EventPeerConnectStatus {
         match self {

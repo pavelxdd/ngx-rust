@@ -305,7 +305,7 @@ enum EventReadinessConnection<'connection, 'address, 'log> {
     Pending(&'connection mut EventPeerPendingConnection<'address, 'log>),
 }
 
-impl<'address, 'log> EventReadinessConnection<'_, 'address, 'log> {
+impl<'log> EventReadinessConnection<'_, '_, 'log> {
     fn parts(
         &self,
         write: bool,

@@ -554,7 +554,7 @@ struct TempFileFixture {
     core: Box<ngx_http_core_loc_conf_t>,
     _slots: Box<[*mut c_void; 1]>,
     connection: Box<ngx_connection_t>,
-    request: ngx_http_request_t,
+    request: Box<ngx_http_request_t>,
 }
 
 #[cfg(feature = "test-link")]
@@ -583,9 +583,9 @@ impl TempFileFixture {
             Box::new(unsafe { MaybeUninit::zeroed().assume_init() });
         connection.log = pool.log().as_ptr();
 
-        let mut request = zeroed_request();
+        let mut request = Box::new(zeroed_request());
         request.pool = pool.raw;
-        request.parent = &raw mut request;
+        request.parent = &raw mut *request;
         request.connection = &raw mut *connection;
         request.loc_conf = slots.as_mut_ptr();
         initialize_request(&mut request);
@@ -2353,12 +2353,12 @@ fn temp_file_writer_reuses_stable_metadata_with_clean_pool_cleanup() {
             }
         }
 
-        let TempFileFixture { pool, temp_dir, .. } = fixture;
-        drop(pool);
+        unsafe { ngx_destroy_pool(fixture.pool.raw) };
+        fixture.pool.disarm();
         assert!(!deleted_path.exists());
         #[cfg(unix)]
         assert_eq!(unsafe { fcntl(fd, F_GETFD) }, -1);
-        drop(temp_dir);
+        drop(fixture.temp_dir);
     }
 }
 
@@ -2410,7 +2410,7 @@ fn temp_file_state_reuses_one_pool_owned_handle_across_callback_scopes() {
     };
 
     let first = unsafe {
-        RequestRefMut::with_raw(&raw mut fixture.request, |request| {
+        RequestRefMut::with_raw(&raw mut *fixture.request, |request| {
             let pool = request.pool().unwrap();
             let input = pool.copy_buffer(b"one", BufferFlags::default()).unwrap();
             let output =
@@ -2422,7 +2422,7 @@ fn temp_file_state_reuses_one_pool_owned_handle_across_callback_scopes() {
     .unwrap();
 
     let second = unsafe {
-        RequestRefMut::with_raw(&raw mut fixture.request, |request| {
+        RequestRefMut::with_raw(&raw mut *fixture.request, |request| {
             let pool = request.pool().unwrap();
             let input = pool.copy_buffer(b"two", BufferFlags::default()).unwrap();
             let output =
@@ -2444,12 +2444,12 @@ fn temp_file_state_reuses_one_pool_owned_handle_across_callback_scopes() {
     #[cfg(unix)]
     let fd = native.file.fd;
 
-    let TempFileFixture { pool, temp_dir, .. } = fixture;
-    drop(pool);
+    unsafe { ngx_destroy_pool(fixture.pool.raw) };
+    fixture.pool.disarm();
     assert!(!path.exists());
     #[cfg(unix)]
     assert_eq!(unsafe { fcntl(fd, F_GETFD) }, -1);
-    drop(temp_dir);
+    drop(fixture.temp_dir);
 }
 
 #[cfg(feature = "test-link")]
@@ -2458,7 +2458,7 @@ fn temp_file_state_release_closes_and_disarms_the_pool_cleanup() {
     let mut fixture = TempFileFixture::new();
     let mut state = request_from(&mut fixture.request).temp_file_state().unwrap();
     unsafe {
-        RequestRefMut::with_raw(&raw mut fixture.request, |request| {
+        RequestRefMut::with_raw(&raw mut *fixture.request, |request| {
             let pool = request.pool().unwrap();
             let input = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
             state.append_buffer(&request, input.view(), input.view().flags()).unwrap();
@@ -2502,7 +2502,7 @@ fn temp_file_state_release_reports_a_missing_pool_cleanup() {
     let mut fixture = TempFileFixture::new();
     let mut state = request_from(&mut fixture.request).temp_file_state().unwrap();
     unsafe {
-        RequestRefMut::with_raw(&raw mut fixture.request, |request| {
+        RequestRefMut::with_raw(&raw mut *fixture.request, |request| {
             let pool = request.pool().unwrap();
             let input = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
             state.append_buffer(&request, input.view(), input.view().flags()).unwrap();
@@ -2554,7 +2554,7 @@ fn temp_file_state_copies_a_short_buffer_reborrow() {
     let mut state = request_from(&mut fixture.request).temp_file_state().unwrap();
 
     let offsets = unsafe {
-        RequestRefMut::with_raw(&raw mut fixture.request, |request| {
+        RequestRefMut::with_raw(&raw mut *fixture.request, |request| {
             let pool = request.pool().unwrap();
             let input = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
             let output = state.append_buffer(&request, input.view(), input.view().flags()).unwrap();
@@ -2613,7 +2613,7 @@ fn temp_file_handle_rejects_replaced_owner_at_the_same_request_addresses() {
     let mut fixture = TempFileFixture::new();
     let mut state = request_from(&mut fixture.request).temp_file_state().unwrap();
     let pool = unsafe { Pool::from_raw(fixture.pool.raw) }.unwrap();
-    let main = NonNull::new(&raw mut fixture.request).unwrap();
+    let main = NonNull::new(&raw mut *fixture.request).unwrap();
     let registry = find_request_context_registry(NonNull::new(pool.as_ptr()).unwrap()).unwrap();
     let original_owner = unsafe { registry.as_ref().owner };
     remove_request_context_registry(&pool, registry, main);

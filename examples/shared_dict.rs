@@ -875,11 +875,13 @@ impl HttpVariableSetter for SharedDictEntriesVariable {
             return;
         };
 
-        if shared_dict_clear(shm_zone).is_ok()
-            && let Ok(Some(log)) = request.log()
-        {
-            ngx_log_debug!(log, "shared dict: clear");
+        if shared_dict_clear(shm_zone).is_err() {
+            return;
         }
+        let Ok(Some(log)) = request.log() else {
+            return;
+        };
+        ngx_log_debug!(log, "shared dict: clear");
     }
 }
 

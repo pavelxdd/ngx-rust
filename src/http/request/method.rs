@@ -274,14 +274,14 @@ enum MethodInner {
     Connect,
 }
 
-impl<'callback> RequestRef<'callback> {
+impl RequestRef<'_> {
     /// Request method verb.
     pub fn method(&self) -> Method {
         Method::from_ngx(unsafe { self.raw.as_ref().method })
     }
 }
 
-impl<'callback> RequestRefMut<'callback> {
+impl RequestRefMut<'_> {
     /// Request method verb.
     pub fn method(&self) -> Method {
         self.view().method()

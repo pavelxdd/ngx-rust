@@ -210,7 +210,7 @@ pub struct Resolver<'resolver> {
     _not_thread_safe: PhantomData<*mut ()>,
 }
 
-impl<'resolver> Resolver<'resolver> {
+impl Resolver<'_> {
     /// Creates a resolver capability from a native nginx resolver.
     ///
     /// # Safety

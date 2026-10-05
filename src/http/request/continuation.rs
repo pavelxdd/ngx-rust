@@ -458,7 +458,7 @@ impl RequestContinuation<'_> {
     }
 }
 
-impl<'callback> RequestRefMut<'callback> {
+impl RequestRefMut<'_> {
     /// Retains the main request while a context delays its terminal HTTP operation.
     ///
     /// `hold` must be the one slot in the pinned request context that owns this delayed path.
