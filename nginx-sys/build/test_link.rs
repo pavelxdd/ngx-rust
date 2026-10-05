@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use super::{ConfiguredCCompiler, NginxSource};
 use crate::link::{
-    NativeLinkInput, logical_makefile_lines, nginx_binary_objects, nginx_build_archives,
-    nginx_native_link_inputs,
+    NativeLinkInput, logical_makefile_lines, nginx_binary_objects, nginx_native_link_inputs,
+    nginx_rust_archives,
 };
 
 pub(super) fn build_test_library(
@@ -50,10 +50,7 @@ pub(super) fn build_test_library(
             sources.push(source);
         }
     }
-    replaced_inputs.extend(
-        nginx_build_archives(&lines, &nginx.source_dir, &nginx.build_dir)
-            .unwrap_or_else(|error| panic!("{error}")),
-    );
+    replaced_inputs.extend(nginx_rust_archives(&lines).unwrap_or_else(|error| panic!("{error}")));
     if external_objects > 0 {
         println!(
             "cargo::warning=using {external_objects} configured object files without rebuilding their sources"
