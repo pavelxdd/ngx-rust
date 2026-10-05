@@ -636,7 +636,6 @@ impl HttpVariableOutput<'_> {
 
     fn write_found(&mut self, len: usize, data: *mut u8, cacheable: bool) {
         self.candidate = Some(ngx_variable_value_t {
-            _bitfield_align_1: [],
             _bitfield_1: ngx_variable_value_t::new_bitfield_1(
                 len as _,
                 1,
@@ -650,7 +649,6 @@ impl HttpVariableOutput<'_> {
 
     fn not_found() -> ngx_variable_value_t {
         ngx_variable_value_t {
-            _bitfield_align_1: [],
             _bitfield_1: ngx_variable_value_t::new_bitfield_1(0, 0, 1, 1, 0),
             data: ptr::null_mut(),
         }
