@@ -3,17 +3,21 @@ MODULE_NAMES	= \
 	ngx_http_async_module \
 	ngx_http_curl_module \
 	ngx_http_shared_dict_module \
-	ngx_http_upstream_custom_module
+	ngx_http_subrequest_module \
+	ngx_http_upstream_custom_module \
+	ngx_stream_probe_module
 
 # Target names used by cargo build.
 TARGET_NAMES	= \
 	async \
 	curl \
 	shared_dict \
-	upstream
+	subrequest \
+	upstream \
+	stream
 
 # extra arguments (e.g. --features) for cargo build
-CARGO_BUILD_ARGS += -p examples --examples
+CARGO_BUILD_ARGS += -p examples --examples --features=async,stream
 
 UNAME_S = $(shell uname -s)
 ifneq ($(UNAME_S), Darwin)
