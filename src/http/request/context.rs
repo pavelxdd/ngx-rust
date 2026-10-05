@@ -248,9 +248,19 @@ pub(super) fn get_or_create_request_context_registry(
         return Ok((registry, false));
     }
 
-    let identity = NEXT_REQUEST_OWNER
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |owner| owner.checked_add(1))
-        .map_err(|_| RequestContextError::Allocation)?;
+    let mut identity = NEXT_REQUEST_OWNER.load(Ordering::Relaxed);
+    loop {
+        let next = identity.checked_add(1).ok_or(RequestContextError::Allocation)?;
+        match NEXT_REQUEST_OWNER.compare_exchange_weak(
+            identity,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(owner) => identity = owner,
+        }
+    }
     let cleanup = NonNull::new(unsafe {
         ngx_pool_cleanup_add(raw.as_ptr(), mem::size_of::<RequestContextRegistryOwner>())
     })
@@ -508,7 +518,7 @@ impl<T> Drop for RequestContextOwner<T> {
     }
 }
 
-impl<'callback> RequestRef<'callback> {
+impl RequestRef<'_> {
     fn module_context_slot(
         &self,
         module: ModuleDescriptor,
@@ -617,7 +627,7 @@ impl MainRequestRefMut<'_> {
     }
 }
 
-impl<'callback> RequestRefMut<'callback> {
+impl RequestRefMut<'_> {
     /// Verifies that `context` is still published in module `M`'s request slot.
     ///
     /// A mismatch cancels every stale registered context before returning `false`.

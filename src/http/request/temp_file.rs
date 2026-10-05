@@ -368,7 +368,7 @@ impl RequestTempFileHandle {
             temp_file_ref.file.log = self.state.log.as_ptr();
             temp_file_ref.path = self.state.path.as_ptr();
             temp_file_ref.pool = self.pool;
-            temp_file_ref.warn = REQUEST_TEMP_FILE_WARNING.as_ptr().cast_mut();
+            temp_file_ref.warn = REQUEST_TEMP_FILE_WARNING.as_ptr().cast_mut().cast();
             temp_file_ref.access = 0o600;
             temp_file_ref.set_log_level(NGX_LOG_WARN as _);
             temp_file_ref.set_clean(1);
@@ -435,7 +435,7 @@ pub(super) fn check_temp_file_write(
     Ok(())
 }
 
-impl<'callback> RequestRefMut<'callback> {
+impl RequestRefMut<'_> {
     /// Creates request-pool state for the configured HTTP temporary-file path.
     ///
     /// The owner allocates its native state and opens its file only when a nonempty memory buffer

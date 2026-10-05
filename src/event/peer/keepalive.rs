@@ -25,7 +25,7 @@ impl<'address, 'log> EventPeer<'address, 'log> {
     /// SSL state. It must remain plain while owned. On success this owner removes both event
     /// timers, replaces their handlers, clears `connection.data`, and becomes solely responsible
     /// for closing the socket and optional pool.
-    #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
+    #[allow(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub unsafe fn attach_keepalive(
         mut self,
         connection: *mut ngx_connection_t,
@@ -148,7 +148,7 @@ impl<'address, 'log> EventPeer<'address, 'log> {
 
 impl<'address, 'log> EventPeerConnection<'address, 'log> {
     /// Validates and prepares an idle connection, then registers read monitoring before transfer.
-    #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
+    #[allow(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub fn into_keepalive<'idle_log>(
         mut self,
         mut preparation: EventPeerPreparation<'idle_log>,
@@ -334,7 +334,7 @@ impl<'address, 'log> EventPeerKeepalive<'address, 'log> {
     }
 
     /// Installs the active logger and transfers the socket back without allocating a new socket.
-    #[expect(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
+    #[allow(clippy::result_large_err, reason = "the error returns the allocation-free peer owner")]
     pub fn into_connection<'active_log>(
         mut self,
         log: LogRef<'active_log>,

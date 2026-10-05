@@ -502,7 +502,7 @@ impl ClientBodyReadStart<'_> {
     }
 }
 
-impl<'callback> RequestRef<'callback> {
+impl RequestRef<'_> {
     /// Returns a checked callback-scoped view over the current request body, when nginx has one.
     pub fn request_body(&self) -> Result<Option<RequestBodyRef<'_>>, RequestBodyError> {
         RequestBodyRef::from_raw(unsafe { self.raw.as_ref().request_body })
@@ -536,9 +536,7 @@ impl<'callback> RequestRefMut<'callback> {
     /// calling nginx again. A late callback from an older generation terminates the request rather
     /// than dispatching `H` against replacement state. The returned token must be released after
     /// its status has been handled.
-    pub fn read_client_body<'request, H: HttpClientBodyHandler>(
-        &'request mut self,
-    ) -> ClientBodyReadStart<'request> {
+    pub fn read_client_body<H: HttpClientBodyHandler>(&mut self) -> ClientBodyReadStart<'_> {
         let callback = raw_client_body_handler::<H>;
         let (status, release_required) = match register_client_body_read(self.raw, callback) {
             Ok(Some(id)) => {
@@ -571,6 +569,7 @@ impl<'callback> RequestRefMut<'callback> {
     }
 }
 
+#[cfg(nginx1_29_8)]
 impl<'request, 'callback> HttpHeadersInBuilder<'request, 'callback> {
     /// Starts constructing a request-pool body candidate for this replacement-header set.
     pub fn request_body_candidate(

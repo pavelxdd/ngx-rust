@@ -735,7 +735,7 @@ impl<'a> Iterator for NgxListIterator<'a> {
     }
 }
 
-impl<'callback> RequestRef<'callback> {
+impl RequestRef<'_> {
     /// Client HTTP User-Agent, when nginx parsed one.
     pub fn user_agent(&self) -> Result<Option<&NgxStr>, RequestError> {
         let header = unsafe { self.raw.as_ref().headers_in.user_agent };

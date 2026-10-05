@@ -396,8 +396,11 @@ mod tests {
         ngx_http_core_srv_conf_t, ngx_http_handler_pt, ngx_http_log_ctx_t,
         ngx_http_phase_handler_t, ngx_http_request_t, ngx_http_run_posted_requests, ngx_int_t,
         ngx_log_t, ngx_module_t, ngx_pool_t, ngx_posted_events, ngx_posted_next_events,
-        ngx_queue_init, ngx_rs_http_request_done, ngx_rs_http_request_set_done,
-        ngx_rs_http_request_terminated, ngx_time_init, ngx_uint_t,
+        ngx_queue_init, ngx_time_init, ngx_uint_t,
+    };
+    #[cfg(nginx1_25_4)]
+    use crate::ffi::{
+        ngx_rs_http_request_done, ngx_rs_http_request_set_done, ngx_rs_http_request_terminated,
     };
     #[cfg(nginx1_25_4)]
     use crate::http::subrequest::{SubRequestBuilder, SubRequestError};

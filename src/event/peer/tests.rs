@@ -208,7 +208,6 @@ unsafe extern "C" fn selected_get(
     NGX_OK as _
 }
 
-#[derive(Default)]
 struct CallbackState {
     connection: *mut ngx_connection_t,
     free_count: usize,
@@ -219,6 +218,22 @@ struct CallbackState {
     set_session_count: usize,
     #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
     save_session_count: usize,
+}
+
+impl Default for CallbackState {
+    fn default() -> Self {
+        Self {
+            connection: ptr::null_mut(),
+            free_count: 0,
+            free_state: 0,
+            notify_count: 0,
+            notify_type: 0,
+            #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+            set_session_count: 0,
+            #[cfg(any(ngx_feature = "ssl", ngx_feature = "compat"))]
+            save_session_count: 0,
+        }
+    }
 }
 
 unsafe extern "C" fn record_free(
@@ -319,7 +334,7 @@ fn test_event_handlers(
     unsafe { EventPeerHandlers::new(read, write) }
 }
 
-fn test_keepalive_preparation<'log>(log: LogRef<'log>) -> EventPeerPreparation<'log> {
+fn test_keepalive_preparation(log: LogRef<'_>) -> EventPeerPreparation<'_> {
     EventPeerPreparation::new(
         log,
         test_event_handlers(idle_read_handler, idle_write_handler),
@@ -359,20 +374,20 @@ fn reject_keepalive_reuse<'address, 'log>(
     }
 }
 
-fn build_peer<'peer>(
-    address: EventPeerAddress<'peer>,
+fn build_peer(
+    address: EventPeerAddress<'_>,
     log: *mut ngx_log_t,
     callbacks: EventPeerCallbacks,
-) -> EventPeer<'peer, 'peer> {
+) -> EventPeer<'_, '_> {
     let log = unsafe { LogRef::from_raw(log) }.unwrap();
     EventPeerBuilder::new(address).log(log).callbacks(callbacks).build().unwrap()
 }
 
-fn build_datagram_peer<'peer>(
-    address: EventPeerAddress<'peer>,
+fn build_datagram_peer(
+    address: EventPeerAddress<'_>,
     log: *mut ngx_log_t,
     callbacks: EventPeerCallbacks,
-) -> EventPeer<'peer, 'peer> {
+) -> EventPeer<'_, '_> {
     let log = unsafe { LogRef::from_raw(log) }.unwrap();
     EventPeerBuilder::new(address)
         .log(log)
@@ -439,7 +454,7 @@ fn builder_requires_valid_address_and_log() {
     let address = ngx_addr_t {
         sockaddr: (&raw mut socket).cast(),
         socklen: size_of::<sockaddr_in>() as _,
-        name: ngx_str_t { len: 4, data: c"peer".as_ptr().cast_mut() },
+        name: ngx_str_t { len: 4, data: c"peer".as_ptr().cast::<u8>().cast_mut() },
     };
     let address = unsafe { EventPeerAddress::from_raw(&raw const address) }.unwrap();
     let mut log: ngx_log_t = unsafe { mem::zeroed() };
@@ -613,7 +628,7 @@ fn peer_address_rejects_socket_length_and_family_mismatches() {
     let address = ngx_addr_t {
         sockaddr: (&raw mut ipv4).cast(),
         socklen: (size_of::<sockaddr_in>() - 1) as _,
-        name: ngx_str_t { len: 4, data: c"peer".as_ptr().cast_mut() },
+        name: ngx_str_t { len: 4, data: c"peer".as_ptr().cast::<u8>().cast_mut() },
     };
     assert_eq!(
         unsafe { EventPeerAddress::from_raw(&raw const address) },
@@ -625,7 +640,7 @@ fn peer_address_rejects_socket_length_and_family_mismatches() {
     let address = ngx_addr_t {
         sockaddr: (&raw mut ipv6).cast(),
         socklen: size_of::<sockaddr_in>() as _,
-        name: ngx_str_t { len: 4, data: c"peer".as_ptr().cast_mut() },
+        name: ngx_str_t { len: 4, data: c"peer".as_ptr().cast::<u8>().cast_mut() },
     };
     assert_eq!(
         unsafe { EventPeerAddress::from_raw(&raw const address) },

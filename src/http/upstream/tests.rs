@@ -670,9 +670,7 @@ unsafe extern "C" fn selected_status_get_peer(
     ORIGINAL_GET_STATUS.load(Ordering::Relaxed)
 }
 
-fn original_peer_get<'callback>(
-    outcome: &'callback Cell<OriginalPeerGetOutcome>,
-) -> OriginalPeerGet<'callback> {
+fn original_peer_get(outcome: &Cell<OriginalPeerGetOutcome>) -> OriginalPeerGet<'_> {
     OriginalPeerGet {
         original: OriginalPeerCallbacks {
             get: Some(selected_status_get_peer),

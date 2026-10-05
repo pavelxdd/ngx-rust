@@ -821,11 +821,18 @@ mod tests {
     static BODY_ORDER: AtomicUsize = AtomicUsize::new(0);
 
     fn record(order: &AtomicUsize, value: usize) {
-        order
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current * 10 + value)
-            })
-            .unwrap();
+        let mut current = order.load(Ordering::Relaxed);
+        loop {
+            match order.compare_exchange_weak(
+                current,
+                current * 10 + value,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     unsafe extern "C" fn ordered_header(_request: *mut ngx_http_request_t) -> ngx_int_t {
