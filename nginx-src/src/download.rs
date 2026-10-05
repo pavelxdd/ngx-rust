@@ -415,6 +415,9 @@ fn extract_archive(archive_path: &Path, extract_output_base_dir: &Path) -> io::R
     let mut archive = Archive::new(GzDecoder::new(archive_file));
     for entry in archive.entries()? {
         let mut entry = entry?;
+        if entry.header().entry_type().is_pax_global_extensions() {
+            continue;
+        }
         let path = entry.path()?.into_owned();
         validate_archive_path(&path, OsStr::new(stem))?;
         if path.components().count() == 1 && !entry.header().entry_type().is_dir() {
@@ -620,6 +623,52 @@ mod tests {
 
         assert_eq!(extracted, output.join("source"));
         assert_eq!(fs::read(extracted.join("README"))?, b"complete");
+        Ok(())
+    }
+
+    #[test]
+    fn global_pax_metadata_does_not_create_a_filesystem_entry() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive = create_archive(
+            &temp_dir,
+            &[
+                TestEntry {
+                    path: "pax_global_header",
+                    entry_type: EntryType::XGlobalHeader,
+                    link_name: None,
+                    contents: b"16 comment=test\n",
+                },
+                directory("source/"),
+                file("source/README", b"complete"),
+            ],
+        )?;
+        let output = temp_dir.path().join("output");
+
+        let extracted = extract_archive(&archive, &output)?;
+
+        assert_eq!(fs::read(extracted.join("README"))?, b"complete");
+        assert!(!output.join("pax_global_header").exists());
+        assert!(!extracted.join("pax_global_header").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn regular_file_named_like_global_pax_metadata_is_rejected() -> io::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let archive = create_archive(
+            &temp_dir,
+            &[
+                directory("source/"),
+                file("source/README", b"partial"),
+                file("pax_global_header", b"not metadata"),
+            ],
+        )?;
+        let output = temp_dir.path().join("output");
+
+        assert!(extract_archive(&archive, &output).is_err());
+        assert!(!output.join("source").exists());
+        assert!(!output.join("pax_global_header").exists());
+        assert_eq!(fs::read_dir(&output)?.count(), 0);
         Ok(())
     }
 
