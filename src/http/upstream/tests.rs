@@ -1,4 +1,6 @@
 use alloc::boxed::Box;
+#[cfg(unix)]
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::Cell;
 #[cfg(unix)]
@@ -9,6 +11,10 @@ use core::mem::MaybeUninit;
 use core::ptr;
 use core::slice;
 use core::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+#[cfg(unix)]
+use std::process::Command;
 use std::sync::MutexGuard;
 
 use super::test_support::TestPool;
@@ -29,10 +35,11 @@ unsafe extern "C" {
 
 #[cfg(unix)]
 unsafe extern "C" {
-    fn fork() -> c_int;
-    fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn _exit(status: c_int) -> !;
 }
+
+#[cfg(unix)]
+const PEER_FREE_ABORT_TEST_CHILD: &str = "NGX_UPSTREAM_FREE_ABORT_TEST_CHILD";
 
 static ORIGINAL_INIT_PEER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static COUNTING_INIT_PEER_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -980,8 +987,8 @@ fn initialize_accounting_peer(
 
 #[test]
 fn repeated_initializer_installation_is_rejected_before_publication() {
-    DELEGATED_INIT_UPSTREAM_CALLS.store(0, Ordering::Relaxed);
     let mut server = ConfiguredServer::new(0);
+    DELEGATED_INIT_UPSTREAM_CALLS.store(0, Ordering::Relaxed);
     server.raw.peer.init_upstream = Some(busy_init_upstream);
 
     assert_eq!(install_upstream_initializer::<DecliningInitializer>(&mut server.raw), Ok(()));
@@ -1278,13 +1285,13 @@ fn upstream_initializer_reads_and_mutates_typed_server_configuration() {
 
 #[test]
 fn upstream_initializer_delegates_and_validates_each_owner() {
-    DELEGATED_INIT_UPSTREAM_CALLS.store(0, Ordering::Relaxed);
     let pool = TestPool::new();
     let mut configuration = unsafe { MaybeUninit::<ngx_conf_t>::zeroed().assume_init() };
     configuration.pool = pool.raw;
 
     {
         let mut server = ConfiguredServer::new(0);
+        DELEGATED_INIT_UPSTREAM_CALLS.store(0, Ordering::Relaxed);
         server.raw.peer.init_upstream = Some(delegated_busy_init_upstream);
         assert_eq!(install_upstream_initializer::<DelegatingInitializer>(&mut server.raw), Ok(()));
         assert_eq!(
@@ -1296,8 +1303,8 @@ fn upstream_initializer_delegates_and_validates_each_owner() {
             },
             NGX_ERROR as _
         );
+        assert_eq!(DELEGATED_INIT_UPSTREAM_CALLS.load(Ordering::Relaxed), 1);
     }
-    assert_eq!(DELEGATED_INIT_UPSTREAM_CALLS.load(Ordering::Relaxed), 1);
     assert_eq!(
         unsafe {
             raw_init_upstream::<DelegatingInitializer>(&raw mut configuration, ptr::null_mut())
@@ -1486,6 +1493,7 @@ fn peer_initializer_rejects_missing_and_invalid_owners() {
 
 #[test]
 fn peer_callback_family_composes_with_distinct_outer_and_original_data() {
+    let mut server = ConfiguredServer::new(0);
     CALLBACK_ORDER.store(0, Ordering::Relaxed);
     OBSERVED_GET_PEER_DATA.store(ptr::null_mut(), Ordering::Relaxed);
     OBSERVED_GET_CALLBACK_DATA.store(ptr::null_mut(), Ordering::Relaxed);
@@ -1511,7 +1519,6 @@ fn peer_callback_family_composes_with_distinct_outer_and_original_data() {
         unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
     initialized_request(&pool, &mut request, &mut request_upstream);
-    let mut server = ConfiguredServer::new(0);
     server.raw.peer.init = Some(ordered_init_peer);
     assert_eq!(server.install_peer::<OrderedPeer>(), Ok(()));
 
@@ -1582,6 +1589,7 @@ fn peer_callback_family_composes_with_distinct_outer_and_original_data() {
 
 #[test]
 fn peer_callbacks_reject_data_owned_by_another_connection() {
+    let mut server = ConfiguredServer::new(0);
     CALLBACK_ORDER.store(0, Ordering::Relaxed);
     let first_pool = TestPool::new();
     let second_pool = TestPool::new();
@@ -1591,7 +1599,6 @@ fn peer_callbacks_reject_data_owned_by_another_connection() {
     let mut second_request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
     initialized_request(&first_pool, &mut first_request, &mut first_upstream);
     initialized_request(&second_pool, &mut second_request, &mut second_upstream);
-    let mut server = ConfiguredServer::new(0);
     server.raw.peer.init = Some(ordered_init_peer);
     assert_eq!(server.install_peer::<OrderedPeer>(), Ok(()));
 
@@ -1673,12 +1680,12 @@ fn peer_callbacks_reject_data_owned_by_another_connection() {
 
 #[test]
 fn discarded_original_selection_is_released_before_get_error() {
+    let mut server = ConfiguredServer::new(0);
     reset_accounting(Status::NGX_OK.0, 1, 0);
     let pool = TestPool::new();
     let mut request_upstream =
         unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
-    let mut server = ConfiguredServer::new(0);
     let typed_data =
         initialize_accounting_peer(&pool, &mut request, &mut request_upstream, &mut server);
     let mut name = ngx_str_t::default();
@@ -1701,12 +1708,12 @@ fn discarded_original_selection_is_released_before_get_error() {
 
 #[test]
 fn duplicate_get_and_free_are_rejected_before_native_accounting() {
+    let mut server = ConfiguredServer::new(0);
     reset_accounting(Status::NGX_OK.0, 0, 0);
     let pool = TestPool::new();
     let mut request_upstream =
         unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
-    let mut server = ConfiguredServer::new(0);
     let typed_data =
         initialize_accounting_peer(&pool, &mut request, &mut request_upstream, &mut server);
     let mut name = ngx_str_t::default();
@@ -1737,12 +1744,12 @@ fn duplicate_get_and_free_are_rejected_before_native_accounting() {
 
 #[test]
 fn get_error_has_no_release_debt_and_retry_gets_a_new_attempt() {
+    let mut server = ConfiguredServer::new(0);
     reset_accounting(Status::NGX_ERROR.0, 0, 0);
     let pool = TestPool::new();
     let mut request_upstream =
         unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
-    let mut server = ConfiguredServer::new(0);
     let typed_data =
         initialize_accounting_peer(&pool, &mut request, &mut request_upstream, &mut server);
     let mut name = ngx_str_t::default();
@@ -1782,12 +1789,12 @@ fn get_error_has_no_release_debt_and_retry_gets_a_new_attempt() {
 #[cfg(unix)]
 #[test]
 fn original_free_runs_before_handler_error_or_abort() {
+    let mut server = ConfiguredServer::new(0);
     reset_accounting(Status::NGX_OK.0, 0, 1);
     let pool = TestPool::new();
     let mut request_upstream =
         unsafe { MaybeUninit::<ngx_http_upstream_t>::zeroed().assume_init() };
     let mut request = unsafe { MaybeUninit::<ngx_http_request_t>::zeroed().assume_init() };
-    let mut server = ConfiguredServer::new(0);
     let typed_data =
         initialize_accounting_peer(&pool, &mut request, &mut request_upstream, &mut server);
     let mut name = ngx_str_t::default();
@@ -1805,9 +1812,7 @@ fn original_free_runs_before_handler_error_or_abort() {
     assert_eq!(ACCOUNTING_CONNS.load(Ordering::Relaxed), 0);
     assert_eq!(ACCOUNTING_REFS.load(Ordering::Relaxed), 0);
 
-    let child = unsafe { fork() };
-    assert!(child >= 0, "fork failed");
-    if child == 0 {
+    if std::env::var_os(PEER_FREE_ABORT_TEST_CHILD).is_some() {
         reset_accounting(Status::NGX_OK.0, 0, 2);
         assert_eq!(
             unsafe { raw_get_peer::<AccountingPeer>(&raw mut request_upstream.peer, typed_data) },
@@ -1819,9 +1824,20 @@ fn original_free_runs_before_handler_error_or_abort() {
         unsafe { _exit(0) };
     }
 
-    let mut status = 0;
-    assert_eq!(unsafe { waitpid(child, &raw mut status, 0) }, child);
-    assert_ne!(status & 0x7f, 0, "free panic did not terminate the child");
+    let executable = std::env::current_exe().expect("test executable");
+    let output = Command::new(executable)
+        .arg("--exact")
+        .arg("http::upstream::tests::original_free_runs_before_handler_error_or_abort")
+        .env(PEER_FREE_ABORT_TEST_CHILD, "1")
+        .env("RUST_TEST_THREADS", "1")
+        .output()
+        .expect("spawn isolated peer-free abort test");
+    assert!(
+        output.status.signal().is_some(),
+        "free panic did not terminate the child: {}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

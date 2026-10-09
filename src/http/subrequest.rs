@@ -518,6 +518,7 @@ mod tests {
     impl NativeSubRequestFixture {
         fn new() -> Self {
             let globals = TestGlobals::new();
+            unsafe { nginx_sys::ngx_time_init() };
             let mut log = Box::new(unsafe { mem::zeroed::<ngx_log_t>() });
             let pool = unsafe { ngx_create_pool(4096, &raw mut *log) };
             assert!(!pool.is_null());
