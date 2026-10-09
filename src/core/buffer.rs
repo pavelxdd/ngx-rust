@@ -1,12 +1,15 @@
+use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::mem;
 use core::ops::Range;
 use core::ptr::{self, NonNull};
 use core::slice;
 
-use nginx_sys::{ngx_buf_t, ngx_create_temp_buf, ngx_fd_t, ngx_file_t, ngx_str_t, off_t};
+use nginx_sys::{
+    ngx_buf_t, ngx_create_temp_buf, ngx_fd_t, ngx_file_t, ngx_pool_cleanup_add, ngx_str_t, off_t,
+};
 
-use crate::core::{Pool, PoolCleanupError};
+use crate::core::Pool;
 
 /// Failure returned while validating or constructing an nginx buffer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,7 +38,17 @@ pub enum BufferError {
     FileDescriptor,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: libc::dev_t,
+    #[cfg(unix)]
+    inode: libc::ino_t,
+    directio: u32,
+}
+
 struct RetainedFile {
+    identity: FileIdentity,
     file: ngx_file_t,
 }
 
@@ -514,7 +527,7 @@ impl<'pool> Pool<'pool> {
     /// Builds a bounded slice from a checked memory or file buffer view.
     ///
     /// Full memory slices retain the source bytes, while partial memory slices are copied.
-    /// File slices duplicate only the native file descriptor and adjust its offsets.
+    /// File slices borrow the source file metadata and adjust the buffer offsets.
     pub fn buffer_slice(
         &self,
         source: BufferRef<'pool>,
@@ -554,8 +567,10 @@ impl<'pool> Pool<'pool> {
 
     /// Retains a callback-scoped file descriptor and builds a pool-owned bounded slice.
     ///
-    /// The retained file has an independent close-on-exec descriptor and fresh asynchronous I/O
-    /// state. Its descriptor is closed by the pool cleanup.
+    /// Compatible slices share a pool-owned close-on-exec descriptor per backing file and
+    /// direct-I/O mode. Current descriptor flags are checked before reuse; older retained
+    /// descriptors remain open until pool cleanup. Each slice has separate file metadata and
+    /// fresh asynchronous I/O state, so concurrent reads do not share mutable per-I/O state.
     pub fn retain_file_buffer_slice(
         &self,
         source: BufferRef<'_>,
@@ -571,39 +586,69 @@ impl<'pool> Pool<'pool> {
         }
 
         let source_file = unsafe { source.file.as_ref() };
-        let name = self.copy_file_name(source_file.name)?;
-        let log = unsafe { (*self.as_ptr()).log };
-        if log.is_null() {
-            return Err(BufferError::InvalidFileRange);
+        let mut file =
+            NonNull::new(self.calloc_type::<ngx_file_t>()).ok_or(BufferError::Allocation)?;
+        let retained = self.retain_file(source_file)?;
+        unsafe {
+            // The cached metadata is never used for I/O; each slice starts with fresh I/O state.
+            file.as_ptr().write(ptr::read(retained.as_ptr()));
+            file.as_mut().set_directio(source_file.directio());
         }
-        let directio = source_file.directio();
-        let retained = self
-            .try_allocate_with_cleanup(|| {
-                let fd = duplicate_file_descriptor(source_file.fd)?;
-                let mut file: ngx_file_t = unsafe { mem::zeroed() };
-                file.fd = fd;
-                file.name = name;
-                file.log = log;
-                file.set_directio(directio);
-                Ok(RetainedFile { file })
-            })
-            .map_err(|error| match error {
-                PoolCleanupError::Allocation => BufferError::Allocation,
-                PoolCleanupError::Construction(error) => error,
-            })?;
         let file = FileView {
-            file: NonNull::from(&retained.file),
+            file,
             start: source.start,
             end: source.end,
             len: source.len,
             _lifetime: PhantomData,
         };
-        match self.build_file_buffer(file, range, flags) {
-            Ok(output) => Ok(output),
-            Err(error) => {
-                retained.remove();
-                Err(error)
+        self.build_file_buffer(file, range, flags)
+    }
+
+    fn retain_file(&self, source: &ngx_file_t) -> Result<NonNull<ngx_file_t>, BufferError> {
+        let identity = file_identity(source.fd, source.directio())?;
+        #[cfg(target_os = "linux")]
+        let directio = file_descriptor_directio(source.fd)?;
+        let mut current = unsafe { (*self.as_ptr()).cleanup };
+        while let Some(cleanup) = NonNull::new(current) {
+            let cleanup = unsafe { cleanup.as_ref() };
+            current = cleanup.next;
+            if !cleanup.handler.is_some_and(|handler| {
+                ptr::fn_addr_eq(handler, retained_file_cleanup as unsafe extern "C" fn(*mut c_void))
+            }) {
+                continue;
             }
+            let retained = unsafe { &*cleanup.data.cast::<RetainedFile>() };
+            if retained.identity != identity {
+                continue;
+            }
+            // A dup shares status flags with its source, so the cached mode can become stale.
+            #[cfg(target_os = "linux")]
+            if file_descriptor_directio(retained.file.fd)? != directio {
+                continue;
+            }
+            return Ok(NonNull::from(&retained.file));
+        }
+
+        let name = self.copy_file_name(source.name)?;
+        let log = unsafe { (*self.as_ptr()).log };
+        if log.is_null() {
+            return Err(BufferError::InvalidFileRange);
+        }
+        let fd = duplicate_file_descriptor(source.fd)?;
+        let mut file: ngx_file_t = unsafe { mem::zeroed() };
+        file.fd = fd;
+        file.name = name;
+        file.log = log;
+        let retained = RetainedFile { identity, file };
+        let mut cleanup = NonNull::new(unsafe {
+            ngx_pool_cleanup_add(self.as_ptr(), mem::size_of::<RetainedFile>())
+        })
+        .ok_or(BufferError::Allocation)?;
+        unsafe {
+            let data = cleanup.as_mut().data.cast::<RetainedFile>();
+            data.write(retained);
+            cleanup.as_mut().handler = Some(retained_file_cleanup);
+            Ok(NonNull::from(&(*data).file))
         }
     }
 
@@ -692,6 +737,33 @@ impl<'pool> Pool<'pool> {
     fn empty_buffer(&self) -> Result<NonNull<ngx_buf_t>, BufferError> {
         NonNull::new(self.calloc_type::<ngx_buf_t>()).ok_or(BufferError::Allocation)
     }
+}
+
+unsafe extern "C" fn retained_file_cleanup(data: *mut c_void) {
+    unsafe { ptr::drop_in_place(data.cast::<RetainedFile>()) };
+}
+
+#[cfg(unix)]
+fn file_identity(fd: ngx_fd_t, directio: u32) -> Result<FileIdentity, BufferError> {
+    let mut stat: libc::stat = unsafe { mem::zeroed() };
+    if unsafe { libc::fstat(fd, &raw mut stat) } == -1 {
+        return Err(BufferError::FileDescriptor);
+    }
+    Ok(FileIdentity { device: stat.st_dev, inode: stat.st_ino, directio })
+}
+
+#[cfg(not(unix))]
+fn file_identity(_fd: ngx_fd_t, _directio: u32) -> Result<FileIdentity, BufferError> {
+    Err(BufferError::FileDescriptor)
+}
+
+#[cfg(target_os = "linux")]
+fn file_descriptor_directio(fd: ngx_fd_t) -> Result<bool, BufferError> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(BufferError::FileDescriptor);
+    }
+    Ok(flags & libc::O_DIRECT != 0)
 }
 
 #[cfg(unix)]
