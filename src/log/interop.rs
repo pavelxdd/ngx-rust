@@ -45,9 +45,9 @@ const fn max_level() -> LevelFilter {
 
 fn level_enabled(level: Level, log_level: usize) -> bool {
     match level {
-        Level::Error => NGX_LOG_ERR as usize <= log_level,
-        Level::Warn => NGX_LOG_WARN as usize <= log_level,
-        Level::Info => NGX_LOG_INFO as usize <= log_level,
+        Level::Error => NGX_LOG_ERR <= log_level,
+        Level::Warn => NGX_LOG_WARN <= log_level,
+        Level::Info => NGX_LOG_INFO <= log_level,
         Level::Debug | Level::Trace => check_mask(DebugMask::Core, log_level),
     }
 }
@@ -99,14 +99,14 @@ mod tests {
 
     #[test]
     fn nginx_threshold_includes_the_selected_level() {
-        assert!(level_enabled(Level::Error, NGX_LOG_ERR as usize));
-        assert!(!level_enabled(Level::Warn, NGX_LOG_ERR as usize));
+        assert!(level_enabled(Level::Error, NGX_LOG_ERR));
+        assert!(!level_enabled(Level::Warn, NGX_LOG_ERR));
     }
 
     #[test]
     fn debug_and_trace_require_the_core_mask() {
-        assert!(level_enabled(Level::Debug, NGX_LOG_DEBUG_CORE as usize));
-        assert!(level_enabled(Level::Trace, NGX_LOG_DEBUG_CORE as usize));
-        assert!(!level_enabled(Level::Debug, NGX_LOG_DEBUG_HTTP as usize));
+        assert!(level_enabled(Level::Debug, NGX_LOG_DEBUG_CORE));
+        assert!(level_enabled(Level::Trace, NGX_LOG_DEBUG_CORE));
+        assert!(!level_enabled(Level::Debug, NGX_LOG_DEBUG_HTTP));
     }
 }

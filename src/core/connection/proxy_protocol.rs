@@ -342,7 +342,7 @@ fn proxy_protocol_tlv_limit(address: ProxyProtocolAddress, transport: SocketType
 
     match transport {
         SocketType::Stream => declared_limit.min(
-            (NGX_PROXY_PROTOCOL_MAX_HEADER as usize)
+            NGX_PROXY_PROTOCOL_MAX_HEADER
                 .saturating_sub(PROXY_PROTOCOL_V2_HEADER_LEN + address_len),
         ),
         SocketType::Datagram => declared_limit,

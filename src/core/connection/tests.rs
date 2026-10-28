@@ -1083,7 +1083,7 @@ fn proxy_protocol_builder_keeps_tcp_and_datagram_tlv_limits_separate() {
         octets: [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
         port: SocketPort::from_host_order(443),
     };
-    let stream_maximum = crate::ffi::NGX_PROXY_PROTOCOL_MAX_HEADER as usize - 16 - 36;
+    let stream_maximum = crate::ffi::NGX_PROXY_PROTOCOL_MAX_HEADER - 16 - 36;
     let stream_tlvs = vec![0_u8; stream_maximum];
     let stream_too_large = vec![0_u8; stream_maximum + 1];
     assert!(

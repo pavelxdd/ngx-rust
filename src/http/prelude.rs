@@ -34,7 +34,6 @@ pub use crate::http::{
 };
 #[cfg(nginx1_29_8)]
 pub use crate::http::{HttpHeadersInBuilder, HttpHeadersOutBuilder};
-#[cfg(feature = "alloc")]
 pub use crate::http::{
     HttpVariableCacheInvalidation, HttpVariableCacheInvalidationError, HttpVariableIndex,
     HttpVariableIndexError, HttpVariableLookupError, get_variable_index,

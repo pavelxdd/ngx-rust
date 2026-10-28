@@ -70,7 +70,7 @@ pub(super) fn checked_request_ptr(
     if !request.as_ptr().is_aligned() {
         return Err(RequestError::MisalignedRequest);
     }
-    if unsafe { request.as_ref().signature } != NGX_HTTP_MODULE {
+    if unsafe { request.as_ref().signature } != NGX_HTTP_MODULE as u32 {
         return Err(RequestError::InvalidRequestSignature);
     }
 
@@ -87,7 +87,7 @@ pub(super) unsafe fn checked_ngx_str<'a>(value: ngx_str_t) -> Result<&'a NgxStr,
     Ok(NgxStr::from_bytes(bytes))
 }
 
-const MAX_SUBREQUEST_PARENT_EDGES: usize = NGX_HTTP_MAX_SUBREQUESTS as usize + 1;
+const MAX_SUBREQUEST_PARENT_EDGES: usize = NGX_HTTP_MAX_SUBREQUESTS + 1;
 /// Highest main-request count a Rust hold may publish; nginx reserves the remaining 1,000.
 pub(super) const MAX_REQUEST_COUNT_AFTER_HOLD: u32 = u16::MAX as u32 - 1000;
 
@@ -198,7 +198,7 @@ impl<'callback> RequestRef<'callback> {
         if !main.as_ptr().is_aligned() {
             return Err(RequestError::MisalignedMain);
         }
-        if unsafe { main.as_ref().signature } != NGX_HTTP_MODULE {
+        if unsafe { main.as_ref().signature } != NGX_HTTP_MODULE as u32 {
             return Err(RequestError::InvalidMainSignature);
         }
         if !ptr::eq(unsafe { main.as_ref().main }, main.as_ptr()) {
@@ -213,7 +213,7 @@ impl<'callback> RequestRef<'callback> {
             let parent = NonNull::new(unsafe { request.as_ref().parent })
                 .ok_or(RequestError::ForeignMain)?;
             if !parent.as_ptr().is_aligned()
-                || unsafe { parent.as_ref().signature } != NGX_HTTP_MODULE
+                || unsafe { parent.as_ref().signature } != NGX_HTTP_MODULE as u32
                 || !ptr::eq(unsafe { parent.as_ref().main }, main.as_ptr())
             {
                 return Err(RequestError::ForeignMain);

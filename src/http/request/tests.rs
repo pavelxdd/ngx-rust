@@ -715,7 +715,7 @@ fn main_request_validation_rejects_missing_invalid_and_foreign_links() {
 
 #[test]
 fn deepest_native_subrequest_chain_resolves_to_main() {
-    let request_count = usize::try_from(NGX_HTTP_MAX_SUBREQUESTS).unwrap() + 2;
+    let request_count = NGX_HTTP_MAX_SUBREQUESTS + 2;
     let mut requests = (0..request_count).map(|_| Box::new(zeroed_request())).collect::<Vec<_>>();
     let main = ptr::from_mut(requests[0].as_mut());
     initialize_request(requests[0].as_mut());

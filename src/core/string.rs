@@ -684,7 +684,6 @@ mod tests {
         assert_eq!(raw.data.cast_const(), bytes.as_ptr());
     }
 
-    #[cfg(feature = "alloc")]
     #[test]
     fn owned_string_exposes_the_same_nginx_bytes() {
         use crate::allocator::Global;

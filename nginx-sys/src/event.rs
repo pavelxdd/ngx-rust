@@ -264,11 +264,8 @@ mod tests {
             let new_key = old_key.wrapping_add(difference as ngx_msec_t);
             assert_timer_add_matches(old_key, new_key);
 
-            let expected_key = if difference.unsigned_abs() < NGX_TIMER_LAZY_DELAY as usize {
-                old_key
-            } else {
-                new_key
-            };
+            let expected_key =
+                if difference.unsigned_abs() < NGX_TIMER_LAZY_DELAY { old_key } else { new_key };
             assert_eq!(timer_add_state(false, old_key, new_key).key, expected_key);
         }
 
