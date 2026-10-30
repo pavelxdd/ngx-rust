@@ -172,18 +172,18 @@ pub mod ffi;
 #[cfg(ngx_feature = "http")]
 pub mod http;
 
+/// The Stream module.
+///
+/// This module provides wrappers and utilities for NGINX Stream configuration and sessions.
+#[cfg(all(feature = "stream", ngx_feature = "stream"))]
+pub mod stream;
+
 /// The log module.
 ///
 /// This module provides an interface into the NGINX logger framework.
 pub mod log;
 
 pub mod sync;
-
-/// The Stream module.
-///
-/// This module provides wrappers and utilities for NGINX Stream configuration and sessions.
-#[cfg(all(feature = "stream", ngx_feature = "stream"))]
-pub mod stream;
 
 /// Define modules exported by this library.
 ///

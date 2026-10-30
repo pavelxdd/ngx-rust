@@ -11,26 +11,8 @@ use crate::core::{
 use crate::ffi::{NGX_ERROR, ngx_int_t, ngx_stream_session_t};
 use crate::log::LogRef;
 use crate::stream::{
-    StreamConfigError, StreamModule, StreamModuleMainConf, StreamModuleServerConf,
+    StreamConfigError, StreamModule, StreamModuleMainConf, StreamModuleServerConf, StreamPhase,
 };
-
-/// Stream phases in which modules can register handlers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(usize)]
-pub enum StreamPhase {
-    /// Immediately after nginx accepts a client connection.
-    PostAccept = crate::ffi::ngx_stream_phases_NGX_STREAM_POST_ACCEPT_PHASE as _,
-    /// Before access checks.
-    Preaccess = crate::ffi::ngx_stream_phases_NGX_STREAM_PREACCESS_PHASE as _,
-    /// Access checks.
-    Access = crate::ffi::ngx_stream_phases_NGX_STREAM_ACCESS_PHASE as _,
-    /// TLS processing.
-    Ssl = crate::ffi::ngx_stream_phases_NGX_STREAM_SSL_PHASE as _,
-    /// Protocol preread processing.
-    Preread = crate::ffi::ngx_stream_phases_NGX_STREAM_PREREAD_PHASE as _,
-    /// Session logging.
-    Log = crate::ffi::ngx_stream_phases_NGX_STREAM_LOG_PHASE as _,
-}
 
 /// Converts a Stream handler result into an nginx status.
 pub trait IntoHandlerStatus {

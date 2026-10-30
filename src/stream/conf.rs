@@ -462,6 +462,24 @@ mod core_module {
         type ServerConf = ngx_stream_core_srv_conf_t;
     }
 
+    /// Stream phases in which modules can register handlers.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[repr(usize)]
+    pub enum StreamPhase {
+        /// Immediately after nginx accepts a client connection.
+        PostAccept = crate::ffi::ngx_stream_phases_NGX_STREAM_POST_ACCEPT_PHASE as _,
+        /// Before access checks.
+        Preaccess = crate::ffi::ngx_stream_phases_NGX_STREAM_PREACCESS_PHASE as _,
+        /// Access checks.
+        Access = crate::ffi::ngx_stream_phases_NGX_STREAM_ACCESS_PHASE as _,
+        /// TLS processing.
+        Ssl = crate::ffi::ngx_stream_phases_NGX_STREAM_SSL_PHASE as _,
+        /// Protocol preread processing.
+        Preread = crate::ffi::ngx_stream_phases_NGX_STREAM_PREREAD_PHASE as _,
+        /// Session logging.
+        Log = crate::ffi::ngx_stream_phases_NGX_STREAM_LOG_PHASE as _,
+    }
+
     /// Registers a typed handler in its declared Stream phase without logging failures.
     ///
     /// Call this function from the module's postconfiguration callback when the caller owns the
@@ -503,7 +521,7 @@ mod core_module {
     }
 }
 
-pub use core_module::{NgxStreamCoreModule, add_phase_handler, try_add_phase_handler};
+pub use core_module::{NgxStreamCoreModule, StreamPhase, add_phase_handler, try_add_phase_handler};
 
 #[cfg(ngx_feature = "stream_ssl")]
 mod ssl {
