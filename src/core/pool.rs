@@ -8,11 +8,12 @@ use core::pin::Pin;
 use core::ptr::{self, NonNull};
 
 use nginx_sys::{
-    NGX_ALIGNMENT, ngx_palloc, ngx_pcalloc, ngx_pfree, ngx_pmemalign, ngx_pnalloc,
-    ngx_pool_cleanup_add, ngx_pool_cleanup_t, ngx_pool_t,
+    NGX_ALIGNMENT, ngx_buf_t, ngx_create_temp_buf, ngx_palloc, ngx_pcalloc, ngx_pfree,
+    ngx_pmemalign, ngx_pnalloc, ngx_pool_cleanup_add, ngx_pool_cleanup_t, ngx_pool_t,
 };
 
 use crate::allocator::{AllocError, Allocator, dangling_for_layout};
+use crate::core::{Buffer, MemoryBuffer, TemporaryBuffer};
 
 /// Non-owning wrapper for a stable [`ngx_pool_t`] that is never reset before destruction.
 ///

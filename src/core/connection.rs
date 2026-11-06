@@ -8,8 +8,8 @@ use core::ffi::c_int;
 use core::marker::PhantomData;
 use core::ptr::{self, NonNull};
 
-use crate::core::{Buffer, BufferError, ChainError, ChainMut, Pool, Status};
 use crate::core::buffer::validate_native_buffer;
+use crate::core::{Buffer, BufferError, ChainError, ChainMut, Pool, Status};
 use crate::event::{EventError, EventRef};
 use crate::ffi::{
     NGX_AGAIN, NGX_ERROR, ngx_buf_t, ngx_chain_t, ngx_connection_local_sockaddr, ngx_connection_t,
@@ -537,6 +537,9 @@ impl<'callback> ConnectionRefMut<'callback> {
         if buffer.is_null() {
             return Ok(None);
         }
+        if !buffer.is_aligned() {
+            return Err(ConnectionError::Buffer(BufferError::MisalignedBuffer));
+        }
         validate_native_buffer(unsafe { &*buffer }).map_err(ConnectionError::Buffer)?;
         Ok(Some(unsafe { &mut *buffer }))
     }
@@ -545,7 +548,10 @@ impl<'callback> ConnectionRefMut<'callback> {
     ///
     /// # Safety
     /// The descriptor and backing storage must outlive its use by the connection.
-    pub unsafe fn replace_buffer(&mut self, mut buffer: impl Buffer) -> Result<(), ConnectionError> {
+    pub unsafe fn replace_buffer(
+        &mut self,
+        mut buffer: impl Buffer,
+    ) -> Result<(), ConnectionError> {
         unsafe { self.raw.as_mut().buffer = buffer.as_ngx_buf_mut() };
         Ok(())
     }
@@ -614,7 +620,11 @@ impl<'callback> BufferSwap<'_, 'callback, '_> {
     /// through the caller's synchronous scratch descriptor.
     pub fn copy_current_to_scratch(&mut self) -> Result<(), ConnectionError> {
         let current = unsafe { self.connection.raw.as_ref().buffer };
-        let current = NonNull::new(current).ok_or(ConnectionError::Buffer(BufferError::NullBuffer))?;
+        let current =
+            NonNull::new(current).ok_or(ConnectionError::Buffer(BufferError::NullBuffer))?;
+        if !current.as_ptr().is_aligned() {
+            return Err(ConnectionError::Buffer(BufferError::MisalignedBuffer));
+        }
         validate_native_buffer(unsafe { current.as_ref() }).map_err(ConnectionError::Buffer)?;
         unsafe { ptr::copy(current.as_ptr(), self.scratch.as_ptr(), 1) };
         Ok(())
@@ -722,6 +732,9 @@ fn connection_buffer<'callback>(
     let buffer = unsafe { connection.as_ref().buffer };
     if buffer.is_null() {
         return Ok(None);
+    }
+    if !buffer.is_aligned() {
+        return Err(ConnectionError::Buffer(BufferError::MisalignedBuffer));
     }
     validate_native_buffer(unsafe { &*buffer }).map_err(ConnectionError::Buffer)?;
     Ok(Some(unsafe { &*buffer }))

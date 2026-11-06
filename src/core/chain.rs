@@ -1,8 +1,8 @@
 use core::marker::PhantomData;
 use core::ptr::{self, NonNull};
 
-use crate::ffi::{ngx_alloc_chain_link, ngx_buf_t, ngx_chain_t};
 use crate::core::{Buffer, BufferError, Pool};
+use crate::ffi::{ngx_alloc_chain_link, ngx_buf_t, ngx_chain_t};
 
 impl<'pool> Pool<'pool> {
     /// Starts an empty pool-owned chain builder.
@@ -87,10 +87,6 @@ impl<'chain> ChainRef<'chain> {
     /// Returns whether the chain has no nginx-visible bytes.
     pub fn is_empty(self) -> Result<bool, ChainError> {
         self.len().map(|len| len == 0)
-    }
-
-    pub(crate) fn as_ptr(self) -> *mut ngx_chain_t {
-        self.head
     }
 }
 
@@ -224,6 +220,10 @@ impl<'chain> Iterator for ChainIter<'chain> {
             self.next = ptr::null_mut();
             return Some(Err(ChainError::NullBuffer));
         }
+        if !link.buf.is_aligned() {
+            self.next = ptr::null_mut();
+            return Some(Err(ChainError::Buffer(BufferError::MisalignedBuffer)));
+        }
         Some(Ok(unsafe { &*link.buf }))
     }
 }
@@ -248,6 +248,10 @@ impl<'chain> Iterator for ChainIterMut<'chain> {
         if link.buf.is_null() {
             self.next = ptr::null_mut();
             return Some(Err(ChainError::NullBuffer));
+        }
+        if !link.buf.is_aligned() {
+            self.next = ptr::null_mut();
+            return Some(Err(ChainError::Buffer(BufferError::MisalignedBuffer)));
         }
         Some(Ok(unsafe { &mut *link.buf }))
     }
@@ -295,6 +299,10 @@ impl<'pool> PoolChain<'pool> {
         Ok(())
     }
 
+    pub(crate) fn belongs_to(&self, pool: &Pool<'_>) -> bool {
+        ptr::eq(self.pool.as_ptr(), pool.as_ptr())
+    }
+
     /// Iterates over the current chain in append order.
     pub fn iter(&self) -> ChainIter<'_> {
         ChainIter { next: self.head_ptr(), _lifetime: PhantomData }
@@ -333,11 +341,6 @@ impl<'pool> PoolChain<'pool> {
     fn head_ptr(&self) -> *mut ngx_chain_t {
         self.head.map_or(ptr::null_mut(), NonNull::as_ptr)
     }
-
-    #[cfg(test)]
-    fn tail_ptr(&self) -> *mut ngx_chain_t {
-        self.tail.map_or(ptr::null_mut(), NonNull::as_ptr)
-    }
 }
 
 fn check_chain_ptr(chain: *mut ngx_chain_t) -> Result<(), ChainError> {
@@ -346,4 +349,3 @@ fn check_chain_ptr(chain: *mut ngx_chain_t) -> Result<(), ChainError> {
     }
     Ok(())
 }
-

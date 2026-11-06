@@ -8,7 +8,7 @@ use nginx_sys::{
     ngx_http_complex_value_t, ngx_http_module_t, ngx_http_send_response, ngx_int_t, ngx_module_t,
     ngx_str_t, ngx_uint_t,
 };
-use ngx::core::{BufferView, ChainRef, ModuleDescriptor, Status};
+use ngx::core::{Buffer, BufferView, ChainRef, ModuleDescriptor, Status};
 use ngx::http::subrequest::{SubRequestBuilder, SubRequestError};
 use ngx::http::{
     HTTPStatus, HttpModule, HttpModuleLocationConf, HttpModuleRequestContext, HttpPhase,

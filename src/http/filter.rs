@@ -365,7 +365,7 @@ mod tests {
         BodyFilter, HeaderFilter, HttpFilter, HttpFilterError, HttpFilterSlot,
         filter_postconfiguration, filter_preconfiguration,
     };
-    use crate::core::{ChainMut, ConnectionError, ModuleDescriptor, Pool, Status};
+    use crate::core::{Buffer, ChainMut, ConnectionError, ModuleDescriptor, Pool, Status};
     use crate::ffi::{
         NGX_HTTP_MODULE, NGX_LOG_EMERG, ngx_buf_t, ngx_chain_t, ngx_conf_t, ngx_connection_t,
         ngx_create_pool, ngx_cycle_t, ngx_destroy_pool, ngx_http_output_body_filter_pt,
@@ -632,12 +632,12 @@ mod tests {
         fn body_filter(_request: &mut RequestRefMut<'_>, chain: ChainMut<'_>) -> Self::BodyOutput {
             let expected = chain
                 .iter()
-                .map(|buffer| buffer.expect("input buffer").len().expect("input length"))
+                .map(|buffer| buffer.expect("input buffer").size().expect("input length"))
                 .sum::<usize>();
             let mut consumed = 0;
             for buffer in chain.into_iter_mut() {
-                let mut buffer = buffer.expect("input buffer");
-                let length = buffer.len().expect("input length");
+                let buffer = buffer.expect("input buffer");
+                let length = buffer.size().expect("input length");
                 buffer.consume(length).expect("consume input");
                 consumed += length;
             }
@@ -683,9 +683,9 @@ mod tests {
                         return Status::NGX_ABORT;
                     }
                 };
-                match buffer.is_empty() {
-                    Ok(true) => {}
-                    Ok(false) => has_data = true,
+                match buffer.size() {
+                    Ok(0) => {}
+                    Ok(_) => has_data = true,
                     Err(_) => {
                         NULL_CHAIN_BODY_MALFORMED_CALLS.fetch_add(1, Ordering::Relaxed);
                         return Status::NGX_ABORT;

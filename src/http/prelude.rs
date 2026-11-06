@@ -26,11 +26,10 @@ pub use crate::http::{
     UpstreamCallbackSlot, UpstreamConfiguration, UpstreamInitStatus, UpstreamInitialization,
     UpstreamInitialized, UpstreamPeerConnection, UpstreamPeerInit, UpstreamPeerInitRequest,
     UpstreamPeerInitStatus, UpstreamPeerSelection, UpstreamPeerState, UpstreamPort,
-    UpstreamServerConf, UpstreamState,   UpstreamUrlMessage,
-    UpstreamUrlParseError, UpstreamUrlViewError, add_phase_handler, add_variable,
-    add_variable_with_setter, exit_process, filter_postconfiguration, filter_preconfiguration,
-    init_process, install_upstream_initializer, phase_handler_postconfiguration, postconfiguration,
-    preconfiguration,
+    UpstreamServerConf, UpstreamState, UpstreamUrlMessage, UpstreamUrlParseError,
+    UpstreamUrlViewError, add_phase_handler, add_variable, add_variable_with_setter, exit_process,
+    filter_postconfiguration, filter_preconfiguration, init_process, install_upstream_initializer,
+    phase_handler_postconfiguration, postconfiguration, preconfiguration,
 };
 #[cfg(nginx1_29_8)]
 pub use crate::http::{HttpHeadersInBuilder, HttpHeadersOutBuilder};

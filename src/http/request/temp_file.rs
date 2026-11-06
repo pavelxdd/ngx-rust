@@ -201,7 +201,7 @@ impl RequestTempFileHandle {
             match buffer.kind()? {
                 BufferView::Memory(bytes) => {
                     let (temp_file, start, end) =
-                        self.append_memory(buffer.as_ptr(), bytes.len())?;
+                        self.append_memory(buffer.as_ngx_buf(), bytes.len())?;
                     self.append_temp_file_buffer(
                         &mut output,
                         pool,
@@ -212,13 +212,17 @@ impl RequestTempFileHandle {
                     )?;
                 }
                 BufferView::File(file) => {
-                    output.append(pool.file_buffer_slice(
-                        buffer,
-                        0..file.len(),
-                        buffer.flags(),
-                    )?)?;
+                    unsafe {
+                        output.append(pool.file_buffer_slice(
+                            buffer,
+                            0..file.len(),
+                            buffer.flags(),
+                        )?)
+                    }?;
                 }
-                BufferView::Control(_) => output.append(pool.control_buffer(buffer.flags())?)?,
+                BufferView::Control(_) => {
+                    unsafe { output.append(pool.control_buffer(buffer.flags())?) }?
+                }
             }
         }
 
@@ -284,20 +288,23 @@ impl RequestTempFileHandle {
     pub fn append_buffer<'request>(
         &mut self,
         request: &'request RequestRefMut<'_>,
-        input: BufferRef<'_>,
+        input: &impl Buffer,
         flags: BufferFlags,
     ) -> Result<PoolChain<'request>, RequestTempFileError> {
         let pool = self.checked_pool(request)?;
         let mut output = pool.chain();
         match input.kind()? {
             BufferView::Memory(bytes) => {
-                let (temp_file, start, end) = self.append_memory(input.as_ptr(), bytes.len())?;
+                let (temp_file, start, end) =
+                    self.append_memory(input.as_ngx_buf(), bytes.len())?;
                 self.append_temp_file_buffer(&mut output, &pool, temp_file, start, end, flags)?;
             }
             BufferView::File(file) => {
-                output.append(pool.retain_file_buffer_slice(input, 0..file.len(), flags)?)?;
+                unsafe {
+                    output.append(pool.retain_file_buffer_slice(input, 0..file.len(), flags)?)
+                }?;
             }
-            BufferView::Control(_) => output.append(pool.control_buffer(flags)?)?,
+            BufferView::Control(_) => unsafe { output.append(pool.control_buffer(flags)?) }?,
         }
         Ok(output)
     }
@@ -349,8 +356,8 @@ impl RequestTempFileHandle {
             buffer.set_last_in_chain(u32::from(flags.last_in_chain));
         }
 
-        let buffer = unsafe { pool.owned_buffer_from_raw(buffer) };
-        output.append(buffer)?;
+        let buffer = MemoryBuffer::from_ngx_buf(buffer.as_ptr());
+        unsafe { output.append(buffer) }?;
         Ok(())
     }
 

@@ -615,13 +615,13 @@ fn chain_ref(chain: PoolChain<'_>) -> ChainRef<'_> {
 }
 
 #[cfg(feature = "test-link")]
-fn pool_file_buffer<'pool>(
-    pool: &Pool<'pool>,
+fn pool_file_buffer(
+    pool: &Pool<'_>,
     fd: ngx_fd_t,
     start: off_t,
     end: off_t,
     flags: BufferFlags,
-) -> (PoolBuffer<'pool>, NonNull<ngx_file_t>) {
+) -> (MemoryBuffer, NonNull<ngx_file_t>) {
     let mut file = NonNull::new(pool.calloc_type::<ngx_file_t>()).unwrap();
     let mut buffer = NonNull::new(pool.calloc_type::<ngx_buf_t>()).unwrap();
     unsafe {
@@ -636,7 +636,7 @@ fn pool_file_buffer<'pool>(
         native.set_last_buf(u32::from(flags.last_buf));
         native.set_last_in_chain(u32::from(flags.last_in_chain));
     }
-    (unsafe { pool.owned_buffer_from_raw(buffer) }, file)
+    (MemoryBuffer::from_ngx_buf(buffer.as_ptr()), file)
 }
 
 #[cfg(feature = "test-link")]
@@ -1861,7 +1861,7 @@ fn request_pool_prepares_a_body_before_output_headers_commit() {
     let pool = request.pool().unwrap();
     let buffer = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
     let mut body = pool.chain();
-    body.append(buffer).unwrap();
+    unsafe { body.append(buffer) }.unwrap();
     let body = body.into_raw();
 
     {
@@ -1918,10 +1918,7 @@ fn request_body_builder_copies_bytes_and_replaces_framing() {
     let request = request_from(&mut raw);
     let body = request.request_body().unwrap().unwrap();
     assert_eq!(body.size().unwrap().bytes(), 3);
-    assert_eq!(
-        body.chain().unwrap().iter().next().unwrap().unwrap().bytes(),
-        Ok(Some(b"new".as_slice()))
-    );
+    assert_eq!(body.chain().unwrap().iter().next().unwrap().unwrap().as_bytes(), b"new".as_slice());
     let headers = request.headers_in().unwrap();
     let fields = headers
         .iter()
@@ -2028,8 +2025,8 @@ fn input_header_builder_publishes_replacement_body_and_framing_together() {
     let body = request.request_body().unwrap().unwrap();
     assert_eq!(body.size().unwrap().bytes(), 11);
     assert_eq!(
-        body.chain().unwrap().iter().next().unwrap().unwrap().bytes(),
-        Ok(Some(b"replacement".as_slice()))
+        body.chain().unwrap().iter().next().unwrap().unwrap().as_bytes(),
+        b"replacement".as_slice()
     );
     let headers = request.headers_in().unwrap();
     let fields = headers
@@ -2139,8 +2136,8 @@ fn input_header_builder_publishes_body_with_an_empty_header_list() {
     let body = request.request_body().unwrap().unwrap();
     assert_eq!(body.size().unwrap().bytes(), 4);
     assert_eq!(
-        body.chain().unwrap().iter().next().unwrap().unwrap().bytes(),
-        Ok(Some(b"body".as_slice()))
+        body.chain().unwrap().iter().next().unwrap().unwrap().as_bytes(),
+        b"body".as_slice()
     );
 }
 
@@ -2298,7 +2295,7 @@ fn temp_file_writer_reuses_stable_metadata_with_clean_pool_cleanup() {
             let request = request_from(&mut fixture.request);
             let pool = request.pool().unwrap();
             let mut input = pool.chain();
-            input.append(pool.copy_buffer(b"body", flags).unwrap()).unwrap();
+            unsafe { input.append(pool.copy_buffer(b"body", flags).unwrap()) }.unwrap();
             let mut writer = request.temp_file().unwrap();
 
             assert!(writer.state.temp_file.is_none());
@@ -2354,11 +2351,14 @@ fn temp_file_writer_keeps_zero_and_multiple_append_offsets() {
     let request = request_from(&mut fixture.request);
     let pool = request.pool().unwrap();
     let mut empty_input = pool.chain();
-    empty_input.append(pool.temporary_buffer(1, zero_flags).unwrap()).unwrap();
+    let mut empty = pool.create_buffer(1).unwrap();
+    empty.set_flags(zero_flags);
+    unsafe { empty_input.append(empty) }.unwrap();
     let mut first_input = pool.chain();
-    first_input.append(pool.copy_buffer(b"one", BufferFlags::default()).unwrap()).unwrap();
+    unsafe { first_input.append(pool.copy_buffer(b"one", BufferFlags::default()).unwrap()) }
+        .unwrap();
     let mut second_input = pool.chain();
-    second_input.append(pool.copy_buffer(b"two", second_flags).unwrap()).unwrap();
+    unsafe { second_input.append(pool.copy_buffer(b"two", second_flags).unwrap()) }.unwrap();
     let mut writer = request.temp_file().unwrap();
 
     let empty_output = writer.append(chain_ref(empty_input)).unwrap();
@@ -2396,8 +2396,7 @@ fn temp_file_state_reuses_one_pool_owned_handle_across_callback_scopes() {
         RequestRefMut::with_raw(&raw mut *fixture.request, |request| {
             let pool = request.pool().unwrap();
             let input = pool.copy_buffer(b"one", BufferFlags::default()).unwrap();
-            let output =
-                state.as_mut().append_buffer(&request, input.view(), input.view().flags()).unwrap();
+            let output = state.as_mut().append_buffer(&request, &input, input.flags()).unwrap();
             let file = output.iter().next().unwrap().unwrap().file().unwrap().unwrap();
             (file.start(), file.end())
         })
@@ -2408,8 +2407,7 @@ fn temp_file_state_reuses_one_pool_owned_handle_across_callback_scopes() {
         RequestRefMut::with_raw(&raw mut *fixture.request, |request| {
             let pool = request.pool().unwrap();
             let input = pool.copy_buffer(b"two", BufferFlags::default()).unwrap();
-            let output =
-                state.as_mut().append_buffer(&request, input.view(), input.view().flags()).unwrap();
+            let output = state.as_mut().append_buffer(&request, &input, input.flags()).unwrap();
             let file = output.iter().next().unwrap().unwrap().file().unwrap().unwrap();
             (file.start(), file.end())
         })
@@ -2444,7 +2442,7 @@ fn temp_file_state_release_closes_and_disarms_the_pool_cleanup() {
         RequestRefMut::with_raw(&raw mut *fixture.request, |request| {
             let pool = request.pool().unwrap();
             let input = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
-            state.append_buffer(&request, input.view(), input.view().flags()).unwrap();
+            state.append_buffer(&request, &input, input.flags()).unwrap();
         })
     }
     .unwrap();
@@ -2488,7 +2486,7 @@ fn temp_file_state_release_reports_a_missing_pool_cleanup() {
         RequestRefMut::with_raw(&raw mut *fixture.request, |request| {
             let pool = request.pool().unwrap();
             let input = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
-            state.append_buffer(&request, input.view(), input.view().flags()).unwrap();
+            state.append_buffer(&request, &input, input.flags()).unwrap();
         })
     }
     .unwrap();
@@ -2540,7 +2538,7 @@ fn temp_file_state_copies_a_short_buffer_reborrow() {
         RequestRefMut::with_raw(&raw mut *fixture.request, |request| {
             let pool = request.pool().unwrap();
             let input = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
-            let output = state.append_buffer(&request, input.view(), input.view().flags()).unwrap();
+            let output = state.append_buffer(&request, &input, input.flags()).unwrap();
             let file = output.iter().next().unwrap().unwrap().file().unwrap().unwrap();
             (file.start(), file.end())
         })
@@ -2565,7 +2563,7 @@ fn temp_file_state_rejects_a_different_request() {
     let input = pool.copy_buffer(b"body", BufferFlags::default()).unwrap();
 
     assert!(matches!(
-        state.append_buffer(&request, input.view(), input.view().flags()),
+        state.append_buffer(&request, &input, input.flags()),
         Err(RequestTempFileError::ForeignRequest)
     ));
     assert!(state.temp_file.is_none());
@@ -2585,7 +2583,7 @@ fn temp_file_handle_rejects_stale_generation_before_pool_state_access() {
     let input = pool.control_buffer(BufferFlags::default()).unwrap();
 
     assert!(matches!(
-        state.append_buffer(&request, input.view(), input.view().flags()),
+        state.append_buffer(&request, &input, input.flags()),
         Err(RequestTempFileError::ForeignRequest)
     ));
 }
@@ -2613,7 +2611,7 @@ fn temp_file_handle_rejects_replaced_owner_at_the_same_request_addresses() {
     let input = pool.control_buffer(BufferFlags::default()).unwrap();
 
     assert!(matches!(
-        state.append_buffer(&request, input.view(), input.view().flags()),
+        state.append_buffer(&request, &input, input.flags()),
         Err(RequestTempFileError::ForeignRequest)
     ));
 }
@@ -2630,10 +2628,10 @@ fn temp_file_writer_copies_file_and_mixed_chain_segments_in_order() {
     let pool = request.pool().unwrap();
     let (file, source_file) = pool_file_buffer(&pool, 47, 7, 10, file_flags);
     let mut input = pool.chain();
-    input.append(pool.copy_buffer(b"left", memory_flags).unwrap()).unwrap();
-    input.append(file).unwrap();
-    input.append(pool.control_buffer(control_flags).unwrap()).unwrap();
-    input.append(pool.copy_buffer(b"right", last_flags).unwrap()).unwrap();
+    unsafe { input.append(pool.copy_buffer(b"left", memory_flags).unwrap()) }.unwrap();
+    unsafe { input.append(file) }.unwrap();
+    unsafe { input.append(pool.control_buffer(control_flags).unwrap()) }.unwrap();
+    unsafe { input.append(pool.copy_buffer(b"right", last_flags).unwrap()) }.unwrap();
     let mut writer = request.temp_file().unwrap();
 
     let output = writer.append(chain_ref(input)).unwrap();
@@ -2678,7 +2676,7 @@ fn temp_file_writer_copies_file_ranges_without_creating_a_temp_file() {
     let pool = request.pool().unwrap();
     let (file, source_file) = pool_file_buffer(&pool, 49, 11, 16, flags);
     let mut input = pool.chain();
-    input.append(file).unwrap();
+    unsafe { input.append(file) }.unwrap();
     let mut writer = request.temp_file().unwrap();
 
     let output = writer.append(chain_ref(input)).unwrap();
@@ -2699,8 +2697,8 @@ fn temp_file_writer_validates_all_input_before_writing() {
     let pool = request.pool().unwrap();
     let (invalid, _) = pool_file_buffer(&pool, 48, -1, 1, BufferFlags::default());
     let mut input = pool.chain();
-    input.append(pool.copy_buffer(b"valid", BufferFlags::default()).unwrap()).unwrap();
-    input.append(invalid).unwrap();
+    unsafe { input.append(pool.copy_buffer(b"valid", BufferFlags::default()).unwrap()) }.unwrap();
+    unsafe { input.append(invalid) }.unwrap();
     let mut writer = request.temp_file().unwrap();
 
     assert!(matches!(
@@ -2728,7 +2726,8 @@ fn temp_file_writer_reports_numeric_short_open_and_write_failures() {
         let request = request_from(&mut fixture.request);
         let pool = request.pool().unwrap();
         let mut input = pool.chain();
-        input.append(pool.copy_buffer(b"body", BufferFlags::default()).unwrap()).unwrap();
+        unsafe { input.append(pool.copy_buffer(b"body", BufferFlags::default()).unwrap()) }
+            .unwrap();
         let mut writer = request.temp_file().unwrap();
 
         assert!(matches!(writer.append(chain_ref(input)), Err(RequestTempFileError::Write)));
@@ -2743,9 +2742,13 @@ fn temp_file_writer_reports_numeric_short_open_and_write_failures() {
         let request = request_from(&mut fixture.request);
         let pool = request.pool().unwrap();
         let mut first_input = pool.chain();
-        first_input.append(pool.copy_buffer(b"first", BufferFlags::default()).unwrap()).unwrap();
+        unsafe { first_input.append(pool.copy_buffer(b"first", BufferFlags::default()).unwrap()) }
+            .unwrap();
         let mut second_input = pool.chain();
-        second_input.append(pool.copy_buffer(b"second", BufferFlags::default()).unwrap()).unwrap();
+        unsafe {
+            second_input.append(pool.copy_buffer(b"second", BufferFlags::default()).unwrap())
+        }
+        .unwrap();
         let mut writer = request.temp_file().unwrap();
         writer.append(chain_ref(first_input)).unwrap();
         let mut temp = writer.state.temp_file.unwrap();
@@ -2771,7 +2774,8 @@ fn temp_file_writer_allocation_failures_do_not_return_partial_output() {
         let request = request_from(&mut fixture.request);
         let pool = request.pool().unwrap();
         let mut input = pool.chain();
-        input.append(pool.copy_buffer(b"body", BufferFlags::default()).unwrap()).unwrap();
+        unsafe { input.append(pool.copy_buffer(b"body", BufferFlags::default()).unwrap()) }
+            .unwrap();
         let input = chain_ref(input);
         unsafe {
             (*fixture.pool.raw).max = 0;
@@ -2802,9 +2806,13 @@ fn temp_file_writer_skips_unpublished_memory_after_output_allocation_failure() {
         let request = request_from(&mut fixture.request);
         let pool = request.pool().unwrap();
         let mut first_input = pool.chain();
-        first_input.append(pool.copy_buffer(b"first", BufferFlags::default()).unwrap()).unwrap();
+        unsafe { first_input.append(pool.copy_buffer(b"first", BufferFlags::default()).unwrap()) }
+            .unwrap();
         let mut second_input = pool.chain();
-        second_input.append(pool.copy_buffer(b"second", BufferFlags::default()).unwrap()).unwrap();
+        unsafe {
+            second_input.append(pool.copy_buffer(b"second", BufferFlags::default()).unwrap())
+        }
+        .unwrap();
         let mut writer = request.temp_file().unwrap();
 
         unsafe {
@@ -4020,15 +4028,16 @@ fn request_body_builder_keeps_file_metadata_and_control_links() {
     source.file_pos = 2;
     source.file_last = 8;
     source.set_in_file(1);
-    let source = unsafe { BufferRef::from_raw(&raw const source) }.unwrap();
+    let source = &source;
     let pool = unsafe { Pool::from_raw(owner.raw) }.unwrap();
-    let file_buffer = pool.file_buffer_slice(source, 1..4, BufferFlags::default()).unwrap();
+    let file_buffer =
+        unsafe { pool.file_buffer_slice(source, 1..4, BufferFlags::default()) }.unwrap();
 
     {
         let mut request = request_from(&mut raw);
         let mut body = request.request_body_builder().unwrap();
         body.append_copy(b"ab").unwrap();
-        body.append(file_buffer).unwrap();
+        unsafe { body.append(file_buffer) }.unwrap();
         body.append_control(BufferFlags { sync: true, ..BufferFlags::default() }).unwrap();
         body.commit().unwrap();
     }
@@ -4037,7 +4046,7 @@ fn request_body_builder_keeps_file_metadata_and_control_links() {
     let body = request.request_body().unwrap().unwrap();
     assert_eq!(body.size().unwrap(), RequestBodySize { bytes: 5, saturated: false });
     let mut chain = body.chain().unwrap().iter();
-    assert_eq!(chain.next().unwrap().unwrap().bytes(), Ok(Some(b"ab".as_slice())));
+    assert_eq!(chain.next().unwrap().unwrap().as_bytes(), b"ab".as_slice());
     match chain.next().unwrap().unwrap().kind().unwrap() {
         BufferView::File(view) => {
             assert_eq!(view.start(), 3);
@@ -4055,7 +4064,7 @@ fn request_body_builder_keeps_file_metadata_and_control_links() {
 
 #[cfg(feature = "test-link")]
 #[test]
-fn request_body_builder_rejects_a_buffer_from_another_pool_before_publication() {
+fn request_body_builder_accepts_native_storage_that_outlives_the_request() {
     let owner = TestPool::new();
     let foreign_owner = TestPool::new();
     let mut raw = zeroed_request();
@@ -4070,13 +4079,14 @@ fn request_body_builder_rejects_a_buffer_from_another_pool_before_publication() 
     let result = {
         let mut request = request_from(&mut raw);
         let mut body = request.request_body_builder().unwrap();
-        body.append(foreign_buffer)
+        unsafe { body.append(foreign_buffer) }.unwrap();
+        body.commit()
     };
-    assert_eq!(
-        result,
-        Err(RequestBodyBuildError::Chain(ChainError::Buffer(BufferError::ForeignPool)))
-    );
-    assert!(raw.request_body.is_null());
+    assert_eq!(result, Ok(()));
+    let request = request_from(&mut raw);
+    let body = request.request_body().unwrap().unwrap();
+    assert_eq!(body.size().unwrap().bytes(), 7);
+    assert_eq!(body.chain().unwrap().iter().next().unwrap().unwrap().as_bytes(), b"foreign");
 }
 
 #[cfg(feature = "test-link")]

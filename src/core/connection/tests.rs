@@ -27,7 +27,7 @@ use super::{
 };
 #[cfg(nginx1_23_2)]
 use crate::core::ProxyProtocolTlvLookup;
-use crate::core::{Buffer, BufferError, BufferFlags, ChainMut, Pool};
+use crate::core::{Buffer, BufferError, BufferFlags, ChainMut};
 #[cfg(feature = "test-link")]
 use crate::ffi::ngx_proxy_protocol_read;
 #[cfg(nginx1_23_2)]
@@ -654,7 +654,10 @@ fn input_buffer_views_distinguish_absent_invalid_and_control_buffers() {
     {
         let connection_view =
             unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
-        assert!(matches!(connection_view.buffer(), Err(ConnectionError::Buffer(BufferError::InvalidMemoryRange))));
+        assert!(matches!(
+            connection_view.buffer(),
+            Err(ConnectionError::Buffer(BufferError::InvalidMemoryRange))
+        ));
     }
 
     let mut control: ngx_buf_t = unsafe { mem::zeroed() };
@@ -674,7 +677,10 @@ fn input_buffer_views_distinguish_absent_invalid_and_control_buffers() {
     reversed_end.set_temporary(1);
     let connection_view =
         unsafe { ConnectionRef::from_raw(raw_connection(&mut connection)) }.unwrap();
-    assert!(matches!(connection_view.buffer(), Err(ConnectionError::Buffer(BufferError::InvalidMemoryRange))));
+    assert!(matches!(
+        connection_view.buffer(),
+        Err(ConnectionError::Buffer(BufferError::InvalidMemoryRange))
+    ));
 }
 
 #[test]
@@ -780,10 +786,6 @@ impl TestPool {
         assert!(!raw.is_null());
         Self { raw, _log: log }
     }
-
-    fn handle(&self) -> Pool<'_> {
-        unsafe { Pool::from_raw(self.raw) }.unwrap()
-    }
 }
 
 #[cfg(feature = "test-link")]
@@ -810,7 +812,6 @@ fn permanent_replacement_installs_the_native_descriptor() {
 
     unsafe { connection_view.replace_buffer(replacement) }.unwrap();
     assert_eq!(connection.buffer, replacement_ptr);
-
 }
 
 #[cfg(feature = "test-link")]

@@ -132,7 +132,7 @@ impl RequestBodyRef<'_> {
 
         for buffer in self.chain()?.iter() {
             let buffer = buffer?;
-            let length = buffer.len().map_err(ChainError::from)?;
+            let length = buffer.size().map_err(ChainError::from)?;
             if let Some(total) = bytes.checked_add(length) {
                 bytes = total;
             } else {
@@ -306,14 +306,17 @@ impl<'callback> RequestBodyCandidate<'callback> {
         }
 
         let buffer = self.pool.copy_buffer(bytes, BufferFlags::default())?;
-        self.append(buffer)
+        unsafe { self.append(buffer) }
     }
 
-    /// Appends one request-pool-owned buffer to the body candidate.
-    pub fn append(&mut self, buffer: PoolBuffer<'callback>) -> Result<(), RequestBodyBuildError> {
-        let length = buffer.view().len()?;
+    /// Appends one native buffer to the body candidate.
+    ///
+    /// # Safety
+    /// The descriptor and backing storage must remain valid until the request releases its body.
+    pub unsafe fn append(&mut self, buffer: impl Buffer) -> Result<(), RequestBodyBuildError> {
+        let length = buffer.size()?;
         let total = self.length.checked_add(length).ok_or(RequestBodyBuildError::LengthOverflow)?;
-        self.chain.append(buffer)?;
+        unsafe { self.chain.append(buffer) }?;
         self.length = total;
         Ok(())
     }
@@ -321,7 +324,7 @@ impl<'callback> RequestBodyCandidate<'callback> {
     /// Appends a zero-size control buffer to the request-pool body candidate.
     pub fn append_control(&mut self, flags: BufferFlags) -> Result<(), RequestBodyBuildError> {
         let buffer = self.pool.control_buffer(flags)?;
-        self.append(buffer)
+        unsafe { self.append(buffer) }
     }
 
     pub(super) fn into_raw(
@@ -360,9 +363,12 @@ impl<'request, 'callback> RequestBodyBuilder<'request, 'callback> {
         self.body.append_copy(bytes)
     }
 
-    /// Appends one request-pool-owned buffer to the body candidate.
-    pub fn append(&mut self, buffer: PoolBuffer<'request>) -> Result<(), RequestBodyBuildError> {
-        self.body.append(buffer)
+    /// Appends one native buffer to the body candidate.
+    ///
+    /// # Safety
+    /// The descriptor and backing storage must remain valid until the request releases its body.
+    pub unsafe fn append(&mut self, buffer: impl Buffer) -> Result<(), RequestBodyBuildError> {
+        unsafe { self.body.append(buffer) }
     }
 
     /// Appends a zero-size control buffer to the body candidate.

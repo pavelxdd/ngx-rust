@@ -4,8 +4,8 @@ use core::ops::Range;
 use core::ptr::{self, NonNull};
 use core::slice;
 
-use crate::ffi::*;
 use crate::core::Pool;
+use crate::ffi::*;
 use core::mem;
 
 /// The `Buffer` trait provides methods for working with an nginx buffer (`ngx_buf_t`).
@@ -86,6 +86,7 @@ pub trait Buffer {
     /// Returns the nginx-visible size, including file-backed data.
     fn size(&self) -> Result<usize, BufferError> {
         let buffer = unsafe { &*self.as_ngx_buf() };
+        validate_native_buffer(buffer)?;
         if in_memory(buffer) {
             return Ok(self.len());
         }
@@ -95,6 +96,7 @@ pub trait Buffer {
     /// Classifies memory, file, and control-only output.
     fn kind(&self) -> Result<BufferView<'_>, BufferError> {
         let buffer = unsafe { &*self.as_ngx_buf() };
+        validate_native_buffer(buffer)?;
         if in_memory(buffer) && !self.is_empty() {
             return Ok(BufferView::Memory(self.as_bytes()));
         }
@@ -129,7 +131,6 @@ pub trait Buffer {
         }
         Ok(())
     }
-
 }
 
 /// The `MutableBuffer` trait extends the `Buffer` trait and provides methods for working with a
@@ -250,6 +251,7 @@ pub enum BufferError {
     ForeignPool,
     /// Nginx could not allocate buffer storage.
     Allocation,
+    /// A file descriptor could not be retained independently.
     FileDescriptor,
 }
 
@@ -269,7 +271,9 @@ struct RetainedFile {
 
 #[cfg(unix)]
 impl Drop for RetainedFile {
-    fn drop(&mut self) { unsafe { libc::close(self.file.fd) }; }
+    fn drop(&mut self) {
+        unsafe { libc::close(self.file.fd) };
+    }
 }
 
 /// Control flags copied to newly built buffers.
@@ -364,10 +368,13 @@ pub enum BufferView<'buffer> {
     Control(ControlView),
 }
 
-
 impl Buffer for ngx_buf_t {
-    fn as_ngx_buf(&self) -> *const ngx_buf_t { self }
-    fn as_ngx_buf_mut(&mut self) -> *mut ngx_buf_t { self }
+    fn as_ngx_buf(&self) -> *const ngx_buf_t {
+        self
+    }
+    fn as_ngx_buf_mut(&mut self) -> *mut ngx_buf_t {
+        self
+    }
 }
 impl<'pool> Pool<'pool> {
     /// Copies bytes into a pool-owned temporary buffer.
@@ -396,7 +403,7 @@ impl<'pool> Pool<'pool> {
         self.reference_memory(bytes.as_ptr(), bytes.len(), flags)
     }
 
-    /// Builds a bounded memory slice, copying partial ranges.
+    /// Builds a bounded memory or file slice, copying partial memory ranges.
     ///
     /// # Safety
     /// The source storage must remain valid for the destination pool lifetime.
@@ -406,12 +413,15 @@ impl<'pool> Pool<'pool> {
         range: Range<usize>,
         flags: BufferFlags,
     ) -> Result<MemoryBuffer, BufferError> {
-        let len = source.len();
+        let len = source.size()?;
         if range.start > range.end || range.end > len {
             return Err(BufferError::OutOfRange);
         }
         if range.is_empty() {
             return self.control_buffer(flags);
+        }
+        if !in_memory(unsafe { &*source.as_ngx_buf() }) {
+            return unsafe { self.file_buffer_slice(source, range, flags) };
         }
         let bytes = source.as_bytes();
         if range.start == 0 && range.end == len {
@@ -420,7 +430,7 @@ impl<'pool> Pool<'pool> {
         self.copy_buffer(&bytes[range], flags)
     }
 
-    /// Duplicates file metadata and builds a bounded file slice.
+    /// Builds a bounded slice borrowing the source file metadata.
     ///
     /// # Safety
     /// The source file must remain valid for the destination pool lifetime.
@@ -551,14 +561,9 @@ impl<'pool> Pool<'pool> {
         let end = off_t::try_from(range.end).map_err(|_| BufferError::Overflow)?;
         let file_start = file.start.checked_add(start).ok_or(BufferError::Overflow)?;
         let file_end = file.start.checked_add(end).ok_or(BufferError::Overflow)?;
-
-        let copied_file =
-            NonNull::new(self.alloc_type::<ngx_file_t>()).ok_or(BufferError::Allocation)?;
-        unsafe { copied_file.as_ptr().write(file.file.as_ptr().read()) };
-
         let mut raw = self.empty_buffer()?;
         unsafe {
-            raw.as_mut().file = copied_file.as_ptr();
+            raw.as_mut().file = file.file.as_ptr();
             raw.as_mut().file_pos = file_start;
             raw.as_mut().file_last = file_end;
             raw.as_mut().set_in_file(1);
@@ -573,7 +578,6 @@ impl<'pool> Pool<'pool> {
         flags.write(unsafe { raw.as_mut() });
         Ok(MemoryBuffer::from_ngx_buf(raw.as_ptr()))
     }
-
 
     fn reference_memory(
         &self,
@@ -632,7 +636,9 @@ fn file_descriptor_directio(fd: ngx_fd_t) -> Result<bool, BufferError> {
 #[cfg(unix)]
 fn duplicate_file_descriptor(fd: ngx_fd_t) -> Result<ngx_fd_t, BufferError> {
     let retained = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
-    if retained == -1 { return Err(BufferError::FileDescriptor); }
+    if retained == -1 {
+        return Err(BufferError::FileDescriptor);
+    }
     Ok(retained)
 }
 
@@ -645,7 +651,8 @@ pub(crate) fn validate_native_buffer(buffer: &ngx_buf_t) -> Result<(), BufferErr
     if in_memory(buffer) {
         let pos = NonNull::new(buffer.pos).ok_or(BufferError::InvalidMemoryRange)?;
         let last = NonNull::new(buffer.last).ok_or(BufferError::InvalidMemoryRange)?;
-        let len = (last.as_ptr() as usize).checked_sub(pos.as_ptr() as usize)
+        let len = (last.as_ptr() as usize)
+            .checked_sub(pos.as_ptr() as usize)
             .ok_or(BufferError::InvalidMemoryRange)?;
         if len > isize::MAX as usize {
             return Err(BufferError::InvalidMemoryRange);
@@ -684,13 +691,17 @@ fn file_range(buffer: &ngx_buf_t) -> Result<Option<FileView<'_>>, BufferError> {
     }))
 }
 
+#[cfg(all(test, feature = "test-link", unix))]
+#[path = "buffer/tests.rs"]
+mod retained_file_tests;
+
 #[cfg(test)]
 mod tests {
     extern crate alloc;
     extern crate std;
 
     use super::*;
-    use crate::core::{ChainMut, ChainRef};
+    use crate::core::{ChainError, ChainMut, ChainRef};
 
     /// Builds the shape `ngx_create_temp_buf` produces: `pos == last == start`.
     fn temp_buf(storage: &mut [u8], raw: &mut ngx_buf_t) -> TemporaryBuffer {
@@ -749,8 +760,8 @@ mod tests {
         raw_file.file_last = 110;
         raw_file.set_in_file(1);
         let sliced = unsafe { pool.buffer_slice(&raw_file, 2..7, BufferFlags::default()) }.unwrap();
-        let view = sliced.as_ngx_buf().file().unwrap().unwrap();
-        assert_ne!(view.file_ptr(), &raw mut file);
+        let view = sliced.file().unwrap().unwrap();
+        assert_eq!(view.file_ptr(), &raw mut file);
         assert_eq!((view.start(), view.end()), (102, 107));
     }
 
@@ -760,9 +771,11 @@ mod tests {
         let owner = TestPool::new();
         let pool = owner.handle();
         let mut output = pool.chain();
-        unsafe { output.append(pool.copy_buffer(b"head", BufferFlags::default()).unwrap()) }.unwrap();
+        unsafe { output.append(pool.copy_buffer(b"head", BufferFlags::default()).unwrap()) }
+            .unwrap();
         let mut candidate = pool.chain();
-        unsafe { candidate.append(pool.copy_buffer(b"body", BufferFlags::default()).unwrap()) }.unwrap();
+        unsafe { candidate.append(pool.copy_buffer(b"body", BufferFlags::default()).unwrap()) }
+            .unwrap();
         output.append_chain(&mut candidate).unwrap();
         assert!(candidate.iter().next().is_none());
         let values: alloc::vec::Vec<_> = output.iter().map(|b| b.unwrap().as_bytes()).collect();
@@ -771,8 +784,14 @@ mod tests {
         let foreign_owner = TestPool::new();
         let foreign_pool = foreign_owner.handle();
         let mut foreign = foreign_pool.chain();
-        unsafe { foreign.append(foreign_pool.copy_buffer(b"foreign", BufferFlags::default()).unwrap()) }.unwrap();
-        assert_eq!(output.append_chain(&mut foreign), Err(ChainError::Buffer(BufferError::ForeignPool)));
+        unsafe {
+            foreign.append(foreign_pool.copy_buffer(b"foreign", BufferFlags::default()).unwrap())
+        }
+        .unwrap();
+        assert_eq!(
+            output.append_chain(&mut foreign),
+            Err(ChainError::Buffer(BufferError::ForeignPool))
+        );
         assert_eq!(foreign.iter().count(), 1);
         assert_eq!(output.iter().count(), 2);
     }
@@ -813,14 +832,19 @@ mod tests {
         let mut suffix = ngx_chain_t { buf: &raw mut second, next: ptr::null_mut() };
         let combined = unsafe { ChainMut::from_raw(&raw mut prefix) }.unwrap();
         let appended = unsafe { ChainMut::from_raw(&raw mut suffix) }.unwrap();
-        let count = unsafe { combined.append_for_output_filter(appended, |chain| chain.iter().count()) }.unwrap();
+        let count =
+            unsafe { combined.append_for_output_filter(appended, |chain| chain.iter().count()) }
+                .unwrap();
         assert_eq!(count, 2);
         assert_eq!(prefix.next, &raw mut suffix);
         prefix.next = ptr::null_mut();
         let result = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
             let combined = unsafe { ChainMut::from_raw(&raw mut prefix) }.unwrap();
             let appended = unsafe { ChainMut::from_raw(&raw mut suffix) }.unwrap();
-            unsafe { combined.append_for_output_filter(appended, |_| panic!("test callback panic")) }.unwrap();
+            unsafe {
+                combined.append_for_output_filter(appended, |_| panic!("test callback panic"))
+            }
+            .unwrap();
         }));
         assert!(result.is_err());
         assert_eq!(prefix.next, &raw mut suffix);
@@ -854,7 +878,8 @@ mod tests {
         let mut tail = ngx_chain_t { buf: &raw mut second, next: ptr::null_mut() };
         let mut head = ngx_chain_t { buf: &raw mut first, next: &raw mut tail };
         let chain = unsafe { ChainRef::from_raw(&raw mut head) }.unwrap();
-        let flags: alloc::vec::Vec<_> = chain.iter().map(|buffer| buffer.unwrap().flags()).collect();
+        let flags: alloc::vec::Vec<_> =
+            chain.iter().map(|buffer| buffer.unwrap().flags()).collect();
         assert_eq!(flags.len(), 2);
         assert!(flags[0].flush);
         assert!(flags[1].sync);
