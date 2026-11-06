@@ -243,6 +243,27 @@ impl Request {
             .unwrap_or_default()
     }
 
+    /// Seconds since the Unix epoch when nginx created the request.
+    pub fn start_sec(&self) -> time_t {
+        self.0.start_sec
+    }
+
+    /// Millisecond component of the request creation time.
+    pub fn start_msec(&self) -> ngx_msec_t {
+        self.0.start_msec
+    }
+
+    /// Bytes received for the request line, headers, and body parsed so far.
+    pub fn request_length(&self) -> off_t {
+        self.0.request_length
+    }
+
+    /// Current value of the client connection's sent-byte counter.
+    pub fn bytes_sent(&self) -> off_t {
+        // SAFETY: nginx assigns a connection before creating a valid HTTP request.
+        unsafe { (*self.0.connection).sent }
+    }
+
     /// Pointer to a [`ngx_connection_t`] client connection object.
     ///
     /// [`ngx_connection_t`]: https://nginx.org/en/docs/dev/development_guide.html#connection
@@ -858,5 +879,37 @@ mod tests {
         let req = unsafe { Request::from_ngx_http_request(&raw mut r) };
         let statuses: Vec<_> = req.upstream_states().iter().map(|s| s.status).collect();
         assert_eq!(statuses, [502, 200]);
+    }
+
+    fn zeroed_request() -> ngx_http_request_t {
+        unsafe { MaybeUninit::zeroed().assume_init() }
+    }
+
+    fn request_from(raw: &mut ngx_http_request_t) -> &mut Request {
+        unsafe { Request::from_ngx_http_request(raw) }
+    }
+
+    #[test]
+    fn request_metrics_read_nginx_fields() {
+        let mut raw = zeroed_request();
+        raw.start_sec = 1_700_000_000;
+        raw.start_msec = 250;
+        raw.request_length = 4096;
+
+        let request = request_from(&mut raw);
+        assert_eq!(request.start_sec(), 1_700_000_000);
+        assert_eq!(request.start_msec(), 250);
+        assert_eq!(request.request_length(), 4096);
+    }
+
+    #[test]
+    fn bytes_sent_reads_the_client_connection() {
+        let mut connection: ngx_connection_t = unsafe { MaybeUninit::zeroed().assume_init() };
+        connection.sent = 8192;
+
+        let mut raw = zeroed_request();
+        raw.connection = &raw mut connection;
+
+        assert_eq!(request_from(&mut raw).bytes_sent(), 8192);
     }
 }
