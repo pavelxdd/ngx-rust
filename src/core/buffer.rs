@@ -602,7 +602,13 @@ impl<'pool> Pool<'pool> {
     }
 
     fn empty_buffer(&self) -> Result<NonNull<ngx_buf_t>, BufferError> {
-        NonNull::new(self.calloc_type::<ngx_buf_t>()).ok_or(BufferError::Allocation)
+        let mut raw =
+            NonNull::new(self.calloc_type::<ngx_buf_t>()).ok_or(BufferError::Allocation)?;
+        let buffer = unsafe { raw.as_mut() };
+        // Empty memory views require a non-null byte pointer.
+        buffer.pos = NonNull::<u8>::dangling().as_ptr();
+        buffer.last = buffer.pos;
+        Ok(raw)
     }
 }
 
@@ -737,6 +743,24 @@ mod tests {
         fn drop(&mut self) {
             unsafe { nginx_sys::ngx_destroy_pool(self.raw) };
         }
+    }
+
+    #[cfg(feature = "test-link")]
+    #[test]
+    fn control_buffer_exposes_an_empty_memory_slice() {
+        let owner = TestPool::new();
+        let pool = owner.handle();
+        let flags = BufferFlags { flush: true, last_buf: true, ..BufferFlags::default() };
+        let buffer = pool.control_buffer(flags).unwrap();
+        let raw = unsafe { &*buffer.as_ngx_buf() };
+
+        assert!(!raw.pos.is_null());
+        assert!(!raw.last.is_null());
+        assert_eq!(buffer.as_bytes(), b"");
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.size(), Ok(0));
+        assert_eq!(buffer.flags(), flags);
+        assert!(matches!(buffer.kind(), Ok(BufferView::Control(_))));
     }
 
     #[cfg(feature = "test-link")]

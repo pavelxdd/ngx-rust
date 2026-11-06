@@ -7,6 +7,43 @@ use alloc::boxed::Box;
 use core::{mem, ptr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+#[test]
+fn file_buffer_builders_expose_an_empty_memory_slice() {
+    use std::io::Write;
+
+    let _guard = crate::TEST_NGINX_GLOBALS.lock().unwrap_or_else(|error| error.into_inner());
+    let mut source = tempfile::tempfile().unwrap();
+    source.write_all(b"abcdef").unwrap();
+    let owner = TestPool::new();
+    let pool = owner.handle();
+    let mut file: ngx_file_t = unsafe { mem::zeroed() };
+    file.fd = source.as_raw_fd();
+    let mut raw_file: ngx_buf_t = unsafe { mem::zeroed() };
+    raw_file.file = &raw mut file;
+    raw_file.file_pos = 1;
+    raw_file.file_last = 6;
+    raw_file.set_in_file(1);
+    let flags = BufferFlags { flush: true, last_buf: true, ..BufferFlags::default() };
+    let borrowed = unsafe { pool.file_buffer_slice(&raw_file, 0..3, flags) }.unwrap();
+    let retained = pool.retain_file_buffer_slice(&raw_file, 0..3, flags).unwrap();
+
+    for buffer in [borrowed, retained] {
+        let raw = unsafe { &*buffer.as_ngx_buf() };
+        assert!(!raw.pos.is_null());
+        assert!(!raw.last.is_null());
+        assert_eq!(buffer.as_bytes(), b"");
+        assert_eq!(buffer.len(), 0);
+        assert_eq!(buffer.size(), Ok(3));
+        assert_eq!(buffer.flags(), flags);
+        let view = buffer.file().unwrap().unwrap();
+        assert_eq!((view.start(), view.end()), (1, 4));
+        let mut bytes = [0; 3];
+        let fd = unsafe { (*view.file_ptr()).fd };
+        assert_eq!(unsafe { libc::pread(fd, bytes.as_mut_ptr().cast(), 3, 1) }, 3);
+        assert_eq!(&bytes, b"bcd");
+    }
+}
+
 #[cfg(all(feature = "test-link", unix))]
 #[test]
 fn retained_file_buffer_slice_owns_its_descriptor_until_pool_cleanup() {
