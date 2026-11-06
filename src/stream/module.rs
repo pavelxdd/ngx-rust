@@ -86,9 +86,11 @@ pub unsafe trait StreamModule {
         let Some(pool) = NonNull::new(cf.pool) else {
             return ptr::null_mut();
         };
-        let pool = unsafe { Pool::from_ngx_pool(pool.as_ptr()) };
-        unsafe { pool.allocate_with_cleanup(Self::MainConf::default) }
-            .map(NonNull::as_ptr)
+        let Some(pool) = (unsafe { Pool::from_raw(pool.as_ptr()) }) else {
+            return ptr::null_mut();
+        };
+        pool.allocate_with_cleanup(Self::MainConf::default)
+            .map(|value| value.into_non_null().as_ptr())
             .unwrap_or(ptr::null_mut())
             .cast()
     }
@@ -120,9 +122,11 @@ pub unsafe trait StreamModule {
         let Some(pool) = NonNull::new(cf.pool) else {
             return ptr::null_mut();
         };
-        let pool = unsafe { Pool::from_ngx_pool(pool.as_ptr()) };
-        unsafe { pool.allocate_with_cleanup(Self::ServerConf::default) }
-            .map(NonNull::as_ptr)
+        let Some(pool) = (unsafe { Pool::from_raw(pool.as_ptr()) }) else {
+            return ptr::null_mut();
+        };
+        pool.allocate_with_cleanup(Self::ServerConf::default)
+            .map(|value| value.into_non_null().as_ptr())
             .unwrap_or(ptr::null_mut())
             .cast()
     }

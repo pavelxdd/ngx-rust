@@ -109,7 +109,7 @@ where
 /// pool until removed.
 pub unsafe trait StreamModuleSessionContext: StreamModule {
     /// Value stored in the module's per-session context slot.
-    type SessionContext;
+    type SessionContext: 'static;
 }
 
 /// Borrowed high-level view of an nginx Stream session.
@@ -172,8 +172,8 @@ impl Session {
     }
 
     /// Memory pool owned by the client connection.
-    fn pool(&self) -> Pool {
-        unsafe { Pool::from_ngx_pool(self.connection().pool) }
+    fn pool(&self) -> Pool<'_> {
+        unsafe { Pool::from_raw(self.connection().pool).unwrap_unchecked() }
     }
 
     /// Logger associated with the client connection.
@@ -256,7 +256,7 @@ impl Session {
             return Ok(unsafe { context.as_mut() });
         }
 
-        let mut context = unsafe { self.pool().allocate_with_cleanup(constructor)? };
+        let mut context = self.pool().allocate_with_cleanup(constructor)?.into_non_null();
         unsafe { *slot.as_ptr() = context.as_ptr().cast() };
         Ok(unsafe { context.as_mut() })
     }
@@ -270,8 +270,8 @@ impl Session {
         let context = NonNull::new(unsafe { *slot.as_ptr() }.cast::<M::SessionContext>())?;
         unsafe { *slot.as_ptr() = core::ptr::null_mut() };
 
-        let mut pool = self.pool();
-        if unsafe { pool.remove(context.as_ptr()) }.is_some() {
+        let pool = self.pool();
+        if unsafe { pool.remove_cleanup(context) } {
             Some(())
         } else {
             unsafe { *slot.as_ptr() = context.as_ptr().cast() };

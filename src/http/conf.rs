@@ -174,7 +174,7 @@ impl HttpModuleConfExt for ngx_http_upstream_srv_conf_t {
 /// module returned by `Self::module()`.
 pub unsafe trait HttpModuleMainConf: HttpModule {
     /// Type for main module configuration
-    type MainConf;
+    type MainConf: 'static;
     /// Get reference to main module configuration
     fn main_conf(o: &impl HttpModuleConfExt) -> Option<&Self::MainConf> {
         unsafe { Some(o.http_main_conf_unchecked(Self::module())?.as_ref()) }
@@ -204,7 +204,7 @@ pub unsafe trait HttpModuleMainConf: HttpModule {
 /// the module returned by `Self::module()`.
 pub unsafe trait HttpModuleServerConf: HttpModule {
     /// Type for server-specific module configuration
-    type ServerConf;
+    type ServerConf: 'static;
     /// Get reference to server-specific module configuration
     fn server_conf(o: &impl HttpModuleConfExt) -> Option<&Self::ServerConf> {
         unsafe { Some(o.http_server_conf_unchecked(Self::module())?.as_ref()) }
@@ -236,7 +236,7 @@ pub unsafe trait HttpModuleServerConf: HttpModule {
 /// for the module returned by `Self::module()`.
 pub unsafe trait HttpModuleLocationConf: HttpModule {
     /// Type for location-specific module configuration
-    type LocationConf;
+    type LocationConf: 'static;
     /// Get reference to location-specific module configuration
     fn location_conf(o: &impl HttpModuleConfExt) -> Option<&Self::LocationConf> {
         unsafe { Some(o.http_location_conf_unchecked(Self::module())?.as_ref()) }

@@ -21,7 +21,7 @@ struct NgxHttpOrigDstCtx {
 }
 
 impl NgxHttpOrigDstCtx {
-    pub fn save(&mut self, addr: &str, port: in_port_t, pool: &Pool) -> Status {
+    pub fn save(&mut self, addr: &str, port: in_port_t, pool: &Pool<'_>) -> Status {
         let Some(addr) = (unsafe { ngx_str_t::from_bytes(pool.as_ptr(), addr.as_bytes()) }) else {
             return Status::NGX_ERROR;
         };
@@ -202,14 +202,17 @@ http_variable_get!(
                 // create context,
                 // set context
                 ngx_log_debug_http!(request, "httporigdst: saving ip - {:?}, port - {}", ip, port,);
-                let pool = request.pool();
+                let raw_pool = request.pool().as_ptr();
                 let Ok(new_ctx) =
                     request.get_or_insert_module_context_with::<Module>(NgxHttpOrigDstCtx::default)
                 else {
                     return Status::NGX_ERROR;
                 };
-
-                if let Err(status) = new_ctx.save(&ip, port, &pool).into_result() {
+                // SAFETY: the request and its pool remain live for this variable callback.
+                let status =
+                    unsafe { Pool::with_raw(raw_pool, |pool| new_ctx.save(&ip, port, &pool)) }
+                        .unwrap_or(Status::NGX_ERROR);
+                if let Err(status) = status.into_result() {
                     return status;
                 }
                 unsafe { new_ctx.bind_addr(v) };
@@ -243,14 +246,17 @@ http_variable_get!(
                 // create context,
                 // set context
                 ngx_log_debug_http!(request, "httporigdst: saving ip - {:?}, port - {}", ip, port,);
-                let pool = request.pool();
+                let raw_pool = request.pool().as_ptr();
                 let Ok(new_ctx) =
                     request.get_or_insert_module_context_with::<Module>(NgxHttpOrigDstCtx::default)
                 else {
                     return Status::NGX_ERROR;
                 };
-
-                if let Err(status) = new_ctx.save(&ip, port, &pool).into_result() {
+                // SAFETY: the request and its pool remain live for this variable callback.
+                let status =
+                    unsafe { Pool::with_raw(raw_pool, |pool| new_ctx.save(&ip, port, &pool)) }
+                        .unwrap_or(Status::NGX_ERROR);
+                if let Err(status) = status.into_result() {
                     return status;
                 }
                 unsafe { new_ctx.bind_port(v) };
