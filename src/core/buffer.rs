@@ -663,7 +663,7 @@ pub(crate) fn validate_native_buffer(buffer: &ngx_buf_t) -> Result<(), BufferErr
         if len > isize::MAX as usize {
             return Err(BufferError::InvalidMemoryRange);
         }
-        if buffer.temporary() != 0 && (buffer.end.is_null() || buffer.end < buffer.last) {
+        if buffer.temporary() != 0 && !buffer.end.is_null() && buffer.end < buffer.last {
             return Err(BufferError::InvalidMemoryRange);
         }
     }
@@ -873,6 +873,24 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(prefix.next, &raw mut suffix);
         assert!(suffix.next.is_null());
+    }
+
+    #[test]
+    fn native_temporary_buffer_without_capacity_exposes_visible_bytes() {
+        let mut bytes = *b"header";
+        let mut buffer: ngx_buf_t = unsafe { core::mem::zeroed() };
+        buffer.pos = bytes.as_mut_ptr();
+        buffer.last = unsafe { buffer.pos.add(bytes.len()) };
+        buffer.set_temporary(1);
+
+        assert_eq!(buffer.size(), Ok(6));
+        assert!(matches!(buffer.kind(), Ok(BufferView::Memory(b"header"))));
+        let mut link = ngx_chain_t { buf: &raw mut buffer, next: ptr::null_mut() };
+        let chain = unsafe { ChainRef::from_raw(&raw mut link) }.unwrap();
+        assert_eq!(chain.iter().next().unwrap().unwrap().as_bytes(), b"header");
+
+        buffer.end = buffer.pos;
+        assert_eq!(buffer.size(), Err(BufferError::InvalidMemoryRange));
     }
 
     #[test]
