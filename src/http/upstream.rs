@@ -34,7 +34,7 @@ use crate::ffi::ngx_http_upstream_state_t;
 /// has one entry per attempt (e.g. failed peer, then successful
 /// peer) in chronological order.
 ///
-/// Yielded by [`crate::http::Request::upstream_states`].  Each
+/// Yielded by [`crate::http::RequestRef::upstream_states`].  Each
 /// instance borrows from the underlying `ngx_http_request_t`'s pool
 /// and is valid for the lifetime of the request.
 ///
